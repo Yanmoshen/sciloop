@@ -1,0 +1,40 @@
+# Copyright 2026 SciLoop contributors
+# Licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
+#
+# 非机密的静态配置（禁止写入任何密钥）。环境相关值一律由环境变量覆盖（见 .env.example）。
+schema_version: "1.0"
+
+app:
+  name: SciLoop
+  tagline: 可审计科研流水线：文献空白 → 可复现实验 → 风险自适应
+  compliance_notice: 本内容由 AI 辅助生成，需研究者自行核验
+
+policy:
+  policy_version: risk-policy-v1.2
+  judgement_order: [safety_ok, time_ok, cost_ok]
+  # 规则层拥有最终决定权，LLM 只能提供建议分
+  guardrails:
+    run_timeout_seconds: 300
+    stage_timeout_seconds: 1200
+    hard_limit_usd: 8.0
+    demo_quota_usd: 3.0
+
+executor:
+  max_concurrency: 2
+  max_output_bytes: 5242880
+  deny_private_network: true
+  runtime_install_forbidden: true
+
+ui:
+  theme_p0: light
+  theme_p1: dark
+  nav_modules:
+    - { path: /feed, label: 论文流 }
+    - { path: /ideas, label: 研究构思 }
+    - { path: /workbench, label: 流水线工作台 }
+    - { path: /knowledge, label: 知识资产 }
+    - { path: /settings, label: 设置 }
+
+demo:
+  snapshot_default: true
+  seed_project_slug: demo-llm-eval

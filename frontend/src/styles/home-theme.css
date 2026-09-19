@@ -1,0 +1,87 @@
+/**
+ * Copyright 2026 SciLoop contributors
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * 总览页专用设计层（n8n design language，来源 designlang-2026-09-18/n8n-io-variables.css）。
+ *
+ * 作用域纪律：本文件所有规则都以 `.sl-home` 为前缀，**只作用于总览壳层**，
+ * 不影响既有 7 个模块页（它们继续使用 styles/tokens.css 的浅色学术蓝）。
+ * 色值全部取自 n8n 提取结果，禁止自造新 hex。
+ */
+
+/* ---------- 浅色 ---------- */
+.sl-home {
+  --h-page-bg: #ffffff;
+  --h-surface: #f7f6fa;
+  --h-surface-raised: #fefefe;
+  --h-surface-input: #f7f6fa;
+  --h-line: rgba(0, 0, 0, 0.12);
+  --h-line-strong: rgba(0, 0, 0, 0.24);
+  --h-fg: #000000;
+  --h-fg-muted: #4b4b4b;
+  --h-fg-subtle: #6f6f6f;
+  --h-primary: #ee4f27;
+  --h-primary-fg: #000000;
+  --h-secondary: #077ac7;
+  --h-hover: rgba(0, 0, 0, 0.05);
+  --h-active: rgba(238, 79, 39, 0.12);
+}
+
+/* ---------- 深色（P0 默认） ---------- */
+:root[data-theme='dark'] .sl-home {
+  --h-page-bg: #0e0918;
+  --h-surface: #1b1728;
+  --h-surface-raised: #1f192a;
+  --h-surface-input: #1a1624;
+  --h-line: rgba(209, 206, 206, 0.14);
+  --h-line-strong: rgba(209, 206, 206, 0.28);
+  --h-fg: #ffffff;
+  --h-fg-muted: #b6b5b9;
+  --h-fg-subtle: #9d9797;
+  --h-primary: #ee4f27;
+  --h-primary-fg: #000000;
+  --h-secondary: #077ac7;
+  --h-hover: rgba(209, 206, 206, 0.08);
+  --h-active: rgba(238, 79, 39, 0.16);
+}
+
+/* ---------- 滚动条：仅总览页范围内美化，禁用系统箭头按钮 ---------- */
+.sl-home ::-webkit-scrollbar,
+.sl-home::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.sl-home ::-webkit-scrollbar-track,
+.sl-home::-webkit-scrollbar-track {
+  background: transparent;
+}
+.sl-home ::-webkit-scrollbar-button,
+.sl-home::-webkit-scrollbar-button {
+  display: none;
+  width: 0;
+  height: 0;
+}
+.sl-home ::-webkit-scrollbar-thumb,
+.sl-home::-webkit-scrollbar-thumb {
+  background: var(--h-line-strong);
+  border: 2px solid transparent;
+  background-clip: content-box;
+  border-radius: 40px;
+}
+.sl-home ::-webkit-scrollbar-thumb:hover,
+.sl-home::-webkit-scrollbar-thumb:hover {
+  background: var(--h-fg-subtle);
+  background-clip: content-box;
+}
+
+/* Firefox 回退（Chromium 走上面的 ::-webkit-scrollbar 分支） */
+@supports (-moz-appearance: none) {
+  .sl-home {
+    scrollbar-width: thin;
+    scrollbar-color: var(--h-line-strong) transparent;
+  }
+}

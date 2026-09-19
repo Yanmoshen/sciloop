@@ -1,0 +1,24 @@
+{
+  "prompt_version": "T1-prompts-v1",
+  "note": "T1 的三个提示词变体。变量 {task_hint} 与 {question} 由模板在运行时用真实样本填充；正文的 SHA-256 会写进 Passport 的 prompt_sha256。",
+  "variants": [
+    {
+      "id": "v1_zeroshot",
+      "label": "零样本直答",
+      "system": "你是一个严谨的评测作答器。直接给出答案，不要解释，不要输出多余文字。\n任务说明：{task_hint}\n只输出答案本身。",
+      "user": "{question}"
+    },
+    {
+      "id": "v2_cot",
+      "label": "先推理后作答",
+      "system": "你是一个严谨的评测作答器。请先在脑中推理，再作答。\n任务说明：{task_hint}\n最终只输出一行，格式为「答案：<答案>」。",
+      "user": "{question}"
+    },
+    {
+      "id": "v3_strict_format",
+      "label": "强格式约束",
+      "system": "你是一个严格的格式执行器。\n任务说明：{task_hint}\n硬性要求：只输出答案；不得包含标点、不得包含单位、不得包含任何解释；若答案是数字，只输出数字本身。",
+      "user": "{question}"
+    }
+  ]
+}

@@ -1,0 +1,81 @@
+# Copyright 2026 SciLoop contributors
+# Licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sciloop-backend"
+version = "0.1.0"
+description = "SciLoop · 可审计科研流水线后端（文献空白 → 可复现实验 → 风险自适应）"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "SciLoop contributors" }]
+
+# 依赖固定为「下限 + 上界」的兼容区间：既保证可复现，又不阻断安全补丁。
+dependencies = [
+    # --- Web / 服务 ---
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.30,<1.0",
+    # --- 数据库 ---
+    "sqlalchemy>=2.0.30,<2.1",
+    "asyncpg>=0.29,<0.31",
+    # psycopg 提供同步驱动：alembic 同步迁移、feed 端点的同步会话工厂与批量任务共用
+    "psycopg[binary]>=3.1,<4.0",
+    "alembic>=1.13,<2.0",
+    # --- 配置与校验 ---
+    "pydantic>=2.7,<3.0",
+    "pydantic-settings>=2.3,<3.0",
+    "python-dotenv>=1.0,<2.0",
+    # WP02 硬需求：结构化输出的本地 JSON Schema 校验（禁止自研校验器）
+    "jsonschema>=4.21",
+    # WP02 硬需求：model_configs.api_key_enc 的 fernet 加密存储（禁止明文落库）
+    "cryptography>=42",
+    # --- 抓取与全文解析 ---
+    "httpx>=0.27,<1.0",
+    "pymupdf>=1.24,<2.0",
+    # --- 调度 ---
+    "apscheduler>=3.10,<4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2,<9.0",
+    "pytest-asyncio>=0.23,<1.0",
+    "ruff>=0.5,<1.0",
+    "black>=24.4,<25.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+# --------------------------------------------------------------------------- #
+# 工具链
+# --------------------------------------------------------------------------- #
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["../tests", "tests"]
+asyncio_mode = "auto"
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["migrations/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM"]
+ignore = [
+    "E501",  # 行长由 black 兜底
+    "B008",  # FastAPI 的 Depends()/Query() 默认值写法
+]
+
+[tool.ruff.lint.per-file-ignores]
+"app/api/v1/*.py" = ["B008"]
+"migrations/*.py" = ["E402"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+extend-exclude = "migrations/versions"

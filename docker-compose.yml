@@ -1,0 +1,110 @@
+# Copyright 2026 SciLoop contributors
+# Licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
+#
+# SciLoop 本地编排：db（PostgreSQL 16）+ backend（FastAPI）+ frontend（nginx 静态托管）
+# 首次启动：cp .env.example .env && docker compose up -d --build
+
+name: sciloop
+
+services:
+  db:
+    # 固定 major 版本的 alpine 变体：体积小、启动快，且满足 PostgreSQL 16 契约
+    image: postgres:16-alpine
+    container_name: sciloop-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-sciloop}
+      POSTGRES_USER: ${POSTGRES_USER:-sciloop}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me}
+      TZ: UTC
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sciloop} -d ${POSTGRES_DB:-sciloop}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sciloop-backend
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # 容器内固定用服务名 db，避免 .env 里的 localhost 泄漏到容器
+      POSTGRES_HOST: db
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-sciloop}:${POSTGRES_PASSWORD:-change_me}@db:5432/${POSTGRES_DB:-sciloop}
+      APP_ENV: ${APP_ENV:-production}
+      # 归一全文文本缓存：固定为容器内路径（与下面的 bind mount 一一对应），
+      # 由 app.services.fulltext.text_cache 读取；写死是为了避免 .env 里的宿主相对路径
+      # （如 ./.data/fulltext-cache）被照搬进容器，导致缓存落到会被清空的临时位置。
+      FULLTEXT_TEXT_CACHE_DIR: /app/backend/.cache/fulltext
+      # APScheduler 三类批量任务默认关闭：演示期不自动抓取/解析，避免消耗外部额度与 LLM 额度
+      SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-0}
+    volumes:
+      # 【WP01 跨包痛点修复】宿主 ./.data/fulltext-cache ←→ 容器全文缓存目录。
+      # 目的：容器重建 / docker compose down && up 后，paper_spans 的 offset 校验仍能判定
+      # valid，不再退化为 valid_by_hash（WP05/WP06/WP13 记录的 blocker）。
+      # 该目录已被 .gitignore 忽略，禁止入库。
+      - ./.data/fulltext-cache:/app/backend/.cache/fulltext
+      # 【论文导入】宿主 ./.data/uploads ←→ 容器上传目录（app/services/ingest/storage.py
+      # 默认即 <backend_root>/.cache/uploads）。容器重建后上传文件仍在，重复导入可被
+      # paper_documents.text_sha256 查重命中。同样已被 .gitignore 忽略，禁止入库。
+      - ./.data/uploads:/app/backend/.cache/uploads
+      # 【论文翻译】宿主 ./.data/artifacts ←→ 容器翻译产物目录（单语/双语 PDF、预览 HTML）。
+      # 产物按 task_id 归档；容器重建后已完成的翻译结果仍可下载。
+      - ./.data/artifacts:/app/backend/.cache/artifacts
+      # 【全文阅读器】宿主 ./.data/reader-library ←→ 容器阅读器库（不可变版本 PDF、文本索引、
+      # 页面对应关系、批注投影）。该目录必须持久化，否则数据库里的版本记录会指向不存在的文件。
+      - ./.data/reader-library:/app/backend/.cache/reader-library
+      # 【同步任务历史】宿主 ./.data/tasks ←→ 容器任务历史目录。抓取任务登记在进程内存里，
+      # 容器重启就没了；这里落一份 JSONL 快照，让「同步任务历史」跨重启可查（不改数据库表）。
+      - ./.data/tasks:/app/backend/.cache/tasks
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    # 先迁移建表（可重复执行），再起服务
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/api/v1/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE: ${VITE_API_BASE:-/api/v1}
+        VITE_DEFAULT_THEME: ${VITE_DEFAULT_THEME:-light}
+    container_name: sciloop-frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      # 必须用 127.0.0.1：容器内 localhost 可能先解析到 ::1，而 nginx 默认只监听 IPv4
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  pgdata:
+    name: sciloop_pgdata

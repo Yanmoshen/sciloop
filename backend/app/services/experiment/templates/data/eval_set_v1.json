@@ -1,0 +1,52 @@
+{
+  "dataset_name": "sciloop-internal-eval",
+  "dataset_version": "sciloop_eval_v1",
+  "provenance": "SciLoop 项目组自建的小样本评测集（30 条），**非公开基准、非采集数据**：条目与参考答案由项目组人工撰写，用于 T1 提示词变体对比与 T3 多模型对照。指标一律由真实模型输出与该参考答案对比得出，不做任何模拟或补齐。",
+  "license": "Apache-2.0（随本仓库）",
+  "tasks": {
+    "sentiment": {
+      "description": "短句情感三分类，参考答案为 positive / negative / neutral 之一",
+      "answer_space": ["positive", "negative", "neutral"]
+    },
+    "arithmetic": {
+      "description": "小学应用题，参考答案为纯数字（不含单位）",
+      "answer_space": "任意整数或小数"
+    },
+    "extraction": {
+      "description": "从句子中抽取指定实体，参考答案为实体文本（保留原句写法）",
+      "answer_space": "原句中的实体文本"
+    }
+  },
+  "items": [
+    { "id": "E01", "task": "sentiment", "input": "这篇论文的实验设置写得非常清楚，我照着复现一次就成功了。", "reference": "positive" },
+    { "id": "E02", "task": "sentiment", "input": "投稿三个月了还没有任何审稿意见，体验很差。", "reference": "negative" },
+    { "id": "E03", "task": "sentiment", "input": "论文共 12 页，包含 5 张图和 3 个表格。", "reference": "neutral" },
+    { "id": "E04", "task": "sentiment", "input": "审稿人给的修改意见非常具体，帮助很大。", "reference": "positive" },
+    { "id": "E05", "task": "sentiment", "input": "实验结果与正文描述不一致，让人难以信服。", "reference": "negative" },
+    { "id": "E06", "task": "sentiment", "input": "该数据集于 2019 年公开发布。", "reference": "neutral" },
+    { "id": "E07", "task": "sentiment", "input": "代码开源得很彻底，连随机种子都写明白了。", "reference": "positive" },
+    { "id": "E08", "task": "sentiment", "input": "附录里没有任何超参说明，复现起来很痛苦。", "reference": "negative" },
+    { "id": "E09", "task": "sentiment", "input": "作者来自三所不同的高校。", "reference": "neutral" },
+    { "id": "E10", "task": "sentiment", "input": "基线对比做得扎实，结论有说服力。", "reference": "positive" },
+    { "id": "E11", "task": "sentiment", "input": "图表分辨率太低，几乎看不清坐标轴。", "reference": "negative" },
+    { "id": "E12", "task": "sentiment", "input": "该模型在四个数据集上做了评测。", "reference": "neutral" },
+    { "id": "E13", "task": "sentiment", "input": "写作流畅，方法部分的动机讲得很透。", "reference": "positive" },
+    { "id": "E14", "task": "sentiment", "input": "相关工作总结得过于简略，遗漏了重要文献。", "reference": "negative" },
+    { "id": "E15", "task": "sentiment", "input": "本文使用 Adam 优化器，学习率为 1e-4。", "reference": "neutral" },
+    { "id": "E16", "task": "arithmetic", "input": "每个实验组有 7 个样本，共 6 组，一共有多少个样本？只输出数字。", "reference": "42" },
+    { "id": "E17", "task": "arithmetic", "input": "批处理大小为 16，训练集有 320 条数据，一个 epoch 需要多少个 batch？只输出数字。", "reference": "20" },
+    { "id": "E18", "task": "arithmetic", "input": "单次调用耗时 250 毫秒，40 次调用共需多少毫秒？只输出数字。", "reference": "10000" },
+    { "id": "E19", "task": "arithmetic", "input": "预算 100 元，每次实验花费 12 元，最多能做几次完整实验？只输出数字。", "reference": "8" },
+    { "id": "E20", "task": "arithmetic", "input": "论文共 48 页，正文占 36 页，附录占多少页？只输出数字。", "reference": "12" },
+    { "id": "E21", "task": "arithmetic", "input": "模型参数量 3.5B，若压缩到原来的 1/7，压缩后是多少 B？只输出数字。", "reference": "0.5" },
+    { "id": "E22", "task": "arithmetic", "input": "三个模型准确率分别为 0.62、0.71、0.78，平均值是多少？保留两位小数，只输出数字。", "reference": "0.70" },
+    { "id": "E23", "task": "arithmetic", "input": "一次实验跑 15 分钟，一天按 8 小时算能做几次？只输出数字。", "reference": "32" },
+    { "id": "E24", "task": "arithmetic", "input": "数据集有 1000 条，划分 8:2 后测试集有多少条？只输出数字。", "reference": "200" },
+    { "id": "E25", "task": "arithmetic", "input": "每条样本平均 380 个 token，30 条样本共多少 token？只输出数字。", "reference": "11400" },
+    { "id": "E26", "task": "extraction", "input": "本文第一作者来自清华大学计算机系。抽取机构名称。", "reference": "清华大学" },
+    { "id": "E27", "task": "extraction", "input": "实验在 NVIDIA A100 上完成训练。抽取硬件名称。", "reference": "NVIDIA A100" },
+    { "id": "E28", "task": "extraction", "input": "模型在 GLUE 基准上取得了最好成绩。抽取基准名称。", "reference": "GLUE" },
+    { "id": "E29", "task": "extraction", "input": "论文投给了 NeurIPS 2026。抽取会议名称。", "reference": "NeurIPS 2026" },
+    { "id": "E30", "task": "extraction", "input": "训练使用了 AdamW 优化器。抽取优化器名称。", "reference": "AdamW" }
+  ]
+}

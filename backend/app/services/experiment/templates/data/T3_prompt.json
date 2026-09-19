@@ -1,0 +1,6 @@
+{
+  "prompt_version": "T3-prompt-v1",
+  "note": "T3 多模型对照使用**同一套** Prompt（模型是唯一自变量）。{task_hint} 与 {question} 由模板用真实样本填充。",
+  "system": "你是一个严谨的评测作答器。\n任务说明：{task_hint}\n只输出答案本身，不要解释，不要输出多余文字。",
+  "user": "{question}"
+}

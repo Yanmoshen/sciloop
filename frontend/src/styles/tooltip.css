@@ -1,0 +1,47 @@
+/**
+ * Copyright 2026 SciLoop contributors
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * 全局 tooltip 浮层样式（配合 utils/globalTooltip.ts）。
+ *
+ * 配色反相：浅色主题用深墨底 + 白字，深色主题用浅灰底 + 深字，两种主题都清晰，
+ * 且不依赖任何一层壳层的局部变量（浮层挂在 body 上，两套壳层通用）。
+ */
+
+#sl-tooltip.sl-tooltip {
+  position: fixed;
+  z-index: 4000;
+  max-width: 320px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: #1f2329;
+  color: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 12px;
+  line-height: 1.5;
+  letter-spacing: 0.2px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.24);
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(-2px);
+  transition:
+    opacity 150ms cubic-bezier(0.4, 0, 0.2, 1),
+    transform 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  word-break: break-word;
+}
+
+#sl-tooltip.sl-tooltip--on {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+:root[data-theme='dark'] #sl-tooltip.sl-tooltip {
+  background: #e8eaed;
+  color: #0f1115;
+  border-color: rgba(15, 17, 21, 0.12);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+}

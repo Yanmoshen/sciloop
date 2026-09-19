@@ -1,0 +1,668 @@
+{
+  "schema_version": "1.0",
+  "wp": "WP04",
+  "purpose": "会议/期刊 -> venue_level(0-4) 白名单。仅用于影响力辅助展示分与 venue 归一，未命中一律置 null（禁止猜测）。",
+  "level_definitions": {
+    "4": "领域旗舰 / CCF-A 级：顶级会议与顶级期刊",
+    "3": "高水平 / CCF-B 级：主流同行评审会议与期刊",
+    "2": "认可 / CCF-C 级：正规同行评审会议与期刊",
+    "1": "一般同行评审：区域性会议、低影响因子期刊、出版社综合刊",
+    "0": "非正式载体：预印本平台、非同行评审档案库（不能视为已发表）"
+  },
+  "level_rule": "4=CCF-A / 领域旗舰；3=CCF-B；2=CCF-C；1=一般同行评审；0=预印本或非同行评审载体。无法确定时不给条目，由 venue.py 返回 null。",
+  "matching_notes": [
+    "aliases 与 canonical 都参与归一匹配；匹配前统一小写、去标点、压缩空白",
+    "带年份写法（NeurIPS 2025 / ICML'24）、届次前缀（41st / Proceedings of the）、后缀（main conference / camera-ready）由 venue.py 归一后匹配",
+    "同一 venue 的 fullname / abbreviation / 带年份三种写法必须落到同一 level"
+  ],
+  "venues": [
+    {
+      "canonical": "NeurIPS",
+      "level": 4,
+      "kind": "conference",
+      "aliases": [
+        "NIPS",
+        "Neural Information Processing Systems",
+        "Conference on Neural Information Processing Systems",
+        "Advances in Neural Information Processing Systems",
+        "Neural Information Processing Systems Conference"
+      ]
+    },
+    {
+      "canonical": "ICML",
+      "level": 4,
+      "kind": "conference",
+      "aliases": [
+        "International Conference on Machine Learning",
+        "International Conference on Machine Learning ICML"
+      ]
+    },
+    {
+      "canonical": "ICLR",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["International Conference on Learning Representations"]
+    },
+    {
+      "canonical": "ACL",
+      "level": 4,
+      "kind": "conference",
+      "aliases": [
+        "Annual Meeting of the Association for Computational Linguistics",
+        "Meeting of the Association for Computational Linguistics",
+        "Association for Computational Linguistics",
+        "ACL Annual Meeting"
+      ]
+    },
+    {
+      "canonical": "EMNLP",
+      "level": 4,
+      "kind": "conference",
+      "aliases": [
+        "Conference on Empirical Methods in Natural Language Processing",
+        "Empirical Methods in Natural Language Processing"
+      ]
+    },
+    {
+      "canonical": "NAACL",
+      "level": 4,
+      "kind": "conference",
+      "aliases": [
+        "Conference of the North American Chapter of the Association for Computational Linguistics",
+        "North American Chapter of the Association for Computational Linguistics",
+        "NAACL HLT",
+        "NAACL-HLT"
+      ]
+    },
+    {
+      "canonical": "CVPR",
+      "level": 4,
+      "kind": "conference",
+      "aliases": [
+        "Conference on Computer Vision and Pattern Recognition",
+        "IEEE Conference on Computer Vision and Pattern Recognition",
+        "IEEE CVPR"
+      ]
+    },
+    {
+      "canonical": "ICCV",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["International Conference on Computer Vision"]
+    },
+    {
+      "canonical": "ECCV",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["European Conference on Computer Vision"]
+    },
+    {
+      "canonical": "AAAI",
+      "level": 4,
+      "kind": "conference",
+      "aliases": [
+        "AAAI Conference on Artificial Intelligence",
+        "Conference on Artificial Intelligence AAAI"
+      ]
+    },
+    {
+      "canonical": "IJCAI",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["International Joint Conference on Artificial Intelligence"]
+    },
+    {
+      "canonical": "KDD",
+      "level": 4,
+      "kind": "conference",
+      "aliases": [
+        "ACM SIGKDD Conference on Knowledge Discovery and Data Mining",
+        "SIGKDD",
+        "Knowledge Discovery and Data Mining",
+        "ACM SIGKDD"
+      ]
+    },
+    {
+      "canonical": "SIGIR",
+      "level": 4,
+      "kind": "conference",
+      "aliases": [
+        "ACM SIGIR Conference on Research and Development in Information Retrieval",
+        "Special Interest Group on Information Retrieval",
+        "SIGIR Conference"
+      ]
+    },
+    {
+      "canonical": "WWW",
+      "level": 4,
+      "kind": "conference",
+      "aliases": [
+        "The Web Conference",
+        "International World Wide Web Conference",
+        "World Wide Web Conference",
+        "Web Conference"
+      ]
+    },
+    {
+      "canonical": "ICRA",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["IEEE International Conference on Robotics and Automation"]
+    },
+    {
+      "canonical": "IROS",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["IEEE RSJ International Conference on Intelligent Robots and Systems", "International Conference on Intelligent Robots and Systems"]
+    },
+    {
+      "canonical": "SIGMOD",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["ACM SIGMOD International Conference on Management of Data", "International Conference on Management of Data"]
+    },
+    {
+      "canonical": "VLDB",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["International Conference on Very Large Data Bases", "Proceedings of the VLDB Endowment", "PVLDB", "Very Large Data Bases"]
+    },
+    {
+      "canonical": "ICDE",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["IEEE International Conference on Data Engineering", "International Conference on Data Engineering"]
+    },
+    {
+      "canonical": "OSDI",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["USENIX Symposium on Operating Systems Design and Implementation"]
+    },
+    {
+      "canonical": "SOSP",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["ACM Symposium on Operating Systems Principles", "Symposium on Operating Systems Principles"]
+    },
+    {
+      "canonical": "CCS",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["ACM Conference on Computer and Communications Security", "ACM CCS", "Computer and Communications Security"]
+    },
+    {
+      "canonical": "S&P",
+      "level": 4,
+      "kind": "conference",
+      "aliases": [
+        "IEEE Symposium on Security and Privacy",
+        "IEEE S&P",
+        "Oakland",
+        "Symposium on Security and Privacy"
+      ]
+    },
+    {
+      "canonical": "USENIX Security",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["USENIX Security Symposium", "USENIX Security"]
+    },
+    {
+      "canonical": "NDSS",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["Network and Distributed System Security Symposium"]
+    },
+    {
+      "canonical": "STOC",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["ACM Symposium on Theory of Computing", "Symposium on Theory of Computing"]
+    },
+    {
+      "canonical": "FOCS",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["IEEE Symposium on Foundations of Computer Science", "Symposium on Foundations of Computer Science"]
+    },
+    {
+      "canonical": "POPL",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["ACM SIGPLAN Symposium on Principles of Programming Languages", "Symposium on Principles of Programming Languages"]
+    },
+    {
+      "canonical": "PLDI",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["ACM SIGPLAN Conference on Programming Language Design and Implementation", "Programming Language Design and Implementation"]
+    },
+    {
+      "canonical": "OOPSLA",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["ACM SIGPLAN Conference on Object Oriented Programming Systems Languages and Applications", "Object Oriented Programming Systems Languages and Applications"]
+    },
+    {
+      "canonical": "ICSE",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["International Conference on Software Engineering"]
+    },
+    {
+      "canonical": "FSE",
+      "level": 4,
+      "kind": "conference",
+      "aliases": [
+        "ACM International Conference on the Foundations of Software Engineering",
+        "ESEC FSE",
+        "ESEC/FSE",
+        "Foundations of Software Engineering",
+        "Joint Meeting of the European Software Engineering Conference and the ACM SIGSOFT Symposium on the Foundations of Software Engineering"
+      ]
+    },
+    {
+      "canonical": "ASE",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["IEEE ACM International Conference on Automated Software Engineering", "International Conference on Automated Software Engineering"]
+    },
+    {
+      "canonical": "CHI",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["ACM Conference on Human Factors in Computing Systems", "ACM CHI", "Human Factors in Computing Systems"]
+    },
+    {
+      "canonical": "UIST",
+      "level": 4,
+      "kind": "conference",
+      "aliases": ["ACM Symposium on User Interface Software and Technology", "User Interface Software and Technology"]
+    },
+    {
+      "canonical": "TPAMI",
+      "level": 4,
+      "kind": "journal",
+      "aliases": ["IEEE Transactions on Pattern Analysis and Machine Intelligence", "Pattern Analysis and Machine Intelligence"]
+    },
+    {
+      "canonical": "JMLR",
+      "level": 4,
+      "kind": "journal",
+      "aliases": ["Journal of Machine Learning Research"]
+    },
+    {
+      "canonical": "TACL",
+      "level": 4,
+      "kind": "journal",
+      "aliases": ["Transactions of the Association for Computational Linguistics"]
+    },
+    {
+      "canonical": "TIP",
+      "level": 4,
+      "kind": "journal",
+      "aliases": ["IEEE Transactions on Image Processing", "Transactions on Image Processing"]
+    },
+    {
+      "canonical": "TNNLS",
+      "level": 4,
+      "kind": "journal",
+      "aliases": ["IEEE Transactions on Neural Networks and Learning Systems", "Transactions on Neural Networks and Learning Systems"]
+    },
+    {
+      "canonical": "TKDE",
+      "level": 4,
+      "kind": "journal",
+      "aliases": ["IEEE Transactions on Knowledge and Data Engineering", "Transactions on Knowledge and Data Engineering"]
+    },
+    {
+      "canonical": "IJCV",
+      "level": 4,
+      "kind": "journal",
+      "aliases": ["International Journal of Computer Vision"]
+    },
+    {
+      "canonical": "TSE",
+      "level": 4,
+      "kind": "journal",
+      "aliases": ["IEEE Transactions on Software Engineering", "Transactions on Software Engineering"]
+    },
+    {
+      "canonical": "TIFS",
+      "level": 4,
+      "kind": "journal",
+      "aliases": ["IEEE Transactions on Information Forensics and Security", "Transactions on Information Forensics and Security"]
+    },
+    {
+      "canonical": "Nature",
+      "level": 4,
+      "kind": "journal",
+      "aliases": ["Nature"]
+    },
+    {
+      "canonical": "Science",
+      "level": 4,
+      "kind": "journal",
+      "aliases": ["Science"]
+    },
+    {
+      "canonical": "COLING",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["International Conference on Computational Linguistics"]
+    },
+    {
+      "canonical": "EACL",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["Conference of the European Chapter of the Association for Computational Linguistics", "European Chapter of the Association for Computational Linguistics"]
+    },
+    {
+      "canonical": "AACL",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["Conference of the Asia Pacific Chapter of the Association for Computational Linguistics", "Asia Pacific Chapter of the Association for Computational Linguistics"]
+    },
+    {
+      "canonical": "ACL Findings",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["Findings of the Association for Computational Linguistics", "Findings of ACL", "Findings of EMNLP", "Findings of NAACL", "Findings"]
+    },
+    {
+      "canonical": "IJCNLP",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["International Joint Conference on Natural Language Processing"]
+    },
+    {
+      "canonical": "CoNLL",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["Conference on Computational Natural Language Learning", "Computational Natural Language Learning"]
+    },
+    {
+      "canonical": "LREC",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["International Conference on Language Resources and Evaluation", "Language Resources and Evaluation"]
+    },
+    {
+      "canonical": "SLT",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["IEEE Spoken Language Technology Workshop", "Spoken Language Technology Workshop", "Spoken Language Technology"]
+    },
+    {
+      "canonical": "INTERSPEECH",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["Conference of the International Speech Communication Association", "INTERSPEECH"]
+    },
+    {
+      "canonical": "ICASSP",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["IEEE International Conference on Acoustics Speech and Signal Processing", "International Conference on Acoustics Speech and Signal Processing"]
+    },
+    {
+      "canonical": "WSDM",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["ACM International Conference on Web Search and Data Mining", "International Conference on Web Search and Data Mining"]
+    },
+    {
+      "canonical": "CIKM",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["ACM International Conference on Information and Knowledge Management", "International Conference on Information and Knowledge Management"]
+    },
+    {
+      "canonical": "RecSys",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["ACM Conference on Recommender Systems", "Conference on Recommender Systems"]
+    },
+    {
+      "canonical": "ECML PKDD",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["European Conference on Machine Learning and Principles and Practice of Knowledge Discovery in Databases", "ECML-PKDD", "Machine Learning and Knowledge Discovery in Databases"]
+    },
+    {
+      "canonical": "AISTATS",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["International Conference on Artificial Intelligence and Statistics", "Artificial Intelligence and Statistics"]
+    },
+    {
+      "canonical": "UAI",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["Conference on Uncertainty in Artificial Intelligence", "Uncertainty in Artificial Intelligence"]
+    },
+    {
+      "canonical": "COLT",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["Conference on Learning Theory", "Computational Learning Theory"]
+    },
+    {
+      "canonical": "BMVC",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["British Machine Vision Conference"]
+    },
+    {
+      "canonical": "WACV",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["IEEE Winter Conference on Applications of Computer Vision", "Winter Conference on Applications of Computer Vision"]
+    },
+    {
+      "canonical": "ACCV",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["Asian Conference on Computer Vision"]
+    },
+    {
+      "canonical": "MICCAI",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["International Conference on Medical Image Computing and Computer Assisted Intervention", "Medical Image Computing and Computer Assisted Intervention"]
+    },
+    {
+      "canonical": "ISSTA",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["ACM SIGSOFT International Symposium on Software Testing and Analysis", "International Symposium on Software Testing and Analysis"]
+    },
+    {
+      "canonical": "ICSME",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["International Conference on Software Maintenance and Evolution", "IEEE International Conference on Software Maintenance and Evolution"]
+    },
+    {
+      "canonical": "SANER",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["International Conference on Software Analysis Evolution and Reengineering", "Software Analysis Evolution and Reengineering"]
+    },
+    {
+      "canonical": "ICPC",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["International Conference on Program Comprehension", "IEEE International Conference on Program Comprehension"]
+    },
+    {
+      "canonical": "EDBT",
+      "level": 3,
+      "kind": "conference",
+      "aliases": ["International Conference on Extending Database Technology", "Extending Database Technology"]
+    },
+    {
+      "canonical": "TOSEM",
+      "level": 3,
+      "kind": "journal",
+      "aliases": ["ACM Transactions on Software Engineering and Methodology", "Transactions on Software Engineering and Methodology"]
+    },
+    {
+      "canonical": "EMSE",
+      "level": 3,
+      "kind": "journal",
+      "aliases": ["Empirical Software Engineering"]
+    },
+    {
+      "canonical": "TASLP",
+      "level": 3,
+      "kind": "journal",
+      "aliases": ["IEEE ACM Transactions on Audio Speech and Language Processing", "Transactions on Audio Speech and Language Processing"]
+    },
+    {
+      "canonical": "TMM",
+      "level": 3,
+      "kind": "journal",
+      "aliases": ["IEEE Transactions on Multimedia", "Transactions on Multimedia"]
+    },
+    {
+      "canonical": "JAIR",
+      "level": 3,
+      "kind": "journal",
+      "aliases": ["Journal of Artificial Intelligence Research"]
+    },
+    {
+      "canonical": "Machine Learning",
+      "level": 3,
+      "kind": "journal",
+      "aliases": ["Machine Learning Journal", "Journal Machine Learning"]
+    },
+    {
+      "canonical": "DMKD",
+      "level": 3,
+      "kind": "journal",
+      "aliases": ["Data Mining and Knowledge Discovery"]
+    },
+    {
+      "canonical": "Pattern Recognition",
+      "level": 3,
+      "kind": "journal",
+      "aliases": ["Pattern Recognition Journal"]
+    },
+    {
+      "canonical": "CVIU",
+      "level": 3,
+      "kind": "journal",
+      "aliases": ["Computer Vision and Image Understanding"]
+    },
+    {
+      "canonical": "Neurocomputing",
+      "level": 2,
+      "kind": "journal",
+      "aliases": ["Neurocomputing"]
+    },
+    {
+      "canonical": "Information Sciences",
+      "level": 2,
+      "kind": "journal",
+      "aliases": ["Information Sciences"]
+    },
+    {
+      "canonical": "Expert Systems with Applications",
+      "level": 2,
+      "kind": "journal",
+      "aliases": ["Expert Systems with Applications"]
+    },
+    {
+      "canonical": "Applied Soft Computing",
+      "level": 2,
+      "kind": "journal",
+      "aliases": ["Applied Soft Computing"]
+    },
+    {
+      "canonical": "Knowledge-Based Systems",
+      "level": 2,
+      "kind": "journal",
+      "aliases": ["Knowledge-Based Systems", "Knowledge Based Systems"]
+    },
+    {
+      "canonical": "Neural Computing and Applications",
+      "level": 2,
+      "kind": "journal",
+      "aliases": ["Neural Computing and Applications"]
+    },
+    {
+      "canonical": "Pattern Recognition Letters",
+      "level": 2,
+      "kind": "journal",
+      "aliases": ["Pattern Recognition Letters"]
+    },
+    {
+      "canonical": "Multimedia Tools and Applications",
+      "level": 2,
+      "kind": "journal",
+      "aliases": ["Multimedia Tools and Applications"]
+    },
+    {
+      "canonical": "Scientific Reports",
+      "level": 2,
+      "kind": "journal",
+      "aliases": ["Scientific Reports"]
+    },
+    {
+      "canonical": "IEEE Access",
+      "level": 1,
+      "kind": "journal",
+      "aliases": ["IEEE Access"]
+    },
+    {
+      "canonical": "PLOS ONE",
+      "level": 1,
+      "kind": "journal",
+      "aliases": ["PLOS ONE", "PLoS ONE"]
+    },
+    {
+      "canonical": "Applied Sciences",
+      "level": 1,
+      "kind": "journal",
+      "aliases": ["Applied Sciences Basel", "MDPI Applied Sciences"]
+    },
+    {
+      "canonical": "Electronics",
+      "level": 1,
+      "kind": "journal",
+      "aliases": ["MDPI Electronics"]
+    },
+    {
+      "canonical": "Sensors",
+      "level": 1,
+      "kind": "journal",
+      "aliases": ["MDPI Sensors"]
+    },
+    {
+      "canonical": "Frontiers",
+      "level": 1,
+      "kind": "journal",
+      "aliases": ["Frontiers in", "Frontiers Media"]
+    },
+    {
+      "canonical": "arXiv preprint",
+      "level": 0,
+      "kind": "preprint",
+      "aliases": ["arXiv", "arXiv.org", "arXiv e-prints", "CoRR", "Computing Research Repository", "arXiv preprint"]
+    },
+    {
+      "canonical": "OpenReview",
+      "level": 0,
+      "kind": "preprint",
+      "aliases": ["OpenReview", "OpenReview.net"]
+    },
+    {
+      "canonical": "Preprint",
+      "level": 0,
+      "kind": "preprint",
+      "aliases": ["Preprint", "Preprints", "Technical Report", "TechRxiv", "bioRxiv", "medRxiv", "SSRN", "Research Square", "Under Review", "Submitted"]
+    }
+  ]
+}

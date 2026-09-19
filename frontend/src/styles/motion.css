@@ -1,0 +1,28 @@
+/**
+ * Copyright 2026 SciLoop contributors
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * 全站换色过渡层（浅色 ↔ 深色切换时渐变，而不是瞬间跳变）。
+ *
+ * 为什么用通配选择器：模块页的颜色散落在各组件里（标题、正文、卡片、边框…），
+ * 逐个补 transition 既啰嗦又容易漏。通配规则的优先级为 0，**不会覆盖**组件里
+ * 已有的 `transition` 声明（比如 hover 位移、按钮动效），只给"没有声明过渡"的
+ * 元素补上背景/文字/边框的 300ms 渐变——正好是换肤需要的那三样。
+ *
+ * 时长 300ms 与总览页（n8n motion scale）保持一致。
+ */
+
+*,
+*::before,
+*::after {
+  transition:
+    background-color 300ms cubic-bezier(0.4, 0, 0.2, 1),
+    color 300ms cubic-bezier(0.4, 0, 0.2, 1),
+    border-color 300ms cubic-bezier(0.4, 0, 0.2, 1),
+    fill 300ms cubic-bezier(0.4, 0, 0.2, 1),
+    stroke 300ms cubic-bezier(0.4, 0, 0.2, 1);
+}

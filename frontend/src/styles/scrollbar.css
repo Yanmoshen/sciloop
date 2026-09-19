@@ -1,0 +1,67 @@
+/**
+ * Copyright 2026 SciLoop contributors
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * 全站滚动条统一样式（对应 ui-polish skill §1）。
+ *
+ * 用法：给任何会滚动的容器加 `class="scroll-y"` 即可，**不要**在组件里再各写一份
+ * （历史上 10+ 个容器各写一遍，改一次要动十几处，还容易漏）。
+ *
+ * ⚠️ 关键坑：同一个元素上**不能**同时出现 `scrollbar-width/color` 与 `::-webkit-scrollbar*`。
+ *    Chromium 121+ 一旦认了标准属性，就会整体放弃 webkit 定制，退回系统默认滚动条
+ *    （带上下箭头那种，实测踩过）。所以标准属性只放在 `@supports not selector(::-webkit-scrollbar)`
+ *    里给 Firefox 兜底。
+ */
+
+.scroll-y {
+  scrollbar-gutter: stable; /* 滚动条出现/消失时内容不跳 */
+}
+
+.scroll-y::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+.scroll-y::-webkit-scrollbar-track {
+  background: transparent;
+  margin: 10px 0;
+  border-radius: 999px;
+}
+
+.scroll-y::-webkit-scrollbar-thumb {
+  background-color: var(--color-border-strong);
+  border: 4px solid transparent;
+  border-radius: 999px;
+  background-clip: content-box;
+  min-height: 44px;
+  transition:
+    background-color 180ms cubic-bezier(0.4, 0, 0.2, 1),
+    border-width 180ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* 悬停变粗 + 变亮，便于抓取 */
+.scroll-y::-webkit-scrollbar-thumb:hover {
+  background-color: var(--color-text-secondary);
+  border-width: 2px;
+}
+
+/* 按住拖动时用品牌色，明确"正在滚动" */
+.scroll-y::-webkit-scrollbar-thumb:active {
+  background-color: var(--color-brand);
+  border-width: 2px;
+}
+
+.scroll-y::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+@supports not selector(::-webkit-scrollbar) {
+  .scroll-y {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-border-strong) transparent;
+  }
+}

@@ -1,0 +1,37 @@
+/**
+ * Copyright 2026 SciLoop contributors
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * 无障碍基线（全站生效，对应 ui-polish skill §2 / §7）
+ *
+ * 1) 键盘焦点环：所有可交互元素统一 2px 品牌色外描边。
+ *    用 `:focus-visible` 而不是 `:focus`——鼠标点击不出现描边，只有键盘 Tab 才出现。
+ *    组件若已有自己的焦点样式，给元素加 `data-focus-plain` 即可退出本规则。
+ * 2) 动效降级：系统开启「减少动态效果」时，把过渡与动画压到最短
+ *    （`motion.css` 给全站补了 300ms 换色过渡，这里必须在 reduced-motion 下关掉）。
+ */
+
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 2px;
+  border-radius: var(--radius-md, 6px);
+}
+
+:where([data-focus-plain]):focus-visible {
+  outline: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
