@@ -93,3 +93,8 @@ scripts/
 deliverables/
 preview/
 
+
+# ===== 本地开发专用覆盖文件（不入库）=====
+# docker-compose.override.yml 把宿主源码挂进容器并开启热重载，仅供本机开发；
+# 交付/生产验收请显式用 docker compose -f docker-compose.yml up -d --build 绕开它。
+docker-compose.override.yml
