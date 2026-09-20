@@ -44,7 +44,8 @@ logger = logging.getLogger("sciloop.chat")
 router = APIRouter(tags=["chat"])
 
 TITLE_MAX_CHARS = 20
-TITLE_MAX_TOKENS = 64
+#: 64 太小：思考型模型会把预算全花在 reasoning 上，content 为空 → 标题静默降级。
+TITLE_MAX_TOKENS = 400
 
 TITLE_PROMPT = (
     "你是科研项目的命名助手。为下面这段研究需求拟一个标题。\n"
@@ -71,6 +72,8 @@ class HomeChatResponse(BaseModel):
     title: str
     #: ``model`` = 模型给出；``fallback`` = 标题调用失败后按用户输入截断
     title_source: str
+    #: 降级原因（仅在 ``title_source == "fallback"`` 时有值）——**如实回传，不静默**
+    title_note: str | None = None
     reply: str
     model_ref: str
     provider: str
@@ -119,6 +122,7 @@ async def home_chat(payload: HomeChatRequest) -> HomeChatResponse:
     # 1) 标题：失败只降级，不让整次请求失败
     title = text[:TITLE_MAX_CHARS]
     title_source = "fallback"
+    title_note: str | None = None
     try:
         title_result = await adapter.chat(
             TITLE_PROMPT.format(text=text),
@@ -133,8 +137,11 @@ async def home_chat(payload: HomeChatRequest) -> HomeChatResponse:
         if candidate:
             title = candidate[:TITLE_MAX_CHARS]
             title_source = "model"
+        else:
+            title_note = "模型未给出标题（返回空正文），已改用输入前 20 字"
     except Exception as exc:  # noqa: BLE001 - 标题是锦上添花，任何失败都降级
         logger.warning("首页标题生成失败，降级为用户输入截断：%s", exc)
+        title_note = f"标题生成失败：{exc}"[:200]
 
     # 2) 正式回答：失败必须如实抛出（不能伪装成功）
     try:
@@ -159,6 +166,7 @@ async def home_chat(payload: HomeChatRequest) -> HomeChatResponse:
     return HomeChatResponse(
         title=title,
         title_source=title_source,
+        title_note=title_note,
         reply=reply_result.content or "",
         model_ref=reply_result.model_ref,
         provider=reply_result.provider,
