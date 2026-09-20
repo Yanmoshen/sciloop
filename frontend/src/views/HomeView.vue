@@ -1041,7 +1041,7 @@ onUnmounted(() => {
   background: var(--h-surface-raised);
   border: 1px solid var(--h-line-strong);
   border-radius: 12px;
-  box-shadow: 0 12px 32px rgb(0 0 0 / 24%);
+  box-shadow: 0 12px 32px rgb(0 0 0 / 24%); /* ui-polish-allow: 浮层投影色 */
   animation: mpick-in 180ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
