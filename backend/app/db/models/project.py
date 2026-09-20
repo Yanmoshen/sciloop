@@ -49,6 +49,10 @@ class Project(Base):
     current_iteration: Mapped[int | None] = mapped_column(Integer, server_default="0")
     settings: Mapped[Any | None] = mapped_column(JSONB)
     is_demo: Mapped[bool | None] = mapped_column(Boolean, server_default="false")
+    #: 左栏「项目」分组里的归档位：归档后从主列表收起、进「已归档」折叠区（迁移 0007）
+    archived: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
     taskbook_id: Mapped[int | None] = mapped_column(
         BIGINT,
         ForeignKey(

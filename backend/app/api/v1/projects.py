@@ -87,6 +87,7 @@ def _project_dict(project: Project, *, include_settings: bool = True) -> dict[st
         "mode": project.mode,
         "current_iteration": int(project.current_iteration or 0),
         "is_demo": bool(project.is_demo),
+        "archived": bool(project.archived),
         "idea_id": int(project.idea_id) if project.idea_id is not None else None,
         "taskbook_id": int(project.taskbook_id) if project.taskbook_id is not None else None,
         "created_at": _iso(project.created_at),
@@ -121,8 +122,13 @@ async def list_projects(
     page_size: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = 20,
     status_filter: Annotated[str | None, Query(alias="status", max_length=24)] = None,
     is_demo: Annotated[bool | None, Query()] = None,
+    archived: Annotated[bool | None, Query()] = False,
 ) -> dict[str, Any]:
-    """项目列表：``is_demo DESC NULLS LAST, id ASC``（附录 B.5「``is_demo`` 排序优先」）。"""
+    """项目列表：``is_demo DESC NULLS LAST, id ASC``（附录 B.5「``is_demo`` 排序优先」）。
+
+    ``archived`` 默认 ``False``：左栏「项目」分组只列未归档项目；传 ``true`` 取「已归档」，
+    传 ``null``（省略时无法表达，故用查询串 ``archived=`` 之外的值）不做过滤。
+    """
     if status_filter is not None and status_filter not in PROJECT_STATUSES:
         raise _error(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -136,6 +142,8 @@ async def list_projects(
         filters.append(Project.status == status_filter)
     if is_demo is not None:
         filters.append(Project.is_demo.is_(is_demo))
+    if archived is not None:
+        filters.append(Project.archived.is_(archived))
 
     async with _session_factory()() as session:
         total = (
@@ -296,28 +304,60 @@ async def create_project(
     return result
 
 
-@router.patch("/{project_id}", summary="重命名项目（Owner）")
+@router.patch("/{project_id}", summary="重命名 / 归档项目（Owner）")
 async def rename_project(
     project_id: int,
     _owner: OwnerDep,
     payload: Annotated[dict[str, Any], Body(...)],
 ) -> dict[str, Any]:
-    """**只允许修改项目名**（``name``，去空白后 1–200 字符）。
+    """**只允许修改 ``name``（1–200 字符）与 ``archived``（布尔）**。
 
     刻意不开放 status / current_iteration / 关联字段：这些由流水线状态机与决策留痕
     维护，从管理端直改会绕过状态机（非法迁移）并破坏审计链。
+
+    ``archived`` 是左栏「项目」分组的收起位，与状态机无关，因此允许直改。
     """
-    name = str(payload.get("name") or "").strip()
-    if not name:
-        raise _error(
-            status.HTTP_422_UNPROCESSABLE_ENTITY, "validation_error", "name 必填", payload
-        )
-    if len(name) > 200:
+    unknown = set(payload) - {"name", "archived"}
+    if unknown:
         raise _error(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "validation_error",
-            "name 长度不得超过 200",
-            {"length": len(name)},
+            f"不支持修改字段：{sorted(unknown)}",
+            {"allowed": ["name", "archived"]},
+        )
+
+    name: str | None = None
+    if "name" in payload:
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            raise _error(
+                status.HTTP_422_UNPROCESSABLE_ENTITY, "validation_error", "name 必填", payload
+            )
+        if len(name) > 200:
+            raise _error(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "validation_error",
+                "name 长度不得超过 200",
+                {"length": len(name)},
+            )
+
+    archived: bool | None = None
+    if "archived" in payload:
+        if not isinstance(payload["archived"], bool):
+            raise _error(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "validation_error",
+                "archived 必须为布尔值",
+                {"archived": payload["archived"]},
+            )
+        archived = payload["archived"]
+
+    if name is None and archived is None:
+        raise _error(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "validation_error",
+            "name 与 archived 至少要提供一个",
+            None,
         )
 
     async with _session_factory()() as session:
@@ -329,7 +369,10 @@ async def rename_project(
                 status.HTTP_404_NOT_FOUND, "project_not_found", f"project {project_id} 不存在"
             )
         previous = project.name
-        project.name = name
+        if name is not None:
+            project.name = name
+        if archived is not None:
+            project.archived = archived
         project.updated_at = func.now()
         await session.commit()
         # 先提交再 refresh：`updated_at` 由服务端生成，flush 后属性会过期，
@@ -337,7 +380,13 @@ async def rename_project(
         await session.refresh(project)
         result = _project_dict(project)
 
-    logger.info("project_renamed project_id=%s from=%s to=%s", project_id, previous, name)
+    logger.info(
+        "project_updated project_id=%s from=%s to=%s archived=%s",
+        project_id,
+        previous,
+        result["name"],
+        result["archived"],
+    )
     return result
 
 

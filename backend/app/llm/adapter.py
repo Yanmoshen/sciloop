@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Any
 
 from app.llm import events as _events
@@ -36,7 +38,7 @@ from app.llm.errors import (
     ModelRoutingError,
     ReplayMissError,
 )
-from app.llm.http_client import OpenAICompatibleClient
+from app.llm.http_client import OpenAICompatibleClient, extract_delta, extract_usage
 from app.llm.pricing import PRICE_MISSING_WARNING, compute_cost_usd, is_non_usd_reason
 from app.llm.providers import (
     detect_capability,
@@ -467,6 +469,278 @@ async def _replay_call(
 
 
 # --------------------------------------------------------------------------- #
+# 流式调用（首页对话专用）
+# --------------------------------------------------------------------------- #
+@dataclass
+class StreamUpdate:
+    """流式链路的一帧。
+
+    ``kind='delta'`` → ``text`` 是本次新增的正文（前端直接追加渲染）；
+    ``kind='done'``  → ``result`` 是收尾后的 :class:`LLMResult`（含用量 / 成本 / 耗时）。
+    中途出错**不吞**：抛 ``LLMError``，调用方保留已渲染的部分并如实标注。
+    """
+
+    kind: str
+    text: str = ""
+    result: LLMResult | None = None
+
+
+async def chat_stream(
+    messages: list[Message] | str,
+    model_ref: str | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    *,
+    stage: str | None = None,
+    purpose: str | None = None,
+    project_id: int | None = None,
+    store: LLMStore | None = None,
+    router: ModelRouter | None = None,
+    transport: OpenAICompatibleClient | None = None,
+    allow_fallback: bool = False,
+    allow_replay: bool | None = None,
+    strict_logging: bool = True,
+    timeout: float | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> AsyncIterator[StreamUpdate]:
+    """流式调用入口（**独立于 ``chat()``，六环节主链路不受影响**）。
+
+    与 :func:`chat` 的差异，都是流式的必然结果：
+
+    - **不做结构化输出**：流式 + json_schema 校验重试会要求"重放已经推给用户的文本"，
+      因此这里只服务首页对话这种纯文本场景。
+    - **一旦吐出正文就不再降级**：换模型重来会让用户看到两段重叠的文本。
+      建连失败（还没吐字）仍可按链降级。
+    - **记账在流结束后补记一次**：``llm_call_logs`` 记的是这一次完整的流式调用。
+    """
+    active_store = store or get_store()
+    active_router = router or get_router()
+    client = transport or OpenAICompatibleClient(timeout=timeout or 60.0)
+    msg_list = _normalize_messages(messages)
+
+    chain = await _resolve_chain(active_router, model_ref, stage, project_id, allow_fallback)
+    replay_mode = is_replay_enabled(allow_replay)
+    prompt_hash = compute_prompt_hash(
+        model_ref=chain[0].model_ref,
+        messages=msg_list,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        json_schema=None,
+    )
+
+    fallback_from: list[str] = []
+    last_error: LLMError | None = None
+
+    for index, model in enumerate(chain):
+        if replay_mode:
+            replayed = await _replay_call(
+                store=active_store,
+                model=model,
+                prompt_hash=prompt_hash,
+                json_schema=None,
+                stage=stage,
+                purpose=purpose,
+                project_id=project_id,
+                strict_logging=strict_logging,
+                fallback_from=fallback_from,
+            )
+            if replayed.content:
+                yield StreamUpdate(kind="delta", text=replayed.content)
+            yield StreamUpdate(kind="done", result=replayed)
+            return
+
+        resolved_temperature = (
+            temperature if temperature is not None else (model.temperature or DEFAULT_TEMPERATURE)
+        )
+        resolved_max_tokens = max_tokens or model.max_tokens or DEFAULT_MAX_TOKENS
+        base_payload = _build_stream_payload(
+            model=model,
+            messages=msg_list,
+            temperature=resolved_temperature,
+            max_tokens=resolved_max_tokens,
+            with_usage=True,
+        )
+
+        started = time.perf_counter()
+        parts: list[str] = []
+        reasoning_parts: list[str] = []
+        finish_reason: str | None = None
+        usage = Usage()
+        model_returned: str | None = None
+        emitted = False
+        payload = base_payload
+
+        try:
+            while True:
+                try:
+                    async for chunk in client.chat_completions_stream(model=model, payload=payload):
+                        returned = chunk.get("model")
+                        if isinstance(returned, str) and returned:
+                            model_returned = returned
+                        chunk_usage = extract_usage(chunk)
+                        if chunk_usage is not None:
+                            usage = chunk_usage
+                        text, reasoning, chunk_finish = extract_delta(chunk)
+                        if chunk_finish:
+                            finish_reason = chunk_finish
+                        if reasoning:
+                            reasoning_parts.append(reasoning)
+                        if text:
+                            parts.append(text)
+                            emitted = True
+                            yield StreamUpdate(kind="delta", text=text)
+                    break
+                except LLMBadRequestError as exc:
+                    # 部分供应商不认识 stream_options：去掉它再试一次（属协议适配，不是重试）
+                    if payload is base_payload and _looks_like_stream_options_rejection(exc):
+                        logger.warning("供应商 %s 拒绝 stream_options，去掉该参数重发", model.provider)
+                        payload = {key: value for key, value in base_payload.items() if key != "stream_options"}
+                        continue
+                    raise
+        except LLMError as exc:
+            duration_ms = int((time.perf_counter() - started) * 1000)
+            await _log_attempts(
+                store=active_store,
+                model=model,
+                attempts=exc.attempts
+                or [AttemptRecord(index=1, duration_ms=duration_ms, error_kind=exc.kind, error_message=exc.message)],
+                stage=stage,
+                purpose=purpose,
+                project_id=project_id,
+                success=False,
+                is_replay=False,
+                cost_unknown_reason=None,
+                error_suffix=exc.kind,
+                strict_logging=strict_logging,
+            )
+            last_error = exc
+            # 已经吐过正文就不能降级：换模型重来会让用户看到两段重叠文本
+            if emitted or not allow_fallback or index == len(chain) - 1:
+                await _events.emit_event(
+                    "llm_error",
+                    {
+                        "stage": stage,
+                        "purpose": purpose,
+                        "model_ref": model.model_ref,
+                        "error_kind": exc.kind,
+                        "message": exc.message,
+                        "project_id": project_id,
+                    },
+                )
+                raise
+            fallback_from.append(model.model_ref)
+            logger.warning(
+                "流式调用 %s 建连失败（%s），按降级链切换到 %s",
+                model.model_ref,
+                exc.kind,
+                chain[index + 1].model_ref,
+            )
+            await _events.emit_fallback(
+                stage=stage,
+                from_ref=model.model_ref,
+                to_ref=chain[index + 1].model_ref,
+                reason=exc.kind,
+                error_kind=exc.kind,
+                project_id=project_id,
+            )
+            continue
+
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        content = "".join(parts)
+        if not content.strip():
+            # 与 `_extract_content` 同一兜底口径：思考型模型可能只吐 reasoning_content，
+            # 此时 content 为空但 token 照记 —— 不改读就会出现「已完成但没有任何输出」。
+            content = "".join(reasoning_parts)
+
+        attempt = AttemptRecord(
+            index=1,
+            duration_ms=duration_ms,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+        )
+        await _log_attempts(
+            store=active_store,
+            model=model,
+            attempts=[attempt],
+            stage=stage,
+            purpose=purpose,
+            project_id=project_id,
+            success=True,
+            is_replay=False,
+            cost_unknown_reason=None,
+            error_suffix=None,
+            strict_logging=strict_logging,
+            usage=usage,
+        )
+        cost, cost_reason = compute_cost_usd(
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            input_price_per_million=model.input_price_per_million,
+            output_price_per_million=model.output_price_per_million,
+            currency=model.price_currency,
+        )
+        if cost_reason:
+            logger.warning(
+                "流式调用 %s 单价缺失，cost_usd 记为 null（禁止估算）：%s",
+                model.model_ref,
+                cost_reason,
+            )
+        yield StreamUpdate(
+            kind="done",
+            result=LLMResult(
+                content=content,
+                model_ref=model.model_ref,
+                provider=model.provider,
+                model_id=model.model_id,
+                usage=usage,
+                cost_usd=cost,
+                cost_unknown_reason=cost_reason,
+                duration_ms=duration_ms,
+                attempts=1,
+                http_calls=1,
+                is_replay=False,
+                finish_reason=finish_reason,
+                stage=stage,
+                purpose=purpose,
+                prompt_hash=prompt_hash,
+                resolved_from=model.source,
+                fallback_from=list(fallback_from),
+                raw={"strategy": "stream", "model_returned": model_returned, "metadata": dict(metadata or {})},
+            ),
+        )
+        return
+
+    raise last_error or LLMError("流式调用失败：降级链已耗尽", detail={"stage": stage})
+
+
+def _build_stream_payload(
+    *,
+    model: ResolvedModel,
+    messages: list[Message],
+    temperature: float,
+    max_tokens: int,
+    with_usage: bool,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": model.model_id,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": True,
+        "messages": messages,
+    }
+    if with_usage:
+        # 不带这个参数时，多数供应商在流式模式下压根不返回 usage（成本只能记 null）
+        payload["stream_options"] = {"include_usage": True}
+    return payload
+
+
+def _looks_like_stream_options_rejection(exc: LLMBadRequestError) -> bool:
+    detail = exc.detail if isinstance(exc.detail, str) else ""
+    blob = f"{exc.message} {detail}".lower()
+    return "stream_options" in blob
+
+
+# --------------------------------------------------------------------------- #
 # 组装与记账
 # --------------------------------------------------------------------------- #
 def _build_payload(
@@ -702,4 +976,4 @@ def _normalize_messages(messages: list[Message] | str) -> list[Message]:
     return normalized
 
 
-__all__ = ["DEFAULT_MAX_TOKENS", "DEFAULT_TEMPERATURE", "chat", "chat_json"]
+__all__ = ["DEFAULT_MAX_TOKENS", "DEFAULT_TEMPERATURE", "StreamUpdate", "chat", "chat_json", "chat_stream"]

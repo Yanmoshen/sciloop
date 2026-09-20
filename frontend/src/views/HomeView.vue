@@ -1,59 +1,84 @@
 <script setup lang="ts">
 /**
  * Copyright 2026 SciLoop contributors
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
+ * Licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
+ * You may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * 总览页（未进入项目时的首页）：一句话入口 + 三张快捷卡。
+ * 对话页（`/` 新对话 · `/c/:conversationId` 打开已有对话）。
  *
- * 会话流程：输入需求 → `POST /chat/home` 真调模型（拿到「标题」+「正式回答」）
- * → 用标题建项目（标题即项目名，出现在左栏「最近打开」）→ 就地展示回答。
- * 进入会话后：开场文案 / 流程行 / 三张卡收起，输入框独占最后一行。
+ * 视觉口径以 Cherry Studio 为准（源码：`components/chat/messages/frame/MessageHeader.tsx`）：
+ * - 用户消息**一律右对齐**、带浅底气泡；助手回答**无气泡无边框**直接输出；
+ * - 助手顶部两行 = 模型名（上）+ 耗时（下：进行中只显示递增秒数，完成显示「已完成 12s」）；
+ * - 助手底部 = 复制按钮；消息区滚动下边界**紧贴输入栏上沿**（输入栏留在文档流里）。
+ *
+ * 链路：`POST /chat/home/stream`（真流式 SSE）→ 边收边渲染；
+ * 六环节流水线那条非流式主链路完全不受影响（见 `app/llm/adapter.py` 的 `chat_stream`）。
+ * 中断/出错时**保留已生成部分**并在尾部如实标注，不假装完成。
  */
-import { computed, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 
-import { chatHome } from '@/api/chat'
-import { latestConversation } from '@/api/conversations'
-import type { CreatedProject } from '@/api/projects'
-import { createProject } from '@/api/projects'
+import { streamChatHome } from '@/api/chat'
+import { getConversation } from '@/api/conversations'
+import MarkdownText from '@/components/MarkdownText.vue'
 import ProjectCreateDialog from '@/components/ProjectCreateDialog.vue'
+import type { CreatedProject } from '@/api/projects'
+import { useConversationStore } from '@/stores/conversations'
 import { useSessionStore } from '@/stores/session'
 import { useSettingsStore } from '@/stores/settings'
 
+type TurnStatus = 'streaming' | 'done' | 'interrupted'
+
+interface Turn {
+  role: 'user' | 'assistant'
+  content: string
+  model?: string
+  durationMs?: number
+  status?: TurnStatus
+}
+
+const route = useRoute()
 const router = useRouter()
 const session = useSessionStore()
 const settings = useSettingsStore()
+const conversations = useConversationStore()
 
 const prompt = ref('')
 const files = ref<Array<{ name: string }>>([])
 const fileInput = ref<HTMLInputElement | null>(null)
+const textareaEl = ref<HTMLTextAreaElement | null>(null)
+const threadEl = ref<HTMLElement | null>(null)
 
-const phase = ref<'idle' | 'thinking' | 'answered'>('idle')
+const turns = ref<Turn[]>([])
+const conversationId = ref<string | null>(null)
+const conversationTitle = ref('')
+const projectId = ref<number | null>(null)
+const archived = ref(false)
+const phase = ref<'idle' | 'thinking'>('idle')
+const errorText = ref('')
+
 const dialogOpen = ref(false)
 const dialogPrefill = ref('')
 
-const errorText = ref('')
 const pickedRef = ref('')
-const listening = ref(false)
+const pickerOpen = ref(false)
+const copiedIndex = ref<number | null>(null)
 
-/** 多轮对话：内存即时显示，后端同时落 JSON，刷新后据此恢复 */
-type Turn = { role: 'user' | 'assistant'; content: string; model?: string; durationText?: string }
-const turns = ref<Turn[]>([])
-const conversationId = ref<string | null>(null)
-
-const canSend = computed(() => prompt.value.trim().length > 0 || files.value.length > 0)
-const active = computed(() => phase.value !== 'idle' || turns.value.length > 0)
+/** 计时：进行中显示递增秒数，完成后换成后端回传的真实耗时 */
+const elapsedMs = ref(0)
+let tick: number | null = null
+let streamStartedAt = 0
 
 const PIPELINE = '文献调研 → idea 生成 → 算法生成 → 算法评审 → 自动实验 → 论文写作 → 论文评审'
 
-/** 默认供应商（后端保证互斥唯一） */
+const active = computed(() => turns.value.length > 0 || phase.value === 'thinking')
+const canSend = computed(() => prompt.value.trim().length > 0 || files.value.length > 0)
+
 const defaultProvider = computed(() => settings.configs.find((config) => config.is_default) ?? null)
 
-/** 模型清单：只列默认供应商的模型；没有默认供应商时只给一个 auto 占位 */
 const modelOptions = computed(() => {
   const provider = defaultProvider.value
   if (!provider) return [{ value: 'auto', label: 'auto' }]
@@ -63,12 +88,16 @@ const modelOptions = computed(() => {
   }))
 })
 
-const pickerOpen = ref(false)
+const pickedLabel = computed(
+  () => modelOptions.value.find((item) => item.value === pickedRef.value)?.label ?? 'auto',
+)
 
-const pendingModel = ref('')
-const copiedIndex = ref<number | null>(null)
-const elapsed = ref(0)
-let tick: number | null = null
+/** 新对话在哪个项目下创建：`/?project=<id>`（左栏项目行的 ＋ 会带这个参数） */
+const pendingProjectId = computed(() => {
+  const raw = route.query.project
+  const value = Number(Array.isArray(raw) ? raw[0] : raw)
+  return Number.isInteger(value) && value > 0 ? value : null
+})
 
 function fmtDuration(ms: number): string {
   const total = Math.max(0, Math.floor(ms / 1000))
@@ -80,29 +109,17 @@ function fmtDuration(ms: number): string {
   return `${s}s`
 }
 
-const elapsedText = computed(() => fmtDuration(elapsed.value))
-
-async function copyAnswer(index: number, text: string): Promise<void> {
-  try {
-    await navigator.clipboard.writeText(text)
-    copiedIndex.value = index
-    window.setTimeout(() => {
-      copiedIndex.value = null
-    }, 1200)
-  } catch {
-    copiedIndex.value = null
-  }
+function durationText(turn: Turn): string {
+  if (turn.role !== 'assistant') return ''
+  if (turn.status === 'streaming') return `${Math.floor(elapsedMs.value / 1000)}s`
+  if (turn.durationMs) return `已完成 ${fmtDuration(turn.durationMs)}`
+  return ''
 }
-const pickedLabel = computed(
-  () => modelOptions.value.find((item) => item.value === pickedRef.value)?.label ?? 'auto',
-)
 
 function pickModel(value: string): void {
   pickedRef.value = value
   pickerOpen.value = false
 }
-
-let timer: number | null = null
 
 function pickFiles(): void {
   fileInput.value?.click()
@@ -119,60 +136,114 @@ function removeFile(index: number): void {
   files.value = files.value.filter((_, i) => i !== index)
 }
 
-/** 语音输入（浏览器原生识别；不可用时按钮不渲染） */
-const speechSupported =
-  typeof window !== 'undefined' &&
-  Boolean(
-    (window as unknown as { SpeechRecognition?: unknown; webkitSpeechRecognition?: unknown })
-      .SpeechRecognition ||
-      (window as unknown as { webkitSpeechRecognition?: unknown }).webkitSpeechRecognition,
-  )
-
-function toggleVoice(): void {
-  type Recognizer = {
-    lang: string
-    interimResults: boolean
-    continuous: boolean
-    onresult: (event: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void
-    onend: () => void
-    onerror: () => void
-    start: () => void
-    stop: () => void
+async function copyAnswer(index: number, text: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text)
+    copiedIndex.value = index
+    window.setTimeout(() => {
+      copiedIndex.value = null
+    }, 1200)
+  } catch {
+    copiedIndex.value = null
   }
-  const holder = window as unknown as {
-    SpeechRecognition?: new () => Recognizer
-    webkitSpeechRecognition?: new () => Recognizer
-  }
-  const Ctor = holder.SpeechRecognition ?? holder.webkitSpeechRecognition
-  if (!Ctor) return
-  if (listening.value) {
-    listening.value = false
-    return
-  }
-  const recognizer = new Ctor()
-  recognizer.lang = 'zh-CN'
-  recognizer.interimResults = false
-  recognizer.continuous = false
-  recognizer.onresult = (event) => {
-    const parts: string[] = []
-    for (let i = 0; i < event.results.length; i += 1) {
-      const first = event.results[i][0]
-      if (first) parts.push(first.transcript)
-    }
-    const text = parts.join('').trim()
-    if (text) prompt.value = prompt.value ? `${prompt.value} ${text}` : text
-  }
-  recognizer.onend = () => {
-    listening.value = false
-  }
-  recognizer.onerror = () => {
-    listening.value = false
-  }
-  listening.value = true
-  recognizer.start()
 }
 
-/** 发送：真调模型拿标题与回答 → 用标题建项目 → 展示回答 */
+/** 输入框随内容长高（上限 200px 后自己滚），这是 Cherry 输入栏的手感 */
+async function autoGrow(): Promise<void> {
+  await nextTick()
+  const el = textareaEl.value
+  if (!el) return
+  el.style.height = 'auto'
+  el.style.height = `${Math.min(el.scrollHeight, 200)}px`
+}
+
+async function scrollToBottom(): Promise<void> {
+  await nextTick()
+  const el = threadEl.value
+  if (el) el.scrollTop = el.scrollHeight
+}
+
+function startTicker(): void {
+  streamStartedAt = Date.now()
+  elapsedMs.value = 0
+  if (tick !== null) window.clearInterval(tick)
+  tick = window.setInterval(() => {
+    elapsedMs.value = Date.now() - streamStartedAt
+  }, 200)
+}
+
+function stopTicker(): void {
+  if (tick !== null) {
+    window.clearInterval(tick)
+    tick = null
+  }
+}
+
+/** 把一条会话摘要同步进左栏（新建时先占位，等标题生成后再整表刷新） */
+function syncStore(): void {
+  const id = conversationId.value
+  if (!id) return
+  conversations.upsert({
+    id,
+    title: conversationTitle.value || null,
+    model_ref: null,
+    project_id: projectId.value,
+    created_at: null,
+    updated_at: new Date().toISOString(),
+    archived: archived.value,
+    turn_count: turns.value.filter((turn) => turn.role === 'user').length * 2,
+  })
+}
+
+// --------------------------------------------------------------------------- //
+// 加载已有对话 / 开新对话
+// --------------------------------------------------------------------------- //
+async function resetToNewConversation(): Promise<void> {
+  turns.value = []
+  conversationId.value = null
+  conversationTitle.value = ''
+  projectId.value = pendingProjectId.value
+  archived.value = false
+  errorText.value = ''
+  phase.value = 'idle'
+  stopTicker()
+  await autoGrow()
+}
+
+async function loadConversation(id: string): Promise<void> {
+  stopTicker()
+  phase.value = 'idle'
+  errorText.value = ''
+  try {
+    const detail = await getConversation(id)
+    conversationId.value = detail.id
+    conversationTitle.value = detail.title ?? ''
+    projectId.value = detail.project_id ?? null
+    archived.value = detail.archived
+    turns.value = (detail.turns ?? []).map((turn) => ({
+      role: turn.role,
+      content: turn.content,
+      model: turn.model_id,
+      durationMs: turn.duration_ms,
+      status: turn.interrupted ? 'interrupted' : 'done',
+    }))
+    await scrollToBottom()
+  } catch (error) {
+    turns.value = []
+    conversationId.value = null
+    errorText.value = error instanceof Error ? error.message : String(error)
+  }
+}
+
+async function init(): Promise<void> {
+  const id = route.params.conversationId
+  if (typeof id === 'string' && id) await loadConversation(id)
+  else await resetToNewConversation()
+}
+
+// --------------------------------------------------------------------------- //
+// 发送（真流式）
+// --------------------------------------------------------------------------- //
 async function send(): Promise<void> {
   if (!canSend.value || phase.value === 'thinking') return
   const text = prompt.value.trim() || files.value.map((file) => file.name).join('、')
@@ -183,91 +254,104 @@ async function send(): Promise<void> {
     return
   }
   if (pickedRef.value === 'auto') {
-    errorText.value = '请先到「模型设置」填写模型'
+    errorText.value = '请先到「设置 - 模型」填写模型'
     return
   }
   const [configIdRaw, ...rest] = pickedRef.value.split(':')
   const configId = Number(configIdRaw)
   const modelId = rest.join(':')
   if (!configId || !modelId) {
-    errorText.value = '请先到「模型设置」填写模型'
+    errorText.value = '请先到「设置 - 模型」填写模型'
     return
   }
 
-  if (timer !== null) window.clearTimeout(timer)
   errorText.value = ''
-  const isFirstTurn = turns.value.length === 0
-  turns.value = [...turns.value, { role: 'user', content: text }]
+  turns.value = [
+    ...turns.value,
+    { role: 'user', content: text, status: 'done' },
+    { role: 'assistant', content: '', model: modelId, status: 'streaming' },
+  ]
+  const assistantIndex = turns.value.length - 1
   phase.value = 'thinking'
-  pendingModel.value = modelId
-  elapsed.value = 0
-  if (tick !== null) window.clearInterval(tick)
-  const startedAt = Date.now()
-  tick = window.setInterval(() => {
-    elapsed.value = Date.now() - startedAt
-  }, 200)
-  // 发送即清空输入框（不等结果），避免旧文本残留在输入框里
   prompt.value = ''
   files.value = []
+  void autoGrow()
+  startTicker()
+  await scrollToBottom()
 
   try {
-    const result = await chatHome({
-      text,
-      model_config_id: configId,
-      model_id: modelId,
-      conversation_id: conversationId.value ?? undefined,
-    })
-    conversationId.value = result.conversation_id
-    if (tick !== null) {
-      window.clearInterval(tick)
-      tick = null
-    }
-    if (!result.reply) {
-      phase.value = 'answered'
-      errorText.value = '模型没有返回正文'
-      return
-    }
-    turns.value = [
-      ...turns.value,
+    await streamChatHome(
       {
-        role: 'assistant',
-        content: result.reply,
-        model: result.model_id,
-        durationText: fmtDuration(elapsed.value),
+        text,
+        model_config_id: configId,
+        model_id: modelId,
+        conversation_id: conversationId.value ?? undefined,
+        project_id: conversationId.value ? undefined : (projectId.value ?? undefined),
       },
-    ]
-    phase.value = 'answered'
-    if (result.title_note) errorText.value = result.title_note
-    // 首个回合才建项目（项目名 = 模型给出的标题）
-    if (isFirstTurn) {
-      const created = await createProject({ name: result.title, note: text, fields: [] })
-      await session.loadProjects()
-      session.selectProject(created.id)
+      {
+        onMeta: (meta) => {
+          conversationId.value = meta.conversation_id
+          projectId.value = meta.project_id
+          conversationTitle.value = meta.title ?? ''
+          if (meta.turn_count === 0) syncStore()
+        },
+        onDelta: (delta) => {
+          const target = turns.value[assistantIndex]
+          if (!target) return
+          target.content += delta
+          void scrollToBottom()
+        },
+        onDone: (done) => {
+          const target = turns.value[assistantIndex]
+          if (!target) return
+          if (done.content) target.content = done.content
+          target.model = done.model_id
+          target.durationMs = done.duration_ms
+          target.status = 'done'
+          void scrollToBottom()
+          // 后端此时已把这一轮落盘：整表刷新一次，左栏顺序/轮次数与磁盘一致
+          void conversations.load()
+        },
+        onTitle: (payload) => {
+          conversationTitle.value = payload.title
+          syncStore()
+          if (payload.title_source === 'fallback' && payload.title_note) {
+            errorText.value = payload.title_note
+          }
+        },
+        onError: (streamError) => {
+          const target = turns.value[assistantIndex]
+          if (target) target.status = 'interrupted'
+          errorText.value = `${streamError.code}：${streamError.message}`
+          void conversations.load()
+        },
+      },
+    )
+  } catch (error) {
+    const target = turns.value[assistantIndex]
+    if (target) {
+      target.status = 'interrupted'
+      // 一个字都没生成：撤掉这条空回答，并把原文放回输入框方便重发
+      if (!target.content) {
+        turns.value = turns.value.filter((_, index) => index !== assistantIndex)
+        prompt.value = text
+      }
     }
-  } catch (err) {
-    phase.value = 'idle'
-    if (tick !== null) {
-      window.clearInterval(tick)
-      tick = null
-    }
-    elapsed.value = 0
-    // 失败要能重发：撤掉刚加进去的那一轮，并把原文放回输入框
-    turns.value = turns.value.slice(0, -1)
-    prompt.value = text
-    const withCode = err as { code?: string; message?: string }
+    const withCode = error as { code?: string; message?: string }
     errorText.value = withCode?.message
       ? `${withCode.code ?? 'failed'}：${withCode.message}`
-      : err instanceof Error
-        ? err.message
-        : String(err)
+      : error instanceof Error
+        ? error.message
+        : String(error)
+  } finally {
+    stopTicker()
+    phase.value = 'idle'
   }
 }
 
-function openCreate(prefill: string): void {
-  dialogPrefill.value = prefill
-  dialogOpen.value = true
-}
-
+// --------------------------------------------------------------------------- //
+// 其它入口
+// --------------------------------------------------------------------------- //
 function goFeed(): void {
   void router.push({ path: '/papers/feed' })
 }
@@ -276,53 +360,79 @@ function goIdeas(): void {
   void router.push({ path: '/ideas' })
 }
 
-/** 创建成功：刷新项目列表并直接进入该项目的流水线工作台 */
+function goWorkbench(): void {
+  if (projectId.value === null) return
+  void router.push({ name: 'workbench', params: { projectId: String(projectId.value) } })
+}
+
+function openCreate(prefill: string): void {
+  dialogPrefill.value = prefill
+  dialogOpen.value = true
+}
+
 function onCreated(project: CreatedProject): void {
   void session.loadProjects()
   session.selectProject(project.id)
   void router.push({ name: 'workbench', params: { projectId: String(project.id) } })
 }
 
+watch(
+  () => route.fullPath,
+  () => {
+    void init()
+  },
+)
+
+watch(prompt, () => {
+  void autoGrow()
+})
+
 onMounted(async () => {
-  prompt.value = ''
   if (!settings.configs.length) await settings.loadConfigs()
   pickedRef.value = modelOptions.value[0]?.value ?? 'auto'
-  // 接着上次对话继续：拉最近一次会话，把轮次铺回界面
-  try {
-    const latest = await latestConversation()
-    if (latest && latest.turns.length) {
-      conversationId.value = latest.id
-      turns.value = latest.turns.map((turn) => ({
-        role: turn.role,
-        content: turn.content,
-        model: turn.model_id,
-        durationText: turn.duration_ms ? fmtDuration(turn.duration_ms) : undefined,
-      }))
-      phase.value = 'answered'
-    }
-  } catch {
-    // 拉不到历史不影响开新对话
-  }
+  await init()
+})
+
+onUnmounted(() => {
+  stopTicker()
 })
 </script>
 
 <template>
-  <section class="hero" :class="{ 'hero--active': active }">
-    <div class="intro">
-      <h1 class="hero__title">使用 AI，体验全新科研工作流</h1>
-      <p class="hero__steps">{{ PIPELINE }}</p>
+  <section class="chat" :class="{ 'chat--active': active }">
+    <div class="chat__intro">
+      <h1 class="chat__title">使用 AI，体验全新科研工作流</h1>
+      <p class="chat__steps">{{ PIPELINE }}</p>
     </div>
 
-    <div v-if="active" class="convo">
+    <div v-if="active" class="chat__head">
+      <span class="chat__name">{{ conversationTitle || '新对话' }}</span>
+      <span class="chat__head-actions">
+        <span v-if="archived" class="tag">已归档</span>
+        <button v-if="projectId !== null" class="ghost" type="button" @click="goWorkbench">
+          流水线工作台
+        </button>
+      </span>
+    </div>
+
+    <div v-if="active" ref="threadEl" class="thread scroll-y">
       <template v-for="(turn, index) in turns" :key="index">
-        <div v-if="turn.role === 'user'" class="convo__item">
-          <span class="bubble bubble--user">{{ turn.content }}</span>
+        <div v-if="turn.role === 'user'" class="turn turn--user">
+          <div class="bubble">{{ turn.content }}</div>
         </div>
-        <div v-else class="reply">
-          <span class="reply__model">{{ turn.model }}</span>
-          <span v-if="turn.durationText" class="reply__time">已完成 {{ turn.durationText }}</span>
-          <p class="reply__text">{{ turn.content }}</p>
-          <div class="reply__actions">
+        <div v-else class="turn turn--assistant">
+          <div class="meta">
+            <span class="meta__model">{{ turn.model }}</span>
+            <span class="meta__time">{{ durationText(turn) }}</span>
+          </div>
+          <MarkdownText v-if="turn.content" :content="turn.content" />
+          <div v-else class="dots" aria-label="正在生成">
+            <span class="dot" />
+            <span class="dot" />
+            <span class="dot" />
+          </div>
+          <div v-if="turn.status === 'interrupted'" class="cut">已中断 / 出错</div>
+          <div v-if="turn.content" class="acts">
             <button
               class="icon-btn"
               type="button"
@@ -352,45 +462,40 @@ onMounted(async () => {
           </div>
         </div>
       </template>
-
-      <div v-if="phase === 'thinking'" class="reply">
-        <span class="reply__model">{{ pendingModel }}</span>
-        <span class="reply__time">{{ elapsedText }}</span>
-        <div class="dots" aria-label="正在思考">
-          <span class="dot" />
-          <span class="dot" />
-          <span class="dot" />
-        </div>
-      </div>
     </div>
 
     <p v-if="errorText" class="state state--error">{{ errorText }}</p>
 
-    <div class="composer">
-      <div class="composer__body">
-        <textarea
-          v-model="prompt"
-          rows="2"
-          placeholder="例如：为长上下文问答设计一套可复现的评测方案"
-          @keydown.enter.exact.prevent="send"
-        />
-        <div class="composer__tools">
+    <div class="composer" :class="{ 'composer--hero': !active }">
+      <textarea
+        ref="textareaEl"
+        v-model="prompt"
+        rows="1"
+        placeholder="描述你的研究需求，例如：为长上下文问答设计一套可复现的评测方案"
+        @keydown.enter.exact.prevent="send"
+      />
+
+      <div class="bar">
+        <div class="bar__left">
           <button class="icon-btn" type="button" title="上传文件" aria-label="上传文件" @click="pickFiles">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+              <path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
             </svg>
           </button>
-          <span
+          <input ref="fileInput" type="file" multiple hidden @change="onFiles" />
+          <button
             v-for="(file, index) in files"
             :key="`${file.name}-${index}`"
-            class="file-chip"
-            :title="file.name"
+            class="chip"
+            type="button"
+            :title="`移除 ${file.name}`"
             @click="removeFile(index)"
           >
-            {{ file.name.length > 22 ? `${file.name.slice(0, 20)}…` : file.name }}
-          </span>
-          <input ref="fileInput" type="file" multiple hidden @change="onFiles" />
+            {{ file.name.length > 20 ? `${file.name.slice(0, 18)}…` : file.name }}
+          </button>
+        </div>
 
+        <div class="bar__right">
           <div class="mpick">
             <button
               class="mpick__trigger"
@@ -401,7 +506,7 @@ onMounted(async () => {
             >
               <span class="mpick__value">{{ pickedLabel }}</span>
               <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
-                <path d="M2 4l3 3 3-3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+                <path d="M2 4l3 3 3-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
               </svg>
             </button>
             <ul v-if="pickerOpen" class="mpick__panel" role="listbox">
@@ -434,33 +539,26 @@ onMounted(async () => {
               </li>
             </ul>
           </div>
+          <button
+            class="send"
+            type="button"
+            :disabled="!canSend || phase === 'thinking'"
+            :title="phase === 'thinking' ? '正在生成' : '发送'"
+            aria-label="发送"
+            @click="send"
+          >
+            <svg width="16" height="16" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+              <path
+                d="M9 15V4M9 4 4.5 8.5M9 4l4.5 4.5"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </button>
         </div>
       </div>
-      <button
-        v-if="speechSupported"
-        class="mic"
-        type="button"
-        :class="{ 'mic--on': listening }"
-        title="语音输入"
-        aria-label="语音输入"
-        @click="toggleVoice"
-      >
-        <svg width="15" height="15" viewBox="0 0 18 18" fill="none" aria-hidden="true">
-          <rect x="7" y="2.5" width="4" height="8" rx="2" stroke="currentColor" stroke-width="1.5" />
-          <path d="M4.5 9a4.5 4.5 0 0 0 9 0M9 13.5V16" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-        </svg>
-      </button>
-      <button class="send" type="button" :disabled="!canSend" aria-label="发送" @click="send">
-        <svg width="15" height="15" viewBox="0 0 18 18" fill="none" aria-hidden="true">
-          <path
-            d="M9 15V4M9 4 4.5 8.5M9 4l4.5 4.5"
-            stroke="currentColor"
-            stroke-width="2"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          />
-        </svg>
-      </button>
     </div>
 
     <section v-if="!active" class="cards">
@@ -507,12 +605,42 @@ onMounted(async () => {
 </template>
 
 <style scoped>
-.hero {
+.chat {
   width: 100%;
   max-width: 880px;
-  padding: 64px 32px 48px;
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  padding: 64px 32px 0;
 }
-.hero__title {
+
+/* 有对话时：hero 收起，thread 吃掉剩余高度，输入栏留在文档流最后一行
+   —— 这样滚动区的下边界天然就是输入栏上沿，中间不留空档。 */
+.chat--active {
+  height: 100%;
+  min-height: 0;
+  padding-bottom: 0;
+  overflow: hidden;
+}
+
+.chat__intro {
+  /* 必须 flex:none：`.chat` 是纵向 flex，默认可收缩的子项会被压到比内容矮，
+     配合 `overflow:hidden` 就把「流程行」裁掉、让输入框盖住开场文案。 */
+  flex: none;
+  max-height: 420px;
+  overflow: hidden;
+  transition:
+    max-height 360ms cubic-bezier(0.4, 0, 0.2, 1),
+    opacity 220ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.chat--active .chat__intro {
+  max-height: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.chat__title {
   margin: 0 0 16px;
   font-family: geomanist, 'Open Sans', ui-sans-serif, system-ui, sans-serif;
   font-size: var(--font-size-4xl);
@@ -520,25 +648,146 @@ onMounted(async () => {
   font-weight: 600;
   letter-spacing: -0.5px;
   color: var(--h-fg);
-  transition: color 300ms cubic-bezier(0.4, 0, 0.2, 1);
 }
-.hero__steps {
+
+.chat__steps {
   margin: 0 0 40px;
   font-size: var(--font-size-lg);
   color: var(--h-fg-muted);
-  transition: color 300ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-/* ---------- 模拟响应（位于输入框上方） ---------- */
-.stream {
-  margin-bottom: 24px;
+/* ---------- 对话头（标题 + 工作台入口） ---------- */
+.chat__head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 0 12px;
+  border-bottom: 1px solid var(--h-line);
 }
+
+.chat__name {
+  min-width: 0;
+  font-size: var(--font-size-lg);
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.chat__head-actions {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.tag {
+  padding: 2px 10px;
+  border: 1px solid var(--h-line-strong);
+  border-radius: 999px;
+  color: var(--h-fg-muted);
+  font-size: var(--font-size-xs);
+}
+
+.ghost {
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--h-line);
+  border-radius: 40px;
+  background: transparent;
+  color: var(--h-fg-muted);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  transition:
+    border-color 180ms cubic-bezier(0.4, 0, 0.2, 1),
+    color 180ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.ghost:hover {
+  border-color: var(--h-primary);
+  color: var(--h-primary);
+}
+
+/* ---------- 消息区 ---------- */
+.thread {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  padding: 18px 0 6px;
+}
+
+.turn {
+  display: flex;
+  flex-direction: column;
+}
+
+/* 用户消息：一律右对齐（此前用 :first-child 控制，只有第一条生效） */
+.turn--user {
+  align-items: flex-end;
+}
+
+.bubble {
+  max-width: 76%;
+  padding: 10px 16px;
+  border-radius: 12px;
+  background: var(--h-active);
+  color: var(--h-fg);
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* 助手回答：无气泡、无边框，直接输出 */
+.turn--assistant {
+  align-items: stretch;
+  gap: 8px;
+}
+
+.meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.meta__model {
+  font-size: var(--font-size-md);
+  font-weight: 600;
+  color: var(--h-fg);
+}
+
+.meta__time {
+  font-size: var(--font-size-sm);
+  color: var(--h-fg-muted);
+}
+
+.acts {
+  display: flex;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.cut {
+  align-self: flex-start;
+  padding: 2px 10px;
+  border: 1px solid var(--h-line-strong);
+  border-radius: 999px;
+  color: var(--h-fg-muted);
+  font-size: var(--font-size-xs);
+}
+
 .dots {
   display: flex;
   align-items: center;
   gap: 6px;
   height: 24px;
 }
+
 .dot {
   width: 8px;
   height: 8px;
@@ -546,12 +795,15 @@ onMounted(async () => {
   background: var(--h-fg-subtle);
   animation: dot-bounce 1.1s cubic-bezier(0.4, 0, 0.2, 1) infinite;
 }
+
 .dot:nth-child(2) {
   animation-delay: 0.15s;
 }
+
 .dot:nth-child(3) {
   animation-delay: 0.3s;
 }
+
 @keyframes dot-bounce {
   0%,
   80%,
@@ -564,171 +816,164 @@ onMounted(async () => {
     opacity: 1;
   }
 }
-.answer {
-  animation: rise 300ms cubic-bezier(0.4, 0, 0.2, 1);
-}
-@keyframes rise {
-  from {
-    opacity: 0;
-    transform: translateY(4px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-/* 模拟响应标记：做成 tag 而不是灰色说明小字 */
-.tag {
-  display: inline-flex;
-  align-items: center;
-  margin-bottom: 10px;
-  padding: 2px 10px;
-  border: 1px solid var(--h-line-strong);
-  border-radius: 999px;
+
+.state--error {
+  flex: none;
+  margin: 8px 0 0;
+  padding: 8px 12px;
+  border-left: 3px solid var(--h-primary);
+  border-radius: 8px;
+  background: var(--h-hover);
   color: var(--h-fg-muted);
-  font-size: var(--font-size-xs);
-  letter-spacing: 0.2px;
-}
-.answer p {
-  margin: 0 0 16px;
-  font-size: var(--font-size-md);
-  line-height: 1.6;
-  color: var(--h-fg-muted);
-}
-.answer__actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+  font-size: var(--font-size-sm);
 }
 
-/* ---------- 输入区 ---------- */
+/* ---------- 输入栏（Cherry 口径：整体一块圆角容器，上输入下工具栏） ---------- */
 .composer {
-  position: relative;
-  padding: 16px 12px 16px 16px;
+  flex: none;
+  width: min(720px, 100%);
+  margin: 0 auto;
+  padding: 12px 12px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   background: var(--h-surface-input);
   border: 1px solid var(--h-line-strong);
-  border-radius: 16px;
+  border-radius: 18px;
   transition:
     background-color 300ms cubic-bezier(0.4, 0, 0.2, 1),
-    border-color 300ms cubic-bezier(0.4, 0, 0.2, 1);
+    border-color 180ms cubic-bezier(0.4, 0, 0.2, 1);
 }
+
+.composer--hero {
+  margin-bottom: 40px;
+}
+
 .composer:focus-within {
   border-color: var(--h-primary);
 }
-.composer__body {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
+
 .composer textarea {
   width: 100%;
-  height: 88px;
-  min-height: 88px;
-  max-height: 88px;
-  padding-right: 12px;
+  height: 26px;
+  max-height: 200px;
+  padding: 0 4px;
   border: 0;
   background: transparent;
   color: var(--h-fg);
   font: inherit;
   font-size: var(--font-size-lg);
-  line-height: 1.5;
+  line-height: 1.6;
   resize: none;
   outline: none;
   overflow-y: auto;
   overscroll-behavior: contain;
 }
+
 .composer textarea::placeholder {
   color: var(--h-fg-subtle);
 }
+
 .composer textarea::-webkit-scrollbar {
   width: 6px;
 }
+
 .composer textarea::-webkit-scrollbar-track {
   background: transparent;
 }
+
 .composer textarea::-webkit-scrollbar-button {
   display: none;
   width: 0;
   height: 0;
 }
+
 .composer textarea::-webkit-scrollbar-thumb {
   background: var(--h-line-strong);
   border: 0;
-  background-clip: border-box;
   border-radius: 40px;
 }
+
 .composer textarea::-webkit-scrollbar-thumb:hover {
   background: var(--h-fg-subtle);
 }
-@supports (-moz-appearance: none) {
-  .composer textarea {
-    scrollbar-width: thin;
-    scrollbar-color: var(--h-line-strong) transparent;
-  }
-}
-.composer__tools {
+
+.bar {
   display: flex;
   align-items: center;
+  gap: 8px;
+  min-height: 32px;
+}
+
+.bar__left,
+.bar__right {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.bar__left {
+  flex: 1;
   flex-wrap: wrap;
-  gap: 8px;
-  padding-right: 44px;
 }
-.tool {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  height: 32px;
-  padding: 0 12px;
-  border: 1px solid var(--h-line);
-  border-radius: 40px;
-  background: transparent;
-  color: var(--h-fg-muted);
-  font: inherit;
-  font-size: var(--font-size-md);
-  cursor: pointer;
-  transition:
-    background-color 300ms cubic-bezier(0.4, 0, 0.2, 1),
-    border-color 180ms cubic-bezier(0.4, 0, 0.2, 1),
-    color 180ms cubic-bezier(0.4, 0, 0.2, 1);
+
+.bar__right {
+  flex: none;
+  margin-left: auto;
 }
-.tool:hover {
-  border-color: var(--h-line-strong);
-  color: var(--h-fg);
-}
-.tool--primary {
-  background: var(--h-primary);
-  border-color: var(--h-primary);
-  color: var(--h-primary-fg);
-  font-weight: 600;
-}
-.tool--primary:hover {
-  color: var(--h-primary-fg);
-  border-color: var(--h-primary);
-}
-.file-chip {
-  display: inline-flex;
-  align-items: center;
-  height: 32px;
-  padding: 0 12px;
+
+.chip {
+  max-width: 180px;
+  height: 26px;
+  padding: 0 10px;
   border: 1px solid var(--h-line);
   border-radius: 40px;
   background: var(--h-hover);
   color: var(--h-fg-muted);
   font-size: var(--font-size-sm);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   cursor: pointer;
 }
-.send {
-  position: absolute;
-  right: 12px;
-  bottom: 12px;
-  width: 34px;
-  height: 34px;
-  display: flex;
+
+.chip:hover {
+  border-color: var(--h-line-strong);
+  color: var(--h-fg);
+}
+
+.icon-btn {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
   border: 0;
-  border-radius: 40px;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--h-fg-subtle);
+  cursor: pointer;
+  transition:
+    background-color 180ms cubic-bezier(0.4, 0, 0.2, 1),
+    color 180ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.icon-btn:hover {
+  background: var(--h-hover);
+  color: var(--h-fg);
+}
+
+.send {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 50%;
   background: var(--h-primary);
   color: var(--h-primary-fg);
   cursor: pointer;
@@ -736,232 +981,42 @@ onMounted(async () => {
     transform 180ms cubic-bezier(0.4, 0, 0.2, 1),
     opacity 180ms cubic-bezier(0.4, 0, 0.2, 1);
 }
+
 .send:disabled {
-  opacity: 0.5;
+  opacity: 0.45;
   cursor: not-allowed;
 }
+
 .send:not(:disabled):hover {
-  transform: translateY(-2px);
+  transform: translateY(-1px);
 }
 
-/* ---------- 三张快捷卡 ---------- */
-.cards {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 16px;
-  margin-top: 40px;
-}
-.card {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  padding: 24px;
-  border: 1px solid var(--h-line);
-  border-radius: 16px;
-  background: var(--h-surface-raised);
-  color: inherit;
-  text-align: left;
-  cursor: pointer;
-  transition:
-    transform 180ms cubic-bezier(0.4, 0, 0.2, 1),
-    border-color 180ms cubic-bezier(0.4, 0, 0.2, 1),
-    background-color 300ms cubic-bezier(0.4, 0, 0.2, 1);
-}
-.card:hover {
-  transform: translateY(-2px);
-  border-color: var(--h-line-strong);
-}
-.card__icon {
-  width: 36px;
-  height: 36px;
-  margin-bottom: 16px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 8px;
-  background: var(--h-active);
-  color: var(--h-primary);
-}
-.card__title {
-  margin-bottom: 8px;
-  font-size: var(--font-size-xl);
-  font-weight: 600;
-}
-.card__desc {
-  font-size: var(--font-size-md);
-  line-height: 1.5;
-  color: var(--h-fg-subtle);
-}
-
-@media (max-width: 900px) {
-  .hero {
-    padding: 32px 16px;
-  }
-  .hero__title {
-    font-size: var(--font-size-3xl);
-  }
-  .cards {
-    grid-template-columns: 1fr;
-  }
-}
-
-/* ---------- 对话态：开场内容收起、输入框独占一行并置底 ---------- */
-
-/* 关键前提：对话态下 hero 必须是「撑满内容区的纵向 flex」。
-   否则 .convo{flex:1} 与 .composer 的定位都会失效 —— 输入框停在半空、还会盖住文本。 */
-.hero--active {
-  display: flex;
-  flex-direction: column;
-  min-height: 100%;
-  position: relative; /* 输入框要相对它浮在底部 */
-  padding-bottom: 0;
-}
-
-/* 开场区与三张卡用「收起高度 + 淡出」过渡：输入框随之平滑下移 */
-.intro,
-.cards {
-  max-height: 420px;
-  opacity: 1;
-  overflow: hidden;
-  transition:
-    max-height 360ms cubic-bezier(0.4, 0, 0.2, 1),
-    opacity 220ms cubic-bezier(0.4, 0, 0.2, 1);
-}
-
-.hero--active .intro,
-.hero--active .cards {
-  max-height: 0;
-  opacity: 0;
-  margin: 0;
-  pointer-events: none;
-}
-
-/* 对话区：吃掉剩余高度，把输入框挤到最后一行（与文本上下分开，不互相遮挡） */
-.hero--active .convo {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow-y: auto;
-  margin-top: 8px;
-  padding-bottom: 24px;
-}
-
-/* 输入框与对话区之间再留一道间距（此前最后一行会贴到输入框上沿） */
-.hero--active .composer {
-  /* 留在文档流里：这样对话区的可滚动区域天然止于输入框上沿，
-     文本永远不可能画到输入框所在区域（此前用 absolute 脱离文档流，正是文本"进框"的原因）。
-     宽度收窄到 720px 实现「不占满整行」，两侧自动留边。 */
-  flex: none;
-  width: min(720px, 100%);
-  margin: 12px auto 0;
-}
-
-.convo {
-  width: 100%;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  padding: 4px 0 16px;
-}
-
-.convo__item {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.convo__item:first-child {
-  align-items: flex-end;
-}
-
-.bubble {
-  max-width: 82%;
-  padding: 12px 16px;
-  border-radius: 12px;
-  line-height: 1.65;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.bubble--user {
-  background: var(--h-active);
-  color: var(--h-fg);
-}
-
-/* 回答：不用气泡、不加边框，直接输出文字（用户要求与参考图一致） */
-.reply {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  width: 100%;
-}
-
-.reply__model,
-.reply__time {
-  color: var(--h-fg-muted);
-  font-size: var(--font-size-md);
-}
-
-.reply__text {
-  margin: 0;
-  color: var(--h-fg);
-  line-height: 1.7;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-
-.reply__actions {
-  display: flex;
-  gap: 6px;
-  margin-top: 2px;
-}
-
-/* 输入框工具行：右侧留出麦克风 + 发送按钮的位置，避免控件互相压住 */
-.composer__tools {
-  padding-right: 84px;
-}
-
-/* 上传：只有一个加号（无底块、无文字） */
-.icon-btn {
-  flex: none;
-  width: 26px;
-  height: 26px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border: 0;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--h-fg-subtle);
-  cursor: pointer;
-  transition: color 180ms cubic-bezier(0.4, 0, 0.2, 1);
-}
-
-.icon-btn:hover {
-  color: var(--h-fg);
-}
-
-/* ---------- 模型选择：只有「名字 + ⌄」，无外框；浮层平滑展开 ---------- */
+/* 模型选择：只有「名字 + ⌄」，无外框；浮层向上展开 */
 .mpick {
   position: relative;
-  margin-left: auto;
 }
 
 .mpick__trigger {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  max-width: 220px;
-  padding: 2px 4px;
+  max-width: 200px;
+  height: 28px;
+  padding: 0 8px;
   border: 0;
+  border-radius: 40px;
   background: transparent;
   color: var(--h-fg-muted);
   font: inherit;
-  font-size: var(--font-size-md);
+  font-size: var(--font-size-sm);
   cursor: pointer;
-  transition: color 180ms cubic-bezier(0.4, 0, 0.2, 1);
+  transition:
+    background-color 180ms cubic-bezier(0.4, 0, 0.2, 1),
+    color 180ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 .mpick__trigger:hover {
+  background: var(--h-hover);
   color: var(--h-fg);
 }
 
@@ -983,7 +1038,7 @@ onMounted(async () => {
   margin: 0;
   padding: 6px;
   list-style: none;
-  background: var(--h-surface-raised, var(--h-surface));
+  background: var(--h-surface-raised);
   border: 1px solid var(--h-line-strong);
   border-radius: 12px;
   box-shadow: 0 12px 32px rgb(0 0 0 / 24%);
@@ -1027,31 +1082,72 @@ onMounted(async () => {
   white-space: nowrap;
 }
 
-/* 语音输入：与发送按钮同排（发送按钮是绝对定位，这里跟随其左侧） */
-.mic {
-  position: absolute;
-  right: 56px;
-  bottom: 12px;
-  width: 34px;
-  height: 34px;
-  display: inline-flex;
+/* ---------- 三张快捷卡 ---------- */
+.cards {
+  flex: none; /* 同 .chat__intro：不能被 flex 压扁 */
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  margin-bottom: 48px;
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  padding: 24px;
+  border: 1px solid var(--h-line);
+  border-radius: 16px;
+  background: var(--h-surface-raised);
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    transform 180ms cubic-bezier(0.4, 0, 0.2, 1),
+    border-color 180ms cubic-bezier(0.4, 0, 0.2, 1),
+    background-color 300ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.card:hover {
+  transform: translateY(-2px);
+  border-color: var(--h-line-strong);
+}
+
+.card__icon {
+  width: 36px;
+  height: 36px;
+  margin-bottom: 16px;
+  display: flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--h-line);
-  border-radius: 40px;
-  background: transparent;
-  color: var(--h-fg-muted);
-  cursor: pointer;
-}
-
-.mic:hover {
-  border-color: var(--h-line-strong);
-  color: var(--h-fg);
-}
-
-.mic--on {
-  border-color: var(--h-primary);
+  border-radius: 8px;
+  background: var(--h-active);
   color: var(--h-primary);
-  box-shadow: 0 0 12px var(--h-primary);
+}
+
+.card__title {
+  margin-bottom: 8px;
+  font-size: var(--font-size-xl);
+  font-weight: 600;
+}
+
+.card__desc {
+  font-size: var(--font-size-md);
+  line-height: 1.5;
+  color: var(--h-fg-subtle);
+}
+
+@media (max-width: 900px) {
+  .chat {
+    padding: 32px 16px 0;
+  }
+
+  .chat__title {
+    font-size: var(--font-size-3xl);
+  }
+
+  .cards {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

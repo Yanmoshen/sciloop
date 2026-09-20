@@ -136,8 +136,11 @@ export function apiUrl(path: string, query?: RequestOptions['query']): string {
  * 1. 后端统一错误体 `{code, message, detail}`（实测 `/api/v1/models/configs` 403、
  *    `/api/v1/costs/summary?project_id=abc` 422 均为此形态）
  * 2. 防御性兜底：顶层 `code` 缺失但 `detail` 是带 `code`/`message` 的对象
+ *
+ * 导出给流式链路（`api/chat.ts`）：SSE 走裸 `fetch`，拿不到 `request()` 的错误规范化，
+ * 但仍要给出同一套 `ApiError`，否则视图层要写两套错误分支。
  */
-async function parseError(response: Response): Promise<ApiError> {
+export async function parseError(response: Response): Promise<ApiError> {
   const fallback = `请求失败（HTTP ${response.status}）`
   let text = ''
   try {

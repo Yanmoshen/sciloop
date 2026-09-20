@@ -125,6 +125,14 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('@/views/HomeView.vue'),
         meta: { title: '开始使用', homeNav: 'home' },
       },
+      // 打开左栏里的某条对话（同一个视图，靠路由参数区分「新对话」与「已有对话」）。
+      // `?project=<id>` 只对 path 为空的「新对话」生效：表示这条新对话建在该项目下。
+      {
+        path: 'c/:conversationId',
+        name: 'conversation',
+        component: () => import('@/views/HomeView.vue'),
+        meta: { title: '对话', homeNav: 'home' },
+      },
       // ---- 文献调研：/papers/* ----
       {
         path: 'papers',

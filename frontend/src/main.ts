@@ -29,6 +29,8 @@ import '@/styles/tooltip.css'
 import '@/styles/a11y.css'
 // 全站滚动条统一样式（给滚动容器加 class="scroll-y" 即可，别再各写一份）
 import '@/styles/scrollbar.css'
+// 对话正文 Markdown 排版（基础 + 代码高亮 + KaTeX 公式），只在 .md 容器内生效
+import '@/styles/markdown.css'
 
 const app = createApp(App)
 
