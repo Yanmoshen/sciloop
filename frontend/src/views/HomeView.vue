@@ -768,7 +768,8 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   min-height: 100%;
-  padding-bottom: 24px;
+  position: relative; /* 输入框要相对它浮在底部 */
+  padding-bottom: 0;
 }
 
 /* 开场区与三张卡用「收起高度 + 淡出」过渡：输入框随之平滑下移 */
@@ -796,13 +797,20 @@ onMounted(async () => {
   min-height: 0;
   overflow-y: auto;
   margin-top: 8px;
-  padding-bottom: 28px; /* 与下方输入框拉开距离，避免最后一行贴着输入框 */
-  scroll-padding-bottom: 28px;
+  /* 留出比输入框更高的空间：这样任何一行都能滚到输入框上方，不会被永久遮住 */
+  padding-bottom: 172px;
+  scroll-padding-bottom: 172px;
 }
 
 /* 输入框与对话区之间再留一道间距（此前最后一行会贴到输入框上沿） */
 .hero--active .composer {
-  margin-top: 12px;
+  position: absolute; /* 浮在对话区之上，而不是占掉一整行 */
+  left: 50%;
+  bottom: 0;
+  z-index: 5;
+  width: min(720px, calc(100% - 24px)); /* 比内容列窄，两侧留边 */
+  transform: translateX(-50%);
+  box-shadow: 0 14px 36px rgb(0 0 0 / 18%);
 }
 
 .convo {
