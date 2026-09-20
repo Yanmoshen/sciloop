@@ -17,11 +17,33 @@
  *    里给 Firefox 兜底。
  */
 
+/**
+ * 2026-09-20 口径调整（用户要求，**全局**）：
+ * **全站默认隐藏滚动条视觉，但滚动能力一律保留**；只有显式加 `.scroll-y` 的容器
+ * （例如「模型服务」里的上游模型列表）才显示细滚动条。
+ *
+ * 为什么必须改：壳层固定后同时存在多个滚动容器（内容区 / 左栏 / 内层列表），
+ * 每个都画一条系统滚动条，右侧会叠出 2–3 条。
+ *
+ * ⚠️ 隐藏同样要遵守上面的坑：**不要**给被隐藏的元素写 `scrollbar-width`，
+ *    否则 Chromium 会放弃 webkit 定制、退回带箭头的系统滚动条（反而更显眼）。
+ */
+
+/* ---------- 全局默认：隐藏滚动条视觉，保留滚动 ---------- */
+*::-webkit-scrollbar,
+*::-webkit-scrollbar-corner {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+/* ---------- 唯一允许显示滚动条的容器 ---------- */
 .scroll-y {
   scrollbar-gutter: stable; /* 滚动条出现/消失时内容不跳 */
 }
 
 .scroll-y::-webkit-scrollbar {
+  display: block; /* 覆盖上面的全局隐藏 */
   width: 12px;
   height: 12px;
 }
@@ -60,8 +82,12 @@
 }
 
 @supports not selector(::-webkit-scrollbar) {
+  /* Firefox 兜底：全局隐藏，仅 .scroll-y 显示细滚动条 */
+  * {
+    scrollbar-width: none;
+  }
   .scroll-y {
     scrollbar-width: thin;
-    scrollbar-color: var(--color-border-strong) transparent;
+    scrollbar-color: var(--h-line-strong, var(--color-border-strong)) transparent;
   }
 }

@@ -104,6 +104,9 @@ ROUTER_REGISTRY: tuple[tuple[str, str, bool], ...] = (
     #       顶层字面前缀，与四核心模块同样规避「静态段被参数路由抢占 → 422」这一类缺陷。
     #       读公开（返回默认值合并后的结果），写要求 Owner（匿名 403 owner_token_required）。
     ("app.api.v1.settings", "/api/v1", False),
+    # 11.2) 首页对话（本轮新增，可选）：/chat/home
+    #       用户一段话 → 模型给标题（＝项目名）+ 正式回答；Owner 专属（产生真实费用）。
+    ("app.api.v1.chat", "/api/v1", False),
     # 12) 模型配置与成本（WP02，自带 /models 与 /costs 前缀）
     ("app.api.v1.models_config", "/api/v1", True),
     ("app.api.v1.costs", "/api/v1", True),

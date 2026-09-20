@@ -329,6 +329,22 @@ def _model_ref(record: Any, model_id: str) -> str:
     return f"{slugify_provider(record.name)}:{model_id}"
 
 
+async def _clear_other_defaults(registry: Any, *, keep_id: int | None) -> list[int]:
+    """默认供应商**互斥**：把除 ``keep_id`` 外的 ``is_default`` 全部取消。
+
+    为什么必须在服务端做：前端开关只写自己那一条，历史上已经出现过两个供应商
+    同时 ``is_default=true``（默认供应商不唯一），导致「默认供应商的第一个模型」
+    这种用法没有确定含义。放在这里，任何写入入口（新增 / 修改）都一致。
+    """
+    cleared: list[int] = []
+    for record in await registry.list_configs():
+        if record.id == keep_id or not record.is_default:
+            continue
+        await registry.update_config(record.id, {"is_default": False})
+        cleared.append(record.id)
+    return cleared
+
+
 # --------------------------------------------------------------------------- #
 # 供应商 CRUD
 # --------------------------------------------------------------------------- #
@@ -363,6 +379,8 @@ async def create_model_config(payload: ModelConfigCreate) -> Any:
         return _fail(400, "invalid_api_key", str(exc))
 
     registry = get_registry()
+    if payload.is_default:
+        await _clear_other_defaults(registry, keep_id=None)
     config_id = await registry.create_config(
         name=payload.name.strip(),
         base_url=payload.base_url,
@@ -401,6 +419,8 @@ async def update_model_config(config_id: int, payload: ModelConfigUpdate) -> Any
         fields["models"] = [entry.model_dump() for entry in payload.models]
     if payload.is_default is not None:
         fields["is_default"] = payload.is_default
+        if payload.is_default:
+            await _clear_other_defaults(registry, keep_id=config_id)
     if payload.type is not None:
         fields["type"] = _normalize_type(payload.type)
     if payload.api_key is not None:

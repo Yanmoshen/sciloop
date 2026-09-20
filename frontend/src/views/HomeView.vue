@@ -9,20 +9,23 @@
  *
  * 总览页（未进入项目时的首页）：一句话入口 + 三张快捷卡。
  *
- * 说明（口径纪律）：
- * - 本轮为 **demo 阶段**：点 ↑ 后展示的是**模拟响应**（前端固定文案 + 三点思考动效），
- *   页面会显式标注「模拟响应 · 演示文案，非实时模型输出」，**不冒充真实模型输出**；
- * - 接入真实 LLM 后只需把 `mockAnswer()` 换成对后端接口的调用，动效与布局不变。
+ * 会话流程：输入需求 → `POST /chat/home` 真调模型（拿到「标题」+「正式回答」）
+ * → 用标题建项目（标题即项目名，出现在左栏「最近打开」）→ 就地展示回答。
+ * 进入会话后：开场文案 / 流程行 / 三张卡收起，输入框独占最后一行。
  */
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
+import { chatHome } from '@/api/chat'
 import type { CreatedProject } from '@/api/projects'
+import { createProject } from '@/api/projects'
 import ProjectCreateDialog from '@/components/ProjectCreateDialog.vue'
 import { useSessionStore } from '@/stores/session'
+import { useSettingsStore } from '@/stores/settings'
 
 const router = useRouter()
 const session = useSessionStore()
+const settings = useSettingsStore()
 
 const prompt = ref('')
 const files = ref<Array<{ name: string }>>([])
@@ -32,9 +35,40 @@ const phase = ref<'idle' | 'thinking' | 'answered'>('idle')
 const dialogOpen = ref(false)
 const dialogPrefill = ref('')
 
+const answer = ref('')
+const userText = ref('')
+const answerTitle = ref('')
+const errorText = ref('')
+const pickedRef = ref('')
+const listening = ref(false)
+
 const canSend = computed(() => prompt.value.trim().length > 0 || files.value.length > 0)
+const active = computed(() => phase.value !== 'idle' || answer.value.length > 0)
 
 const PIPELINE = '文献调研 → idea 生成 → 算法生成 → 算法评审 → 自动实验 → 论文写作 → 论文评审'
+
+/** 默认供应商（后端保证互斥唯一） */
+const defaultProvider = computed(() => settings.configs.find((config) => config.is_default) ?? null)
+
+/** 模型清单：只列默认供应商的模型；没有默认供应商时只给一个 auto 占位 */
+const modelOptions = computed(() => {
+  const provider = defaultProvider.value
+  if (!provider) return [{ value: 'auto', label: 'auto' }]
+  return (provider.models ?? []).map((entry) => ({
+    value: `${provider.id}:${entry.model_id}`,
+    label: entry.model_id,
+  }))
+})
+
+const pickerOpen = ref(false)
+const pickedLabel = computed(
+  () => modelOptions.value.find((item) => item.value === pickedRef.value)?.label ?? 'auto',
+)
+
+function pickModel(value: string): void {
+  pickedRef.value = value
+  pickerOpen.value = false
+}
 
 let timer: number | null = null
 
@@ -53,20 +87,109 @@ function removeFile(index: number): void {
   files.value = files.value.filter((_, i) => i !== index)
 }
 
-/** 模拟响应：三点跳动约 1.6s 后给出结果（demo 阶段不调真实模型） */
-function send(): void {
-  if (!canSend.value) return
-  if (timer !== null) window.clearTimeout(timer)
-  phase.value = 'thinking'
-  timer = window.setTimeout(() => {
-    phase.value = 'answered'
-    timer = null
-  }, 1600)
+/** 语音输入（浏览器原生识别；不可用时按钮不渲染） */
+const speechSupported =
+  typeof window !== 'undefined' &&
+  Boolean(
+    (window as unknown as { SpeechRecognition?: unknown; webkitSpeechRecognition?: unknown })
+      .SpeechRecognition ||
+      (window as unknown as { webkitSpeechRecognition?: unknown }).webkitSpeechRecognition,
+  )
+
+function toggleVoice(): void {
+  type Recognizer = {
+    lang: string
+    interimResults: boolean
+    continuous: boolean
+    onresult: (event: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void
+    onend: () => void
+    onerror: () => void
+    start: () => void
+    stop: () => void
+  }
+  const holder = window as unknown as {
+    SpeechRecognition?: new () => Recognizer
+    webkitSpeechRecognition?: new () => Recognizer
+  }
+  const Ctor = holder.SpeechRecognition ?? holder.webkitSpeechRecognition
+  if (!Ctor) return
+  if (listening.value) {
+    listening.value = false
+    return
+  }
+  const recognizer = new Ctor()
+  recognizer.lang = 'zh-CN'
+  recognizer.interimResults = false
+  recognizer.continuous = false
+  recognizer.onresult = (event) => {
+    const parts: string[] = []
+    for (let i = 0; i < event.results.length; i += 1) {
+      const first = event.results[i][0]
+      if (first) parts.push(first.transcript)
+    }
+    const text = parts.join('').trim()
+    if (text) prompt.value = prompt.value ? `${prompt.value} ${text}` : text
+  }
+  recognizer.onend = () => {
+    listening.value = false
+  }
+  recognizer.onerror = () => {
+    listening.value = false
+  }
+  listening.value = true
+  recognizer.start()
 }
 
-function mockAnswer(): string {
-  const topic = prompt.value.trim() || '这个课题'
-  return `「${topic}」可以拆成三个可验证问题：任务难度的分层定义、上下文长度与答案稳定性的关系、以及对照基线的可比性。建议先用 20–50 条样本做分层对照实验，再决定是否扩展到多语言与多轮问答。`
+/** 发送：真调模型拿标题与回答 → 用标题建项目 → 展示回答 */
+async function send(): Promise<void> {
+  if (!canSend.value || phase.value === 'thinking') return
+  const text = prompt.value.trim() || files.value.map((file) => file.name).join('、')
+  if (!text) return
+
+  if (!session.isOwner) {
+    errorText.value = '只读面：需要 OWNER_TOKEN'
+    return
+  }
+  if (pickedRef.value === 'auto') {
+    errorText.value = '请先到「模型设置」填写模型'
+    return
+  }
+  const [configIdRaw, ...rest] = pickedRef.value.split(':')
+  const configId = Number(configIdRaw)
+  const modelId = rest.join(':')
+  if (!configId || !modelId) {
+    errorText.value = '请先到「模型设置」填写模型'
+    return
+  }
+
+  if (timer !== null) window.clearTimeout(timer)
+  errorText.value = ''
+  answer.value = ''
+  userText.value = text
+  phase.value = 'thinking'
+  // 发送即清空输入框（不等结果），避免旧文本残留在输入框里
+  prompt.value = ''
+  files.value = []
+
+  try {
+    const result = await chatHome({ text, model_config_id: configId, model_id: modelId })
+    answerTitle.value = result.title
+    answer.value = result.reply
+    phase.value = 'answered'
+    const created = await createProject({ name: result.title, note: text, fields: [] })
+    await session.loadProjects()
+    session.selectProject(created.id)
+  } catch (err) {
+    phase.value = 'idle'
+    // 失败要能重发：把原文放回输入框
+    prompt.value = text
+    const withCode = err as { code?: string; message?: string }
+    errorText.value = withCode?.message
+      ? `${withCode.code ?? 'failed'}：${withCode.message}`
+      : err instanceof Error
+        ? err.message
+        : String(err)
+  }
 }
 
 function openCreate(prefill: string): void {
@@ -89,33 +212,36 @@ function onCreated(project: CreatedProject): void {
   void router.push({ name: 'workbench', params: { projectId: String(project.id) } })
 }
 
-onMounted(() => {
+onMounted(async () => {
   prompt.value = ''
+  if (!settings.configs.length) await settings.loadConfigs()
+  pickedRef.value = modelOptions.value[0]?.value ?? 'auto'
 })
 </script>
 
 <template>
-  <section class="hero">
-    <h1 class="hero__title">使用 AI，体验全新科研工作流</h1>
-    <p class="hero__steps">{{ PIPELINE }}</p>
+  <section class="hero" :class="{ 'hero--active': active }">
+    <div class="intro">
+      <h1 class="hero__title">使用 AI，体验全新科研工作流</h1>
+      <p class="hero__steps">{{ PIPELINE }}</p>
+    </div>
 
-    <div v-if="phase !== 'idle'" class="stream">
+    <div v-if="active" class="convo">
+      <div class="convo__item">
+        <span class="bubble bubble--user">{{ userText }}</span>
+      </div>
       <div v-if="phase === 'thinking'" class="dots" aria-label="正在思考">
         <span class="dot" />
         <span class="dot" />
         <span class="dot" />
       </div>
-      <div v-else class="answer">
-        <span class="tag">模拟响应</span>
-        <p>{{ mockAnswer() }}</p>
-        <div class="answer__actions">
-          <button class="tool tool--primary" type="button" @click="openCreate(prompt)">
-            新建项目并预填
-          </button>
-          <button class="tool" type="button" @click="goFeed">去文献调研</button>
-        </div>
+      <div v-else-if="answer" class="convo__item">
+        <span v-if="answerTitle" class="pill pill--quiet">{{ answerTitle }}</span>
+        <p class="bubble bubble--ai">{{ answer }}</p>
       </div>
     </div>
+
+    <p v-if="errorText" class="state state--error">{{ errorText }}</p>
 
     <div class="composer">
       <div class="composer__body">
@@ -126,11 +252,10 @@ onMounted(() => {
           @keydown.enter.exact.prevent="send"
         />
         <div class="composer__tools">
-          <button class="tool" type="button" @click="pickFiles">
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <button class="icon-btn" type="button" title="上传文件" aria-label="上传文件" @click="pickFiles">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
               <path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
             </svg>
-            上传文件
           </button>
           <span
             v-for="(file, index) in files"
@@ -142,8 +267,66 @@ onMounted(() => {
             {{ file.name.length > 22 ? `${file.name.slice(0, 20)}…` : file.name }}
           </span>
           <input ref="fileInput" type="file" multiple hidden @change="onFiles" />
+
+          <div class="mpick">
+            <button
+              class="mpick__trigger"
+              type="button"
+              aria-haspopup="listbox"
+              :aria-expanded="pickerOpen ? 'true' : 'false'"
+              @click="pickerOpen = !pickerOpen"
+            >
+              <span class="mpick__value">{{ pickedLabel }}</span>
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
+                <path d="M2 4l3 3 3-3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+              </svg>
+            </button>
+            <ul v-if="pickerOpen" class="mpick__panel" role="listbox">
+              <li
+                v-for="option in modelOptions"
+                :key="option.value"
+                class="mpick__option"
+                :class="{ 'mpick__option--on': option.value === pickedRef }"
+                role="option"
+                :aria-selected="option.value === pickedRef ? 'true' : 'false'"
+                @click="pickModel(option.value)"
+              >
+                <span class="mpick__label">{{ option.label }}</span>
+                <svg
+                  v-if="option.value === pickedRef"
+                  width="12"
+                  height="12"
+                  viewBox="0 0 12 12"
+                  fill="none"
+                  aria-hidden="true"
+                >
+                  <path
+                    d="M2.5 6.5 5 9l4.5-6"
+                    stroke="currentColor"
+                    stroke-width="1.6"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              </li>
+            </ul>
+          </div>
         </div>
       </div>
+      <button
+        v-if="speechSupported"
+        class="mic"
+        type="button"
+        :class="{ 'mic--on': listening }"
+        title="语音输入"
+        aria-label="语音输入"
+        @click="toggleVoice"
+      >
+        <svg width="15" height="15" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+          <rect x="7" y="2.5" width="4" height="8" rx="2" stroke="currentColor" stroke-width="1.5" />
+          <path d="M4.5 9a4.5 4.5 0 0 0 9 0M9 13.5V16" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+        </svg>
+      </button>
       <button class="send" type="button" :disabled="!canSend" aria-label="发送" @click="send">
         <svg width="15" height="15" viewBox="0 0 18 18" fill="none" aria-hidden="true">
           <path
@@ -157,7 +340,7 @@ onMounted(() => {
       </button>
     </div>
 
-    <section class="cards">
+    <section v-if="!active" class="cards">
       <button class="card" type="button" @click="openCreate(prompt)">
         <span class="card__icon">
           <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
@@ -497,5 +680,222 @@ onMounted(() => {
   .cards {
     grid-template-columns: 1fr;
   }
+}
+
+/* ---------- 对话态：开场内容收起、输入框独占一行并置底 ---------- */
+
+/* 关键前提：对话态下 hero 必须是「撑满内容区的纵向 flex」。
+   否则 .convo{flex:1} 与 .composer 的定位都会失效 —— 输入框停在半空、还会盖住文本。 */
+.hero--active {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  padding-bottom: 24px;
+}
+
+/* 开场区与三张卡用「收起高度 + 淡出」过渡：输入框随之平滑下移 */
+.intro,
+.cards {
+  max-height: 420px;
+  opacity: 1;
+  overflow: hidden;
+  transition:
+    max-height 360ms cubic-bezier(0.4, 0, 0.2, 1),
+    opacity 220ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.hero--active .intro,
+.hero--active .cards {
+  max-height: 0;
+  opacity: 0;
+  margin: 0;
+  pointer-events: none;
+}
+
+/* 对话区：吃掉剩余高度，把输入框挤到最后一行（与文本上下分开，不互相遮挡） */
+.hero--active .convo {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  margin-top: 8px;
+}
+
+.convo {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 4px 0 16px;
+}
+
+.convo__item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.convo__item:first-child {
+  align-items: flex-end;
+}
+
+.bubble {
+  max-width: 82%;
+  padding: 12px 16px;
+  border-radius: 12px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.bubble--user {
+  background: var(--h-active);
+  color: var(--h-fg);
+}
+
+.bubble--ai {
+  background: var(--h-surface);
+  border: 1px solid var(--h-line);
+  color: var(--h-fg);
+  max-width: 100%;
+}
+
+/* 输入框工具行：右侧留出麦克风 + 发送按钮的位置，避免控件互相压住 */
+.composer__tools {
+  padding-right: 84px;
+}
+
+/* 上传：只有一个加号（无底块、无文字） */
+.icon-btn {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--h-fg-subtle);
+  cursor: pointer;
+  transition: color 180ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.icon-btn:hover {
+  color: var(--h-fg);
+}
+
+/* ---------- 模型选择：只有「名字 + ⌄」，无外框；浮层平滑展开 ---------- */
+.mpick {
+  position: relative;
+  margin-left: auto;
+}
+
+.mpick__trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  padding: 2px 4px;
+  border: 0;
+  background: transparent;
+  color: var(--h-fg-muted);
+  font: inherit;
+  font-size: var(--font-size-md);
+  cursor: pointer;
+  transition: color 180ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.mpick__trigger:hover {
+  color: var(--h-fg);
+}
+
+.mpick__value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mpick__panel {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 40;
+  min-width: 200px;
+  max-width: 320px;
+  max-height: 260px;
+  overflow-y: auto;
+  margin: 0;
+  padding: 6px;
+  list-style: none;
+  background: var(--h-surface-raised, var(--h-surface));
+  border: 1px solid var(--h-line-strong);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgb(0 0 0 / 24%);
+  animation: mpick-in 180ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+@keyframes mpick-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.mpick__option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  color: var(--h-fg);
+  cursor: pointer;
+  transition: background-color 140ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.mpick__option:hover {
+  background: var(--h-hover);
+}
+
+.mpick__option--on {
+  color: var(--h-primary);
+}
+
+.mpick__label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 语音输入：与发送按钮同排（发送按钮是绝对定位，这里跟随其左侧） */
+.mic {
+  position: absolute;
+  right: 56px;
+  bottom: 12px;
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--h-line);
+  border-radius: 40px;
+  background: transparent;
+  color: var(--h-fg-muted);
+  cursor: pointer;
+}
+
+.mic:hover {
+  border-color: var(--h-line-strong);
+  color: var(--h-fg);
+}
+
+.mic--on {
+  border-color: var(--h-primary);
+  color: var(--h-primary);
+  box-shadow: 0 0 12px var(--h-primary);
 }
 </style>

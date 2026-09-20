@@ -187,7 +187,13 @@ function failure(err: unknown): string {
  */
 async function patch(body: Record<string, unknown>): Promise<boolean> {
   const config = current.value
-  if (!config || !props.canWrite) return false
+  if (!config) return false
+  // 只读面：**不能静默返回**（否则表现成「点了没反应」）。按钮本身已前置禁用，
+  // 这里只是兜底，并把真实原因说出来。
+  if (!props.canWrite) {
+    errorNotice.value = '只读面：需要 OWNER_TOKEN'
+    return false
+  }
   busy.value = true
   errorNotice.value = ''
   notice.value = ''
@@ -579,7 +585,6 @@ async function removeProvider(): Promise<void> {
           <div class="sec__head">
             <span class="sec__title">模型</span>
             <span class="pill pill--quiet">共 {{ models.length }} 个</span>
-            <span v-if="missingPriceCount" class="pill pill--warn">单价未配置 {{ missingPriceCount }} 个</span>
             <span v-if="nonUsdCount" class="pill pill--warn" title="非 USD 定价不换算、不计入 USD 护栏">
               非 USD，未计入护栏 {{ nonUsdCount }} 个
             </span>
@@ -680,7 +685,12 @@ async function removeProvider(): Promise<void> {
                 </label>
                 <div class="row__edit-end">
                   <button class="btn btn--sm" type="button" @click="cancelEditPrice">取消</button>
-                  <button class="btn btn--sm btn--primary" type="button" :disabled="busy" @click="savePrice(entry)">
+                  <button
+                    class="btn btn--sm btn--primary"
+                    type="button"
+                    :disabled="!canWrite || busy"
+                    @click="savePrice(entry)"
+                  >
                     保存单价
                   </button>
                 </div>

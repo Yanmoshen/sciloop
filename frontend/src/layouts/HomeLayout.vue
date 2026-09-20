@@ -536,9 +536,13 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+/* 壳层：整页不滚动，只有中间内容区滚动（左栏与顶栏固定）
+   —— `height`（而非 `min-height`）+ `overflow: hidden` 是必须的：
+   只要留着 `min-height: 100vh`，内容变高时根容器会被撑高，整页就会出现第二条滚动条。 */
 .sl-home {
   display: flex;
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
   background: var(--h-page-bg);
   color: var(--h-fg);
   font-family: 'Open Sans', ui-sans-serif, system-ui, 'PingFang SC', 'Microsoft YaHei', sans-serif;
@@ -565,6 +569,7 @@ onUnmounted(() => {
 .rail {
   width: 248px;
   flex: none;
+  overflow-y: auto; /* 导航过长时内部滚动；滚动条视觉由 styles/scrollbar.css 全局隐藏 */
   padding: 24px 16px;
   display: flex;
   flex-direction: column;
@@ -983,10 +988,12 @@ onUnmounted(() => {
   font-size: var(--font-size-xs);
   color: var(--h-fg-subtle);
 }
-/* 内容区：左栏常驻，只有中间这块随路由切换 */
+/* 内容区：左栏常驻，只有中间这块随路由切换；也是全站唯一的一级滚动容器 */
 .content {
   flex: 1;
   min-width: 0;
+  min-height: 0; /* flex 子项默认可被内容撑高，必须归零才能让 overflow 生效 */
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   align-items: center;
