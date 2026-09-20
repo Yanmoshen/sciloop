@@ -74,7 +74,13 @@ const elapsedMs = ref(0)
 let tick: number | null = null
 let streamStartedAt = 0
 
-const PIPELINE = '文献调研 → idea 生成 → 算法生成 → 算法评审 → 自动实验 → 论文写作 → 论文评审'
+/**
+ * 首页开场那一行「流程」文案（各阶段之间用 → 连接）。
+ * 注意：这是**给研究者看的闭环描述**，与工作台里六环节的机器阶段名（`STAGE_LABELS`：
+ * survey/plan/plan_review/experiment/writing/review）是两套口径，改这里不会动工作台。
+ */
+const PIPELINE =
+  '文献调研 → Idea 生成与可行性分析 → 实验准备 → 执行实验 → 结果分析 → 论文写作 → 论文评审'
 
 const active = computed(() => turns.value.length > 0 || phase.value === 'thinking')
 const canSend = computed(() => prompt.value.trim().length > 0 || files.value.length > 0)
