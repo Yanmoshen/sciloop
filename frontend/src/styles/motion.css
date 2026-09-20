@@ -60,7 +60,8 @@
  * 也不会像 `max-height` 那样在内容不足时"空跑"一段。
  * 用法：<div class="fold" :class="{ 'fold--open': open }"><div>…内容…</div></div>
  * ⚠️ `grid-template-rows` 可动画需要 Chromium 107+；旧浏览器降级为瞬变（功能不受影响）。
- * ⚠️ 内容常驻 DOM（不再 v-if）——折叠区里若有几十行列表，请确认常驻可接受。 */
+ * ⚠️ 内容常驻 DOM（不再 v-if）——折叠区里若有几十行列表，请确认常驻可接受；
+ *    收起时靠 `visibility: hidden`（延迟到高度收完）保证对键盘/读屏不可达。 */
 .fold {
   display: grid;
   grid-template-rows: 0fr;
@@ -76,19 +77,27 @@
      min-content，收不干净。 */
   min-height: 0;
   overflow: hidden;
+  /* 折叠内容常驻 DOM（不再 v-if），所以收起后必须对键盘 / 读屏**不可达**：
+     否则左栏 40 个项目行各自的「更多」菜单、开场区收起后的三张卡按钮，
+     都还能被 Tab 走到、被读屏念出来。 */
+  visibility: visible;
   /* 子元素自己的上下 padding / border / margin **不随 grid 行高收缩**：
      实测「文献调研」收起后仍留 6px、「更多」菜单还会露出一条空边框，
      三张卡外面的 46px 下边距也会照留。所以这三项也要跟着过渡到 0。 */
   transition:
     padding-block var(--motion-dur) var(--motion-ease),
     margin-block var(--motion-dur) var(--motion-ease),
-    border-block-width var(--motion-dur) var(--motion-ease);
+    border-block-width var(--motion-dur) var(--motion-ease),
+    visibility 0s linear 0s;
 }
 
 .fold:not(.fold--open) > * {
   padding-block: 0;
   margin-block: 0;
   border-block-width: 0;
+  visibility: hidden;
+  /* 最后那档 visibility 延迟到高度收完（260ms）再切 —— 否则收起时内容会"提前消失"闪一下 */
+  transition-delay: 0s, 0s, 0s, var(--motion-dur);
 }
 
 /* ---------- ② 入场：自下而上淡入 ----------

@@ -74,6 +74,10 @@ class HomeChatRequest(BaseModel):
     conversation_id: str | None = Field(default=None, max_length=64)
     #: 不传 = 未分组；传了 = 这条新会话直接归到该项目下
     project_id: int | None = None
+    #: **编辑重开**：把这轮当成"改写第 N 条用户消息"——先丢弃该条及其后的所有轮次，
+    #: 再以 ``text`` 作为新的第 N 条重问一次。不传 = 普通追加一轮。
+    #: 只接受指向 user 轮次的下标（指到 assistant 轮次直接 422，不做猜测）。
+    replace_from: int | None = Field(default=None, ge=0)
 
 
 class HomeChatResponse(BaseModel):
@@ -153,6 +157,31 @@ async def _generate_title(text: str, ref: str) -> tuple[str, str, str | None]:
     return title, title_source, title_note
 
 
+def _truncate_for_edit(conversation: dict[str, Any] | None, replace_from: int | None) -> bool:
+    """``replace_from`` 非空 = 编辑重开：校验下标并丢弃该条及其后的所有轮次（不落盘）。
+
+    返回 True 表示本次走"编辑重开"（调用方据此决定：① 不重新生成标题；② 即使一个字都没生成，
+    也要把用户改过的内容落盘 —— 用户改了就一定留痕）。
+
+    校验从严、不做猜测：会话不存在 → 404；下标越界 → 422；指到 assistant 轮次 → 422。
+    """
+    if replace_from is None:
+        return False
+    if conversation is None:
+        raise _error(404, "conversation_not_found", "要编辑的会话不存在（可能已被删除）")
+    turns = conversation.get("turns") or []
+    if replace_from >= len(turns):
+        raise _error(
+            422,
+            "turn_index_out_of_range",
+            f"第 {replace_from} 条消息不存在（当前共 {len(turns)} 条）",
+        )
+    if (turns[replace_from] or {}).get("role") != "user":
+        raise _error(422, "not_a_user_turn", "只能编辑你自己发过的消息")
+    conversations.truncate_from(conversation, replace_from)
+    return True
+
+
 @router.post(
     "/chat/home",
     response_model=HomeChatResponse,
@@ -166,12 +195,20 @@ async def home_chat(payload: HomeChatRequest) -> HomeChatResponse:
 
     ref = await _resolve_model_ref(payload.model_config_id, payload.model_id)
 
-    # 1) 标题：失败只降级，不让整次请求失败
-    title, title_source, title_note = await _generate_title(text, ref)
+    conversation = conversations.read(payload.conversation_id) if payload.conversation_id else None
+    # 编辑重开：先校验并截断（会话不存在/下标越界都不会先建出空会话）
+    is_edit = _truncate_for_edit(conversation, payload.replace_from)
+
+    # 1) 标题：失败只降级，不让整次请求失败。编辑重开不动标题 —— 用户改的是正文，
+    #    这次会话的主题没变（也避免"编辑一下标题就换了"）。
+    if is_edit and conversation is not None:
+        title = str(conversation.get("title") or text[:TITLE_MAX_CHARS])
+        title_source, title_note = "kept", None
+    else:
+        title, title_source, title_note = await _generate_title(text, ref)
 
     # 2) 正式回答：失败必须如实抛出（不能伪装成功）
-    #    带上下文：同一会话的历史轮次（实现「接着上次继续」）
-    conversation = conversations.read(payload.conversation_id) if payload.conversation_id else None
+    #    带上下文：同一会话的历史轮次（实现「接着上次继续」；编辑重开后即为截断后的历史）
     history = conversations.context_messages(conversation) if conversation else []
     try:
         reply_result = await adapter.chat(
@@ -192,14 +229,14 @@ async def home_chat(payload: HomeChatRequest) -> HomeChatResponse:
             {"model_ref": ref, "type": type(exc).__name__},
         ) from exc
 
-    # 3) 落盘：新会话用模型给的标题建，已知会话则只补这一轮
+    # 3) 落盘：新会话用模型给的标题建，已知会话则只补这一轮（编辑重开时标题保持不变）
     if conversation is None:
         conversation = conversations.create(
             title=title,
             model_ref=ref,
             project_id=payload.project_id,
         )
-    else:
+    elif not is_edit:
         conversations.rename(str(conversation["id"]), title)
     conversations.append_turns(
         conversation,
@@ -253,6 +290,10 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
 
     落盘在 ``finally`` 里做：正常结束、报错、客户端断开三种情况都会把已生成的部分写进
     会话文件——**不白花 token**，也不允许"界面显示了但记录里没有"。
+
+    ``replace_from`` 非空时为**编辑重开**：先校验（会话必须存在、下标必须指向 user 轮次，
+    否则 404 / 422）再丢弃该条及其后的所有轮次，然后以 ``text`` 作为新的该条重问一次。
+    这种情况下即使一个字都没生成也会落盘 —— 用户改过的正文必须留痕。
     """
     text = payload.text.strip()
     if not text:
@@ -261,6 +302,8 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
     ref = await _resolve_model_ref(payload.model_config_id, payload.model_id)
 
     conversation = conversations.read(payload.conversation_id) if payload.conversation_id else None
+    # 编辑重开：先校验并截断，再建会话（会话不存在/下标越界都不会先建出空会话）
+    is_edit = _truncate_for_edit(conversation, payload.replace_from)
     is_new = conversation is None
     if conversation is None:
         conversation = conversations.create(
@@ -331,8 +374,9 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
                 title_task.cancel()
             duration_ms = int((time.perf_counter() - started) * 1000)
             generated = "".join(buffer)
-            if generated or error_info is None:
-                # 有正文 → 追加本轮；无正文且无错误 → 模型真的返回空，也要如实记一条
+            # 有正文 → 追加本轮；无正文且无错误 → 模型真的返回空，也要如实记一条。
+            # 编辑重开时**无条件落盘**：用户改过的正文必须留痕，否则刷新后改动就凭空消失了。
+            if generated or error_info is None or is_edit:
                 conversations.append_turns(
                     conversation,
                     [

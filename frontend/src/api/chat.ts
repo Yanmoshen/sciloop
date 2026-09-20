@@ -26,6 +26,11 @@ export interface HomeChatInput {
   conversation_id?: string
   /** 不传 = 未分组；传了 = 这条新会话直接归到该项目下 */
   project_id?: number
+  /**
+   * 编辑重开：把这轮当成「改写第 N 条用户消息」——后端先丢弃该条及其后的所有轮次，
+   * 再以 `text` 作为新的第 N 条重问。只接受指向 user 轮次的下标（指到 assistant 会 422）。
+   */
+  replace_from?: number
 }
 
 export interface HomeChatResult {

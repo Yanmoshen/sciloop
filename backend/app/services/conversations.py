@@ -167,6 +167,22 @@ def append_turns(record: dict[str, Any], new_turns: list[dict[str, Any]]) -> dic
     return record
 
 
+def truncate_from(record: dict[str, Any], index: int) -> dict[str, Any]:
+    """只保留 ``index`` 之前的轮次（第 ``index`` 条及其后全部丢弃），**不落盘**。
+
+    用于「编辑某条用户消息后从此处重开」：调用方负责接着 ``append_turns`` 写入新一轮，
+    这样"截断 + 追加"只在同一个 ``finally`` 里写一次文件 —— 中途模型失败也能保住用户改的内容，
+    也不会出现"截断写盘了、新一轮没写上"的半成品状态。
+
+    ``index`` 越界时抛 ``IndexError``（调用方转成 422），不静默取边界值。
+    """
+    turns = list(record.get("turns") or [])
+    if index < 0 or index > len(turns):
+        raise IndexError(f"截断位置越界：index={index}，当前轮次={len(turns)}")
+    record["turns"] = turns[:index]
+    return record
+
+
 def move(conversation_id: str, project_id: Any) -> dict[str, Any] | None:
     """把会话移入某项目（``project_id=None`` 即移回未分组）。"""
     record = read(conversation_id)

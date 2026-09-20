@@ -272,6 +272,22 @@ function openConversation(conversation: ConversationBrief): void {
   void router.push({ name: 'conversation', params: { conversationId: conversation.id } })
 }
 
+/** 当前正在看的那条对话（左栏据此高亮 —— 对话页顶栏标题已去掉，这里成了唯一的方位标识） */
+function isCurrentConversation(id: string): boolean {
+  return route.name === 'conversation' && String(route.params.conversationId ?? '') === id
+}
+
+/**
+ * 打开某项目的流水线工作台。
+ * 原先是对话页顶部那个按钮（带项目参数直达），顶栏去掉后入口收到这里 ——
+ * 否则「按项目直达看板」就没路径了，只能从左栏「流水线工作台」进再自己挑项目。
+ */
+function openProjectWorkbench(projectId: number): void {
+  closeMore()
+  session.selectProject(projectId)
+  void router.push({ name: 'workbench', params: { projectId: String(projectId) } })
+}
+
 function openMove(conversation: ConversationBrief): void {
   moveTarget.value = conversation
   moveOpen.value = true
@@ -614,7 +630,7 @@ onUnmounted(() => {
             {{ conversations.error || '暂无未分组对话' }}
           </p>
           <div v-for="c in conversations.ungrouped" :key="c.id" class="crow">
-            <button class="crow__item" type="button" :title="c.title || '未命名对话'" @click="openConversation(c)">
+            <button class="crow__item" :class="{ 'crow__item--on': isCurrentConversation(c.id) }" type="button" :title="c.title || '未命名对话'" @click="openConversation(c)">
               {{ c.title || '未命名对话' }}
             </button>
             <span class="crow__acts">
@@ -728,6 +744,27 @@ onUnmounted(() => {
             <div class="fold" :class="{ 'fold--open': moreOpen === p.id }">
               <ul class="pmenu" role="menu">
                 <li>
+                  <button
+                    class="pmenu__item"
+                    type="button"
+                    role="menuitem"
+                    @click="openProjectWorkbench(p.id)"
+                  >
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <circle cx="3.6" cy="8" r="1.7" stroke="currentColor" stroke-width="1.3" />
+                      <circle cx="12.4" cy="4.4" r="1.7" stroke="currentColor" stroke-width="1.3" />
+                      <circle cx="12.4" cy="11.6" r="1.7" stroke="currentColor" stroke-width="1.3" />
+                      <path
+                        d="M5.2 7.2 10.8 5M5.2 8.8l5.6 2.2"
+                        stroke="currentColor"
+                        stroke-width="1.3"
+                        stroke-linecap="round"
+                      />
+                    </svg>
+                    流水线工作台
+                  </button>
+                </li>
+                <li>
                   <button class="pmenu__item" type="button" role="menuitem" @click="closeMore(); openRename(p)">
                     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                       <path
@@ -766,7 +803,7 @@ onUnmounted(() => {
                 </p>
                 <div v-for="c in conversations.forProject(p.id)" :key="c.id" class="crow crow--child">
                   <button
-                    class="crow__item"
+                    class="crow__item" :class="{ 'crow__item--on': isCurrentConversation(c.id) }"
                     type="button"
                     :title="c.title || '未命名对话'"
                     @click="openConversation(c)"
@@ -872,7 +909,7 @@ onUnmounted(() => {
                   </p>
                   <div v-for="c in projectConversations(p.id)" :key="c.id" class="crow crow--child">
                     <button
-                      class="crow__item"
+                      class="crow__item" :class="{ 'crow__item--on': isCurrentConversation(c.id) }"
                       type="button"
                       :title="c.title || '未命名对话'"
                       @click="openConversation(c)"
@@ -908,7 +945,7 @@ onUnmounted(() => {
               {{ conversations.archivedError || '暂无已归档对话' }}
             </p>
             <div v-for="c in archivedLooseConversations" :key="c.id" class="crow crow--child">
-              <button class="crow__item" type="button" :title="c.title || '未命名对话'" @click="openConversation(c)">
+              <button class="crow__item" :class="{ 'crow__item--on': isCurrentConversation(c.id) }" type="button" :title="c.title || '未命名对话'" @click="openConversation(c)">
                 {{ c.title || '未命名对话' }}
               </button>
               <span class="crow__acts crow__acts--always">
@@ -1434,6 +1471,15 @@ onUnmounted(() => {
 /* 菜单打开时让项目行保持「悬停态」：指针移到行内菜单上会离开行的盒子 */
 .crow--open {
   background: var(--h-hover);
+}
+
+/* 当前正在看的那条对话：对话页顶栏标题已移除，这个高亮是唯一的方位标识。
+   用 inset box-shadow 画左侧竖条，不引入定位/伪元素（.crow__item 里没有 position）。 */
+.crow__item--on {
+  color: var(--h-fg);
+  font-weight: 600;
+  background: var(--h-active);
+  box-shadow: inset 3px 0 0 var(--h-primary);
 }
 
 /* 项目行的「更多」菜单：行内块（不做绝对定位浮层，避免被滚动区裁掉） */

@@ -25,6 +25,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { streamChatHome } from '@/api/chat'
 import { getConversation } from '@/api/conversations'
 import MarkdownText from '@/components/MarkdownText.vue'
+import ConfirmDialog from '@/components/home/ConfirmDialog.vue'
 import ProjectCreateDialog from '@/components/ProjectCreateDialog.vue'
 import type { CreatedProject } from '@/api/projects'
 import { useConversationStore } from '@/stores/conversations'
@@ -269,49 +270,52 @@ async function init(): Promise<void> {
 // --------------------------------------------------------------------------- //
 // 发送（真流式）
 // --------------------------------------------------------------------------- //
-async function send(): Promise<void> {
-  if (!canSend.value || phase.value === 'thinking') return
-  const text = prompt.value.trim() || files.value.map((file) => file.name).join('、')
-  if (!text) return
+interface PickedModel {
+  configId: number
+  modelId: string
+}
 
+/** 解析当前选中的模型；不可用时写 errorText 并返回 null（发送与编辑重开共用同一套校验） */
+function pickedModel(): PickedModel | null {
   if (!session.isOwner) {
     errorText.value = writeDenied('发送消息')
-    return
+    return null
   }
   if (pickedRef.value === 'auto') {
     errorText.value = '请先到「设置 - 模型」填写模型'
-    return
+    return null
   }
   const [configIdRaw, ...rest] = pickedRef.value.split(':')
   const configId = Number(configIdRaw)
   const modelId = rest.join(':')
   if (!configId || !modelId) {
     errorText.value = '请先到「设置 - 模型」填写模型'
-    return
+    return null
   }
+  return { configId, modelId }
+}
 
-  errorText.value = ''
-  turns.value = [
-    ...turns.value,
-    { role: 'user', content: text, status: 'done' },
-    { role: 'assistant', content: '', model: modelId, status: 'streaming' },
-  ]
-  const assistantIndex = turns.value.length - 1
-  phase.value = 'thinking'
-  prompt.value = ''
-  files.value = []
-  void autoGrow()
-  startTicker()
-  await scrollToBottom()
-
+/**
+ * 跑一轮真流式对话（发送与「编辑重开」共用）。
+ *
+ * `assistantIndex` = 本地那条等待中的 assistant 轮下标；`replaceFrom` 非空表示编辑重开
+ * （后端会先丢弃该条及其后的轮次，再以 `text` 作为新的该条重问）。
+ */
+async function runStream(
+  text: string,
+  model: PickedModel,
+  assistantIndex: number,
+  replaceFrom?: number,
+): Promise<void> {
   try {
     await streamChatHome(
       {
         text,
-        model_config_id: configId,
-        model_id: modelId,
+        model_config_id: model.configId,
+        model_id: model.modelId,
         conversation_id: conversationId.value ?? undefined,
         project_id: conversationId.value ? undefined : (projectId.value ?? undefined),
+        replace_from: replaceFrom,
       },
       {
         onMeta: (meta) => {
@@ -356,8 +360,9 @@ async function send(): Promise<void> {
     const target = turns.value[assistantIndex]
     if (target) {
       target.status = 'interrupted'
-      // 一个字都没生成：撤掉这条空回答，并把原文放回输入框方便重发
-      if (!target.content) {
+      // 一个字都没生成：普通发送撤掉这条空回答并把原文放回输入框；
+      // **编辑重开不回滚** —— 后端已把用户改过的正文落盘，本地回滚反而会和磁盘不一致。
+      if (!target.content && replaceFrom === undefined) {
         turns.value = turns.value.filter((_, index) => index !== assistantIndex)
         prompt.value = text
       }
@@ -374,6 +379,123 @@ async function send(): Promise<void> {
   }
 }
 
+async function send(): Promise<void> {
+  if (!canSend.value || phase.value === 'thinking') return
+  const text = prompt.value.trim() || files.value.map((file) => file.name).join('、')
+  if (!text) return
+
+  const model = pickedModel()
+  if (!model) return
+
+  errorText.value = ''
+  turns.value = [
+    ...turns.value,
+    { role: 'user', content: text, status: 'done' },
+    { role: 'assistant', content: '', model: model.modelId, status: 'streaming' },
+  ]
+  const assistantIndex = turns.value.length - 1
+  phase.value = 'thinking'
+  prompt.value = ''
+  files.value = []
+  void autoGrow()
+  startTicker()
+  await scrollToBottom()
+  await runStream(text, model, assistantIndex)
+}
+
+// --------------------------------------------------------------------------- //
+// 编辑某条用户消息 → 从此处重开
+// --------------------------------------------------------------------------- //
+const editingIndex = ref<number | null>(null)
+const editingText = ref('')
+const editConfirmOpen = ref(false)
+const editPendingIndex = ref<number | null>(null)
+
+/** 编辑框上限高度（超过就内部滚动），与 autoGrow 的 200px 分开：编辑框通常更长 */
+const EDIT_MAX_PX = 320
+
+function sizeEditBox(el: HTMLTextAreaElement): void {
+  el.style.height = 'auto'
+  el.style.height = `${Math.min(el.scrollHeight, EDIT_MAX_PX)}px`
+}
+
+/** 输入时自适应高度（拿事件目标即可，不需要 ref） */
+function onEditInput(event: Event): void {
+  const el = event.target as HTMLTextAreaElement
+  sizeEditBox(el)
+}
+
+function startEdit(index: number, content: string): void {
+  if (phase.value === 'thinking') return
+  editingIndex.value = index
+  editingText.value = content
+  editConfirmOpen.value = false
+  editPendingIndex.value = null
+  errorText.value = ''
+  void nextTick(() => {
+    const el = threadEl.value?.querySelector<HTMLTextAreaElement>('.editbox__input')
+    if (!el) return
+    sizeEditBox(el)
+    el.focus()
+    // 光标落到末尾，符合"改一改再说"的习惯
+    el.setSelectionRange(el.value.length, el.value.length)
+  })
+}
+
+function cancelEdit(): void {
+  editingIndex.value = null
+  editingText.value = ''
+  editPendingIndex.value = null
+  editConfirmOpen.value = false
+}
+
+/** 这条消息后面还有轮次吗？有就先弹一次确认（截断会丢弃它们） */
+function turnsAfterEdit(index: number): number {
+  return Math.max(0, turns.value.length - index - 1)
+}
+
+function submitEdit(): void {
+  const index = editingIndex.value
+  if (index === null) return
+  const text = editingText.value.trim()
+  if (!text || phase.value === 'thinking') return
+  if (turnsAfterEdit(index) > 0) {
+    editPendingIndex.value = index
+    editConfirmOpen.value = true
+    return
+  }
+  void performEdit(index, text)
+}
+
+async function confirmEditRestart(): Promise<void> {
+  const index = editPendingIndex.value
+  const text = editingText.value.trim()
+  editConfirmOpen.value = false
+  editPendingIndex.value = null
+  if (index === null || !text) return
+  await performEdit(index, text)
+}
+
+async function performEdit(index: number, text: string): Promise<void> {
+  const model = pickedModel()
+  if (!model) return
+
+  errorText.value = ''
+  // 本地先按同一口径截断：保留 index 之前的轮次，第 index 条换成新正文，再挂一条等待中的回答
+  turns.value = [
+    ...turns.value.slice(0, index),
+    { role: 'user', content: text, status: 'done' },
+    { role: 'assistant', content: '', model: model.modelId, status: 'streaming' },
+  ]
+  const assistantIndex = index + 1
+  editingIndex.value = null
+  editingText.value = ''
+  phase.value = 'thinking'
+  startTicker()
+  await scrollToBottom()
+  await runStream(text, model, assistantIndex, index)
+}
+
 // --------------------------------------------------------------------------- //
 // 其它入口
 // --------------------------------------------------------------------------- //
@@ -385,10 +507,6 @@ function goIdeas(): void {
   void router.push({ path: '/ideas' })
 }
 
-function goWorkbench(): void {
-  if (projectId.value === null) return
-  void router.push({ name: 'workbench', params: { projectId: String(projectId.value) } })
-}
 
 function openCreate(prefill: string): void {
   dialogPrefill.value = prefill
@@ -445,20 +563,97 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <div v-if="active" class="chat__head">
-      <span class="chat__name">{{ conversationTitle || '新对话' }}</span>
-      <span class="chat__head-actions">
-        <span v-if="archived" class="tag">已归档</span>
-        <button v-if="projectId !== null" class="ghost" type="button" @click="goWorkbench">
-          流水线工作台
-        </button>
-      </span>
-    </div>
-
+    <!-- 对话态不再显示标题栏：标题在左栏会话行上（已高亮），「流水线工作台」入口移到左栏项目行的 ⋯ 菜单，
+         消息区因此直接顶上，可用高度更大。 -->
     <div v-if="active" ref="threadEl" class="thread scroll-y">
       <template v-for="(turn, index) in turns" :key="index">
         <div v-if="turn.role === 'user'" class="turn turn--user">
-          <div class="bubble">{{ turn.content }}</div>
+          <!-- 编辑态：原地把这条消息换成编辑框（不另开弹窗），改完直接从这里重开 -->
+          <div v-if="editingIndex === index" class="editbox">
+            <textarea
+              v-model="editingText"
+              rows="1"
+              class="editbox__input"
+              aria-label="修改这条消息"
+              @input="onEditInput"
+              @keydown.esc="cancelEdit"
+            />
+            <p class="editbox__impact">
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <circle cx="8" cy="8" r="6.2" stroke="currentColor" stroke-width="1.3" />
+                <path d="M8 7.2v4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+                <circle cx="8" cy="4.9" r="0.85" fill="currentColor" />
+              </svg>
+              编辑后将从此处重新开始对话，后续问答会被丢弃，已有产物不受影响
+            </p>
+            <div class="editbox__acts">
+              <button class="ghost" type="button" @click="cancelEdit">取消</button>
+              <button
+                class="editbox__send"
+                type="button"
+                :disabled="!editingText.trim() || phase === 'thinking'"
+                @click="submitEdit"
+              >
+                发送
+              </button>
+            </div>
+          </div>
+
+          <template v-else>
+            <div class="bubble">{{ turn.content }}</div>
+            <div class="acts acts--right">
+              <button
+                class="icon-btn"
+                type="button"
+                :title="copiedIndex === index ? '已复制' : '复制'"
+                :aria-label="copiedIndex === index ? '已复制' : '复制'"
+                @click="copyAnswer(index, turn.content)"
+              >
+                <svg
+                  v-if="copiedIndex !== index"
+                  width="14"
+                  height="14"
+                  viewBox="0 0 16 16"
+                  fill="none"
+                  aria-hidden="true"
+                >
+                  <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" stroke="currentColor" stroke-width="1.3" />
+                  <path
+                    d="M10.5 5.5V4a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 4v5A1.5 1.5 0 0 0 4 10.5h1.5"
+                    stroke="currentColor"
+                    stroke-width="1.3"
+                    stroke-linecap="round"
+                  />
+                </svg>
+                <svg v-else width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <path
+                    d="M3 8.5 6.5 12 13 4.5"
+                    stroke="currentColor"
+                    stroke-width="1.6"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+              </button>
+              <button
+                class="icon-btn"
+                type="button"
+                title="编辑"
+                aria-label="编辑"
+                @click="startEdit(index, turn.content)"
+              >
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <path
+                    d="M11.4 2.6a1.35 1.35 0 0 1 1.9 1.9l-7.6 7.6-2.7.8.8-2.7 7.6-7.6Z"
+                    stroke="currentColor"
+                    stroke-width="1.3"
+                    stroke-linejoin="round"
+                  />
+                  <path d="M10.3 3.7 12.3 5.7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                </svg>
+              </button>
+            </div>
+          </template>
         </div>
         <div v-else class="turn turn--assistant">
           <div class="meta">
@@ -643,6 +838,13 @@ onUnmounted(() => {
     </div>
 
     <ProjectCreateDialog v-model="dialogOpen" :prefill="dialogPrefill" @created="onCreated" />
+    <ConfirmDialog
+      v-model="editConfirmOpen"
+      title="从这条消息重新开始"
+      :message="`编辑后将从这条消息处重新开始对话，它后面的 ${turnsAfterEdit(editPendingIndex ?? 0)} 条消息（含问答）会被丢弃。已有产物不受影响。`"
+      confirm-text="重新发送"
+      @confirm="confirmEditRestart"
+    />
   </section>
 </template>
 
@@ -691,41 +893,6 @@ onUnmounted(() => {
   margin: 0 0 40px;
   font-size: var(--font-size-lg);
   color: var(--h-fg-muted);
-}
-
-/* ---------- 对话头（标题 + 工作台入口） ---------- */
-.chat__head {
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 0 0 12px;
-  border-bottom: 1px solid var(--h-line);
-}
-
-.chat__name {
-  min-width: 0;
-  font-size: var(--font-size-lg);
-  font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.chat__head-actions {
-  margin-left: auto;
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  flex: none;
-}
-
-.tag {
-  padding: 2px 10px;
-  border: 1px solid var(--h-line-strong);
-  border-radius: 999px;
-  color: var(--h-fg-muted);
-  font-size: var(--font-size-xs);
 }
 
 .ghost {
@@ -807,6 +974,84 @@ onUnmounted(() => {
   display: flex;
   gap: 6px;
   margin-top: 2px;
+}
+
+/* 用户消息的操作行：与气泡同侧（右对齐）。
+   助手那条保持左对齐 —— 两侧各自贴着自己的内容，视线不用横跳。 */
+.acts--right {
+  justify-content: flex-end;
+  gap: 4px;
+}
+
+/* ---------- 就地编辑某条用户消息 ---------- */
+.editbox {
+  /* 编辑态切到"整列宽 + 左对齐文字"：既贴近原文幅面，又够地方改长文；
+     底色沿用用户气泡色，一眼看出"还是我那条消息"。 */
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: 12px 14px 10px;
+  border: 1px solid var(--h-line-strong);
+  border-radius: 14px;
+  background: var(--h-active);
+}
+
+.editbox__input {
+  width: 100%;
+  min-height: 44px;
+  max-height: 320px;
+  overflow-y: auto;
+  resize: none;
+  border: 0;
+  background: transparent;
+  color: var(--h-fg);
+  font: inherit;
+  font-size: var(--font-size-md);
+  line-height: 1.65;
+  outline: none;
+}
+
+/* 「后续问答会被丢弃」是真实后果，不是装饰性小字 —— 用警示色，别混在灰字里被忽略 */
+.editbox__impact {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0 0;
+  color: var(--color-warning);
+  font-size: var(--font-size-xs);
+}
+
+.editbox__acts {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.editbox__send {
+  height: 30px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 40px;
+  background: var(--h-fg);
+  /* 底色是 --h-fg：反色文字必须用 --h-page-bg。
+     ⚠️ 写成 var(--h-bg) 会因该令牌不存在而在计算时整条失效 → 退化成继承色，黑底黑字看不见。 */
+  color: var(--h-page-bg);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  transition:
+    opacity var(--motion-dur-fast) var(--motion-ease),
+    background-color var(--motion-dur-fast) var(--motion-ease);
+}
+
+.editbox__send:hover:not(:disabled) {
+  opacity: 0.88;
+}
+
+.editbox__send:disabled {
+  opacity: 0.4;
+  cursor: default;
 }
 
 .cut {
