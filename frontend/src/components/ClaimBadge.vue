@@ -134,7 +134,13 @@ function onSelect(): void {
 </script>
 
 <template>
-  <el-tooltip :content="detail" placement="top" :show-after="120">
+  <el-tooltip
+    :content="detail"
+    placement="top"
+    :show-after="120"
+    :enterable="true"
+    :hide-after="120"
+  >
     <button
       type="button"
       class="claim-badge"

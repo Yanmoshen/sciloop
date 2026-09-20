@@ -107,10 +107,6 @@
             <span class="row__label">许可证</span>
             <div class="row__body"><span>Apache License 2.0</span></div>
           </div>
-          <div class="row">
-            <span class="row__label">合规</span>
-            <div class="row__body"><span>本内容由 AI 辅助生成，需研究者自行核验</span></div>
-          </div>
         </div>
       </div>
     </section>

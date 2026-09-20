@@ -15,7 +15,7 @@
 #sl-tooltip.sl-tooltip {
   position: fixed;
   z-index: 4000;
-  max-width: 320px;
+  max-width: 360px;
   padding: 6px 10px;
   border-radius: 8px;
   background: #1f2329;
@@ -25,7 +25,11 @@
   line-height: 1.5;
   letter-spacing: 0.2px;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.24);
-  pointer-events: none;
+  /* 可悬停 + 可选中：让用户能把鼠标移上来、选中并复制提示里的文字（2026-09-20 由 none 改为 auto） */
+  pointer-events: auto;
+  cursor: text;
+  user-select: text;
+  -webkit-user-select: text;
   opacity: 0;
   transform: translateY(-2px);
   transition:
@@ -44,4 +48,16 @@
   color: #0f1115;
   border-color: rgba(15, 17, 21, 0.12);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+}
+
+/**
+ * Element Plus 浮层（el-tooltip / el-popover / 下拉面板）同口径：
+ * 允许鼠标移入、允许选中里面的文字 —— 与 #sl-tooltip 保持一致的用户期待。
+ * 组件侧同时补了 `:enterable="true"` + `:hide-after="120"`（CoverageTag / ClaimBadge / ParseView）。
+ */
+.el-popper.is-dark,
+.el-popper.is-light {
+  pointer-events: auto;
+  user-select: text;
+  -webkit-user-select: text;
 }

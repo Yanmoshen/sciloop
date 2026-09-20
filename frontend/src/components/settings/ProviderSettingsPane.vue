@@ -494,7 +494,6 @@ async function removeProvider(): Promise<void> {
         <section class="sec">
           <div class="sec__head">
             <span class="sec__title">API 密钥</span>
-            <span v-if="current.api_key_masked" class="tag-mono">{{ current.api_key_masked }}</span>
           </div>
           <div class="sec__row">
             <input

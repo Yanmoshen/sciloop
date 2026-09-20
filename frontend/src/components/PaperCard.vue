@@ -22,6 +22,7 @@ import InfluenceBreakdown from '@/components/InfluenceBreakdown.vue'
 import CoverageTag from '@/components/CoverageTag.vue'
 import { ApiError } from '@/api/client'
 import { fetchPaperSources, type FeedItem, type FeedViewName } from '@/api/feed'
+import { codeRepoLink, paperSourceLink } from '@/utils/paperLink'
 
 const props = withDefaults(
   defineProps<{
@@ -71,35 +72,9 @@ function formatScore(value: number | null | undefined): string {
   return String(Math.round(value * 100) / 100)
 }
 
-/** 来源徽标：只出现有真实依据的来源 */
-interface Badge {
-  key: string
-  label: string
-  detail: string
-  tone: 'base' | 'aux'
-}
-
-const badges = computed<Badge[]>(() => {
-  const list: Badge[] = []
-  const item = props.item
-  if (item.source || item.external_id) {
-    list.push({
-      key: 'arxiv',
-      label: 'arXiv',
-      detail: `${item.source ?? 'unknown'} · ${item.external_id ?? '无外部 ID'}`,
-      tone: 'base',
-    })
-  }
-  if (item.llm_novelty_tag && item.llm_novelty_tag.display !== 'unavailable') {
-    list.push({
-      key: 'llm',
-      label: 'LLM',
-      detail: `llm_novelty 辅助标签（prompt_version=${item.llm_novelty_tag.prompt_version ?? '未获取'}）`,
-      tone: 'aux',
-    })
-  }
-  return list
-})
+/** 来源链接（arXiv 摘要页 / DOI / PDF）与代码仓库链接：都没有时该行不渲染，不打印占位 */
+const sourceLink = computed(() => paperSourceLink(props.item))
+const codeLink = computed(() => codeRepoLink(props.item))
 
 /** 展开区：真实取数留痕（懒加载，避免首屏 N 次请求） */
 const sources = ref<Record<string, { label: string; http: number | null; fields: number; ok: boolean }>>(
@@ -169,28 +144,6 @@ defineExpose({ toggle })
       </span>
     </header>
 
-    <div class="paper-card__badges">
-      <span v-for="badge in badges" :key="badge.key" class="badge" :class="`badge--${badge.tone}`" :title="badge.detail">
-        {{ badge.label }}
-      </span>
-      <span
-        v-for="row in sourceRows"
-        :key="`src-${row[0]}`"
-        class="badge"
-        :class="row[1].ok ? 'badge--base' : 'badge--warn'"
-        :title="`真实取数留痕：${row[1].fields} 条记录，last_http_status=${row[1].http ?? '未获取'}`"
-      >
-        {{ row[1].label }}
-      </span>
-      <span
-        v-if="sourceRows.length === 0 && !sourcesLoaded"
-        class="badge badge--ghost"
-        title="展开后按真实取数留痕补全来源徽标（不臆测来源）"
-      >
-        来源徽标展开后按取数留痕补全
-      </span>
-    </div>
-
     <p class="paper-card__abstract">{{ item.abstract ?? '摘要未获取' }}</p>
 
     <dl class="paper-card__meta">
@@ -238,13 +191,24 @@ defineExpose({ toggle })
           <span v-else>{{ item.citation_count }}</span>
         </dd>
       </div>
-      <div class="meta-item">
-        <dt>代码</dt>
+      <div v-if="sourceLink || codeLink" class="meta-item">
+        <dt>链接</dt>
         <dd>
-          <a v-if="item.code_url" :href="item.code_url" target="_blank" rel="noreferrer noopener">
-            仓库链接
-          </a>
-          <span v-else class="missing">未获取</span>
+          <a
+            v-if="sourceLink"
+            class="meta-link"
+            :href="sourceLink.href"
+            target="_blank"
+            rel="noreferrer noopener"
+          >{{ sourceLink.text }}</a>
+          <template v-if="sourceLink && codeLink"> · </template>
+          <a
+            v-if="codeLink"
+            class="meta-link"
+            :href="codeLink.href"
+            target="_blank"
+            rel="noreferrer noopener"
+          >{{ codeLink.text }}</a>
         </dd>
       </div>
     </dl>
@@ -361,37 +325,6 @@ defineExpose({ toggle })
 .paper-card__coverage {
   flex: 0 0 auto;
 }
-.paper-card__badges {
-  display: flex;
-  gap: var(--space-1);
-  flex-wrap: wrap;
-}
-
-.badge {
-  padding: 0 var(--space-2);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-sm);
-  font-size: var(--font-size-xs);
-  color: var(--color-text-secondary);
-  background-color: var(--color-bg-subtle);
-}
-
-.badge--aux {
-  border-color: var(--color-brand);
-  color: var(--color-brand);
-  background-color: var(--color-brand-soft);
-}
-
-.badge--warn {
-  border-color: var(--color-warning);
-  color: var(--color-warning);
-  background-color: var(--color-warning-soft);
-}
-
-.badge--ghost {
-  border-style: dashed;
-  background-color: transparent;
-}
 
 .paper-card__abstract {
   display: -webkit-box;
@@ -424,6 +357,15 @@ defineExpose({ toggle })
 .meta-item dd {
   margin: 0;
   min-width: 0;
+}
+
+.meta-link {
+  color: var(--color-brand);
+  word-break: break-all;
+}
+
+.meta-link:hover {
+  text-decoration: underline;
 }
 
 .venue-source {

@@ -500,6 +500,8 @@ onMounted(() => {
               : 'public_demo 只读面不允许写操作：需 Owner 令牌'
           "
           placement="bottom"
+          :enterable="true"
+          :hide-after="120"
         >
           <el-button
             type="primary"

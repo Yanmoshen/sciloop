@@ -107,7 +107,13 @@ const iconName = computed(() => {
 </script>
 
 <template>
-  <el-tooltip :content="detail" placement="top" :show-after="120">
+  <el-tooltip
+    :content="detail"
+    placement="top"
+    :show-after="120"
+    :enterable="true"
+    :hide-after="120"
+  >
     <span class="coverage-tag" :class="[`coverage-tag--${tone}`, `coverage-tag--${size}`]">
       <span class="coverage-tag__icon" aria-hidden="true">{{ iconName }}</span>
       <span class="coverage-tag__text">{{ label }}</span>
