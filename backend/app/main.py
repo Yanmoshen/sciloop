@@ -107,6 +107,9 @@ ROUTER_REGISTRY: tuple[tuple[str, str, bool], ...] = (
     # 11.2) 首页对话（本轮新增，可选）：/chat/home
     #       用户一段话 → 模型给标题（＝项目名）+ 正式回答；Owner 专属（产生真实费用）。
     ("app.api.v1.chat", "/api/v1", False),
+    # 11.3) 会话（本轮新增，可选）：/conversations
+    #       首页对话的多轮记录（JSON 落盘），刷新后据此恢复。
+    ("app.api.v1.conversations", "/api/v1", False),
     # 12) 模型配置与成本（WP02，自带 /models 与 /costs 前缀）
     ("app.api.v1.models_config", "/api/v1", True),
     ("app.api.v1.costs", "/api/v1", True),

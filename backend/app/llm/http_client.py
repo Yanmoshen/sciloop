@@ -296,6 +296,18 @@ def _extract_content(data: dict[str, Any]) -> tuple[str, str | None]:
     if content is None:
         # 部分供应商把结果放在 text 字段
         content = first.get("text") or ""
+    if not str(content).strip():
+        # 思考型模型（或网关）可能把正文放在 reasoning_content / reasoning，
+        # 而 content 为空、completion_tokens 却照常计入 —— 此时改读思考内容，
+        # 否则前端会拿到空正文（表现为「已完成但没有任何输出」）。
+        reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+        if isinstance(reasoning, list):
+            reasoning = "".join(
+                str(item.get("text") or "") if isinstance(item, dict) else str(item)
+                for item in reasoning
+            )
+        if isinstance(reasoning, str) and reasoning.strip():
+            content = reasoning
     return str(content), finish_reason
 
 

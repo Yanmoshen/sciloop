@@ -73,7 +73,11 @@ const MODULE_NAV = [
 const keyword = ref('')
 
 /** 最近打开：真实项目列表（后端按 is_demo 优先返回），不做本地假数据 */
-const recent = computed(() => session.projects.slice(0, 6))
+const recent = computed(() =>
+  [...session.projects]
+    .sort((a, b) => String(b.created_at ?? '').localeCompare(String(a.created_at ?? '')))
+    .slice(0, 6),
+)
 
 /** 当前高亮的主入口；未标注 homeNav 的页面不高亮 */
 const activeKey = computed(() => (route.meta?.homeNav as string | undefined) ?? '')

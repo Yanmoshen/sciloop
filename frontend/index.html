@@ -18,9 +18,12 @@
           document.documentElement.dataset.theme = isDark ? 'dark' : 'light'
           // Element Plus 认的是 html.dark 类（其暗色变量表挂在 .dark 下）
           document.documentElement.classList.toggle('dark', isDark)
+          // 原生滚动条 / 表单控件跟随主题（与 stores/session.ts 的 applyTheme 同口径）
+          document.documentElement.style.colorScheme = isDark ? 'dark' : 'light'
         } catch (e) {
           document.documentElement.dataset.theme = 'light'
           document.documentElement.classList.remove('dark')
+          document.documentElement.style.colorScheme = 'light'
         }
       })()
     </script>

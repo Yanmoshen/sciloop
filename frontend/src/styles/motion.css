@@ -6,14 +6,20 @@
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * 全站换色过渡层（浅色 ↔ 深色切换时渐变，而不是瞬间跳变）。
+ * 全站换色过渡层 + **主题切换的"整页瞬时换色"开关**。
  *
+ * 第 1 层（通配过渡）：普通换色（hover、状态切换）平滑一点。
  * 为什么用通配选择器：模块页的颜色散落在各组件里（标题、正文、卡片、边框…），
  * 逐个补 transition 既啰嗦又容易漏。通配规则的优先级为 0，**不会覆盖**组件里
  * 已有的 `transition` 声明（比如 hover 位移、按钮动效），只给"没有声明过渡"的
- * 元素补上背景/文字/边框的 300ms 渐变——正好是换肤需要的那三样。
+ * 元素补上背景/文字/边框的 300ms 渐变。时长 300ms 与总览页（n8n motion scale）保持一致。
  *
- * 时长 300ms 与总览页（n8n motion scale）保持一致。
+ * 第 2 层（`.sl-theme-switching` 掐断）：**切换主题时必须瞬时、整页统一**（2026-09-20 修）。
+ * 上面那条通配过渡在切换主题时是负担 —— 每个元素都各自跑一遍自己的过渡，
+ * 各组件时长还不一致（壳层 300ms、按钮 160ms…），于是出现用户实测的两个毛病：
+ * ① 几千个属性一起动画 → 明显卡顿；② 时长短的不一致 → **不同区块变色时间不一样**。
+ * 所以 `stores/session.ts` 的 `applyTheme()` 会在切换前后各一帧挂上该类，
+ * 把全部过渡按 0 处理：新配色在**一次样式重算**里整页落地，画完即摘掉。
  */
 
 *,
@@ -25,4 +31,18 @@
     border-color 300ms cubic-bezier(0.4, 0, 0.2, 1),
     fill 300ms cubic-bezier(0.4, 0, 0.2, 1),
     stroke 300ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/**
+ * 主题切换中的"静默帧"：掐断全部过渡（含组件自己声明的），
+ * 让 `<html>` 上的 data-theme / dark / colorScheme 三处变更一次性生效。
+ * 由 stores/session.ts 在切换前后各挂一帧，不需要任何组件配合。
+ */
+:root.sl-theme-switching,
+:root.sl-theme-switching *,
+:root.sl-theme-switching *::before,
+:root.sl-theme-switching *::after {
+  transition: none !important;
+  transition-duration: 0s !important;
+  transition-delay: 0s !important;
 }

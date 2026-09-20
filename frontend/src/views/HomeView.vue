@@ -17,6 +17,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
 import { chatHome } from '@/api/chat'
+import { latestConversation } from '@/api/conversations'
 import type { CreatedProject } from '@/api/projects'
 import { createProject } from '@/api/projects'
 import ProjectCreateDialog from '@/components/ProjectCreateDialog.vue'
@@ -35,15 +36,17 @@ const phase = ref<'idle' | 'thinking' | 'answered'>('idle')
 const dialogOpen = ref(false)
 const dialogPrefill = ref('')
 
-const answer = ref('')
-const userText = ref('')
-const answerTitle = ref('')
 const errorText = ref('')
 const pickedRef = ref('')
 const listening = ref(false)
 
+/** 多轮对话：内存即时显示，后端同时落 JSON，刷新后据此恢复 */
+type Turn = { role: 'user' | 'assistant'; content: string; model?: string; durationText?: string }
+const turns = ref<Turn[]>([])
+const conversationId = ref<string | null>(null)
+
 const canSend = computed(() => prompt.value.trim().length > 0 || files.value.length > 0)
-const active = computed(() => phase.value !== 'idle' || answer.value.length > 0)
+const active = computed(() => phase.value !== 'idle' || turns.value.length > 0)
 
 const PIPELINE = '文献调研 → idea 生成 → 算法生成 → 算法评审 → 自动实验 → 论文写作 → 论文评审'
 
@@ -62,10 +65,9 @@ const modelOptions = computed(() => {
 
 const pickerOpen = ref(false)
 
-const answerModel = ref('')
-const copied = ref(false)
+const pendingModel = ref('')
+const copiedIndex = ref<number | null>(null)
 const elapsed = ref(0)
-const doneText = ref('')
 let tick: number | null = null
 
 function fmtDuration(ms: number): string {
@@ -80,15 +82,15 @@ function fmtDuration(ms: number): string {
 
 const elapsedText = computed(() => fmtDuration(elapsed.value))
 
-async function copyAnswer(): Promise<void> {
+async function copyAnswer(index: number, text: string): Promise<void> {
   try {
-    await navigator.clipboard.writeText(answer.value)
-    copied.value = true
+    await navigator.clipboard.writeText(text)
+    copiedIndex.value = index
     window.setTimeout(() => {
-      copied.value = false
+      copiedIndex.value = null
     }, 1200)
   } catch {
-    copied.value = false
+    copiedIndex.value = null
   }
 }
 const pickedLabel = computed(
@@ -194,11 +196,10 @@ async function send(): Promise<void> {
 
   if (timer !== null) window.clearTimeout(timer)
   errorText.value = ''
-  answer.value = ''
-  userText.value = text
+  const isFirstTurn = turns.value.length === 0
+  turns.value = [...turns.value, { role: 'user', content: text }]
   phase.value = 'thinking'
-  answerModel.value = ''
-  doneText.value = ''
+  pendingModel.value = modelId
   elapsed.value = 0
   if (tick !== null) window.clearInterval(tick)
   const startedAt = Date.now()
@@ -210,19 +211,39 @@ async function send(): Promise<void> {
   files.value = []
 
   try {
-    const result = await chatHome({ text, model_config_id: configId, model_id: modelId })
-    answerTitle.value = result.title
-    answer.value = result.reply
-    answerModel.value = result.model_id
+    const result = await chatHome({
+      text,
+      model_config_id: configId,
+      model_id: modelId,
+      conversation_id: conversationId.value ?? undefined,
+    })
+    conversationId.value = result.conversation_id
     if (tick !== null) {
       window.clearInterval(tick)
       tick = null
     }
-    doneText.value = fmtDuration(elapsed.value)
+    if (!result.reply) {
+      phase.value = 'answered'
+      errorText.value = '模型没有返回正文'
+      return
+    }
+    turns.value = [
+      ...turns.value,
+      {
+        role: 'assistant',
+        content: result.reply,
+        model: result.model_id,
+        durationText: fmtDuration(elapsed.value),
+      },
+    ]
     phase.value = 'answered'
-    const created = await createProject({ name: result.title, note: text, fields: [] })
-    await session.loadProjects()
-    session.selectProject(created.id)
+    if (result.title_note) errorText.value = result.title_note
+    // 首个回合才建项目（项目名 = 模型给出的标题）
+    if (isFirstTurn) {
+      const created = await createProject({ name: result.title, note: text, fields: [] })
+      await session.loadProjects()
+      session.selectProject(created.id)
+    }
   } catch (err) {
     phase.value = 'idle'
     if (tick !== null) {
@@ -230,7 +251,8 @@ async function send(): Promise<void> {
       tick = null
     }
     elapsed.value = 0
-    // 失败要能重发：把原文放回输入框
+    // 失败要能重发：撤掉刚加进去的那一轮，并把原文放回输入框
+    turns.value = turns.value.slice(0, -1)
     prompt.value = text
     const withCode = err as { code?: string; message?: string }
     errorText.value = withCode?.message
@@ -265,6 +287,22 @@ onMounted(async () => {
   prompt.value = ''
   if (!settings.configs.length) await settings.loadConfigs()
   pickedRef.value = modelOptions.value[0]?.value ?? 'auto'
+  // 接着上次对话继续：拉最近一次会话，把轮次铺回界面
+  try {
+    const latest = await latestConversation()
+    if (latest && latest.turns.length) {
+      conversationId.value = latest.id
+      turns.value = latest.turns.map((turn) => ({
+        role: turn.role,
+        content: turn.content,
+        model: turn.model_id,
+        durationText: turn.duration_ms ? fmtDuration(turn.duration_ms) : undefined,
+      }))
+      phase.value = 'answered'
+    }
+  } catch {
+    // 拉不到历史不影响开新对话
+  }
 })
 </script>
 
@@ -276,46 +314,52 @@ onMounted(async () => {
     </div>
 
     <div v-if="active" class="convo">
-      <div class="convo__item">
-        <span class="bubble bubble--user">{{ userText }}</span>
-      </div>
-      <div v-if="phase !== 'idle' || answer" class="reply">
-        <span class="reply__model">{{ answerModel }}</span>
-        <span class="reply__time">{{ phase === 'thinking' ? elapsedText : `已完成 ${doneText}` }}</span>
-        <p v-if="answer" class="reply__text">{{ answer }}</p>
-        <div v-else-if="phase === 'thinking'" class="dots" aria-label="正在思考">
-          <span class="dot" />
-          <span class="dot" />
-          <span class="dot" />
+      <template v-for="(turn, index) in turns" :key="index">
+        <div v-if="turn.role === 'user'" class="convo__item">
+          <span class="bubble bubble--user">{{ turn.content }}</span>
         </div>
-        <p v-else class="state state--error">模型没有返回正文</p>
-        <div v-if="answer" class="reply__actions">
-          <button
-            class="icon-btn"
-            type="button"
-            :title="copied ? '已复制' : '复制回答'"
-            :aria-label="copied ? '已复制' : '复制回答'"
-            @click="copyAnswer"
-          >
-            <svg v-if="!copied" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" stroke="currentColor" stroke-width="1.3" />
-              <path
-                d="M10.5 5.5V4a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 4v5A1.5 1.5 0 0 0 4 10.5h1.5"
-                stroke="currentColor"
-                stroke-width="1.3"
-                stroke-linecap="round"
-              />
-            </svg>
-            <svg v-else width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <path
-                d="M3 8.5 6.5 12 13 4.5"
-                stroke="currentColor"
-                stroke-width="1.6"
-                stroke-linecap="round"
-                stroke-linejoin="round"
-              />
-            </svg>
-          </button>
+        <div v-else class="reply">
+          <span class="reply__model">{{ turn.model }}</span>
+          <span v-if="turn.durationText" class="reply__time">已完成 {{ turn.durationText }}</span>
+          <p class="reply__text">{{ turn.content }}</p>
+          <div class="reply__actions">
+            <button
+              class="icon-btn"
+              type="button"
+              :title="copiedIndex === index ? '已复制' : '复制回答'"
+              :aria-label="copiedIndex === index ? '已复制' : '复制回答'"
+              @click="copyAnswer(index, turn.content)"
+            >
+              <svg v-if="copiedIndex !== index" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" stroke="currentColor" stroke-width="1.3" />
+                <path
+                  d="M10.5 5.5V4a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 4v5A1.5 1.5 0 0 0 4 10.5h1.5"
+                  stroke="currentColor"
+                  stroke-width="1.3"
+                  stroke-linecap="round"
+                />
+              </svg>
+              <svg v-else width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path
+                  d="M3 8.5 6.5 12 13 4.5"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </button>
+          </div>
+        </div>
+      </template>
+
+      <div v-if="phase === 'thinking'" class="reply">
+        <span class="reply__model">{{ pendingModel }}</span>
+        <span class="reply__time">{{ elapsedText }}</span>
+        <div class="dots" aria-label="正在思考">
+          <span class="dot" />
+          <span class="dot" />
+          <span class="dot" />
         </div>
       </div>
     </div>

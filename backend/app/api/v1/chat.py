@@ -38,6 +38,7 @@ from app.llm import adapter
 from app.llm.errors import LLMError
 from app.llm.registry import get_registry
 from app.llm.types import slugify_provider
+from app.services import conversations
 
 logger = logging.getLogger("sciloop.chat")
 
@@ -66,6 +67,8 @@ class HomeChatRequest(BaseModel):
     text: str = Field(min_length=1, max_length=4000)
     model_config_id: int
     model_id: str = Field(min_length=1, max_length=200)
+    #: 不传 = 新建会话；传了 = 接着这个会话继续（会带上最近若干轮作为上下文）
+    conversation_id: str | None = Field(default=None, max_length=64)
 
 
 class HomeChatResponse(BaseModel):
@@ -75,6 +78,8 @@ class HomeChatResponse(BaseModel):
     #: 降级原因（仅在 ``title_source == "fallback"`` 时有值）——**如实回传，不静默**
     title_note: str | None = None
     reply: str
+    #: 本次会话 id（后端 JSON 落盘），前端据此接着继续
+    conversation_id: str
     model_ref: str
     provider: str
     model_id: str
@@ -144,10 +149,14 @@ async def home_chat(payload: HomeChatRequest) -> HomeChatResponse:
         title_note = f"标题生成失败：{exc}"[:200]
 
     # 2) 正式回答：失败必须如实抛出（不能伪装成功）
+    #    带上下文：同一会话的历史轮次（实现「接着上次继续」）
+    conversation = conversations.read(payload.conversation_id) if payload.conversation_id else None
+    history = conversations.context_messages(conversation) if conversation else []
     try:
         reply_result = await adapter.chat(
             [
                 {"role": "system", "content": REPLY_SYSTEM},
+                *history,
                 {"role": "user", "content": text},
             ],
             model_ref=ref,
@@ -162,11 +171,28 @@ async def home_chat(payload: HomeChatRequest) -> HomeChatResponse:
             {"model_ref": ref, "type": type(exc).__name__},
         ) from exc
 
+    # 3) 落盘：新会话用模型给的标题建，已知会话则追加这一轮
+    if conversation is None:
+        conversation = conversations.create(title=title, model_ref=ref)
+    conversations.append_turns(
+        conversation,
+        [
+            {"role": "user", "content": text},
+            {
+                "role": "assistant",
+                "content": reply_result.content or "",
+                "model_id": reply_result.model_id,
+                "duration_ms": reply_result.duration_ms,
+            },
+        ],
+    )
+
     usage = reply_result.usage
     return HomeChatResponse(
         title=title,
         title_source=title_source,
         title_note=title_note,
+        conversation_id=str(conversation["id"]),
         reply=reply_result.content or "",
         model_ref=reply_result.model_ref,
         provider=reply_result.provider,

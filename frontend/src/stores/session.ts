@@ -26,6 +26,8 @@ export interface ProjectBrief {
   status?: string
   mode?: string
   is_demo?: boolean
+  /** 供「最近打开」按时间排序 */
+  created_at?: string | null
 }
 
 export interface HealthPayload {
@@ -58,11 +60,32 @@ export const useSessionStore = defineStore('session', () => {
     return (import.meta.env?.VITE_DEFAULT_THEME as ThemeMode | undefined) ?? 'light'
   }
 
+  /**
+   * 切换主题。**必须"瞬间 + 整页统一"生效**（2026-09-20 修卡顿 / 逐块错峰变色）。
+   *
+   * 站内给颜色配了过渡：`styles/motion.css` 有一条 `*` 通配的 300ms 换色过渡，
+   * 各组件（如 HomeLayout 壳层）又有自己的 160/300ms 声明。直接切 `data-theme` 的话：
+   * ① 页面上每个元素都各自跑一遍过渡 → 大树下明显掉帧（卡顿）；
+   * ② 各元素时长不一致 → 观感是"不同区块变色时间不一样"（错峰）。
+   *
+   * 做法：切换前后各一帧挂上 `sl-theme-switching` 类（见 motion.css）掐断全部过渡，
+   * 让新配色在**一次样式重算**里整页落地；下一帧再摘掉，过渡照旧可用。
+   */
   function applyTheme(next: ThemeMode): void {
     theme.value = next
-    document.documentElement.dataset.theme = next
+    const root = document.documentElement
+    root.classList.add('sl-theme-switching')
+    root.dataset.theme = next
     // Element Plus 的暗色变量挂在 html.dark 下，必须同步切换（只改 data-theme 不够）
-    document.documentElement.classList.toggle('dark', next === 'dark')
+    root.classList.toggle('dark', next === 'dark')
+    // 原生控件 / 滚动条跟随主题，免得"主题换了、原生控件还是旧配色"
+    root.style.colorScheme = next
+    // 强制一次同步样式重算：确保新配色在"无过渡"状态下立刻落地
+    void root.offsetHeight
+    // 双 rAF：等新配色这一帧画完再恢复过渡，避免恢复瞬间又跑一遍动画
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => root.classList.remove('sl-theme-switching'))
+    })
     try {
       localStorage.setItem(THEME_KEY, next)
     } catch {

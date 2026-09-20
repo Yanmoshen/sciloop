@@ -54,6 +54,8 @@ services:
       # valid，不再退化为 valid_by_hash（WP05/WP06/WP13 记录的 blocker）。
       # 该目录已被 .gitignore 忽略，禁止入库。
       - ./.data/fulltext-cache:/app/backend/.cache/fulltext
+      # 【首页对话】宿主 ./.data/conversations ←→ 容器会话目录（刷新后接着上次对话）。
+      - ./.data/conversations:/app/backend/.cache/conversations
       # 【论文导入】宿主 ./.data/uploads ←→ 容器上传目录（app/services/ingest/storage.py
       # 默认即 <backend_root>/.cache/uploads）。容器重建后上传文件仍在，重复导入可被
       # paper_documents.text_sha256 查重命中。同样已被 .gitignore 忽略，禁止入库。
