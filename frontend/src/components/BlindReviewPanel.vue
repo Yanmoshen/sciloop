@@ -290,7 +290,7 @@ function valueOf(value: number | null | undefined): string {
         >
           提交 {{ pendingLabels.length }} 条标签
         </el-button>
-        <span v-if="!canWrite" class="hint hint--warn">public_demo 面禁止写操作（需 Owner 令牌）</span>
+        <span v-if="!canWrite" class="hint hint--warn">浏览模式下不可评分：需先在「设置」启用编辑</span>
       </div>
 
       <ul v-if="pendingLabels.length" class="pending">

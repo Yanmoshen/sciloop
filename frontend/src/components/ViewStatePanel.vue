@@ -88,12 +88,12 @@ defineEmits<{ retry: [] }>()
       <template #title>{{ permissionTitle }}</template>
       <template #default>
         <p class="states__body">
-          {{ permissionNote ?? '匿名会话在 public_demo 面只读：写操作返回 403 owner_token_required。' }}
+          {{ permissionNote ?? '当前为浏览模式：写操作需要先在「设置」里启用编辑。' }}
         </p>
         <p v-if="showOwnerHint" class="states__body">
           恢复方式：在
           <RouterLink to="/settings">设置页</RouterLink>
-          填入服务端 <code>OWNER_TOKEN</code>（只存本机 sessionStorage，服务端仍会逐条校验并留审计日志）。
+          在「设置」里填写即可写入（凭据只存本机，服务端仍会逐条校验并留审计记录）。
         </p>
         <el-button
           v-if="retryable"

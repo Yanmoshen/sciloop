@@ -56,6 +56,12 @@ export interface PaperSearchItem {
 export interface SearchQuery {
   q?: string
   field?: string
+  /** 全库筛选：来源（arxiv / semantic_scholar / openalex / github），空串＝不过滤 */
+  source?: string
+  /** 全库筛选：解析状态（parsed=已解析 / unparsed=未解析），空串＝不过滤；非法值服务端 422 */
+  parseStatus?: string
+  /** 全库排序：published=发表时间倒序（默认）/ citation=引用数倒序（null 排最后） */
+  sort?: 'published' | 'citation'
   page?: number
   pageSize?: number
 }
@@ -64,15 +70,26 @@ export type SearchResponse = Paginated<PaperSearchItem> & {
   query?: string | null
   field?: string | null
   source?: string
+  source_filter?: string | null
+  parse_status?: string | null
+  sort?: string | null
   note?: string
 }
 
-/** GET /papers/search（本地库检索：q 命中标题/摘要，field 命中 arXiv 分类） */
+/**
+ * GET /papers/search（本地库检索）。
+ *
+ * ``q`` 命中标题/摘要，``field`` 命中 arXiv 分类；**``source`` / ``parse_status`` / ``sort`` 全库生效**
+ * （2026-09-20 之前只在当前页切片，翻页即失效）。
+ */
 export function searchPapers(query: SearchQuery, signal?: AbortSignal): Promise<SearchResponse> {
   return get<SearchResponse>('/papers/search', {
     query: {
       q: query.q || undefined,
       field: query.field || undefined,
+      source: query.source || undefined,
+      parse_status: query.parseStatus || undefined,
+      sort: query.sort ?? 'published',
       page: query.page ?? 1,
       page_size: query.pageSize ?? 20,
     },

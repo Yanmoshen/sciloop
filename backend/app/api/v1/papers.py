@@ -197,11 +197,29 @@ def search_papers(
     session: DbSession,
     q: str | None = Query(None, description="标题/摘要关键词（不区分大小写）"),
     field: str | None = Query(None, description="arXiv 分类（如 cs.CL）或 OpenAlex 领域"),
+    source: str | None = Query(None, description="来源：arxiv / semantic_scholar / openalex / github"),
+    parse_status: str | None = Query(
+        None,
+        pattern="^(parsed|unparsed)$",
+        description="解析状态：parsed=已解析 / unparsed=未解析；非法值 → 422",
+    ),
+    sort: str = Query(
+        "published",
+        pattern="^(published|citation)$",
+        description="排序：published=发表时间倒序（默认）/ citation=引用数倒序；非法值 → 422",
+    ),
     limit: int = Query(20, ge=1, le=SEARCH_LIMIT_MAX),
     page: int = Query(1, ge=1),
     page_size: int | None = Query(None, ge=1, le=MAX_PAGE_SIZE),
 ) -> dict[str, Any]:
-    """本地检索：``q`` 命中标题/摘要，``field`` 命中 arXiv 分类（primary/categories）。"""
+    """本地检索：``q`` 命中标题/摘要，``field`` 命中 arXiv 分类（primary/categories）。
+
+    2026-09-20 补 ``source`` / ``parse_status`` / ``sort`` 三个**全库**参数：
+    此前来源、解析状态、排序都只在**当前页 20 条**上做（前端切片），翻页即失效 ——
+    用户要在 389 篇里选几篇对比时很容易漏选。下沉到库里后，分页是"筛选结果的分页"。
+
+    口径：缺失字段一律 null，**不做推断**；``citation`` 排序把 null 排最后（不当 0 参与排序）。
+    """
     size = int(page_size or limit)
     size = max(1, min(size, MAX_PAGE_SIZE))
 
@@ -221,6 +239,13 @@ def search_papers(
                 ),
             )
         )
+    if source and source.strip():
+        conditions.append(Paper.source == source.strip())
+    if parse_status == "parsed":
+        conditions.append(Paper.is_parsed.is_(True))
+    elif parse_status == "unparsed":
+        # 未解析 = 明确 False 或历史 null（两者都不算"已解析"）
+        conditions.append(Paper.is_parsed.isnot(True))
 
     stmt = select(Paper)
     count_stmt = select(func.count()).select_from(Paper)
@@ -228,13 +253,14 @@ def search_papers(
         stmt = stmt.where(*conditions)
         count_stmt = count_stmt.where(*conditions)
 
+    if sort == "citation":
+        order_by = (Paper.citation_count.desc().nullslast(), Paper.id.desc())
+    else:
+        order_by = (Paper.published_at.desc().nullslast(), Paper.id.desc())
+
     total = int(session.execute(count_stmt).scalar_one() or 0)
     rows = (
-        session.execute(
-            stmt.order_by(Paper.published_at.desc().nullslast(), Paper.id.desc())
-            .offset((page - 1) * size)
-            .limit(size)
-        )
+        session.execute(stmt.order_by(*order_by).offset((page - 1) * size).limit(size))
         .scalars()
         .all()
     )
@@ -247,7 +273,10 @@ def search_papers(
         field=field,
         limit=limit,
         source="local_db",
-        note="本地库检索（取数由 POST /papers/fetch 触发）；缺失字段一律 null，不做推断",
+        source_filter=source,
+        parse_status=parse_status,
+        sort=sort,
+        note="本地库检索（全库筛选/排序；取数由 POST /papers/fetch 触发）；缺失字段一律 null，不做推断",
     )
 
 

@@ -154,9 +154,9 @@ const advice = computed<{ title: string; body: string; tone: 'danger' | 'info' }
     }
     if (codes.includes(403) || errors.includes('403')) {
       return {
-        title: '建议：缺少 Owner 令牌（403）',
+        title: '建议：当前是浏览模式',
         tone: 'danger',
-        body: '去「设置」页把 Owner 令牌贴一次，再回来点重新同步。',
+        body: '去「设置」页启用编辑，再回来点重新同步。',
       }
     }
     if (errors.includes('timeout') || errors.includes('connect')) {

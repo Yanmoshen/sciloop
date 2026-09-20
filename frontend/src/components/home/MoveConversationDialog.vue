@@ -13,6 +13,7 @@
  * 真实写操作：`PATCH /conversations/{id}`（Owner）。403 如实说明，不做本地假装成功。
  */
 import { computed, ref, watch } from 'vue'
+import { writeDenied } from '@/utils/messages'
 
 import { moveConversation } from '@/api/conversations'
 import type { ProjectBrief } from '@/stores/session'
@@ -67,7 +68,7 @@ async function submit(): Promise<void> {
     const status = (error as { status?: number } | undefined)?.status
     notice.value =
       status === 403
-        ? 'public_demo 只读面无法移动对话（服务端 403）：请在「设置」页填入 OWNER_TOKEN 后重试。'
+        ? writeDenied('移动对话')
         : error instanceof Error
           ? error.message
           : String(error)

@@ -16,6 +16,7 @@
  * 规则层拥有最终决定权，LLM 只能给建议分；阈值展示一律带来源。
  */
 import { computed, ref } from 'vue'
+import { writeDenied } from '@/utils/messages'
 
 import {
   POLICY_ACTION_LABELS,
@@ -68,7 +69,7 @@ const latest = computed<DecisionRecord | null>(() => {
 
 const canWrite = computed(() => session.isOwner || store.ownerWritesAllowed)
 const writeBlockReason = computed(() =>
-  canWrite.value ? '' : 'public_demo 面禁止写操作（需在设置页填入 Owner 令牌，服务端仍会独立校验）',
+  canWrite.value ? '' : writeDenied('调整风险策略'),
 )
 
 const approvedRecently = computed(() =>

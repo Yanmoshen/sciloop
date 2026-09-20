@@ -23,6 +23,7 @@ import CoverageTag from '@/components/CoverageTag.vue'
 import { ApiError } from '@/api/client'
 import { fetchPaperSources, type FeedItem, type FeedViewName } from '@/api/feed'
 import { codeRepoLink, paperSourceLink } from '@/utils/paperLink'
+import { RANK_DIMENSION_TEXT } from '@/utils/messages'
 
 const props = withDefaults(
   defineProps<{
@@ -59,11 +60,11 @@ const venueLabel = computed(() => props.item.venue ?? 'venue 未获取')
 const sortValue = computed(() => {
   switch (props.activeView) {
     case 'influence':
-      return { label: 'influence_score（辅助分）', value: formatScore(props.item.influence_score) }
+      return { label: '影响力分（辅助）', value: formatScore(props.item.influence_score) }
     case 'latest':
-      return { label: 'published_at（时间倒序）', value: props.item.published_at ?? '未获取' }
+      return { label: '发表时间（倒序）', value: props.item.published_at ?? '未获取' }
     default:
-      return { label: 'rank_score（四维加权）', value: formatScore(props.item.rank_score) }
+      return { label: '推荐排序分（四项加权）', value: formatScore(props.item.rank_score) }
   }
 })
 
@@ -218,18 +219,18 @@ defineExpose({ toggle })
         <small>当前排序依据 · {{ sortValue.label }}</small>
         <strong>{{ sortValue.value }}</strong>
       </span>
-      <span class="score-box">
-        <small>rank_score（推荐排序分）</small>
+      <span class="score-box" :title="`推荐理由：${RANK_DIMENSION_TEXT}（逐维明细见展开区）`">
+        <small>推荐理由 · 四项加权</small>
         <strong :class="{ missing: item.rank_score === null }">{{ formatScore(item.rank_score) }}</strong>
       </span>
-      <span class="score-box score-box--aux">
-        <small>influence_score（辅助分，不用于默认排序）</small>
+      <span class="score-box score-box--aux" title="辅助分：只在「影响力」视图用于排序，不影响默认推荐">
+        <small>影响力分（辅助）</small>
         <strong :class="{ missing: item.influence_score === null }">
           {{ formatScore(item.influence_score) }}
         </strong>
       </span>
-      <span class="score-box">
-        <small>数据完整度 score_coverage</small>
+      <span class="score-box" title="该论文在四个维度上「有真实取数」的比例；缺数据的维度不参与推断">
+        <small>数据完整度</small>
         <strong :class="{ missing: item.score_coverage === null }">
           {{ item.score_coverage === null ? '未获取' : item.score_coverage }}
         </strong>

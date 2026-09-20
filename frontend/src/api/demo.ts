@@ -250,8 +250,8 @@ export function deriveDemoMode(snapshot: boolean, replay: boolean): DemoMode {
 }
 
 export const ACCESS_MODE_LABELS: Record<AccessMode, string> = {
-  public_demo: 'public_demo（只读演示面）',
-  owner_mode: 'owner_mode（研究者可写）',
+  public_demo: '浏览模式（只读）',
+  owner_mode: '可编辑（研究者）',
 }
 
 export function accessModeLabel(mode: AccessMode | null | undefined): string {
@@ -411,7 +411,7 @@ function stopPolling(): void {
   poller = null
 }
 
-/** 切换演示开关（**owner_only**：匿名会话会收到 403 owner_token_required） */
+/** 切换演示开关（仅 Owner 面；浏览模式会被拒绝） */
 async function toggleMode(payload: DemoModeRequest): Promise<DemoModeResult> {
   const result = await setDemoMode(payload)
   if (result.status) status.value = result.status

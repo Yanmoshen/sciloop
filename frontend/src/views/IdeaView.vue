@@ -18,9 +18,10 @@
  * - 被丢弃的条目（无证据）与非法证据引用号原样列出，不做静默过滤。
  *
  * 说明：`EvidenceDrawer.vue` 不在 WP08 owned_paths 内，故抽屉内联实现；
- * 证据解析统一走 WP13 `GET /evidence/{type}/{id}`。
+ * 证据解析统一走共享的证据接口。
  */
 import { computed, onMounted, ref } from 'vue'
+import { writeDenied } from '@/utils/messages'
 
 import { getEvidenceDetail, type EvidenceDetail } from '@/api/claims'
 import {
@@ -49,8 +50,7 @@ const canWrite = computed(() => session.isOwner)
 const writeDeniedNote = computed(() =>
   canWrite.value
     ? null
-    : '生成 idea、绑定证据、可行性计算与任务书均为写操作：public_demo 只读面会被后端拒绝（403 owner_token_required）。' +
-      '可在设置页填入服务端 OWNER_TOKEN 后重试。',
+    : writeDenied('生成 idea、绑定证据、可行性计算与创建任务书'),
 )
 
 const tab = ref<'evidence' | 'feasibility' | 'taskbook'>('evidence')
@@ -123,7 +123,7 @@ async function retryIdeas(): Promise<void> {
 const permissionDenied = computed(() => !canWrite.value || store.errorStatus === 403)
 const permissionTitle = computed(() =>
   store.errorStatus === 403
-    ? '权限受限：该写操作已被服务端拒绝（403 owner_token_required）'
+    ? writeDenied('该写操作')
     : '只读演示面：生成 / 绑定 / 可行性 / 任务书入口已前置禁用（非请求被拒）',
 )
 const permissionNote = computed(() =>
@@ -214,7 +214,7 @@ async function onCreateManual(): Promise<void> {
 async function onBind(idea: Idea): Promise<void> {
   bindNotice.value = null
   if (!canWrite.value) {
-    bindNotice.value = 'public_demo 只读面：绑定证据属写操作，需先在设置页填入 OWNER_TOKEN'
+    bindNotice.value = writeDenied('绑定证据')
     return
   }
   const candidates: EvidenceCandidate[] = []
@@ -247,7 +247,7 @@ async function onBind(idea: Idea): Promise<void> {
 
 async function onFeasibility(idea: Idea): Promise<void> {
   if (!canWrite.value) {
-    bindNotice.value = 'public_demo 只读面：可行性计算属写操作，需先在设置页填入 OWNER_TOKEN'
+    bindNotice.value = writeDenied('可行性计算')
     return
   }
   if (!idea.has_evidence) {
@@ -266,7 +266,7 @@ async function onFeasibility(idea: Idea): Promise<void> {
 
 async function onTaskbookCreate(payload: Record<string, unknown>): Promise<void> {
   if (!canWrite.value) {
-    bindNotice.value = 'public_demo 只读面：创建任务书属写操作，需先在设置页填入 OWNER_TOKEN'
+    bindNotice.value = writeDenied('创建任务书')
     return
   }
   await store.submitTaskbook({
@@ -483,7 +483,7 @@ const modeHint = computed(() => {
         </nav>
 
         <section v-show="tab === 'evidence'" class="panel">
-          <h3>证据绑定（走 WP13 哈希优先校验）</h3>
+          <h3>证据绑定（按哈希优先校验）</h3>
           <p v-if="!selected" class="meta">请先在左侧选中一条 idea。</p>
           <template v-else>
             <p class="meta">

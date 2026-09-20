@@ -13,6 +13,7 @@
  * 不做本地假装成功。模块壳层（ShellLayout）里另有一份浅色学术蓝版本，两者互不影响。
  */
 import { ref, watch } from 'vue'
+import { writeDenied } from '@/utils/messages'
 
 import { renameProject } from '@/api/projects'
 import { useSessionStore } from '@/stores/session'
@@ -66,7 +67,7 @@ async function submit(): Promise<void> {
     const status = (error as { status?: number } | undefined)?.status
     notice.value =
       status === 403
-        ? 'public_demo 只读面无法重命名（服务端 403）：请在「设置」页填入 OWNER_TOKEN 后重试。'
+        ? writeDenied('重命名项目')
         : error instanceof Error
           ? error.message
           : String(error)

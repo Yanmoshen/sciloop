@@ -23,6 +23,7 @@
  * 进入项目后由 ShellLayout（模块壳层）接管，7 个模块页保持原样。
  */
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { writeDenied } from '@/utils/messages'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 
@@ -244,7 +245,7 @@ async function unarchive(conversation: ConversationBrief): Promise<void> {
 function messageOf(error: unknown): string {
   const status = (error as { status?: number } | undefined)?.status
   if (status === 403) {
-    return 'public_demo 只读面无法修改对话（服务端 403）：请在「设置」页填入 OWNER_TOKEN 后重试。'
+    return writeDenied('修改对话')
   }
   return error instanceof Error ? error.message : String(error)
 }
@@ -686,7 +687,8 @@ onUnmounted(() => {
           <input
             v-model="keyword"
             type="search"
-            placeholder="搜索论文 / 项目 / 决策记录"
+            placeholder="搜索论文标题 / 摘要"
+            aria-label="搜索论文（标题或摘要）"
             @keyup.enter="search"
           />
         </div>

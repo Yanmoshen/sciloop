@@ -174,7 +174,7 @@ const diffRows = computed(() => {
           rerun（用当前实时模型重跑，需 Owner）
         </el-button>
         <span v-if="!canWrite" class="hint hint--warn">
-          非 Owner：rerun 按钮已禁用（public_demo 面禁止该写操作，后端返回 403）
+          浏览模式下不可重跑：需先在「设置」启用编辑
         </span>
       </section>
     </template>

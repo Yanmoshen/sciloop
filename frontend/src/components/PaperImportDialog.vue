@@ -13,9 +13,11 @@
  * 旧路由保留为重定向（`/papers?import=1`）。**内部逻辑（上传 / 标识符 / 轮询进度 / 导入历史）一字未改**，
  * 只加外壳与分栏：左侧导航 ① 导入（拖拽上传 + 按标识符 + 本次导入进度）② 导入历史（自带分页）。
  *
- * 写操作全部是 Owner 面：public_demo 匿名调用会拿到 403，界面如实提示去「设置」页填令牌。
+ * 写操作全部是 Owner 面。2026-09-20 评审第 5 条：**打开弹窗就先说清"当前能不能导入"**，
+ * 而不是让用户拖完文件、点提交才吃 403；文案也换成用户能行动的说法（见 utils/messages.ts）。
  */
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
 
 import {
   fetchImportHistory,
@@ -25,9 +27,17 @@ import {
   type ImportHistoryItem,
   type ImportJob,
 } from '@/api/imports'
+import { useSessionStore } from '@/stores/session'
+import { writeDenied } from '@/utils/messages'
 
 const props = withDefaults(defineProps<{ open: boolean }>(), { open: false })
 const emit = defineEmits<{ 'update:open': [open: boolean] }>()
+
+const router = useRouter()
+const session = useSessionStore()
+
+/** 是否能导入：取决于是否已启用编辑（Owner 令牌就位） */
+const canImport = computed(() => session.isOwner)
 
 /** 弹窗左侧导航面板 */
 const pane = ref<'import' | 'history'>('import')
@@ -113,9 +123,7 @@ function startPolling(taskId: string): void {
 
 function ownerHint(error: unknown): string {
   const status = (error as { status?: number })?.status
-  if (status === 403) {
-    return 'public_demo 只读面无法导入（服务端 403）：请在「设置」页填入 OWNER_TOKEN 后重试。'
-  }
+  if (status === 403) return writeDenied('导入论文')
   return error instanceof Error ? error.message : String(error)
 }
 
@@ -205,6 +213,12 @@ function close(): void {
   emit('update:open', false)
 }
 
+/** 「去设置」：关掉弹窗直接进设置页，别让用户在两个页面之间自己找 */
+function openSettings(): void {
+  close()
+  void router.push({ path: '/settings' })
+}
+
 function onKeydown(event: KeyboardEvent): void {
   if (event.key === 'Escape') close()
 }
@@ -263,6 +277,20 @@ onUnmounted(() => {
           <p v-if="notice" class="notice">{{ notice }}</p>
 
           <template v-if="pane === 'import'">
+            <!-- 能不能导入：在用户拖文件之前就说清楚（评审第 5 条） -->
+            <div class="perm" :class="canImport ? 'perm--ok' : 'perm--readonly'">
+              <span class="perm__dot" aria-hidden="true" />
+              <span class="perm__text">
+                {{
+                  canImport
+                    ? '当前可导入：已启用编辑，上传 PDF 与标识符都会真实写入论文库。'
+                    : '当前为浏览模式：导入是写操作，需先在「设置」里启用编辑才能导入。'
+                }}
+              </span>
+              <button v-if="!canImport" class="btn btn--primary" type="button" @click="openSettings">
+                去设置
+              </button>
+            </div>
     <div class="grid">
       <article class="panel">
         <div class="panel__head">
@@ -304,7 +332,8 @@ onUnmounted(() => {
           <button
             class="btn btn--primary"
             type="button"
-            :disabled="files.length === 0 || busy === 'files'"
+            :disabled="files.length === 0 || busy === 'files' || !canImport"
+            :title="canImport ? 'POST /papers/import' : '浏览模式下无法导入：需先启用编辑'"
             @click="submitFiles"
           >
             {{ busy === 'files' ? '提交中…' : '开始导入' }}
@@ -327,7 +356,8 @@ onUnmounted(() => {
           <button
             class="btn btn--primary"
             type="button"
-            :disabled="!identifiers.trim() || busy === 'ids'"
+            :disabled="!identifiers.trim() || busy === 'ids' || !canImport"
+            :title="canImport ? 'POST /papers/import/identifiers' : '浏览模式下无法导入：需先启用编辑'"
             @click="submitIdentifiers"
           >
             {{ busy === 'ids' ? '提交中…' : '导入标识符' }}
@@ -542,6 +572,46 @@ onUnmounted(() => {
 }
 
 /* ---------- 面板内容（沿用原独立页的样式口径） ---------- */
+/* 能不能导入的横幅：写面绿点 / 只读面警示色 + 一个"去设置"动作 */
+.perm {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-subtle);
+  font-size: var(--font-size-sm);
+}
+
+.perm--ok {
+  border-color: var(--color-success);
+  background: var(--color-success-soft);
+  color: var(--color-success);
+}
+
+.perm--readonly {
+  border-color: var(--color-warning);
+  background: var(--color-warning-soft);
+  color: var(--color-warning);
+}
+
+.perm__dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.perm__text {
+  flex: 1;
+}
+
+.perm .btn {
+  flex: none;
+  height: 28px;
+}
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));

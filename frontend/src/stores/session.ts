@@ -104,7 +104,7 @@ export const useSessionStore = defineStore('session', () => {
   /** owner 令牌已就位即视为可写面（后端仍会独立校验） */
   const isOwner = computed(() => ownerToken.value.length > 0)
   const accessLabel = computed(() =>
-    isOwner.value ? 'owner_mode（可写）' : 'public_demo（只读）',
+    isOwner.value ? '可编辑（Owner）' : '浏览模式（只读）',
   )
 
   function updateOwnerToken(token: string): void {

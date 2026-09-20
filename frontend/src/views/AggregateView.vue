@@ -13,9 +13,10 @@
  *
  * 说明：证据抽屉（EvidenceDrawer）**不在 WP08 的 owned_paths** 内（见
  * assets/tasks/index.json -> ownership_map.WP08），因此本页把抽屉内联实现，
- * 证据解析一律复用 WP13 的 `GET /evidence/{type}/{id}`（不另写一套）。
+ * 证据解析复用统一的证据接口（不另写一套）。
  */
 import { computed, onMounted, ref, watch } from 'vue'
+import { writeDenied } from '@/utils/messages'
 import { useRoute, useRouter } from 'vue-router'
 
 import { getEvidenceDetail, type EvidenceDetail } from '@/api/claims'
@@ -36,13 +37,12 @@ const router = useRouter()
 const store = useIdeaStore()
 const session = useSessionStore()
 
-/** 创建聚合是写操作：public_demo 匿名面必然 403，故前置禁用并给出原因 */
+/** 创建聚合是写操作：浏览模式下前置禁用并说明怎么启用 */
 const canWrite = computed(() => session.isOwner)
 const writeDeniedNote = computed(() =>
   canWrite.value
     ? null
-    : '创建聚合（POST /aggregations）属写操作：public_demo 只读面会被拒绝（403 owner_token_required）。' +
-      '可在设置页填入服务端 OWNER_TOKEN 后重试；只读路径仍可选择左侧「已有聚合」查看真实结果。',
+    : writeDenied('创建对比分析') + '浏览模式下仍可在左侧「已有聚合」查看真实结果。',
 )
 
 /**
@@ -52,7 +52,7 @@ const writeDeniedNote = computed(() =>
 const permissionDenied = computed(() => !canWrite.value || store.errorStatus === 403)
 const permissionTitle = computed(() =>
   store.errorStatus === 403
-    ? '权限受限：该写操作已被服务端拒绝（403 owner_token_required）'
+    ? writeDenied('该写操作')
     : '只读演示面：创建聚合入口已前置禁用（非请求被拒）',
 )
 const permissionNote = computed(() => {
@@ -79,7 +79,7 @@ const activePaperId = ref<number | null>(null)
 /** 动作反馈：输入不合法 / 写操作被拒 / 创建失败时给出可见原因，杜绝「点了没反应」 */
 const actionNotice = ref<string | null>(null)
 
-// ---- 证据抽屉（内联实现，数据来自 WP13 契约） ----
+// ---- 证据抽屉（内联实现，数据来自统一证据契约） ----
 const drawerOpen = ref(false)
 const drawerTitle = ref('')
 const drawerItems = ref<CellEvidence[]>([])
@@ -253,12 +253,12 @@ const aggregation = computed(() => store.aggregation)
           type="button"
           class="agg__btn agg__btn--primary"
           :disabled="!canWrite || store.busy === 'createAggregation'"
-          :title="canWrite ? 'POST /aggregations' : '仅 Owner 面可写：public_demo 只读'"
+          :title="canWrite ? 'POST /aggregations' : '浏览模式下不可写：需先在「设置」启用编辑'"
           @click="createAggregation"
         >
           {{ store.busy === 'createAggregation' ? '聚合中…' : '创建聚合' }}
         </button>
-        <span v-if="!canWrite" class="agg__denied">public_demo 只读：创建聚合已禁用</span>
+        <span v-if="!canWrite" class="agg__denied">浏览模式：创建聚合已禁用</span>
       </div>
 
       <el-alert
@@ -353,7 +353,7 @@ const aggregation = computed(() => store.aggregation)
           </p>
           <div class="drawer__actions">
             <button type="button" class="drawer__btn" :disabled="detailLoading === candidateKey(ev.candidate)" @click="loadDetail(ev)">
-              {{ detailLoading === candidateKey(ev.candidate) ? '解析中…' : '解析证据（WP13）' }}
+              {{ detailLoading === candidateKey(ev.candidate) ? '解析中…' : '解析证据' }}
             </button>
             <a class="drawer__link" :href="`/papers/parse/${ev.paper_id}`">跳转论文解析页 /papers/parse/{{ ev.paper_id }}</a>
           </div>

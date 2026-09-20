@@ -196,7 +196,7 @@ async function patch(body: Record<string, unknown>, okText?: string): Promise<bo
   // 只读面：**不能静默返回**（否则表现成「点了没反应」）。按钮本身已前置禁用，
   // 这里只是兜底，并把真实原因说出来。
   if (!props.canWrite) {
-    errorNotice.value = '只读面：需要 OWNER_TOKEN'
+    errorNotice.value = '当前是浏览模式：保存配置需要先启用编辑。'
     return false
   }
   busy.value = true
@@ -516,9 +516,9 @@ async function removeProvider(): Promise<void> {
         <span
           v-if="!canWrite"
           class="pill pill--warn"
-          title="写入需要 OWNER_TOKEN：在「通用设置」里填写后再试"
+          title="写入需要先启用编辑：在「通用设置」里填写后可保存"
         >
-          只读面
+          浏览模式
         </span>
         <span v-else-if="errorNotice" class="pill pill--warn">{{ errorNotice }}</span>
         <span v-else-if="notice" class="pill pill--ok">{{ notice }}</span>

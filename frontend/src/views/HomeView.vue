@@ -19,6 +19,7 @@
  * 中断/出错时**保留已生成部分**并在尾部如实标注，不假装完成。
  */
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { writeDenied } from '@/utils/messages'
 import { useRoute, useRouter } from 'vue-router'
 
 import { streamChatHome } from '@/api/chat'
@@ -250,7 +251,7 @@ async function send(): Promise<void> {
   if (!text) return
 
   if (!session.isOwner) {
-    errorText.value = '只读面：需要 OWNER_TOKEN'
+    errorText.value = writeDenied('发送消息')
     return
   }
   if (pickedRef.value === 'auto') {

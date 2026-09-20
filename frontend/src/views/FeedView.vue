@@ -7,7 +7,7 @@
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * 论文库首页（WP07-T1）：三视图 Tab（recommended 默认）+ 筛选器 + 分页 + 演示标识（snapshot/replay）。
+ * 论文库首页：三视图 Tab（推荐默认）+ 筛选器 + 分页 + 演示数据标识（快照 / 回放）。
  *
  * 口径分离（计划书 §2.7.5）：
  *   推荐视图 rank_score DESC ｜ 影响力视图 influence_score DESC（辅助分）｜ 最新视图 published_at DESC
@@ -51,11 +51,11 @@ const dataSourceOverride = computed(() =>
 const dataSourceLabel = computed(() => {
   switch (current.value.dataSource) {
     case 'snapshot':
-      return '演示快照 snapshot'
+      return '演示数据（快照）'
     case 'replay':
-      return '回放数据 replay'
+      return '演示数据（回放）'
     case 'live':
-      return '实时数据 live'
+      return '实时数据'
     default:
       return '数据来源未获取'
   }

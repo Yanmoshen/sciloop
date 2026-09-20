@@ -262,7 +262,7 @@ function onSave(): void {
         </button>
       </template>
       <span v-if="writeDenied" class="tb__warn">
-        当前为 public_demo 只读面：任务书写操作已被前置禁用（后端会返回 403 owner_token_required）；请在设置页填入 OWNER_TOKEN 后重试。
+        当前为浏览模式：生成任务书是写操作，需先在「设置」里启用编辑。
       </span>
     </footer>
   </section>

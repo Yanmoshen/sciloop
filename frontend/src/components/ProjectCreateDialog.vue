@@ -17,6 +17,7 @@
  * 后端暂无「方向字典」接口，若需要入库需另加接口与迁移。
  */
 import { computed, ref, watch } from 'vue'
+import { writeDenied } from '@/utils/messages'
 
 import { createProject, isOwnerRequired, RESEARCH_FIELDS, type CreatedProject } from '@/api/projects'
 
@@ -155,7 +156,7 @@ async function submit(): Promise<void> {
     close()
   } catch (error) {
     notice.value = isOwnerRequired(error)
-      ? 'public_demo 只读面无法创建项目（服务端 403 owner_token_required）：请在「设置」页填入服务端 OWNER_TOKEN 后重试。'
+      ? writeDenied('创建项目')
       : error instanceof Error
         ? error.message
         : String(error)

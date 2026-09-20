@@ -101,7 +101,7 @@ const maxStageCost = computed(() =>
       <strong class="cost-title">成本双线</strong>
       <span class="cost-used">
         已用 {{ usd(snapshot?.used_usd) }}
-        <span class="cost-src">（{{ snapshot ? 'GET /costs/summary' : '契约默认值，接口未取到' }}）</span>
+        <span class="cost-src">（{{ snapshot ? '来自成本接口' : '接口未取到，显示契约默认值' }}）</span>
       </span>
       <span class="cost-replay">
         回放节省 <strong>{{ usd(snapshot?.replay_saved_usd ?? 0) }}</strong>
@@ -131,9 +131,9 @@ const maxStageCost = computed(() =>
     </div>
 
     <p v-if="snapshot && !snapshot.cost_complete" class="cost-warn">
-      成本不完整（cost_complete=false）：{{ snapshot.warning ?? '存在缺少单价的调用，done 值未估算' }}
+      成本统计不完整：{{ snapshot.warning ?? '有调用缺少单价，未完成部分未估算' }}
     </p>
-    <p v-if="!snapshot" class="cost-warn">未取到成本接口值，以上为契约常量双线（8.0 / 3.0），不与真实消耗混算。</p>
+    <p v-if="!snapshot" class="cost-warn">未取到成本接口值：以上为契约参考线，不与真实消耗混算。</p>
 
     <div v-if="breakdown.length" class="cost-breakdown">
       <h4>分环节成本（breakdown_by_stage）</h4>

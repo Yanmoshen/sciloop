@@ -11,7 +11,7 @@
  *
  * 布局：
  * - 顶部：当前项目（只读展示）+ 运行控制（启动/暂停/继续/停止/切换模式）
- *   + 停止原因显著展示 + SSE 连接状态
+ *   + 停止原因显著展示 + 实时连接状态
  * - 成本双线常驻（护栏 8.0 / 演示配额 3.0）
  * - 主体按 Tab 分区：看板 / 决策日志 / 实验与 Passport / 盲评校准 / 草稿与三件套
  *
@@ -20,6 +20,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
+import { liveStatus } from '@/utils/messages'
 import BlindReviewPanel from '@/components/BlindReviewPanel.vue'
 import CostGuardrailBar from '@/components/CostGuardrailBar.vue'
 import DecisionLogPanel from '@/components/DecisionLogPanel.vue'
@@ -77,20 +78,7 @@ const stopReasonText = computed(() =>
  * 两者都不是「整页失败」，因此以顶部提示条而不是 error 呈现。
  */
 
-const connectionText = computed(() => {
-  switch (store.connection) {
-    case 'open':
-      return '实时已连接'
-    case 'connecting':
-      return '连接中'
-    case 'reconnecting':
-      return '重连中（已自动重拉快照）'
-    case 'error':
-      return '连接失败'
-    default:
-      return '未订阅'
-  }
-})
+const connectionText = computed(() => liveStatus(store.connection))
 
 const projectOptions = computed(() =>
   store.projects.map((item) => ({
@@ -188,7 +176,7 @@ function gotoPassport(runId: number | null): void {
         <span class="chip" :class="`chip--status-${projectStatus}`">{{ projectStatus }}</span>
         <span class="chip">模式 {{ store.status?.mode ?? '—' }}</span>
         <span class="chip">迭代 {{ store.iteration }}</span>
-        <span class="chip" :class="`chip--sse-${store.connection}`">SSE：{{ connectionText }}</span>
+        <span class="chip" :class="`chip--sse-${store.connection}`">{{ connectionText }}</span>
       </div>
 
       <div class="topbar-row">
@@ -224,7 +212,7 @@ function gotoPassport(runId: number | null): void {
           <span v-if="store.isWaitingHuman">· 等待人工介入（{{ store.pendingDecision?.decision_point ?? '—' }}）</span>
         </span>
         <span v-if="store.lastSyncedAt" class="muted">
-          快照同步 {{ new Date(store.lastSyncedAt).toLocaleTimeString() }}（状态以接口为准，SSE 仅实时展示）
+          快照同步 {{ new Date(store.lastSyncedAt).toLocaleTimeString() }}（以接口状态为准）
         </span>
         <span v-if="store.projectsNote" class="muted muted--warn">{{ store.projectsNote }}</span>
       </div>

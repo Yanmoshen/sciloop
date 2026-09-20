@@ -17,6 +17,7 @@
  * 渲染由 `components/PdfPane.vue` 用 PDF.js 完成；批注读写走既有 `/reader/...` 接口。
  */
 import { computed, onUnmounted, ref, watch } from 'vue'
+import { writeDenied } from '@/utils/messages'
 import { useRoute, useRouter } from 'vue-router'
 
 import {
@@ -117,7 +118,7 @@ function versionLabel(kind: string | undefined): string {
 function ownerHint(error: unknown): string {
   const status = (error as { status?: number })?.status
   if (status === 403) {
-    return 'public_demo 只读面无法写入（服务端 403）：请在「设置」页填入 OWNER_TOKEN 后重试。'
+    return writeDenied('保存批注')
   }
   if (status === 409) return '该批注已被其他地方修改，请重新打开后再改。'
   return error instanceof Error ? error.message : String(error)

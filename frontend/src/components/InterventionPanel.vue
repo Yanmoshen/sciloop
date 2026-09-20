@@ -16,6 +16,7 @@
  * 写操作需 Owner；public_demo 面按钮禁用并说明原因（后端仍会独立拒绝）。
  */
 import { computed, ref } from 'vue'
+import { writeDenied } from '@/utils/messages'
 
 import {
   INTERVENTION_NODES,
@@ -57,7 +58,7 @@ const DECISION_NAMES: Record<string, string> = {
 
 const canWrite = computed(() => session.isOwner || store.ownerWritesAllowed)
 const writeBlockReason = computed(() =>
-  canWrite.value ? '' : 'public_demo 面禁止写操作（需在设置页填入 Owner 令牌）',
+  canWrite.value ? '' : writeDenied('接管 / 批准该决策'),
 )
 
 const nodes = computed(() =>

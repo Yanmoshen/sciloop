@@ -243,9 +243,9 @@ const novelty = computed(() => describeNovelty(props.novelty))
     <div class="breakdown__head">
       <div class="breakdown__scores">
         <span class="score-chip">
-          推荐排序分 rank_score
+          推荐排序分
           <em>{{ formatScore(rankScore) }}</em>
-          <small>数据完整度 score_coverage：{{ formatCoverage(scoreCoverage) }}</small>
+          <small>数据完整度：{{ formatCoverage(scoreCoverage) }}</small>
         </span>
         <span class="score-chip score-chip--aux">
           影响力分 influence_score

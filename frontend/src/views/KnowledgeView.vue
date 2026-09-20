@@ -575,7 +575,7 @@ onMounted(async () => {
     />
 
     <p v-if="ownerDenied" class="knowledge__readonly">
-      当前为 public_demo 只读面：本页只做检索与核验，不提供写操作（建卡 / 回放 / 重跑等入口在 Workbench 内并已按访问面禁用）。
+      当前为浏览模式：本页只做检索与核验。写操作（建卡 / 回放 / 重跑）在工作台内，需先启用编辑。
     </p>
 
     <el-tabs v-model="tab" class="knowledge__tabs">
@@ -585,7 +585,7 @@ onMounted(async () => {
             v-model="keyword"
             size="small"
             class="toolbar__input"
-            placeholder="标题 / 摘要关键词（留空则按 rank_score 列出）"
+            placeholder="标题 / 摘要关键词（留空按推荐排序）"
             clearable
             @keyup.enter="runSearch"
           />
@@ -616,7 +616,7 @@ onMounted(async () => {
               <p class="asset-item__title">{{ item.title }}</p>
               <p class="asset-item__meta">
                 #{{ item.id }} · {{ item.source ?? '来源未获取' }} · {{ item.published_at ?? '时间未获取' }} ·
-                venue {{ item.venue ?? '未获取' }} · 引用 {{ item.citation_count ?? '未获取' }} · rank_score
+                venue {{ item.venue ?? '未获取' }} · 引用 {{ item.citation_count ?? '未获取' }} · 推荐分
                 {{ item.rank_score ?? '未获取' }}
               </p>
             </li>

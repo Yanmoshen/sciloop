@@ -14,6 +14,7 @@
  * 真实写操作：`POST /projects`（Owner）。403 如实说明需要 OWNER_TOKEN，不做本地假装成功。
  */
 import { ref, watch } from 'vue'
+import { writeDenied } from '@/utils/messages'
 
 import { createProject, type CreatedProject } from '@/api/projects'
 
@@ -59,7 +60,7 @@ async function submit(): Promise<void> {
     const status = (error as { status?: number } | undefined)?.status
     notice.value =
       status === 403
-        ? 'public_demo 只读面无法新建项目（服务端 403）：请在「设置」页填入 OWNER_TOKEN 后重试。'
+        ? writeDenied('新建项目')
         : error instanceof Error
           ? error.message
           : String(error)

@@ -53,7 +53,7 @@ const unknown = computed(() => props.accessMode === null && session.status === n
 
 const headline = computed(() => {
   if (unknown.value) return '访问面未获取'
-  return owner.value ? 'owner_mode · 研究者可写' : 'public_demo · 只读演示面'
+  return owner.value ? '可编辑 · 研究者面' : '浏览模式 · 只读'
 })
 
 const detail = computed(() => {
@@ -62,11 +62,11 @@ const detail = computed(() => {
   }
   if (owner.value) {
     return mode.value === 'owner_mode'
-      ? '已携带有效 X-Owner-Token：写操作与实时运行可用（服务端仍逐条校验并留审计日志）'
-      : '已携带 X-Owner-Token，但服务端当前访问面仍为 public_demo：写操作会被拒绝'
+      ? '已启用编辑：导入、建卡、运行等写操作可用；服务端仍逐条校验并留审计记录。'
+      : '令牌已填，但服务端当前仍是浏览模式：写操作会被拒绝，请确认令牌与服务端一致。'
   }
   const reason = session.ownerSession?.permissions?.reason
-  return reason ?? '匿名会话只读：写操作返回 403 owner_token_required；令牌只由服务端环境变量提供'
+  return reason ?? '当前为浏览模式：可检索、阅读、导出；导入 / 建卡 / 运行等写操作需先在「设置」里启用编辑。'
 })
 
 const modeClass = computed(() => ({
@@ -123,7 +123,7 @@ const tooltip = computed(() =>
   background-color: var(--color-bg-subtle, var(--bg-subtle));
 }
 
-/* ---- public_demo：中性只读面，虚线边框与可写面区分 ---- */
+/* ---- 浏览模式：中性只读面，虚线边框与可编辑面区分 ---- */
 .owner-badge--public {
   border-style: dashed;
   color: var(--color-text-secondary, var(--text-secondary));
