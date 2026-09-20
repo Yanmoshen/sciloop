@@ -185,7 +185,7 @@ function failure(err: unknown): string {
  * 统一写入口：`PATCH /models/configs/{id}`（Owner）。
  * 失败**如实显示**服务端的 code / message，不吞掉、不伪装成功。
  */
-async function patch(body: Record<string, unknown>): Promise<boolean> {
+async function patch(body: Record<string, unknown>, okText?: string): Promise<boolean> {
   const config = current.value
   if (!config) return false
   // 只读面：**不能静默返回**（否则表现成「点了没反应」）。按钮本身已前置禁用，
@@ -200,6 +200,7 @@ async function patch(body: Record<string, unknown>): Promise<boolean> {
   try {
     await updateModelConfig(config.id, body)
     await store.loadConfigs()
+    if (okText) notice.value = okText
     return true
   } catch (err) {
     errorNotice.value = failure(err)
@@ -330,8 +331,8 @@ function priceLabel(entry: ModelEntry): string {
 }
 
 /** 新的 `models[]`：原样保留后端回带的每个键（如 `cacheRead`），只做增删改 */
-function withModels(next: ModelEntry[]): Promise<boolean> {
-  return patch({ models: next })
+function withModels(next: ModelEntry[], okText?: string): Promise<boolean> {
+  return patch({ models: next }, okText)
 }
 
 async function syncModels(): Promise<void> {
@@ -393,8 +394,11 @@ function cancelEditPrice(): void {
   editingModelId.value = null
 }
 
-function toNumber(raw: string): number | null {
-  const text = raw.trim()
+function toNumber(raw: string | number | null | undefined): number | null {
+  // ⚠️ 入参可能是数字：`v-model` 绑在 <input type="number"> 上时会自动做 number 转换，
+  // 此前直接 `raw.trim()` 会抛 `a.trim is not a function`，导致保存整条静默失败。
+  if (raw === null || raw === undefined) return null
+  const text = typeof raw === 'number' ? String(raw) : raw.trim()
   if (text === '') return null
   const value = Number(text)
   return Number.isFinite(value) && value >= 0 ? value : null
@@ -402,17 +406,21 @@ function toNumber(raw: string): number | null {
 
 /** 单价写回：只覆盖 input/output，保留 pricing 里的其它键（如 cacheRead） */
 async function savePrice(entry: ModelEntry): Promise<void> {
-  const currency = priceCurrency.value.trim().toUpperCase() || 'USD'
-  const side = (value: number | null): PricingSide | null =>
-    value === null ? null : { currency, perMillionTokens: value }
-  const next: ModelEntry[] = models.value.map((model) =>
-    model.model_id === entry.model_id
-      ? { ...model, pricing: { ...(model.pricing ?? {}), input: side(toNumber(priceInput.value)), output: side(toNumber(priceOutput.value)) } }
-      : model,
-  )
-  if (await withModels(next)) {
-    editingModelId.value = null
-    syncNotice.value = `已更新 ${entry.model_id} 的单价`
+  // 任何异常都要出现在反馈条上：此前「点了保存没反应」就是因为异常被静默吞掉。
+  try {
+    const currency = priceCurrency.value.trim().toUpperCase() || 'USD'
+    const side = (value: number | null): PricingSide | null =>
+      value === null ? null : { currency, perMillionTokens: value }
+    const next: ModelEntry[] = models.value.map((model) =>
+      model.model_id === entry.model_id
+        ? { ...model, pricing: { ...(model.pricing ?? {}), input: side(toNumber(priceInput.value)), output: side(toNumber(priceOutput.value)) } }
+        : model,
+    )
+    if (await withModels(next, `已更新 ${entry.model_id} 的单价`)) {
+      editingModelId.value = null
+    }
+  } catch (err) {
+    errorNotice.value = `保存单价失败：${err instanceof Error ? err.message : String(err)}`
   }
 }
 
@@ -494,6 +502,19 @@ async function removeProvider(): Promise<void> {
           </button>
         </div>
       </header>
+
+      <div class="ps__feedback">
+        <span
+          v-if="!canWrite"
+          class="pill pill--warn"
+          title="写入需要 OWNER_TOKEN：在「通用设置」里填写后再试"
+        >
+          只读面
+        </span>
+        <span v-else-if="errorNotice" class="pill pill--warn">{{ errorNotice }}</span>
+        <span v-else-if="notice" class="pill pill--ok">{{ notice }}</span>
+        <span v-else-if="syncNotice" class="pill pill--ok">{{ syncNotice }}</span>
+      </div>
 
       <div class="ps__body">
         <!-- ---------- API 密钥 ---------- -->
@@ -627,7 +648,6 @@ async function removeProvider(): Promise<void> {
           </div>
 
           <p v-if="syncError" class="state state--error">{{ syncError }}</p>
-          <p v-else-if="syncNotice" class="state"><span class="pill pill--ok">{{ syncNotice }}</span></p>
 
           <ul v-if="filteredModels.length" class="rows">
             <li v-for="entry in filteredModels" :key="entry.model_id" class="row">
@@ -702,8 +722,6 @@ async function removeProvider(): Promise<void> {
           </p>
         </section>
 
-        <p v-if="errorNotice" class="state state--error">{{ errorNotice }}</p>
-        <p v-else-if="notice" class="state"><span class="pill pill--ok">{{ notice }}</span></p>
 
         <!-- ---------- 危险操作 ---------- -->
         <div class="danger">
@@ -1321,4 +1339,13 @@ async function removeProvider(): Promise<void> {
   opacity: 0.45;
   cursor: not-allowed;
 }
+/* 保存反馈条：位于右栏头部与滚动体之间，**不随内容滚动** —— 用户此前投诉
+   「点了保存没反应」，根因之一就是提示渲染在滚动区底部、根本不在视野里。 */
+.ps__feedback {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 16px 12px;
+}
+
 </style>
