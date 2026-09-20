@@ -29,6 +29,7 @@ import { ElMessage } from 'element-plus'
 
 import { setConversationArchived, type ConversationBrief } from '@/api/conversations'
 import type { CreatedProject } from '@/api/projects'
+import { setProjectArchived } from '@/api/projects'
 import ConfirmDialog from '@/components/home/ConfirmDialog.vue'
 import MoveConversationDialog from '@/components/home/MoveConversationDialog.vue'
 import ProjectNameDialog from '@/components/home/ProjectNameDialog.vue'
@@ -143,7 +144,7 @@ function openSettings(): void {
 // ---- 同步任务历史（顶栏按钮打开）----
 const historyOpen = ref(false)
 
-// ---- 项目行：重命名（沿用既有弹窗）----
+// ---- 项目行：重命名 / 归档（都收进「更多」菜单里）----
 const renameOpen = ref(false)
 const renameTargetId = ref<number | null>(null)
 const renameTargetName = ref('')
@@ -154,6 +155,31 @@ function openRename(project: { id: number; name: string }): void {
   renameOpen.value = true
 }
 
+/**
+ * 「更多」浮层：同一时间只开一个，点别处 / Esc / 选中任一项都关掉。
+ *
+ * 用 `stopPropagation` + 文档级监听实现（不用 `mouseleave` 那种「够不着」的判定）：
+ * 菜单是行内绝对定位浮层，鼠标从按钮移到菜单项的路上不会穿过别的东西。
+ */
+const moreOpen = ref<number | null>(null)
+
+function toggleMore(projectId: number, event: MouseEvent): void {
+  event.stopPropagation()
+  moreOpen.value = moreOpen.value === projectId ? null : projectId
+}
+
+function closeMore(): void {
+  moreOpen.value = null
+}
+
+function onDocumentClick(): void {
+  closeMore()
+}
+
+function onDocumentKeydown(event: KeyboardEvent): void {
+  if (event.key === 'Escape') closeMore()
+}
+
 // --------------------------------------------------------------------------- //
 // 已归档折叠区与项目展开
 // --------------------------------------------------------------------------- //
@@ -161,8 +187,35 @@ const archivedOpen = ref(false)
 
 async function toggleArchived(): Promise<void> {
   archivedOpen.value = !archivedOpen.value
-  if (archivedOpen.value) await conversations.loadArchived()
+  if (archivedOpen.value) {
+    await Promise.all([conversations.loadArchived(), session.loadArchivedProjects()])
+  }
 }
+
+/**
+ * 项目下的**全部**对话（含已归档）：项目本身被归档后，它的未归档对话在「项目」区
+ * 会随项目行一起消失，必须在「已归档 → 项目」里仍能看得到、点得开。
+ */
+function projectConversations(projectId: number): ConversationBrief[] {
+  const all = [...conversations.items, ...conversations.archived]
+  return all.filter((item) => item.project_id === projectId)
+}
+
+const archivedProjectIds = computed(() => new Set(session.archivedProjects.map((p) => p.id)))
+
+/** 「已归档 → 对话」只列**不挂在已归档项目下**的那些，避免与项目节点重复显示 */
+const archivedLooseConversations = computed(() =>
+  conversations.archived.filter((item) => {
+    const owner = item.project_id
+    if (owner == null) return true
+    return !archivedProjectIds.value.has(owner)
+  }),
+)
+
+/** 折叠区徽标 = 顶层可见行数（与展开后看到的一致） */
+const archivedTotal = computed(
+  () => session.archivedProjects.length + archivedLooseConversations.value.length,
+)
 
 /** 展开/收起某个项目下的对话（点项目行 = 展开，不再直接跳工作台） */
 const expandedProjects = ref<number[]>([])
@@ -259,6 +312,60 @@ async function onProjectCreated(project: CreatedProject): Promise<void> {
   expandedProjects.value = [...expandedProjects.value, project.id]
 }
 
+// --------------------------------------------------------------------------- //
+// 项目归档 / 取消归档
+// --------------------------------------------------------------------------- //
+const projectArchiveOpen = ref(false)
+const projectArchiveBusy = ref(false)
+const projectArchiveTarget = ref<{ id: number; name: string } | null>(null)
+
+function askArchiveProject(project: { id: number; name: string }): void {
+  closeMore()
+  projectArchiveTarget.value = project
+  projectArchiveOpen.value = true
+}
+
+async function confirmArchiveProject(): Promise<void> {
+  const target = projectArchiveTarget.value
+  if (!target || projectArchiveBusy.value) return
+  projectArchiveBusy.value = true
+  try {
+    await setProjectArchived(target.id, true)
+    await Promise.all([
+      session.loadProjects(),
+      session.loadArchivedProjects(),
+      conversations.load(),
+      conversations.loadArchived(),
+    ])
+    projectArchiveOpen.value = false
+    projectArchiveTarget.value = null
+  } catch (error) {
+    ElMessage.warning(projectMessageOf(error))
+  } finally {
+    projectArchiveBusy.value = false
+  }
+}
+
+async function unarchiveProject(projectId: number): Promise<void> {
+  try {
+    await setProjectArchived(projectId, false)
+    await Promise.all([
+      session.loadProjects(),
+      session.loadArchivedProjects(),
+      conversations.load(),
+      conversations.loadArchived(),
+    ])
+  } catch (error) {
+    ElMessage.warning(projectMessageOf(error))
+  }
+}
+
+function projectMessageOf(error: unknown): string {
+  const status = (error as { status?: number } | undefined)?.status
+  if (status === 403) return writeDenied('修改项目')
+  return error instanceof Error ? error.message : String(error)
+}
+
 // ---- 任务：顶栏按钮 → 历史 → 打开某一条的完整监控窗口 ----
 const tasks = useTaskStore()
 const monitorOpen = ref(false)
@@ -290,10 +397,16 @@ onMounted(() => {
   void conversations.load()
   // 已归档要一起拉：折叠区虽然收起，但徽标上的条数得是真的
   void conversations.loadArchived()
+  void session.loadArchivedProjects()
+  // 「更多」浮层的关闭：点任意处 / Esc
+  document.addEventListener('click', onDocumentClick)
+  document.addEventListener('keydown', onDocumentKeydown)
   tasks.startWatch()
 })
 
 onUnmounted(() => {
+  document.removeEventListener('click', onDocumentClick)
+  document.removeEventListener('keydown', onDocumentKeydown)
   tasks.stopWatch()
   tasks.stopPolling()
 })
@@ -535,7 +648,7 @@ onUnmounted(() => {
             {{ session.projectsError || '暂无项目' }}
           </p>
           <template v-for="p in session.projects" :key="p.id">
-            <div class="crow crow--project">
+            <div class="crow crow--project" :class="{ 'crow--open': moreOpen === p.id }">
               <button
                 class="crow__item crow__item--project"
                 type="button"
@@ -571,10 +684,26 @@ onUnmounted(() => {
                 <button
                   class="icon-btn"
                   type="button"
-                  title="重命名项目"
-                  aria-label="重命名项目"
-                  @click="openRename(p)"
+                  title="更多"
+                  aria-label="更多"
+                  aria-haspopup="menu"
+                  :aria-expanded="moreOpen === p.id ? 'true' : 'false'"
+                  @click="toggleMore(p.id, $event)"
                 >
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <circle cx="3.4" cy="8" r="1.3" fill="currentColor" />
+                    <circle cx="8" cy="8" r="1.3" fill="currentColor" />
+                    <circle cx="12.6" cy="8" r="1.3" fill="currentColor" />
+                  </svg>
+                </button>
+              </span>
+            </div>
+
+            <!-- 「更多」菜单做成**行内块**而不是绝对定位浮层：左栏滚动区是 overflow:auto，
+                 浮层贴边时会被裁掉；行内块不会被裁，也不用算坐标。 -->
+            <ul v-if="moreOpen === p.id" class="pmenu" role="menu">
+              <li>
+                <button class="pmenu__item" type="button" role="menuitem" @click="closeMore(); openRename(p)">
                   <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                     <path
                       d="M11.4 2.6a1.35 1.35 0 0 1 1.9 1.9l-7.6 7.6-2.7.8.8-2.7 7.6-7.6Z"
@@ -584,9 +713,25 @@ onUnmounted(() => {
                     />
                     <path d="M10.3 3.7 12.3 5.7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
                   </svg>
+                  重命名
                 </button>
-              </span>
-            </div>
+              </li>
+              <li>
+                <button class="pmenu__item" type="button" role="menuitem" @click="askArchiveProject(p)">
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path
+                      d="M2.6 5.6h10.8v7a.8.8 0 0 1-.8.8H3.4a.8.8 0 0 1-.8-.8v-7Z"
+                      stroke="currentColor"
+                      stroke-width="1.3"
+                      stroke-linejoin="round"
+                    />
+                    <path d="M2 3.4h12v2.2H2z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
+                    <path d="M6.6 8.4h2.8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                  </svg>
+                  归档
+                </button>
+              </li>
+            </ul>
 
             <div v-if="isExpanded(p.id)" class="ckids">
               <p v-if="conversations.forProject(p.id).length === 0" class="group__empty group__empty--child">
@@ -620,7 +765,7 @@ onUnmounted(() => {
           </template>
         </div>
 
-        <!-- 已归档：折叠区，可展开、可取消归档 -->
+        <!-- 已归档：折叠区，分「项目 / 对话」两块，都可展开、可取消归档 -->
         <div class="group">
           <div class="group__head">
             <button
@@ -641,14 +786,97 @@ onUnmounted(() => {
                 </svg>
               </span>
               <span class="group__title">已归档</span>
-              <span class="group__count">{{ conversations.archived.length }}</span>
+              <span class="group__count">{{ archivedTotal }}</span>
             </button>
           </div>
           <div v-show="archivedOpen" class="ckids">
-            <p v-if="conversations.archived.length === 0" class="group__empty group__empty--child">
+            <p class="group__title group__title--nested">项目</p>
+            <p v-if="session.archivedProjects.length === 0" class="group__empty group__empty--child">
+              {{ session.archivedProjectsError || '暂无已归档项目' }}
+            </p>
+            <template v-for="p in session.archivedProjects" :key="`archived-project-${p.id}`">
+              <div class="crow crow--child">
+                <button
+                  class="crow__item"
+                  type="button"
+                  :title="p.name"
+                  :aria-expanded="isExpanded(p.id)"
+                  @click="toggleProject(p.id)"
+                >
+                  <span class="crow__caret" :class="{ 'crow__caret--open': isExpanded(p.id) }">
+                    <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
+                      <path
+                        d="M4.4 2.6 7.8 6l-3.4 3.4"
+                        stroke="currentColor"
+                        stroke-width="1.5"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                      />
+                    </svg>
+                  </span>
+                  <span class="crow__label">{{ p.name }}</span>
+                </button>
+                <span class="crow__acts crow__acts--always">
+                  <button
+                    class="icon-btn"
+                    type="button"
+                    title="取消归档"
+                    aria-label="取消归档"
+                    @click="unarchiveProject(p.id)"
+                  >
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <path
+                        d="M3.6 8a4.4 4.4 0 1 0 1.4-3.2M3.4 3.2v3h3"
+                        stroke="currentColor"
+                        stroke-width="1.3"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                      />
+                    </svg>
+                  </button>
+                </span>
+              </div>
+              <div v-if="isExpanded(p.id)" class="ckids ckids--deep">
+                <p v-if="projectConversations(p.id).length === 0" class="group__empty group__empty--child">
+                  该项目暂无对话
+                </p>
+                <div v-for="c in projectConversations(p.id)" :key="c.id" class="crow crow--child">
+                  <button
+                    class="crow__item"
+                    type="button"
+                    :title="c.title || '未命名对话'"
+                    @click="openConversation(c)"
+                  >
+                    {{ c.title || '未命名对话' }}
+                  </button>
+                  <span v-if="c.archived" class="crow__acts crow__acts--always">
+                    <button
+                      class="icon-btn"
+                      type="button"
+                      title="取消归档"
+                      aria-label="取消归档"
+                      @click="unarchive(c)"
+                    >
+                      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                        <path
+                          d="M3.6 8a4.4 4.4 0 1 0 1.4-3.2M3.4 3.2v3h3"
+                          stroke="currentColor"
+                          stroke-width="1.3"
+                          stroke-linecap="round"
+                          stroke-linejoin="round"
+                        />
+                      </svg>
+                    </button>
+                  </span>
+                </div>
+              </div>
+            </template>
+
+            <p class="group__title group__title--nested">对话</p>
+            <p v-if="archivedLooseConversations.length === 0" class="group__empty group__empty--child">
               {{ conversations.archivedError || '暂无已归档对话' }}
             </p>
-            <div v-for="c in conversations.archived" :key="c.id" class="crow crow--child">
+            <div v-for="c in archivedLooseConversations" :key="c.id" class="crow crow--child">
               <button class="crow__item" type="button" :title="c.title || '未命名对话'" @click="openConversation(c)">
                 {{ c.title || '未命名对话' }}
               </button>
@@ -790,6 +1018,14 @@ onUnmounted(() => {
       confirm-text="归档"
       :busy="archiveBusy"
       @confirm="confirmArchive"
+    />
+    <ConfirmDialog
+      v-model="projectArchiveOpen"
+      title="归档项目"
+      :message="`「${projectArchiveTarget?.name || '该项目'}」将从「项目」收起并移入「已归档」，项目下的对话一并收起；归档后仍可从「已归档」展开并继续对话。`"
+      confirm-text="归档"
+      :busy="projectArchiveBusy"
+      @confirm="confirmArchiveProject"
     />
     <TaskHistoryDialog v-model="historyOpen" @open="openTaskMonitor" />
     <TaskMonitorDialog
@@ -1168,9 +1404,63 @@ onUnmounted(() => {
 
 .crow:hover .crow__acts,
 .crow:focus-within .crow__acts,
+.crow--open .crow__acts,
 .crow__acts--always {
   opacity: 1;
   pointer-events: auto;
+}
+
+/* 菜单打开时让项目行保持「悬停态」：指针移到行内菜单上会离开行的盒子 */
+.crow--open {
+  background: var(--h-hover);
+}
+
+/* 项目行的「更多」菜单：行内块（不做绝对定位浮层，避免被滚动区裁掉） */
+.pmenu {
+  margin: 2px 0 4px 14px;
+  padding: 4px;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border: 1px solid var(--h-line-strong);
+  border-radius: 10px;
+  background: var(--h-surface-raised);
+  animation: nav-unfold 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.pmenu__item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--h-fg-muted);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background-color 160ms cubic-bezier(0.4, 0, 0.2, 1),
+    color 160ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.pmenu__item:hover {
+  background: var(--h-hover);
+  color: var(--h-fg);
+}
+
+/* 「已归档」里的二级小标题（项目 / 对话）：复用分组标题的排版，只调缩进 */
+.group__title--nested {
+  padding: 4px 12px 2px 16px;
+}
+
+/* 已归档项目展开后的对话：比项目再缩进一级 */
+.ckids--deep {
+  margin-left: 14px;
 }
 
 /* 项目下的对话：缩进一级 */

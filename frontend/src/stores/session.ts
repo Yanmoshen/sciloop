@@ -119,8 +119,11 @@ export const useSessionStore = defineStore('session', () => {
 
   // ---- 当前 Project ----
   const projects = ref<ProjectBrief[]>([])
+  /** 已归档项目（默认不取；展开左栏「已归档」时才拉） */
+  const archivedProjects = ref<ProjectBrief[]>([])
   const currentProjectId = ref<number | null>(null)
   const projectsError = ref('')
+  const archivedProjectsError = ref('')
   const currentProject = computed(
     () => projects.value.find((p) => p.id === currentProjectId.value) ?? null,
   )
@@ -144,6 +147,27 @@ export const useSessionStore = defineStore('session', () => {
       projects.value = []
       if (!(error instanceof ApiError && error.status === 404)) projectsError.value = message(error)
     }
+  }
+
+  async function loadArchivedProjects(): Promise<void> {
+    try {
+      const data = await get<
+        { items: ProjectBrief[]; total: number } | ProjectBrief[]
+      >('/projects', { query: { page: 1, page_size: 100, archived: true } })
+      archivedProjects.value = Array.isArray(data) ? data : (data.items ?? [])
+      archivedProjectsError.value = ''
+    } catch (error) {
+      archivedProjects.value = []
+      archivedProjectsError.value = message(error)
+    }
+  }
+
+  /** 按 id 取项目名（先查未归档、再查已归档）；取不到返回 null —— 不编造名字 */
+  function projectName(id: number | null | undefined): string | null {
+    if (id === null || id === undefined) return null
+    const hit =
+      projects.value.find((p) => p.id === id) ?? archivedProjects.value.find((p) => p.id === id)
+    return hit?.name ?? null
   }
 
   // ---- 健康状态 ----
@@ -183,15 +207,19 @@ export const useSessionStore = defineStore('session', () => {
     accessLabel,
     accessMode,
     applyTheme,
+    archivedProjects,
+    archivedProjectsError,
     currentProject,
     currentProjectId,
     forgetOwnerToken,
     health,
     healthError,
     isOwner,
+    loadArchivedProjects,
     loadHealth,
     loadProjects,
     ownerToken,
+    projectName,
     projects,
     projectsError,
     riskThresholds,

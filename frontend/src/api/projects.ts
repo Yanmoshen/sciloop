@@ -49,6 +49,16 @@ export async function renameProject(id: number, name: string): Promise<ProjectDe
   return patch<ProjectDetail>(`/projects/${id}`, { body: { name: name.trim() } })
 }
 
+/**
+ * 归档 / 取消归档项目：`PATCH /projects/{id}`（Owner 写操作，只改 archived）。
+ *
+ * 归档 = 从左栏「项目」收起、进「已归档」折叠区；**不动流水线状态、不删数据**，
+ * 项目下的对话一并收起，但点开仍可继续聊。
+ */
+export async function setProjectArchived(id: number, archived: boolean): Promise<ProjectDetail> {
+  return patch<ProjectDetail>(`/projects/${id}`, { body: { archived } })
+}
+
 export interface CreatedProject {
   id: number
   name: string

@@ -100,6 +100,15 @@ const pendingProjectId = computed(() => {
   return Number.isInteger(value) && value > 0 ? value : null
 })
 
+/**
+ * 开场主标题：在项目内新建对话时点名项目（`在“项目名”中开始对话`）。
+ * 名字取不到（项目已删 / 还没加载完）就退回默认文案 —— 不编造项目名。
+ */
+const heroTitle = computed(() => {
+  const name = session.projectName(pendingProjectId.value)
+  return name ? `在“${name}”中开始对话` : '使用 AI，体验全新科研工作流'
+})
+
 function fmtDuration(ms: number): string {
   const total = Math.max(0, Math.floor(ms / 1000))
   const h = Math.floor(total / 3600)
@@ -390,6 +399,8 @@ watch(prompt, () => {
 
 onMounted(async () => {
   if (!settings.configs.length) await settings.loadConfigs()
+  // 项目名要用来拼开场标题（`/?project=<id>`）：列表空的就先拉一次，避免标题闪成默认文案
+  if (!session.projects.length) void session.loadProjects()
   pickedRef.value = modelOptions.value[0]?.value ?? 'auto'
   await init()
 })
@@ -402,7 +413,7 @@ onUnmounted(() => {
 <template>
   <section class="chat" :class="{ 'chat--active': active }">
     <div class="chat__intro">
-      <h1 class="chat__title">使用 AI，体验全新科研工作流</h1>
+      <h1 class="chat__title">{{ heroTitle }}</h1>
       <p class="chat__steps">{{ PIPELINE }}</p>
     </div>
 
