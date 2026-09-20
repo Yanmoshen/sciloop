@@ -46,3 +46,127 @@
   transition-duration: 0s !important;
   transition-delay: 0s !important;
 }
+
+/* ===========================================================================
+ * 通用动效工具类（第 3 层）
+ *
+ * 改前每个"展开/收起"都是各写各的：多数只有淡入动画、**收起瞬间消失**，位移只有 4px；
+ * 弹层入场有 7 份重复的 `@keyframes pop`。这里给三个可复用的原语，全站统一引用。
+ * 时长/缓动一律走 tokens.css 的 `--motion-*` 令牌。
+ * ======================================================================== */
+
+/* ---------- ① 折叠：真正的高度过渡（展开↔收起都平滑） ----------
+ * 用 `grid-template-rows: 0fr → 1fr`：内容高度自适应、无需 JS 量高度、
+ * 也不会像 `max-height` 那样在内容不足时"空跑"一段。
+ * 用法：<div class="fold" :class="{ 'fold--open': open }"><div>…内容…</div></div>
+ * ⚠️ `grid-template-rows` 可动画需要 Chromium 107+；旧浏览器降级为瞬变（功能不受影响）。
+ * ⚠️ 内容常驻 DOM（不再 v-if）——折叠区里若有几十行列表，请确认常驻可接受。 */
+.fold {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows var(--motion-dur) var(--motion-ease);
+}
+
+.fold--open {
+  grid-template-rows: 1fr;
+}
+
+.fold > * {
+  /* min-height:0 是 0fr 折叠的必需项：不加的话 `0fr` 行的最小值会退化成内容的
+     min-content，收不干净。 */
+  min-height: 0;
+  overflow: hidden;
+  /* 子元素自己的上下 padding / border / margin **不随 grid 行高收缩**：
+     实测「文献调研」收起后仍留 6px、「更多」菜单还会露出一条空边框，
+     三张卡外面的 46px 下边距也会照留。所以这三项也要跟着过渡到 0。 */
+  transition:
+    padding-block var(--motion-dur) var(--motion-ease),
+    margin-block var(--motion-dur) var(--motion-ease),
+    border-block-width var(--motion-dur) var(--motion-ease);
+}
+
+.fold:not(.fold--open) > * {
+  padding-block: 0;
+  margin-block: 0;
+  border-block-width: 0;
+}
+
+/* ---------- ② 入场：自下而上淡入 ----------
+ * `.rise-step-N` 是逐级错峰（同一容器里的非兄弟元素也能用，不依赖 DOM 嵌套）。 */
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(var(--motion-rise));
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.rise-in {
+  animation: rise-in var(--motion-dur-slow) var(--motion-ease-out) both;
+}
+
+.rise-step-1 {
+  animation-delay: 0ms;
+}
+
+.rise-step-2 {
+  animation-delay: var(--motion-stagger);
+}
+
+.rise-step-3 {
+  animation-delay: calc(var(--motion-stagger) * 2);
+}
+
+.rise-step-4 {
+  animation-delay: calc(var(--motion-stagger) * 3);
+}
+
+/* ---------- ③ 弹层/浮层入场：全站一套 ----------
+ * 改前 7 个弹窗各定义一份同名 `pop`（180/200ms 混用），另有 imp-pop / picked-pop /
+ * bubble-in / mpick-in 四种近似动画。现统一成本类，时长缓动走令牌。 */
+@keyframes dialog-pop {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.dialog-enter {
+  animation: dialog-pop var(--motion-dur) var(--motion-ease-out);
+}
+
+/* 内容区在小区域里出现（下拉面板、气泡）：位移小一点，别从很远的地方飞进来 */
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.pop-in {
+  animation: pop-in var(--motion-dur-fast) var(--motion-ease-out);
+}
+
+/* ---------- ④ 按压反馈 ----------
+ * 只给"没有用 transform 做定位/布局"的元素加（.press 需显式声明，不全局通配，
+ * 避免踩到已经拿 transform 做居中或拖拽的元素）。 */
+.press {
+  transition:
+    transform var(--motion-dur-fast) var(--motion-ease-out),
+    background-color var(--motion-dur) var(--motion-ease);
+}
+
+.press:active {
+  transform: scale(var(--motion-press));
+}

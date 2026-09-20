@@ -817,7 +817,7 @@ async function removeProvider(): Promise<void> {
   font-size: var(--font-size-sm);
   line-height: 1;
   cursor: pointer;
-  transition: background-color 300ms ease, color 300ms ease;
+  transition: background-color var(--motion-dur) var(--motion-ease), color var(--motion-dur) var(--motion-ease);
 }
 
 .ps__icon-btn:hover {
@@ -847,7 +847,7 @@ async function removeProvider(): Promise<void> {
   font-size: var(--font-size-sm);
   text-align: left;
   cursor: pointer;
-  transition: background-color 300ms ease;
+  transition: background-color var(--motion-dur) var(--motion-ease);
 }
 
 .ps__item:hover {
@@ -929,7 +929,7 @@ async function removeProvider(): Promise<void> {
   font: inherit;
   font-size: var(--font-size-sm);
   cursor: pointer;
-  transition: background-color 300ms ease, border-color 300ms ease;
+  transition: background-color var(--motion-dur) var(--motion-ease), border-color var(--motion-dur) var(--motion-ease);
 }
 
 .ps__add:hover:not(:disabled) {
@@ -1150,7 +1150,7 @@ async function removeProvider(): Promise<void> {
   font: inherit;
   font-size: var(--font-size-sm);
   outline: none;
-  transition: border-color 300ms ease;
+  transition: border-color var(--motion-dur) var(--motion-ease);
 }
 
 .input {
@@ -1199,7 +1199,7 @@ async function removeProvider(): Promise<void> {
   font: inherit;
   font-size: var(--font-size-md);
   cursor: pointer;
-  transition: background-color 300ms ease;
+  transition: background-color var(--motion-dur) var(--motion-ease);
 }
 
 .icon-btn:hover:not(:disabled) {
@@ -1224,7 +1224,7 @@ async function removeProvider(): Promise<void> {
   font-size: var(--font-size-sm);
   cursor: pointer;
   white-space: nowrap;
-  transition: background-color 300ms ease;
+  transition: background-color var(--motion-dur) var(--motion-ease);
 }
 
 .btn:hover:not(:disabled) {

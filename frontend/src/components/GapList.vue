@@ -61,7 +61,8 @@ function toggle(id: number): void {
 
         <p class="gaps__text">{{ gap.gap_text }}</p>
 
-        <div v-if="openId === gap.id" class="gaps__detail">
+        <div class="fold" :class="{ 'fold--open': openId === gap.id }">
+          <div class="gaps__detail">
           <div class="gaps__block">
             <h4>未被解决的证据（真实原文片段）</h4>
             <ol v-if="gap.unsolved_evidence?.length" class="gaps__evidence">
@@ -107,6 +108,7 @@ function toggle(id: number): void {
           </div>
 
           <p v-if="gap.unsolved_scope_note" class="gaps__scope">{{ gap.unsolved_scope_note }}</p>
+          </div>
         </div>
 
         <button v-if="props.selectable !== false" type="button" class="gaps__btn" @click="emit('generate', { gap })">

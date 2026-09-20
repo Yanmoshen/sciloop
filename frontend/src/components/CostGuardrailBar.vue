@@ -257,7 +257,7 @@ const maxStageCost = computed(() =>
 .bar-fill {
   height: 100%;
   background-color: var(--color-success);
-  transition: width 0.3s ease;
+  transition: width var(--motion-dur) var(--motion-ease);
 }
 
 .cost-line--warn .bar-fill {

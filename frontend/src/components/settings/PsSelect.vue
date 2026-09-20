@@ -316,7 +316,7 @@ watch([open, activeIndex], async ([isOpen, index]) => {
   height: 6px;
   flex: none;
   color: var(--h-fg-subtle);
-  transition: transform 160ms ease;
+  transition: transform var(--motion-dur) var(--motion-ease);
 }
 
 .ps-select__caret--open {

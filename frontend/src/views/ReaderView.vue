@@ -634,17 +634,7 @@ onUnmounted(() => {
   border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-popover);
-  animation: bubble-in 160ms cubic-bezier(0.16, 1, 0.3, 1);
-}
-@keyframes bubble-in {
-  from {
-    opacity: 0;
-    transform: translateY(-4px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
+  animation: pop-in var(--motion-dur-fast) var(--motion-ease-out);
 }
 .bubble__quote {
   margin: 0;

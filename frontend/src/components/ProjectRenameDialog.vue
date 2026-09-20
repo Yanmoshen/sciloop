@@ -129,18 +129,7 @@ async function submit(): Promise<void> {
   border-radius: 20px;
   box-shadow: 0 24px 64px rgba(0, 0, 0, 0.35); /* ui-polish-allow: 弹窗投影色 */
   font-size: var(--font-size-md);
-  animation: pop 180ms cubic-bezier(0.4, 0, 0.2, 1);
-}
-
-@keyframes pop {
-  from {
-    opacity: 0;
-    transform: translateY(6px) scale(0.985);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
+  animation: dialog-pop var(--motion-dur) var(--motion-ease-out);
 }
 
 .dialog__title {

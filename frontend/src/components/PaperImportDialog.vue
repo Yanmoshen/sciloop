@@ -479,18 +479,7 @@ onUnmounted(() => {
   border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-lg);
   box-shadow: 0 24px 64px rgba(0, 0, 0, 0.4);
-  animation: imp-pop 160ms cubic-bezier(0.16, 1, 0.3, 1);
-}
-
-@keyframes imp-pop {
-  from {
-    opacity: 0;
-    transform: translateY(-8px) scale(0.98);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
+  animation: dialog-pop var(--motion-dur) var(--motion-ease-out);
 }
 
 .imp-dialog__head {

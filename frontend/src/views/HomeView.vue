@@ -30,6 +30,7 @@ import type { CreatedProject } from '@/api/projects'
 import { useConversationStore } from '@/stores/conversations'
 import { useSessionStore } from '@/stores/session'
 import { useSettingsStore } from '@/stores/settings'
+import { consumeEntrance } from '@/utils/pageEntrance'
 
 type TurnStatus = 'streaming' | 'done' | 'interrupted'
 
@@ -108,6 +109,14 @@ const heroTitle = computed(() => {
   const name = session.projectName(pendingProjectId.value)
   return name ? `在“${name}”中开始对话` : '使用 AI，体验全新科研工作流'
 })
+
+/**
+ * 开场逐级入场：只在**从别的页面切回首页类路由**时播（壳层打标，这里消费一次）。
+ * 「已经在首页」（点 ＋ 新建对话、首页 ↔ 对话互跳）与硬刷新都不播 —— 那是同页内切换，
+ * 再放一遍"自下而上"只会显得啰嗦。
+ */
+const entranceOn = ref(false)
+let entranceTimer: number | null = null
 
 function fmtDuration(ms: number): string {
   const total = Math.max(0, Math.floor(ms / 1000))
@@ -398,6 +407,14 @@ watch(prompt, () => {
 })
 
 onMounted(async () => {
+  entranceOn.value = consumeEntrance()
+  if (entranceOn.value) {
+    // 动画跑完就把标记收掉：类留着虽然不会重播（animation 只跑一次），
+    // 但它会一直声称"正在入场"，与真实状态不符；也让后续任何重挂载都不会意外补播。
+    entranceTimer = window.setTimeout(() => {
+      entranceOn.value = false
+    }, 600)
+  }
   if (!settings.configs.length) await settings.loadConfigs()
   // 项目名要用来拼开场标题（`/?project=<id>`）：列表空的就先拉一次，避免标题闪成默认文案
   if (!session.projects.length) void session.loadProjects()
@@ -407,14 +424,19 @@ onMounted(async () => {
 
 onUnmounted(() => {
   stopTicker()
+  if (entranceTimer !== null) window.clearTimeout(entranceTimer)
 })
 </script>
 
 <template>
-  <section class="chat" :class="{ 'chat--active': active }">
-    <div class="chat__intro">
-      <h1 class="chat__title">{{ heroTitle }}</h1>
-      <p class="chat__steps">{{ PIPELINE }}</p>
+  <section class="chat" :class="{ 'chat--active': active, 'chat--enter': entranceOn }">
+    <!-- 开场区展开/收起统一走 .fold（双向高度过渡），替掉原来的 max-height 硬编码
+         —— 内容不足 420px 时旧写法会"空跑"一段，收展节奏不匀。 -->
+    <div class="fold" :class="{ 'fold--open': !active }">
+      <div class="chat__intro">
+        <h1 class="chat__title rise-in rise-step-1">{{ heroTitle }}</h1>
+        <p class="chat__steps rise-in rise-step-2">{{ PIPELINE }}</p>
+      </div>
     </div>
 
     <div v-if="active" class="chat__head">
@@ -478,7 +500,7 @@ onUnmounted(() => {
 
     <p v-if="errorText" class="state state--error">{{ errorText }}</p>
 
-    <div class="composer" :class="{ 'composer--hero': !active }">
+    <div class="composer rise-in rise-step-3" :class="{ 'composer--hero': !active }">
       <textarea
         ref="textareaEl"
         v-model="prompt"
@@ -552,7 +574,7 @@ onUnmounted(() => {
             </ul>
           </div>
           <button
-            class="send"
+            class="send press"
             type="button"
             :disabled="!canSend || phase === 'thinking'"
             :title="phase === 'thinking' ? '正在生成' : '发送'"
@@ -573,8 +595,9 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <section v-if="!active" class="cards">
-      <button class="card" type="button" @click="openCreate(prompt)">
+    <div class="fold" :class="{ 'fold--open': !active }">
+      <section class="cards rise-in rise-step-4">
+        <button class="card press" type="button" @click="openCreate(prompt)">
         <span class="card__icon">
           <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
             <path d="M9 3v12M3 9h12" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
@@ -584,7 +607,7 @@ onUnmounted(() => {
         <span class="card__desc">快速开始新的研究</span>
       </button>
 
-      <button class="card" type="button" @click="goFeed">
+      <button class="card press" type="button" @click="goFeed">
         <span class="card__icon">
           <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
             <circle cx="8" cy="8" r="4.5" stroke="currentColor" stroke-width="1.6" />
@@ -595,7 +618,7 @@ onUnmounted(() => {
         <span class="card__desc">聚合检索文献，输出结构化分析总结</span>
       </button>
 
-      <button class="card" type="button" @click="goIdeas">
+      <button class="card press" type="button" @click="goIdeas">
         <span class="card__icon">
           <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden="true">
             <path
@@ -610,7 +633,8 @@ onUnmounted(() => {
         <span class="card__title">idea 生成</span>
         <span class="card__desc">生成带证据和可行性评估的研究构想</span>
       </button>
-    </section>
+      </section>
+    </div>
 
     <ProjectCreateDialog v-model="dialogOpen" :prefill="dialogPrefill" @created="onCreated" />
   </section>
@@ -635,21 +659,16 @@ onUnmounted(() => {
   overflow: hidden;
 }
 
-.chat__intro {
-  /* 必须 flex:none：`.chat` 是纵向 flex，默认可收缩的子项会被压到比内容矮，
-     配合 `overflow:hidden` 就把「流程行」裁掉、让输入框盖住开场文案。 */
+/* 开场区与三张卡各自套一个 .fold：两个包装器都是 `.chat` 的 flex 子项，必须 flex:none ——
+   默认可收缩会把它们压到比内容矮，配合折叠裁剪就表现为「输入框盖住开场文案」（2026-09-20 实测踩过）。 */
+.chat > .fold {
   flex: none;
-  max-height: 420px;
-  overflow: hidden;
-  transition:
-    max-height 360ms cubic-bezier(0.4, 0, 0.2, 1),
-    opacity 220ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-.chat--active .chat__intro {
-  max-height: 0;
-  opacity: 0;
-  pointer-events: none;
+/* 只做「入场」：进入首页时逐级自下而上淡入（@keyframes rise-in 在 styles/motion.css，
+   全站共用一份）。非入场场景（点 ＋ 新建、硬刷新）把 .rise-in 关掉，元素就是静态的。 */
+.chat:not(.chat--enter) .rise-in {
+  animation: none;
 }
 
 .chat__title {
@@ -1054,18 +1073,8 @@ onUnmounted(() => {
   border: 1px solid var(--h-line-strong);
   border-radius: 12px;
   box-shadow: 0 12px 32px rgb(0 0 0 / 24%); /* ui-polish-allow: 浮层投影色 */
-  animation: mpick-in 180ms cubic-bezier(0.4, 0, 0.2, 1);
-}
-
-@keyframes mpick-in {
-  from {
-    opacity: 0;
-    transform: translateY(6px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  /* 浮层入场走全站统一的 .pop-in（styles/motion.css），本地不再自定义 keyframes */
+  animation: pop-in var(--motion-dur-fast) var(--motion-ease-out);
 }
 
 .mpick__option {
@@ -1096,11 +1105,13 @@ onUnmounted(() => {
 
 /* ---------- 三张快捷卡 ---------- */
 .cards {
-  flex: none; /* 同 .chat__intro：不能被 flex 压扁 */
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 16px;
-  margin-bottom: 48px;
+  /* padding-top 是给 hover 抬升留的余量：外层 .fold 会给直接子元素加 overflow:hidden，
+     卡片 hover 上移 2px 会被裁掉顶上一条，留 2px 正好；margin 相应减 2px，版面不变。 */
+  padding-top: 2px;
+  margin-bottom: 46px;
 }
 
 .card {

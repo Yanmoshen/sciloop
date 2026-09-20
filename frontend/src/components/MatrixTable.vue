@@ -135,7 +135,8 @@ const evidenceTotal = computed(() =>
                       {{ isOpen(row, dim.key) ? '收起' : '定位方式' }}
                     </button>
                   </div>
-                  <ul v-if="isOpen(row, dim.key)" class="matrix__evidence">
+                  <div class="fold" :class="{ 'fold--open': isOpen(row, dim.key) }">
+                    <ul class="matrix__evidence">
                     <li v-for="(ev, index) in cellOf(row, dim.key)?.evidence" :key="index">
                       <span class="matrix__ev-kind">{{ ev.kind }}</span>
                       <span class="matrix__ev-label">{{ ev.label }}</span>
@@ -148,6 +149,7 @@ const evidenceTotal = computed(() =>
                       备注：{{ cellOf(row, dim.key)?.note }}
                     </li>
                   </ul>
+                  </div>
                 </template>
               </td>
             </tr>

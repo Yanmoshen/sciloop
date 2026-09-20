@@ -240,7 +240,8 @@ defineExpose({ toggle })
       </el-button>
     </div>
 
-    <section v-if="expanded" class="paper-card__detail">
+    <div class="fold" :class="{ 'fold--open': expanded }">
+      <section class="paper-card__detail">
       <InfluenceBreakdown
         :rank-breakdown="item.rank_breakdown ?? {}"
         :influence-breakdown="item.score_breakdown ?? {}"
@@ -292,7 +293,8 @@ defineExpose({ toggle })
           <p v-else class="extra-body">该论文无取数留痕记录（未获取，不推断来源）</p>
         </div>
       </div>
-    </section>
+      </section>
+    </div>
   </article>
 </template>
 

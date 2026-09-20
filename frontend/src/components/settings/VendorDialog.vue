@@ -226,7 +226,7 @@ async function submit(): Promise<void> {
   font: inherit;
   font-size: var(--font-size-md);
   outline: none;
-  transition: border-color 300ms ease;
+  transition: border-color var(--motion-dur) var(--motion-ease);
 }
 
 .input:focus {
@@ -264,7 +264,7 @@ async function submit(): Promise<void> {
   font-size: var(--font-size-md);
   cursor: pointer;
   white-space: nowrap;
-  transition: background-color 300ms ease;
+  transition: background-color var(--motion-dur) var(--motion-ease);
 }
 
 .btn:hover:not(:disabled) {

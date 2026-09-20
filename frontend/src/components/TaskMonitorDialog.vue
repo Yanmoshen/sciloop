@@ -387,18 +387,7 @@ function finishText(): string {
   border: 1px solid var(--color-border-strong);
   border-radius: 18px;
   box-shadow: var(--shadow-popover);
-  animation: pop 200ms cubic-bezier(0.4, 0, 0.2, 1);
-}
-
-@keyframes pop {
-  from {
-    opacity: 0;
-    transform: translateY(8px) scale(0.985);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
+  animation: dialog-pop var(--motion-dur) var(--motion-ease-out);
 }
 
 .head {

@@ -39,6 +39,7 @@ import TaskMonitorDialog from '@/components/TaskMonitorDialog.vue'
 import { useConversationStore } from '@/stores/conversations'
 import { useSessionStore } from '@/stores/session'
 import { useTaskStore } from '@/stores/tasks'
+import { requestEntrance } from '@/utils/pageEntrance'
 
 const session = useSessionStore()
 const conversations = useConversationStore()
@@ -93,6 +94,25 @@ const activeModule = computed(() => (route.meta?.module as string | undefined) ?
 
 /** 「首页那套」的页面（开始使用 / 对话）：内容区不加模块页的内边距，撑满交给页面自己排 */
 const isHomeLike = computed(() => route.name === 'home' || route.name === 'conversation')
+
+/** 首页类路由名（判断"上一次是不是已经在首页"用，与 isHomeLike 同一口径） */
+const HOME_LIKE_ROUTES = new Set(['home', 'conversation'])
+
+/**
+ * 页面入场信号：只在**从别的页面切回首页类路由**时打标。
+ *
+ * 「已经在首页」（点 ＋ 新建对话、首页 ↔ 对话之间互跳）不打标 ⇒ 不播入场动画：
+ * 那属于同一页内部的切换，再放一遍"自下而上"会显得啰嗦。
+ * 首次加载也不打标（watcher 只在 name 变化时触发），所以硬刷新不会播。
+ */
+watch(
+  () => route.name,
+  (name, previous) => {
+    if (HOME_LIKE_ROUTES.has(String(name)) && !HOME_LIKE_ROUTES.has(String(previous))) {
+      requestEntrance()
+    }
+  },
+)
 
 /**
  * 文献调研分组：落在任一子页时视为激活（并自动展开）。
@@ -459,7 +479,9 @@ onUnmounted(() => {
                 </button>
               </div>
 
-              <div v-show="literatureOpen" class="nav__children">
+            <!-- 展开/收起走全站统一的 .fold（双向高度过渡），不再用「只淡入、收起瞬变」的 animation -->
+            <div class="fold" :class="{ 'fold--open': literatureOpen }">
+              <div class="nav__children">
                 <RouterLink
                   v-for="child in item.children"
                   :key="child.key"
@@ -471,6 +493,7 @@ onUnmounted(() => {
                   {{ child.label }}
                 </RouterLink>
               </div>
+            </div>
             </div>
 
             <!-- 普通项：开始使用 / 知识库 -->
@@ -700,54 +723,26 @@ onUnmounted(() => {
             </div>
 
             <!-- 「更多」菜单做成**行内块**而不是绝对定位浮层：左栏滚动区是 overflow:auto，
-                 浮层贴边时会被裁掉；行内块不会被裁，也不用算坐标。 -->
-            <ul v-if="moreOpen === p.id" class="pmenu" role="menu">
-              <li>
-                <button class="pmenu__item" type="button" role="menuitem" @click="closeMore(); openRename(p)">
-                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                    <path
-                      d="M11.4 2.6a1.35 1.35 0 0 1 1.9 1.9l-7.6 7.6-2.7.8.8-2.7 7.6-7.6Z"
-                      stroke="currentColor"
-                      stroke-width="1.3"
-                      stroke-linejoin="round"
-                    />
-                    <path d="M10.3 3.7 12.3 5.7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
-                  </svg>
-                  重命名
-                </button>
-              </li>
-              <li>
-                <button class="pmenu__item" type="button" role="menuitem" @click="askArchiveProject(p)">
-                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                    <path
-                      d="M2.6 5.6h10.8v7a.8.8 0 0 1-.8.8H3.4a.8.8 0 0 1-.8-.8v-7Z"
-                      stroke="currentColor"
-                      stroke-width="1.3"
-                      stroke-linejoin="round"
-                    />
-                    <path d="M2 3.4h12v2.2H2z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
-                    <path d="M6.6 8.4h2.8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
-                  </svg>
-                  归档
-                </button>
-              </li>
-            </ul>
-
-            <div v-if="isExpanded(p.id)" class="ckids">
-              <p v-if="conversations.forProject(p.id).length === 0" class="group__empty group__empty--child">
-                该项目暂无对话
-              </p>
-              <div v-for="c in conversations.forProject(p.id)" :key="c.id" class="crow crow--child">
-                <button
-                  class="crow__item"
-                  type="button"
-                  :title="c.title || '未命名对话'"
-                  @click="openConversation(c)"
-                >
-                  {{ c.title || '未命名对话' }}
-                </button>
-                <span class="crow__acts">
-                  <button class="icon-btn" type="button" title="归档" aria-label="归档" @click="askArchive(c)">
+                 浮层贴边时会被裁掉；行内块不会被裁，也不用算坐标。
+                 展开/收起同样走统一 .fold。 -->
+            <div class="fold" :class="{ 'fold--open': moreOpen === p.id }">
+              <ul class="pmenu" role="menu">
+                <li>
+                  <button class="pmenu__item" type="button" role="menuitem" @click="closeMore(); openRename(p)">
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <path
+                        d="M11.4 2.6a1.35 1.35 0 0 1 1.9 1.9l-7.6 7.6-2.7.8.8-2.7 7.6-7.6Z"
+                        stroke="currentColor"
+                        stroke-width="1.3"
+                        stroke-linejoin="round"
+                      />
+                      <path d="M10.3 3.7 12.3 5.7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                    </svg>
+                    重命名
+                  </button>
+                </li>
+                <li>
+                  <button class="pmenu__item" type="button" role="menuitem" @click="askArchiveProject(p)">
                     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                       <path
                         d="M2.6 5.6h10.8v7a.8.8 0 0 1-.8.8H3.4a.8.8 0 0 1-.8-.8v-7Z"
@@ -758,8 +753,41 @@ onUnmounted(() => {
                       <path d="M2 3.4h12v2.2H2z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
                       <path d="M6.6 8.4h2.8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
                     </svg>
+                    归档
                   </button>
-                </span>
+                </li>
+              </ul>
+            </div>
+
+            <div class="fold" :class="{ 'fold--open': isExpanded(p.id) }">
+              <div class="ckids">
+                <p v-if="conversations.forProject(p.id).length === 0" class="group__empty group__empty--child">
+                  该项目暂无对话
+                </p>
+                <div v-for="c in conversations.forProject(p.id)" :key="c.id" class="crow crow--child">
+                  <button
+                    class="crow__item"
+                    type="button"
+                    :title="c.title || '未命名对话'"
+                    @click="openConversation(c)"
+                  >
+                    {{ c.title || '未命名对话' }}
+                  </button>
+                  <span class="crow__acts">
+                    <button class="icon-btn" type="button" title="归档" aria-label="归档" @click="askArchive(c)">
+                      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                        <path
+                          d="M2.6 5.6h10.8v7a.8.8 0 0 1-.8.8H3.4a.8.8 0 0 1-.8-.8v-7Z"
+                          stroke="currentColor"
+                          stroke-width="1.3"
+                          stroke-linejoin="round"
+                        />
+                        <path d="M2 3.4h12v2.2H2z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
+                        <path d="M6.6 8.4h2.8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                      </svg>
+                    </button>
+                  </span>
+                </div>
               </div>
             </div>
           </template>
@@ -789,7 +817,8 @@ onUnmounted(() => {
               <span class="group__count">{{ archivedTotal }}</span>
             </button>
           </div>
-          <div v-show="archivedOpen" class="ckids">
+          <div class="fold" :class="{ 'fold--open': archivedOpen }">
+            <div class="ckids">
             <p class="group__title group__title--nested">项目</p>
             <p v-if="session.archivedProjects.length === 0" class="group__empty group__empty--child">
               {{ session.archivedProjectsError || '暂无已归档项目' }}
@@ -836,38 +865,40 @@ onUnmounted(() => {
                   </button>
                 </span>
               </div>
-              <div v-if="isExpanded(p.id)" class="ckids ckids--deep">
-                <p v-if="projectConversations(p.id).length === 0" class="group__empty group__empty--child">
-                  该项目暂无对话
-                </p>
-                <div v-for="c in projectConversations(p.id)" :key="c.id" class="crow crow--child">
-                  <button
-                    class="crow__item"
-                    type="button"
-                    :title="c.title || '未命名对话'"
-                    @click="openConversation(c)"
-                  >
-                    {{ c.title || '未命名对话' }}
-                  </button>
-                  <span v-if="c.archived" class="crow__acts crow__acts--always">
+              <div class="fold" :class="{ 'fold--open': isExpanded(p.id) }">
+                <div class="ckids ckids--deep">
+                  <p v-if="projectConversations(p.id).length === 0" class="group__empty group__empty--child">
+                    该项目暂无对话
+                  </p>
+                  <div v-for="c in projectConversations(p.id)" :key="c.id" class="crow crow--child">
                     <button
-                      class="icon-btn"
+                      class="crow__item"
                       type="button"
-                      title="取消归档"
-                      aria-label="取消归档"
-                      @click="unarchive(c)"
+                      :title="c.title || '未命名对话'"
+                      @click="openConversation(c)"
                     >
-                      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                        <path
-                          d="M3.6 8a4.4 4.4 0 1 0 1.4-3.2M3.4 3.2v3h3"
-                          stroke="currentColor"
-                          stroke-width="1.3"
-                          stroke-linecap="round"
-                          stroke-linejoin="round"
-                        />
-                      </svg>
+                      {{ c.title || '未命名对话' }}
                     </button>
-                  </span>
+                    <span v-if="c.archived" class="crow__acts crow__acts--always">
+                      <button
+                        class="icon-btn"
+                        type="button"
+                        title="取消归档"
+                        aria-label="取消归档"
+                        @click="unarchive(c)"
+                      >
+                        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                          <path
+                            d="M3.6 8a4.4 4.4 0 1 0 1.4-3.2M3.4 3.2v3h3"
+                            stroke="currentColor"
+                            stroke-width="1.3"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                          />
+                        </svg>
+                      </button>
+                    </span>
+                  </div>
                 </div>
               </div>
             </template>
@@ -899,6 +930,7 @@ onUnmounted(() => {
                   </svg>
                 </button>
               </span>
+            </div>
             </div>
           </div>
         </div>
@@ -1198,17 +1230,6 @@ onUnmounted(() => {
   flex-direction: column;
   gap: 2px;
   padding: 2px 0 4px 14px;
-  animation: nav-unfold 200ms cubic-bezier(0.16, 1, 0.3, 1);
-}
-@keyframes nav-unfold {
-  from {
-    opacity: 0;
-    transform: translateY(-4px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
 }
 .nav__item--child {
   padding: 7px 12px;
@@ -1426,7 +1447,6 @@ onUnmounted(() => {
   border: 1px solid var(--h-line-strong);
   border-radius: 10px;
   background: var(--h-surface-raised);
-  animation: nav-unfold 180ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .pmenu__item {
@@ -1469,7 +1489,6 @@ onUnmounted(() => {
   flex-direction: column;
   gap: 2px;
   padding-left: 14px;
-  animation: nav-unfold 200ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .crow--child .crow__item {
