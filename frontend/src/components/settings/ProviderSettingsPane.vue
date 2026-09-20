@@ -65,6 +65,11 @@ const editingModelId = ref<string | null>(null)
 const priceInput = ref('')
 const priceOutput = ref('')
 const priceCurrency = ref('USD')
+/** 币种只有两项：界面显示「人民币（RMB）」，入库存 ISO 码 CNY */
+const CURRENCY_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
+  { value: 'USD', label: 'USD' },
+  { value: 'CNY', label: '人民币（RMB）' },
+]
 const pendingDelete = ref(false)
 
 const filtered = computed(() => {
@@ -276,6 +281,9 @@ const testPill = computed(() => {
  * 模型：搜索 / 获取模型列表 / 单价
  * ------------------------------------------------------------------ */
 const models = computed(() => current.value?.models ?? [])
+
+/** 是否已有默认供应商（后端保证互斥唯一）。没有默认供应商时，模型相关保存一律前置禁用。 */
+const hasDefaultProvider = computed(() => store.configs.some((config) => config.is_default))
 
 const filteredModels = computed(() => {
   const keyword = modelQuery.value.trim().toLowerCase()
@@ -494,6 +502,7 @@ async function removeProvider(): Promise<void> {
             type="button"
             role="switch"
             aria-label="默认供应商"
+            title="默认供应商：首页「开始使用」默认用它的第一个模型；模型相关保存也要求先有默认供应商"
             :aria-checked="current.is_default ? 'true' : 'false'"
             :disabled="!canWrite"
             @click="toggleDefault"
@@ -606,6 +615,9 @@ async function removeProvider(): Promise<void> {
           <div class="sec__head">
             <span class="sec__title">模型</span>
             <span class="pill pill--quiet">共 {{ models.length }} 个</span>
+            <span v-if="!hasDefaultProvider" class="pill pill--warn" title="模型相关保存需要先有一个默认供应商：打开右上角「默认供应商」开关即可">
+              先设为默认供应商
+            </span>
             <span v-if="nonUsdCount" class="pill pill--warn" title="非 USD 定价不换算、不计入 USD 护栏">
               非 USD，未计入护栏 {{ nonUsdCount }} 个
             </span>
@@ -622,7 +634,7 @@ async function removeProvider(): Promise<void> {
             <button
               class="btn btn--sm"
               type="button"
-              :disabled="!canWrite || !hasKey || syncing"
+              :disabled="!canWrite || !hasKey || syncing || !hasDefaultProvider"
               @click="syncModels"
             >
               {{ syncing ? '获取中…' : '获取模型列表' }}
@@ -640,7 +652,7 @@ async function removeProvider(): Promise<void> {
             <button
               class="btn btn--sm"
               type="button"
-              :disabled="!canWrite || !newModelId.trim() || busy"
+              :disabled="!canWrite || !newModelId.trim() || busy || !hasDefaultProvider"
               @click="addModel"
             >
               + 添加模型
@@ -683,7 +695,7 @@ async function removeProvider(): Promise<void> {
                   class="icon-btn"
                   type="button"
                   :aria-label="`移除模型 ${entry.model_id}`"
-                  :disabled="!canWrite || busy"
+                  :disabled="!canWrite || busy || !hasDefaultProvider"
                   @click="removeModel(entry)"
                 >
                   −
@@ -701,14 +713,14 @@ async function removeProvider(): Promise<void> {
                 </label>
                 <label class="field">
                   <span class="field__label">币种</span>
-                  <input v-model="priceCurrency" class="input input--sm" type="text" placeholder="USD" />
+                  <PsSelect v-model="priceCurrency" :options="CURRENCY_OPTIONS" aria-label="币种" />
                 </label>
                 <div class="row__edit-end">
                   <button class="btn btn--sm" type="button" @click="cancelEditPrice">取消</button>
                   <button
                     class="btn btn--sm btn--primary"
                     type="button"
-                    :disabled="!canWrite || busy"
+                    :disabled="!canWrite || busy || !hasDefaultProvider"
                     @click="savePrice(entry)"
                   >
                     保存单价
@@ -1149,7 +1161,8 @@ async function removeProvider(): Promise<void> {
   flex: 0 1 220px;
 }
 
-.sec__row > .input[type='text'] {
+.sec__row > .input[type='text'],
+.sec__row > .input[type='password'] {
   flex: 0 1 200px;
 }
 
@@ -1346,6 +1359,41 @@ async function removeProvider(): Promise<void> {
   flex-wrap: wrap;
   gap: 8px;
   padding: 0 16px 12px;
+}
+
+/* 3) 默认供应商开关：深浅色都要看得清（此前开启态与轨道对比度不足） */
+.sw__knob {
+  position: absolute;
+  top: 50%;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--h-fg-muted);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 30%);
+  transform: translateY(-50%);
+  transition:
+    transform 180ms cubic-bezier(0.4, 0, 0.2, 1),
+    background-color 180ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.sw:hover {
+  border-color: var(--h-fg-muted);
+}
+
+.sw[aria-checked='true'] {
+  background: var(--h-primary);
+  border-color: var(--h-primary);
+}
+
+.sw[aria-checked='true'] .sw__knob {
+  background: var(--h-primary-fg, #fff);
+  transform: translate(18px, -50%);
+}
+
+.sw:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 
 </style>

@@ -46,6 +46,47 @@ const listId = `ps-select-${useId()}`
 const optionId = (index: number): string => `${listId}-option-${index}`
 
 const open = ref(false)
+
+/** 弹层坐标：fixed 定位需自己算（祖先 overflow 会裁掉 absolute 弹层） */
+const panelStyle = ref<Record<string, string>>({})
+
+function syncPanel(): void {
+  const el = root.value
+  if (!el) return
+  const rect = el.getBoundingClientRect()
+  const below = window.innerHeight - rect.bottom
+  const flip = below < 240 && rect.top > below
+  // 钳制到视口内：触发器被滚出视口时，`innerHeight - rect.top` 会是负数，弹层会跑到屏幕外
+  panelStyle.value = flip
+    ? {
+        left: `${rect.left}px`,
+        width: `${rect.width}px`,
+        top: 'auto',
+        bottom: `${Math.max(8, window.innerHeight - rect.top + 4)}px`,
+      }
+    : {
+        left: `${rect.left}px`,
+        width: `${rect.width}px`,
+        top: `${Math.min(rect.bottom + 4, Math.max(8, window.innerHeight - 8))}px`,
+        bottom: 'auto',
+      }
+}
+
+watch(open, (isOpen) => {
+  if (!isOpen) return
+  syncPanel()
+  void nextTick(syncPanel)
+})
+
+onMounted(() => {
+  window.addEventListener('scroll', syncPanel, true)
+  window.addEventListener('resize', syncPanel)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('scroll', syncPanel, true)
+  window.removeEventListener('resize', syncPanel)
+})
 const activeIndex = ref(-1)
 const root = ref<HTMLElement | null>(null)
 const panel = ref<HTMLElement | null>(null)
@@ -172,7 +213,14 @@ watch([open, activeIndex], async ([isOpen, index]) => {
       </svg>
     </button>
 
-    <ul v-if="open" :id="listId" ref="panel" class="ps-select__panel" role="listbox">
+    <ul
+      v-if="open"
+      :id="listId"
+      ref="panel"
+      class="ps-select__panel"
+      :style="panelStyle"
+      role="listbox"
+    >
       <li
         v-for="(item, index) in options"
         :id="optionId(index)"
@@ -276,11 +324,10 @@ watch([open, activeIndex], async ([isOpen, index]) => {
 }
 
 .ps-select__panel {
-  position: absolute;
+  /* fixed 而非 absolute：祖先容器（如模型列表 .rows 的 overflow-y:auto）会把 absolute
+     弹层裁掉，只剩第一项可见。坐标由 JS 依触发器实时计算。 */
+  position: fixed;
   z-index: var(--z-popover);
-  top: calc(100% + 4px);
-  left: 0;
-  width: 100%;
   max-height: 240px;
   margin: 0;
   padding: 4px;

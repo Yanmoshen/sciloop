@@ -159,6 +159,10 @@
       <div class="card card--flush">
         <div class="card__head">
           <span class="card__title">按环节路由</span>
+          <span v-if="store.error" class="pill pill--warn">
+            {{ store.errorCode ?? 'failed' }}：{{ store.error }}
+          </span>
+          <span v-else-if="store.notice" class="pill pill--ok">{{ store.notice }}</span>
           <div class="card__actions">
             <span
               v-if="store.isolation"
@@ -357,7 +361,14 @@
         </div>
       </div>
 
-      <!-- 数据源健康 -->
+    </section>
+
+    <!-- ================= 3 拉取设置 ================= -->
+    <section v-show="activeTab === 'fetch'" class="pane" aria-label="拉取设置">
+      <header class="page-head">
+        <h1 class="page-title">拉取设置</h1>
+      </header>
+
       <div class="card card--flush">
         <div class="card__head">
           <span class="card__title">数据源健康</span>
@@ -389,9 +400,7 @@
             </tr>
           </tbody>
         </table>
-        <p v-else class="state card__foot">
-          点击「立即自检」拉取四源状态（arXiv / Semantic Scholar / OpenAlex / GitHub）
-        </p>
+        <p v-else class="state card__foot">暂无数据</p>
       </div>
     </section>
 
@@ -677,16 +686,20 @@ import { useSettingsStore } from '@/stores/settings'
 /* ------------------------------------------------------------------ *
  * 页签
  * ------------------------------------------------------------------ */
-type TabKey = 'general' | 'model' | 'reading'
+import { useQueryTab } from '@/utils/queryTab'
+
+type TabKey = 'general' | 'model' | 'fetch' | 'reading'
 
 const TABS: ReadonlyArray<{ key: TabKey; label: string }> = [
   { key: 'general', label: '通用设置' },
   { key: 'model', label: '模型与成本设置' },
+  { key: 'fetch', label: '拉取设置' },
   { key: 'reading', label: '阅读设置' },
 ]
 
 /** 页内切换：三个页签同属 `/settings`，**不改 URL、不进路由** */
-const activeTab = ref<TabKey>('general')
+const TAB_KEYS: ReadonlyArray<TabKey> = TABS.map((tab) => tab.key)
+const activeTab = useQueryTab<TabKey>('tab', TAB_KEYS, 'general')
 
 /* ------------------------------------------------------------------ *
  * 共享状态与权限
