@@ -283,11 +283,12 @@ onMounted(async () => {
         <span class="reply__model">{{ answerModel }}</span>
         <span class="reply__time">{{ phase === 'thinking' ? elapsedText : `已完成 ${doneText}` }}</span>
         <p v-if="answer" class="reply__text">{{ answer }}</p>
-        <div v-else class="dots" aria-label="正在思考">
+        <div v-else-if="phase === 'thinking'" class="dots" aria-label="正在思考">
           <span class="dot" />
           <span class="dot" />
           <span class="dot" />
         </div>
+        <p v-else class="state state--error">模型没有返回正文</p>
         <div v-if="answer" class="reply__actions">
           <button
             class="icon-btn"
