@@ -14,13 +14,23 @@
       → 原位覆盖回写（redact 原文本 + insert_textbox 写译文，保留图片与页面尺寸）
       → mono 单语 PDF；仅 translate 模式再拼装 dual 双语 PDF（原文页/译文页交替）
 
-诚实性约束
-----------
+版式策略（**可读性优先于"塞进去"**）
+-----------------------------------
 
-- 回写失败的块**保留原文**并把原因（页码 + bbox + 原因）逐条写进 ``layout_warnings``；
-- 字号放不下时先自动缩小，缩到下限仍放不下即如实记录，**不假装版式完美**；
-- 无真实 LLM 凭据时使用本地桩（``provider=local-stub``），桩**保留原文并加显式标记**，
-  绝不伪造中文译文；每次桩调用都会写 ``llm_call_logs`` 自证。
+1. **旋转文本块不回写**：``get_text("dict")`` 里 ``line["dir"] != (1, 0)`` 的块
+   （arXiv 侧栏水印、竖排表头等）**跳过**并保留原文。把旋转文本按横排塞进窄 bbox
+   会退化成"一行一个字"，是本引擎最严重的观感缺陷（实测 ``bbox=[10.9,213.9,37.6,555.0]``
+   的 arXiv 侧栏宽 26.7pt，12pt 被压到 4.6pt 仍是一列单字）。
+2. **块框互相重叠的块不回写**：同一行的公式碎片（上下标、根号）会被切成多个 bbox 重叠的块，
+   此时**不存在"原位"**，逐块回写必然叠印。这类块跳过并保留原文。
+3. **字号有可读下限**：绝不把译文压到 ``MIN_READABLE_FONT_SIZE`` 以下，也不低于原字号的
+   ``READABILITY_FLOOR_RATIO``（原字号本身更小时以原字号为界，不做放大）。
+4. **放不下先扩容再放弃**：原位放不下时，沿**同栏内、不与任何文本块/图像重叠**的纵向空隙把
+   bbox 向下扩（扩到下一个同栏障碍之前或页底边距），在扩容后的框里按可读下限重算字号。
+5. **兜底保留原文**：上述都放不下 → **保留原文**并把页码 + bbox + 原因逐条写进 ``layout_warnings``，
+   同时给出按原因汇总的计数行，**不假装版式完美**。
+6. 无真实 LLM 凭据时使用本地桩（``provider=local-stub``），桩**保留原文并加显式标记**，
+   绝不伪造中文译文；每次桩调用都会写 ``llm_call_logs`` 自证。
 """
 
 from __future__ import annotations
@@ -50,10 +60,18 @@ CJK_REGISTERED_FONTNAME = "sciloopcjk"
 #: ASCII 相对字宽（内置 CJK 字体的 ASCII 度量接近全角，注册 TTF 后为比例宽度）
 ASCII_WIDTH_BUILTIN = 1.0
 ASCII_WIDTH_REGISTERED = 0.52
-#: 回写字号下限（低于此值不再缩小，改为保留原文）
+#: 回写字号的**绝对**技术下限（低于此值 PyMuPDF 已无法正常排字）
 MIN_FONT_SIZE = 4.0
+#: 回写字号的**可读性**下限（pt）：低于此值不再缩小，改为扩容或保留原文
+MIN_READABLE_FONT_SIZE = 7.0
+#: 可读性下限的相对约束：不得低于原字号的该比例
+READABILITY_FLOOR_RATIO = 0.75
+#: 纵向扩容时与相邻文本块保留的安全间距（pt）
+EXPAND_GAP = 2.0
+#: 纵向扩容时距页面下边距保留的余量（pt）
+EXPAND_BOTTOM_MARGIN = 18.0
 #: 字号缩小到该比例以下时如实记一条 layout_warning（可读性下降）
-SHRINK_WARN_RATIO = 0.62
+SHRINK_WARN_RATIO = 0.90
 
 #: 本地桩的 provider / model 命名（必须自证「非真实模型」）
 STUB_PROVIDER = "local-stub"
@@ -85,6 +103,8 @@ class TextBlock:
     source_text: str
     font_size: float
     color: tuple[float, float, float]
+    #: 该块是否含旋转文本（``line["dir"] != (1, 0)``）——旋转块不做原位回写
+    rotated: bool = False
 
 
 @dataclass(slots=True)
@@ -201,14 +221,25 @@ def _text_width(text: str, size: float, ascii_ratio: float) -> float:
     return width
 
 
+def _readable_floor(base: float) -> float:
+    """该块允许的**最小可读字号**。
+
+    ``max(7.0pt, 原字号 × 0.75)``，但**不超过原字号**（原字号本身很小的脚注/图注
+    不做放大，否则会比原文更醒目、反而破坏版式）。
+    """
+    base = max(MIN_FONT_SIZE, float(base or 0.0))
+    return round(min(base, max(MIN_READABLE_FONT_SIZE, base * READABILITY_FLOOR_RATIO)), 2)
+
+
 def _required_font_size(
-    rect: Any, text: str, base: float, ascii_ratio: float
+    rect: Any, text: str, base: float, ascii_ratio: float, floor: float | None = None
 ) -> float | None:
-    """在 ``rect`` 内放得下的最大字号（从 base 逐步缩小）；放不下返回 ``None``。"""
+    """在 ``rect`` 内放得下的最大字号（从 base 逐步缩小，不低于 ``floor``）；放不下返回 ``None``。"""
     limit = max(1.0, float(rect.width) - 1.0)
     height_limit = max(1.0, float(rect.height) + 1.5)
-    size = max(MIN_FONT_SIZE, min(float(base), 24.0))
-    while size >= MIN_FONT_SIZE:
+    lower = max(MIN_FONT_SIZE, float(floor) if floor is not None else MIN_FONT_SIZE)
+    size = max(lower, min(float(base), 24.0))
+    while size >= lower:
         lines = 0
         for piece in text.split("\n"):
             lines += max(1, math.ceil(_text_width(piece, size, ascii_ratio) / limit)) if piece else 1
@@ -218,6 +249,99 @@ def _required_font_size(
     return None
 
 
+def _overlap_area(first: Sequence[float], second: Sequence[float]) -> float:
+    """两个 bbox 的重叠面积（不依赖 PyMuPDF，便于纯函数测试）。"""
+    width = min(float(first[2]), float(second[2])) - max(float(first[0]), float(second[0]))
+    height = min(float(first[3]), float(second[3])) - max(float(first[1]), float(second[1]))
+    return width * height if width > 0 and height > 0 else 0.0
+
+
+def _colliding_block_indexes(
+    rects: Sequence[Sequence[float]], *, min_area: float = 4.0
+) -> set[int]:
+    """块框**互相重叠**的块下标集合。
+
+    学术 PDF 里同一行的公式碎片（上下标、根号、花体符号）会被切成多个文本块，
+    彼此的 bbox 本身就重叠（实测样张 496 块里有 28 块如此）。这种情况下**不存在"原位"**：
+    逐块回写会让同一行多个块的新文本叠在一起（实测 page=5 出现 2308pt² 的叠印）。
+    这些块一律跳过、保留原文，比强行回写更诚实。
+    """
+    colliding: set[int] = set()
+    for i in range(len(rects)):
+        for j in range(i + 1, len(rects)):
+            if _overlap_area(rects[i], rects[j]) > min_area:
+                colliding.add(i)
+                colliding.add(j)
+    return colliding
+
+
+def _page_text_rects(page: Any) -> list[tuple[float, float, float, float]]:
+    """本页**全部**文本块占位框（含单字符页码、页眉页脚）。
+
+    不能用"翻译工作集里的块"当障碍物：``extract_blocks`` 会丢掉 ``len(text) < 2`` 的块，
+    而页码（"5"）正是一个字符 —— 用它当边界会让最后一个块扩容时**盖住页码**
+    （实测：审计脚本抓到 3 处回写文字压住页脚数字）。
+    """
+    try:
+        payload = page.get_text("dict")
+    except Exception as exc:  # noqa: BLE001 - 取不到就退化为无文本障碍
+        logger.debug("get_text('dict') 失败，扩容不避让文本：%s", exc)
+        return []
+    rects: list[tuple[float, float, float, float]] = []
+    for block in payload.get("blocks") or []:
+        if int(block.get("type", 0)) != 0:
+            continue
+        bbox = block.get("bbox")
+        if not bbox:
+            continue
+        rects.append((float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])))
+    return rects
+
+
+def _page_image_rects(page: Any) -> list[tuple[float, float, float, float]]:
+    """本页**图像**占位框。
+
+    扩容只能避让文本块是不够的：双栏论文里的图常常独占一栏下方，
+    只看文本块会把译文压到图上。取不到图像信息时退化为空表（只避让文本块）。
+    """
+    try:
+        info = page.get_image_info() or []
+    except Exception as exc:  # noqa: BLE001 - 拿不到图像信息不该阻断回写
+        logger.debug("get_image_info 失败，扩容仅避让文本块：%s", exc)
+        return []
+    rects: list[tuple[float, float, float, float]] = []
+    for item in info:
+        bbox = item.get("bbox") if isinstance(item, dict) else None
+        if not bbox:
+            continue
+        rects.append((float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])))
+    return rects
+
+
+def _expand_rect(
+    pymupdf: Any,
+    rect: Any,
+    occupied: Sequence[tuple[float, float, float, float]],
+    page_bottom: float,
+) -> Any | None:
+    """把 ``rect`` 沿纵向**向下扩容**到同栏内下一个文本块之前（不与任何块重叠）。
+
+    「同栏」用水平投影是否相交判断：只有横向与自身重叠、且顶部在自身下方的块才构成下界，
+    避免把双栏排版里另一栏的块误当成障碍。没有任何空间可扩时返回 ``None``。
+    """
+    bottom = float(page_bottom)
+    for other in occupied:
+        top = float(other[1])
+        if top < float(rect.y1) - 1.0:
+            continue
+        if float(other[2]) <= float(rect.x0) + 1.0 or float(other[0]) >= float(rect.x1) - 1.0:
+            continue
+        bottom = min(bottom, top - EXPAND_GAP)
+    if bottom <= float(rect.y1) + 1.0:
+        return None
+    return pymupdf.Rect(float(rect.x0), float(rect.y0), float(rect.x1), bottom)
+
+
 def _insert_block(
     page: Any,
     rect: Any,
@@ -225,11 +349,12 @@ def _insert_block(
     size: float,
     color: tuple[float, float, float],
     font_file: Path | None,
+    floor: float | None = None,
 ) -> tuple[bool, float, str | None]:
     """把一个文本块写进 ``rect``；返回 ``(是否写入, 实际字号, 失败原因)``。
 
     估算字号只是起点：``insert_textbox`` 返回负数表示放不下且**不会写入任何内容**，
-    因此这里按 0.85 的步长继续缩小重试（纯测量、无副作用），直到放下或触到下限。
+    因此这里按 0.85 的步长继续缩小重试（纯测量、无副作用），直到放下或触到**可读下限**。
     """
     payload = str(text or "")
     if not payload.strip():
@@ -241,8 +366,9 @@ def _insert_block(
         }
     else:  # pragma: no cover - 极端回退路径
         kwargs = {"fontname": CJK_FONTNAME}
-    attempt = max(MIN_FONT_SIZE, min(float(size), 24.0))
-    while attempt >= MIN_FONT_SIZE:
+    lower = max(MIN_FONT_SIZE, float(floor) if floor is not None else MIN_FONT_SIZE)
+    attempt = max(lower, min(float(size), 24.0))
+    while True:
         try:
             leftover = page.insert_textbox(
                 rect, payload, fontsize=attempt, color=color, align=0, **kwargs
@@ -251,11 +377,17 @@ def _insert_block(
             return False, attempt, f"insert_textbox_failed: {type(exc).__name__}"
         if leftover >= 0:
             return True, attempt, None
-        smaller = round(attempt * 0.85, 2)
-        if smaller >= attempt:
+        if attempt <= lower + 1e-9:
             break
-        attempt = smaller
-    return False, MIN_FONT_SIZE, "insert_textbox_overflow"
+        # 0.85 步长可能直接跨过「下限与上一档之间」的可行字号（如下限 9.0、
+        # 12 → 10.2 → 8.67 就漏掉了 9.5），因此最后一档**必须精确落在下限上**再试一次。
+        nxt = round(attempt * 0.85, 2)
+        if nxt < lower:
+            nxt = lower
+        if nxt >= attempt:
+            break
+        attempt = nxt
+    return False, lower, "insert_textbox_overflow_at_readable_floor"
 
 
 # --------------------------------------------------------------------------- #
@@ -280,7 +412,16 @@ def extract_blocks(document: Any, *, max_pages: int) -> tuple[list[TextBlock], l
             pieces: list[str] = []
             size = 0.0
             color = 0
+            rotated = False
             for line in raw_block.get("lines") or []:
+                direction = line.get("dir") or (1.0, 0.0)
+                try:
+                    dx, dy = float(direction[0]), float(direction[1])
+                except (TypeError, ValueError):
+                    dx, dy = 1.0, 0.0
+                # 非水平行（侧栏水印、竖排表头等）→ 该块标记为旋转块，回写阶段跳过
+                if abs(dx - 1.0) > 0.01 or abs(dy) > 0.01:
+                    rotated = True
                 for span in line.get("spans") or []:
                     chunk = str(span.get("text") or "")
                     if chunk.strip():
@@ -298,6 +439,7 @@ def extract_blocks(document: Any, *, max_pages: int) -> tuple[list[TextBlock], l
                     source_text=text,
                     font_size=size or 10.0,
                     color=_int_to_rgb(color),
+                    rotated=rotated,
                 )
             )
         if len(page_blocks) > MAX_BLOCKS_PER_PAGE:
@@ -459,26 +601,45 @@ def render_mono(
 ) -> tuple[bytes, list[BlockOutcome]]:
     """把译文原位覆盖回写到原文 PDF，返回 ``(mono_bytes, outcomes)``。
 
-    每个块：先判断译文能否放进原 bbox（自动缩小字号），能放才 redact 原文，
-    然后写入译文；放不下或写入失败 → **保留原文**并逐条记录 ``layout_warnings``。
+    每个块按以下顺序处置：
+
+    1. 旋转块（侧栏/水印/竖排）→ **跳过**，保留原文；
+    2. 与同页其他块框重叠的块（公式碎片/上下标）→ **跳过**，保留原文（无"原位"可言）；
+    3. 译文在原 bbox 内、字号不低于可读下限即可放下 → 原位覆盖；
+    4. 放不下 → 沿**同栏纵向空隙**扩容后再试（扩展高度不与他人/图像重叠）；
+    5. 仍放不下或写入失败 → **保留原文**，逐条记录 ``layout_warnings`` 并按原因汇总计数。
+
+    绝不为了"看起来塞进去了"把字号压到不可读（旧版会一路缩到 4pt，
+    把 ``bbox=[10.9,213.9,37.6,555.0]`` 的 arXiv 侧栏压成一列单字）。
     """
     pymupdf = _get_pymupdf()
     document = pymupdf.open(stream=source_bytes, filetype="pdf")
     font_file = _cjk_font_file()
     ascii_ratio = ASCII_WIDTH_REGISTERED if font_file is not None else ASCII_WIDTH_BUILTIN
     outcomes: list[BlockOutcome] = []
+    skipped_rotated = 0
+    skipped_unreadable = 0
+    skipped_overlap = 0
+    expanded_blocks = 0
     try:
         by_page: dict[int, list[int]] = {}
         for index, block in enumerate(blocks):
-            target = targets[index] if index < len(targets) else None
             by_page.setdefault(block.page, []).append(index)
 
         for page_number in sorted(by_page):
             if cancel_check is not None and cancel_check():
                 raise TranslationCancelled("任务已取消")
             page = document.load_page(page_number - 1)
-            pending: list[tuple[int, Any, str, float, tuple[float, float, float]]] = []
-            for index in by_page[page_number]:
+            page_rects = [blocks[item].bbox for item in by_page[page_number]]
+            # 障碍物 = 本页全部文本占位（含页码）+ 全部图像：扩容不得压到任何一方上
+            obstacles = _page_text_rects(page) + _page_image_rects(page)
+            # 可扩容到的下边界 = 页面下边距。**不要再加"最后一个文本块 +6pt"的上限**：
+            # 那会让每页最后一个块几乎无法扩容；页脚/页码由 obstacles 守住。
+            page_bottom = float(page.rect.height) - EXPAND_BOTTOM_MARGIN
+            # (index, redact_rect, write_rect, target, size, color, grew)
+            pending: list[tuple[int, Any, Any, str, float, tuple[float, float, float], bool]] = []
+            colliding = _colliding_block_indexes(page_rects)
+            for position, index in enumerate(by_page[page_number]):
                 block = blocks[index]
                 target = targets[index] if index < len(targets) else None
                 if not target or target == block.source_text:
@@ -493,6 +654,28 @@ def render_mono(
                         )
                     )
                     continue
+                if block.rotated:
+                    reason = "rotated_block_skipped"
+                    skipped_rotated += 1
+                    warnings.append(
+                        f"page={block.page} bbox={_fmt_bbox(block.bbox)} 译文未回写：{reason}"
+                        "（侧栏/水印/竖排文本按原方向保留，不按横排塞入窄框）"
+                    )
+                    outcomes.append(
+                        BlockOutcome(block.page, block.bbox, block.source_text, target, False, reason)
+                    )
+                    continue
+                if position in colliding:
+                    reason = "overlaps_neighbour_block_skipped"
+                    skipped_overlap += 1
+                    warnings.append(
+                        f"page={block.page} bbox={_fmt_bbox(block.bbox)} 译文未回写：{reason}"
+                        "（与同页其他文本块的框重叠，原位回写会与邻块新文本叠印）"
+                    )
+                    outcomes.append(
+                        BlockOutcome(block.page, block.bbox, block.source_text, target, False, reason)
+                    )
+                    continue
                 rect = pymupdf.Rect(block.bbox)
                 if rect.width <= 2 or rect.height <= 2:
                     reason = "block_bbox_too_small"
@@ -503,23 +686,35 @@ def render_mono(
                         BlockOutcome(block.page, block.bbox, block.source_text, target, False, reason)
                     )
                     continue
-                size = _required_font_size(rect, target, block.font_size, ascii_ratio)
+                floor = _readable_floor(block.font_size)
+                write_rect = rect
+                size = _required_font_size(rect, target, block.font_size, ascii_ratio, floor)
+                grew = False
                 if size is None:
-                    reason = "translated_text_does_not_fit_original_block"
+                    grown = _expand_rect(pymupdf, rect, obstacles, page_bottom)
+                    if grown is not None:
+                        grown_size = _required_font_size(
+                            grown, target, block.font_size, ascii_ratio, floor
+                        )
+                        if grown_size is not None:
+                            size, write_rect, grew = grown_size, grown, True
+                if size is None:
+                    reason = "translated_text_does_not_fit_at_readable_size"
+                    skipped_unreadable += 1
                     warnings.append(
-                        f"page={block.page} bbox={_fmt_bbox(block.bbox)} 译文未回写（缩到 "
-                        f"{MIN_FONT_SIZE}pt 仍放不下，已保留原文）：{reason}"
+                        f"page={block.page} bbox={_fmt_bbox(block.bbox)} 译文未回写（在可读下限 "
+                        f"{floor:.1f}pt 与原块/同栏空隙内均放不下，已保留原文）：{reason}"
                     )
                     outcomes.append(
                         BlockOutcome(block.page, block.bbox, block.source_text, target, False, reason)
                     )
                     continue
-                pending.append((index, rect, target, size, block.color))
+                pending.append((index, rect, write_rect, target, size, block.color, grew))
 
             if not pending:
                 continue
             try:
-                for _index, rect, _target, _size, _color in pending:
+                for _index, rect, _write_rect, _target, _size, _color, _grew in pending:
                     page.add_redact_annot(rect)
                 # images=NONE：红色遮盖只删该块文本，绝不删除正文图片（PDF_REDACT_IMAGE_NONE）
                 page.apply_redactions(
@@ -529,20 +724,28 @@ def render_mono(
             except Exception as exc:  # noqa: BLE001 - 整页 redact 失败则整页保留原文
                 reason = f"redaction_failed: {type(exc).__name__}"
                 warnings.append(f"page={page_number} 原文本清除失败（{reason}），该页保留原文")
-                for index, _rect, target, _size, _color in pending:
+                for index, _rect, _write_rect, target, _size, _color, _grew in pending:
                     block = blocks[index]
                     outcomes.append(
                         BlockOutcome(block.page, block.bbox, block.source_text, target, False, reason)
                     )
                 continue
 
-            for index, rect, target, size, color in pending:
+            for index, rect, write_rect, target, size, color, grew in pending:
                 block = blocks[index]
-                written, used_size, failure = _insert_block(page, rect, target, size, color, font_file)
+                written, used_size, failure = _insert_block(
+                    page, write_rect, target, size, color, font_file, floor=_readable_floor(block.font_size)
+                )
                 if not written:
                     # 回写失败 → 立即把**原文**写回该块，避免「清了原文什么都没写」的内容丢失
                     restored, _restore_size, restore_failure = _insert_block(
-                        page, rect, block.source_text, block.font_size, color, font_file
+                        page,
+                        rect,
+                        block.source_text,
+                        block.font_size,
+                        color,
+                        font_file,
+                        floor=_readable_floor(block.font_size),
                     )
                     reason = failure or "insert_failed"
                     warnings.append(
@@ -553,14 +756,35 @@ def render_mono(
                         BlockOutcome(block.page, block.bbox, block.source_text, target, False, reason)
                     )
                     continue
+                if grew:
+                    expanded_blocks += 1
                 if used_size < block.font_size * SHRINK_WARN_RATIO:
                     warnings.append(
                         f"page={block.page} bbox={_fmt_bbox(block.bbox)} 译文回写字号由 "
-                        f"{block.font_size:.1f}pt 缩到 {used_size:.1f}pt（原块放不下，可读性下降）"
+                        f"{block.font_size:.1f}pt 缩到 {used_size:.1f}pt（受原块限制，仍在可读下限内）"
                     )
                 outcomes.append(
                     BlockOutcome(block.page, block.bbox, block.source_text, target, True, None)
                 )
+
+        if skipped_rotated:
+            warnings.append(
+                f"共 {skipped_rotated} 块旋转文本（侧栏/水印/竖排）未回写，PDF 中按原方向保留"
+            )
+        if skipped_unreadable:
+            warnings.append(
+                f"共 {skipped_unreadable} 块因可读下限（{MIN_READABLE_FONT_SIZE:g}pt 且不低于原字号 "
+                f"{READABILITY_FLOOR_RATIO:.0%}）内放不下而未回写，PDF 中保留原文"
+            )
+        if skipped_overlap:
+            warnings.append(
+                f"共 {skipped_overlap} 块与同页其他文本块框重叠（公式碎片/上下标），"
+                "未回写以避免叠印，PDF 中保留原文"
+            )
+        if expanded_blocks:
+            warnings.append(
+                f"共 {expanded_blocks} 块通过同栏纵向扩容回写（译文占用了原块下方空白，未与他人重叠）"
+            )
 
         document.set_metadata(
             {
@@ -698,9 +922,13 @@ def build_preview(
 
 
 __all__ = [
+    "EXPAND_BOTTOM_MARGIN",
+    "EXPAND_GAP",
     "MAX_BLOCKS_PER_PAGE",
     "MAX_BLOCKS_TOTAL",
     "MIN_FONT_SIZE",
+    "MIN_READABLE_FONT_SIZE",
+    "READABILITY_FLOOR_RATIO",
     "SHRINK_WARN_RATIO",
     "STUB_MARK",
     "STUB_MODEL_ID",

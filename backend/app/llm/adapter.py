@@ -37,7 +37,7 @@ from app.llm.errors import (
     ReplayMissError,
 )
 from app.llm.http_client import OpenAICompatibleClient
-from app.llm.pricing import PRICE_MISSING_WARNING, compute_cost_usd
+from app.llm.pricing import PRICE_MISSING_WARNING, compute_cost_usd, is_non_usd_reason
 from app.llm.providers import (
     detect_capability,
     json_strategy,
@@ -323,9 +323,9 @@ async def _live_call(
             cost, cost_reason = compute_cost_usd(
                 prompt_tokens=outcome.usage.prompt_tokens,
                 completion_tokens=outcome.usage.completion_tokens,
-                input_price=model.input_price,
-                output_price=model.output_price,
-                price_unit=model.price_unit,
+                input_price_per_million=model.input_price_per_million,
+                output_price_per_million=model.output_price_per_million,
+                currency=model.price_currency,
             )
             if cost_reason:
                 logger.warning(
@@ -408,9 +408,9 @@ async def _replay_call(
     cost, cost_reason = compute_cost_usd(
         prompt_tokens=hit.usage.prompt_tokens,
         completion_tokens=hit.usage.completion_tokens,
-        input_price=model.input_price,
-        output_price=model.output_price,
-        price_unit=model.price_unit,
+        input_price_per_million=model.input_price_per_million,
+        output_price_per_million=model.output_price_per_million,
+        currency=model.price_currency,
     )
     if cost_reason:
         cost_reason = f"replay_counterfactual:{cost_reason}"
@@ -599,9 +599,9 @@ async def _log_attempts(
             cost, reason = compute_cost_usd(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
-                input_price=model.input_price,
-                output_price=model.output_price,
-                price_unit=model.price_unit,
+                input_price_per_million=model.input_price_per_million,
+                output_price_per_million=model.output_price_per_million,
+                currency=model.price_currency,
             )
             if reason and cost_unknown_reason is None:
                 cost_unknown_reason = reason
@@ -615,9 +615,16 @@ async def _log_attempts(
         if extra_note:
             error_parts.append(extra_note.strip("; "))
         if cost_unknown_reason:
-            error_parts.append(PRICE_MISSING_WARNING if not cost_unknown_reason.startswith("replay") else cost_unknown_reason)
+            # 非 USD 定价的原因串必须**原样**落库：/costs/summary 据此分桶，
+            # 让前端能显示「非 USD，未计入护栏」；其余缺价原因沿用既有告警文案。
+            if is_non_usd_reason(cost_unknown_reason) or cost_unknown_reason.startswith("replay"):
+                error_parts.append(cost_unknown_reason)
+            else:
+                error_parts.append(PRICE_MISSING_WARNING)
             logger.warning(
-                "单价缺失，cost_usd=null（禁止估算）model=%s reason=%s", model.model_ref, cost_unknown_reason
+                "本次调用 cost_usd=null（禁止估算）model=%s reason=%s",
+                model.model_ref,
+                cost_unknown_reason,
             )
         if not success and not error_parts:
             error_parts.append("call_failed")

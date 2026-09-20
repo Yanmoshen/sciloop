@@ -167,7 +167,16 @@ class ReaderVersion(Base):
 
     __table_args__ = (
         UniqueConstraint("document_id", "version_no", name="uq_reader_versions_document_id_version_no"),
-        UniqueConstraint("document_id", "kind", name="uq_reader_versions_document_id_kind"),
+        # 同一 kind 允许保留历史（迁移 0004）：唯一性下沉到 (document_id, kind, task_id)。
+        # 用 coalesce 把 original 版本的 NULL task_id 归一成 ''，否则 PostgreSQL 不约束 NULL，
+        # original 的「每文档唯一」就只剩代码在守。
+        Index(
+            "uq_reader_versions_document_kind_task",
+            "document_id",
+            "kind",
+            text("coalesce(task_id, '')"),
+            unique=True,
+        ),
         _kinds_check("kind", "kind", VERSION_KINDS),
         Index("idx_reader_versions_document", "document_id"),
     )

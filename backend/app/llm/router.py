@@ -309,9 +309,9 @@ class ModelRouter:
             source=source,
             model_config_id=config.id,
             provider_name=config.name,
-            input_price=price.input_price,
-            output_price=price.output_price,
-            price_unit=price.unit,
+            input_price_per_million=price.input_per_million,
+            output_price_per_million=price.output_per_million,
+            price_currency=price.normalized_currency,
             provider_capability=capability.key,
             extra={"models": config.models},
         )

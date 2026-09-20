@@ -26,9 +26,18 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.llm import adapter
 from app.llm.errors import IsolationViolation, LLMError, SecretBackendUnavailable
+from app.llm.pricing import parse_price_info
+from app.llm.providers import models_url
 from app.llm.registry import STAGES, get_registry
 from app.llm.router import get_router
-from app.llm.secret import encrypt_api_key, is_env_ref, key_fingerprint, mask_api_key
+from app.llm.secret import (
+    decrypt_api_key,
+    encrypt_api_key,
+    is_env_ref,
+    key_fingerprint,
+    mask_api_key,
+)
+from app.services.paper_source.cache import get_source_http
 
 logger = logging.getLogger(__name__)
 
@@ -36,26 +45,44 @@ router = APIRouter(prefix="/models", tags=["models"])
 
 CONNECTIVITY_TEST_PURPOSE = "connectivity_test"
 
+#: 「获取模型列表」所用的受限出网客户端来源名（进程内共享限流/缓存）
+SYNC_MODELS_SOURCE = "model_registry"
+
 
 # --------------------------------------------------------------------------- #
 # 模型定义
 # --------------------------------------------------------------------------- #
+class PricingSide(BaseModel):
+    """定价的一端（输入或输出）。Cherry Studio 口径：每百万 token + 币种。"""
+
+    currency: str = "USD"
+    perMillionTokens: float | None = Field(default=None, ge=0)
+
+
+class Pricing(BaseModel):
+    """模型定价（Cherry Studio 口径）。留空表示未知 -> cost_usd 记 null。"""
+
+    input: PricingSide | None = None
+    output: PricingSide | None = None
+
+
 class ModelEntry(BaseModel):
     """供应商下的一个可路由模型（对应 ``model_configs.models[]`` 的一项）。"""
 
     model_id: str = Field(min_length=1, max_length=96)
     label: str | None = None
     context_window: int | None = Field(default=None, ge=0)
-    #: 单价（每 ``price_unit`` 个 token）。留空表示未知 -> cost_usd 记 null
-    input_price: float | None = Field(default=None, ge=0)
-    output_price: float | None = Field(default=None, ge=0)
-    price_unit: int | None = Field(default=1000, gt=0)
+    #: 定价。缺任一端表示未知 -> cost_usd 记 null（禁止估算）
+    pricing: Pricing | None = None
     temperature: float | None = Field(default=None, ge=0, le=2)
     max_tokens: int | None = Field(default=None, gt=0)
 
     @property
     def pricing_complete(self) -> bool:
-        return self.input_price is not None and self.output_price is not None
+        pricing = self.pricing
+        if pricing is None or pricing.input is None or pricing.output is None:
+            return False
+        return pricing.input.perMillionTokens is not None and pricing.output.perMillionTokens is not None
 
 
 class ModelConfigCreate(BaseModel):
@@ -65,6 +92,8 @@ class ModelConfigCreate(BaseModel):
     api_key: str = Field(min_length=1)
     models: list[ModelEntry] = Field(default_factory=list)
     is_default: bool = False
+    #: 端点类型（``openai`` / ``anthropic`` / …）。不做枚举校验，未知值原样接受
+    type: str | None = Field(default=None, max_length=32)
 
     @field_validator("base_url")
     @classmethod
@@ -81,6 +110,7 @@ class ModelConfigUpdate(BaseModel):
     api_key: str | None = None
     models: list[ModelEntry] | None = None
     is_default: bool | None = None
+    type: str | None = Field(default=None, max_length=32)
 
 
 class ModelConfigOut(BaseModel):
@@ -97,6 +127,8 @@ class ModelConfigOut(BaseModel):
     last_tested_at: datetime | None = None
     test_ok: bool | None = None
     created_at: datetime | None = None
+    #: 端点类型（``openai`` / ``anthropic`` / …）；None = 按 OpenAI 兼容处理
+    type: str | None = None
 
 
 class ModelConfigList(BaseModel):
@@ -120,6 +152,17 @@ class ConnectivityTestResult(BaseModel):
     message: str | None = None
     #: 本次测试同样写入 llm_call_logs 的说明
     logged_to: str = "llm_call_logs"
+
+
+class SyncModelsResult(BaseModel):
+    """``POST /models/configs/{id}/sync-models`` 的结果（如实回传上游计数）。"""
+
+    fetched: int
+    added: list[str] = Field(default_factory=list)
+    existing: list[str] = Field(default_factory=list)
+    #: 实际请求的 URL（便于排障；不含任何凭据）
+    endpoint: str
+    test_ok: bool = True
 
 
 class RoutingEntryIn(BaseModel):
@@ -214,11 +257,45 @@ def _api_key_source(stored: str) -> str:
     return "encrypted"
 
 
+def _normalize_type(value: str | None) -> str | None:
+    """归一 ``type``：去空白；空串视为未设置（None）。未知取值原样保留，不做枚举校验。"""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _extract_model_ids(rows: list[Any]) -> list[str]:
+    """从上游 ``data`` 数组提取模型 id（保序去重）。
+
+    上游条目不是 ``{"id": ...}`` 形状时抛 :class:`ValueError`，由调用方转
+    ``invalid_response``——**不猜测**、不伪造列表。
+    """
+    ids: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError(f"data[] 元素不是对象：{type(row).__name__}")
+        raw = row.get("id")
+        model_id = str(raw).strip() if raw is not None else ""
+        if not model_id:
+            raise ValueError("data[] 元素缺少非空 id")
+        if model_id in seen:
+            continue
+        seen.add(model_id)
+        ids.append(model_id)
+    return ids
+
+
+def _entry_pricing_complete(entry: dict[str, Any]) -> bool:
+    """按 Cherry 口径判定一个 ``models[]`` 项的定价是否完整（兼容旧键）。"""
+    price = parse_price_info(entry)
+    return price.input_per_million is not None and price.output_per_million is not None
+
+
 def _to_out(record: Any) -> ModelConfigOut:
     models = [dict(entry) for entry in (record.models or [])]
-    pricing_complete = all(
-        entry.get("input_price") is not None and entry.get("output_price") is not None for entry in models
-    )
+    pricing_complete = all(_entry_pricing_complete(entry) for entry in models)
     warning = None
     if not models:
         warning = "尚未登记任何模型，无法用于路由"
@@ -242,6 +319,7 @@ def _to_out(record: Any) -> ModelConfigOut:
         last_tested_at=record.last_tested_at,
         test_ok=record.test_ok,
         created_at=record.created_at,
+        type=getattr(record, "type", None),
     )
 
 
@@ -291,6 +369,7 @@ async def create_model_config(payload: ModelConfigCreate) -> Any:
         api_key_enc=api_key_enc,
         models=[entry.model_dump() for entry in payload.models],
         is_default=payload.is_default,
+        type=_normalize_type(payload.type),
     )
     record = await registry.get_config(config_id)
     if record is None:  # pragma: no cover - 刚写入不可能查不到
@@ -322,6 +401,8 @@ async def update_model_config(config_id: int, payload: ModelConfigUpdate) -> Any
         fields["models"] = [entry.model_dump() for entry in payload.models]
     if payload.is_default is not None:
         fields["is_default"] = payload.is_default
+    if payload.type is not None:
+        fields["type"] = _normalize_type(payload.type)
     if payload.api_key is not None:
         try:
             fields["api_key_enc"] = encrypt_api_key(payload.api_key)
@@ -422,6 +503,117 @@ async def test_model_config(
         model_id=result.model_id,
         latency_ms=result.duration_ms,
         reply_preview=(result.content or "")[:60],
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 获取模型列表（后端出网，Owner 专属）
+# --------------------------------------------------------------------------- #
+@router.post(
+    "/configs/{config_id}/sync-models",
+    response_model=SyncModelsResult,
+    summary="从供应商拉取模型列表并合并（Owner 专属；新增项 pricing 留空，不猜价格）",
+    dependencies=[Depends(require_owner)],
+)
+async def sync_models(config_id: int) -> Any:
+    """后端出网调该供应商的 OpenAI 兼容 ``/v1/models``，把 ``data[].id`` 并入本地 ``models``。
+
+    失败一律如实回传，**不伪造列表**：
+
+    - 未配置 Key → ``409 api_key_missing``
+    - 连不上/超时 → ``502 upstream_unreachable``
+    - 上游非 2xx → ``502 upstream_http_error``
+    - 响应不是 ``{"data": [...]}`` → ``502 invalid_response``
+
+    新增模型的 ``pricing`` 留空（前端需引导用户补齐）；Key 只用于 ``Authorization`` 头，
+    任何响应都不回显。
+    """
+    registry = get_registry()
+    record = await registry.get_config(config_id)
+    if record is None:
+        return _fail(404, "not_found", f"供应商 {config_id} 不存在")
+
+    api_key = decrypt_api_key(record.api_key_enc)
+    if not api_key:
+        return _fail(
+            409,
+            "api_key_missing",
+            "该供应商尚未配置可用的 API Key（请在设置页填写，或改用 env:变量名 引用）",
+            {"config_id": config_id, "api_key_source": _api_key_source(record.api_key_enc)},
+        )
+
+    try:
+        endpoint = models_url(record.base_url)
+    except ValueError as exc:
+        return _fail(400, "invalid_base_url", str(exc), {"base_url": record.base_url})
+
+    client = get_source_http(SYNC_MODELS_SOURCE, qps=0, max_retries=0, use_cache=False)
+    result = await client.get_json(
+        endpoint,
+        headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+        use_cache=False,
+        max_retries=0,
+        expect_json=True,
+    )
+    if not result.ok:
+        if result.status_code is None:
+            return _fail(
+                502,
+                "upstream_unreachable",
+                "无法连接供应商模型列表端点（网络不可达或超时）",
+                {"endpoint": endpoint, "error": result.error or result.error_kind or "unknown"},
+            )
+        return _fail(
+            502,
+            "upstream_http_error",
+            f"供应商模型列表端点返回 HTTP {result.status_code}",
+            {"status": result.status_code, "endpoint": endpoint},
+        )
+
+    payload = result.payload
+    rows = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return _fail(
+            502,
+            "invalid_response",
+            '供应商响应不是预期的 {"data": [...]} 形态',
+            {"endpoint": endpoint},
+        )
+    try:
+        fetched_ids = _extract_model_ids(rows)
+    except ValueError as exc:
+        return _fail(
+            502,
+            "invalid_response",
+            f"供应商响应中的 data[] 不符合预期：{exc}",
+            {"endpoint": endpoint},
+        )
+
+    local_models = [dict(entry) for entry in (record.models or [])]
+    known = {str(entry.get("model_id")) for entry in local_models if entry.get("model_id")}
+    added = [model_id for model_id in fetched_ids if model_id not in known]
+    existing = [model_id for model_id in fetched_ids if model_id in known]
+
+    if added:
+        # pricing 留空（禁止猜价）；label 用模型 id，用户可在设置页补齐
+        merged = local_models + [{"model_id": model_id, "label": model_id, "pricing": {}} for model_id in added]
+        await registry.update_config(config_id, {"models": merged})
+        get_router().invalidate()
+
+    await registry.mark_tested(config_id, True)
+    logger.info(
+        "sync-models config=%s endpoint=%s fetched=%d added=%d",
+        config_id,
+        endpoint,
+        len(fetched_ids),
+        len(added),
+    )
+    return SyncModelsResult(
+        fetched=len(fetched_ids),
+        added=added,
+        existing=existing,
+        endpoint=endpoint,
+        test_ok=True,
     )
 
 

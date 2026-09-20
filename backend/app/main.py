@@ -100,6 +100,10 @@ ROUTER_REGISTRY: tuple[tuple[str, str, bool], ...] = (
     # 11) 演示与访问面（WP16）
     ("app.api.v1.demo", "/api/v1", False),
     ("app.api.v1.owner", "/api/v1", False),
+    # 11.1) 全局设置（本轮新增，可选）：/settings/{scope}
+    #       顶层字面前缀，与四核心模块同样规避「静态段被参数路由抢占 → 422」这一类缺陷。
+    #       读公开（返回默认值合并后的结果），写要求 Owner（匿名 403 owner_token_required）。
+    ("app.api.v1.settings", "/api/v1", False),
     # 12) 模型配置与成本（WP02，自带 /models 与 /costs 前缀）
     ("app.api.v1.models_config", "/api/v1", True),
     ("app.api.v1.costs", "/api/v1", True),

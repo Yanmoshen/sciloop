@@ -20,10 +20,14 @@
 - **ORM 层**：本模块注册 ``before_update`` 事件，任何 UPDATE 抛
   :class:`ReaderVersionImmutableError`（``code=reader_version_immutable``）；
 - **数据库层**：迁移 ``0003_reader_library`` 的 ``BEFORE UPDATE`` 触发器同码拒绝；
-- **重复登记**：``UNIQUE (document_id, kind)`` + 显式 409 ``version_already_registered``
+- **重复登记**：同一 ``(document_id, kind, task_id)`` → 显式 409 ``version_already_registered``
   ——**选择 409 而不是「静默返回旧版本」**：用户登记的是另一个 ``task_id`` 的产物，
   返回旧记录会让「我登记成功了」变成假象，属于取证上的撒谎。既有版本 id 放在
-  ``detail.existing_version_id``，前端可据此提示「该 kind 已登记，如需换译文请先删除文档」。
+  ``detail.existing_version_id``。
+- **同 kind 可追加**（迁移 ``0004_reader_version_kind_history``）：同一 ``kind`` 的**不同**
+  ``task_id`` 会追加为更高 ``version_no`` 的新版本，旧版本一行不动。"当前版本" = 同 kind 的
+  最大 ``version_no``（阅读器按倒序展示）。这条是「引擎修好后新译文登记不进来」的解药：
+  旧口径下 ``chinese`` 被早期产物占用后，修正后的译文永远进不了阅读器。
 
 翻译 manifest（与并行 agent 的冻结接口）
 ----------------------------------------
@@ -339,6 +343,10 @@ async def get_version(
 async def _assert_kind_free(
     session: AsyncSession, document: ReaderDocument, kind: str
 ) -> None:
+    """``kind`` 在该文档下**完全没有**版本时才通过（仅用于 ``original``）。
+
+    ``original`` 每文档有且仅有一个，且由创建文档时自动登记。
+    """
     existing = (
         await session.execute(
             select(ReaderVersion).where(
@@ -354,6 +362,38 @@ async def _assert_kind_free(
             detail={
                 "document_id": int(document.id),
                 "kind": kind,
+                "existing_version_id": existing.id,
+                "existing_task_id": existing.task_id,
+            },
+        )
+
+
+async def _assert_source_not_registered(
+    session: AsyncSession, document: ReaderDocument, *, kind: str, task_id: str
+) -> None:
+    """同一 ``(kind, task_id)`` 已登记 → 409（幂等重入防护）。
+
+    与 :func:`_assert_kind_free` 的区别：同 ``kind`` 的**不同**产物允许追加为更高
+    ``version_no`` 的新版本（迁移 0004），只有「同一份产物重复登记」才是错误。
+    """
+    normalized = str(task_id).strip()
+    existing = (
+        await session.execute(
+            select(ReaderVersion).where(
+                ReaderVersion.document_id == int(document.id),
+                ReaderVersion.kind == kind,
+                ReaderVersion.task_id == normalized,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise VersionAlreadyRegisteredError(
+            f"阅读文档 {document.id} 已登记 kind='{kind}' 的 task_id='{normalized}' 版本 "
+            f"{existing.id}（同一份产物重复登记，不覆盖既有记录）",
+            detail={
+                "document_id": int(document.id),
+                "kind": kind,
+                "task_id": normalized,
                 "existing_version_id": existing.id,
                 "existing_task_id": existing.task_id,
             },
@@ -459,13 +499,17 @@ async def register_from_manifest(
     kind: str,
     task_id: str,
 ) -> ReaderVersion:
-    """从翻译 manifest 登记不可变版本（``chinese`` / ``simple`` / ``bilingual``）。"""
+    """从翻译 manifest 登记不可变版本（``chinese`` / ``simple`` / ``bilingual``）。
+
+    同一 ``kind`` 可以登记**多份不同** ``task_id`` 的产物（追加为更高 ``version_no``）；
+    同一 ``(kind, task_id)`` 重复登记 → 409。
+    """
     if kind not in REGISTRABLE_KINDS:
         raise ManifestInvalidError(
             f"kind='{kind}' 不允许通过该接口登记（original 由创建文档时自动生成）",
             detail={"allowed": list(REGISTRABLE_KINDS), "all": list(VERSION_KINDS)},
         )
-    await _assert_kind_free(session, document, kind)
+    await _assert_source_not_registered(session, document, kind=kind, task_id=task_id)
     manifest = load_manifest(task_id)
 
     manifest_paper = manifest.get("paper_id")

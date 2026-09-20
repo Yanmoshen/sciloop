@@ -70,13 +70,16 @@ const documentId = computed(() => {
 })
 const inReading = computed(() => documentId.value !== null)
 
-const sourceVersion = computed(
-  () => versions.value.find((item) => item.id === sourceVersionId.value) ?? null,
+/**
+ * 译文版本：同一 kind 可以登记多份（历史追加，见迁移 0004），
+ * 因此按 version_no **倒序**排 —— 最新版在最前，也就是默认阅读的那一份。
+ */
+const translationVersions = computed(() =>
+  versions.value
+    .filter((item) => item.kind !== 'original')
+    .slice()
+    .sort((left, right) => right.version_no - left.version_no),
 )
-const targetVersion = computed(
-  () => versions.value.find((item) => item.id === targetVersionId.value) ?? null,
-)
-const translationVersions = computed(() => versions.value.filter((item) => item.kind !== 'original'))
 
 const sourcePdfUrl = computed(() =>
   documentId.value && sourceVersionId.value
@@ -162,7 +165,7 @@ async function loadReading(id: number): Promise<void> {
 
     const original = versions.value.find((item) => item.kind === 'original')
     sourceVersionId.value = original?.id ?? null
-    // 默认右栏放「已登记的第一个译文版本」（没有就留空，由用户点登记）
+    // 默认右栏放「最新的译文版本」（translationVersions 已按 version_no 倒序；没有就留空，由用户点登记）
     targetVersionId.value = translationVersions.value[0]?.id ?? null
   } catch (error) {
     notice.value = error instanceof Error ? error.message : String(error)
@@ -399,7 +402,6 @@ onUnmounted(() => {
         <section class="pane">
           <header class="pane__head">
             <span class="pane__title">原文</span>
-            <span class="chip">{{ versionLabel(sourceVersion?.kind) }}</span>
             <span class="spacer" />
             <a v-if="sourcePdfUrl" class="link-btn" :href="sourcePdfUrl" target="_blank" rel="noopener">打开原始 PDF</a>
           </header>
@@ -415,7 +417,6 @@ onUnmounted(() => {
         <section class="pane">
           <header class="pane__head">
             <span class="pane__title">译文</span>
-            <span v-if="targetVersion" class="chip">{{ versionLabel(targetVersion.kind) }}</span>
             <span class="spacer" />
             <a v-if="targetPdfUrl" class="link-btn" :href="targetPdfUrl" target="_blank" rel="noopener">
               打开原始 PDF

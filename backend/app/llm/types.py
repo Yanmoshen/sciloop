@@ -79,10 +79,11 @@ class ResolvedModel:
     model_config_id: int | None = None
     #: 供应商配置名（用于展示；与 model_ref 的 provider 段一致）
     provider_name: str | None = None
-    #: 单价（每 ``price_unit`` 个 token，默认 1K）；缺失为 None -> cost_usd 记 null
-    input_price: float | None = None
-    output_price: float | None = None
-    price_unit: int = 1000
+    #: 单价（**每百万 token**，Cherry Studio 口径）；缺失为 None -> cost_usd 记 null
+    input_price_per_million: float | None = None
+    output_price_per_million: float | None = None
+    #: 定价币种。护栏基准是 USD；非 USD 时不做汇率换算，cost_usd 记 null
+    price_currency: str = "USD"
     #: 供应商能力画像（见 providers.py）
     provider_capability: str = "unknown"
     extra: dict[str, Any] = field(default_factory=dict)
@@ -93,7 +94,7 @@ class ResolvedModel:
 
     @property
     def has_price(self) -> bool:
-        return self.input_price is not None or self.output_price is not None
+        return self.input_price_per_million is not None or self.output_price_per_million is not None
 
     @property
     def api_key_configured(self) -> bool:
@@ -110,9 +111,9 @@ class ResolvedModel:
             "model_config_id": self.model_config_id,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
-            "input_price": self.input_price,
-            "output_price": self.output_price,
-            "price_unit": self.price_unit,
+            "input_price_per_million": self.input_price_per_million,
+            "output_price_per_million": self.output_price_per_million,
+            "price_currency": self.price_currency,
             "api_key_configured": self.api_key_configured,
         }
 

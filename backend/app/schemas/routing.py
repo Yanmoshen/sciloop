@@ -30,12 +30,13 @@ class ModelConfigBrief(SciLoopModel):
     base_url: str
     models: list[dict[str, object]] = Field(
         default_factory=list,
-        description="[{model_id, label, context_window, input_price, output_price}]",
+        description="[{model_id, label, context_window, pricing.input/output.{currency, perMillionTokens}}]",
     )
     is_default: bool = False
     last_tested_at: datetime | None = None
     test_ok: bool | None = None
     created_at: datetime | None = None
+    type: str | None = None
 
 
 class Routing(SciLoopModel):

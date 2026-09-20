@@ -20,19 +20,15 @@
  * 15 页文档不再卡在「正在渲染」。
  */
 import * as pdfjs from 'pdfjs-dist'
-import PdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?worker'
+import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
 import { onBeforeUnmount, ref, watch } from 'vue'
 
 import type { ReaderAnnotation } from '@/api/reader'
 
-// Worker 用 Vite 的 `?worker` 打包（产物是 .js，nginx 的 MIME 映射正确）。
-// 踩过两个坑：
-// ① `?url` 引入 .mjs 时 nginx 以 application/octet-stream 返回，浏览器按模块 MIME 校验拒绝加载；
-// ② `GlobalWorkerOptions.workerPort` 是**全局单例**：左右两个阅读面并排会共享同一个 worker，
-//    第二个文档会一直卡在解析阶段。所以这里**每个阅读面各建一个 PDFWorker**。
-function createWorker(): pdfjs.PDFWorker {
-  return new pdfjs.PDFWorker({ port: new PdfWorker() as unknown as Worker })
-}
+// 用 `?url` 指向打包后的 worker 文件：pdf.js 会**为每个文档各起一个 worker**，
+// 左右两个阅读面因此互不干扰（用全局 workerPort 会共享同一个 worker，第二个文档会卡住）。
+// 依赖 frontend/nginx.conf 给 `.mjs` 补的 text/javascript 映射，否则浏览器按 MIME 校验拒载。
+pdfjs.GlobalWorkerOptions.workerSrc = workerUrl
 
 const props = defineProps<{
   src: string
@@ -51,7 +47,6 @@ const loading = ref(false)
 const error = ref('')
 
 let doc: pdfjs.PDFDocumentProxy | null = null
-let worker: pdfjs.PDFWorker | null = null
 let observer: IntersectionObserver | null = null
 let token = 0
 let building = false
@@ -69,10 +64,6 @@ function cleanup(): void {
   if (doc) {
     void doc.destroy()
     doc = null
-  }
-  if (worker) {
-    worker.destroy()
-    worker = null
   }
 }
 
@@ -171,8 +162,7 @@ async function build(): Promise<void> {
   error.value = ''
   const run = token
   try {
-    worker = createWorker()
-    doc = await pdfjs.getDocument({ url: props.src, worker }).promise
+    doc = await pdfjs.getDocument({ url: props.src }).promise
     if (run !== token || !doc) return
     pageCount.value = doc.numPages
     const containerWidth = host.value.clientWidth || 640

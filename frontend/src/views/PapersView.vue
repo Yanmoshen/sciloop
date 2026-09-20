@@ -19,7 +19,6 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
-import { get } from '@/api/client'
 import { createAggregation } from '@/api/idea'
 import {
   fetchPapersOverview,
@@ -28,6 +27,7 @@ import {
   type PaperSearchItem,
 } from '@/api/papers'
 import { rebuildCard } from '@/api/parse'
+import SmoothSelect from '@/components/SmoothSelect.vue'
 import TaskMonitorDialog from '@/components/TaskMonitorDialog.vue'
 import { useSessionStore } from '@/stores/session'
 import { useTaskStore } from '@/stores/tasks'
@@ -38,20 +38,29 @@ const session = useSessionStore()
 const PAGE_SIZE = 20
 const FIELD_OPTIONS = ['cs.AI', 'cs.CL', 'cs.CV', 'cs.LG']
 
-interface SourceHealthItem {
-  source: string
-  label?: string
-  ok?: boolean
-  status?: string
-  degraded_reason?: string | null
-  last_http_status?: number | null
-  last_fetched_at?: string | null
-}
+/** 筛选区下拉项（平滑下拉需要 {value,label} 结构，原生 option 的文案原样搬过来） */
+const FIELD_SELECT_OPTIONS = [
+  { value: '', label: '全部领域' },
+  ...FIELD_OPTIONS.map((item) => ({ value: item, label: item })),
+]
+const SOURCE_SELECT_OPTIONS = [
+  { value: '', label: '全部来源（本页）' },
+  { value: 'arxiv', label: 'arXiv' },
+  { value: 'semantic_scholar', label: 'Semantic Scholar' },
+  { value: 'openalex', label: 'OpenAlex' },
+]
+const PARSE_SELECT_OPTIONS = [
+  { value: '', label: '全部解析状态（本页）' },
+  { value: 'parsed', label: '已解析' },
+  { value: 'unparsed', label: '未解析' },
+]
+const SORT_SELECT_OPTIONS = [
+  { value: 'published', label: '按发表时间（本页）' },
+  { value: 'citation', label: '按引用数（本页）' },
+]
 
 const overview = ref<PapersOverview | null>(null)
 const overviewError = ref('')
-const sources = ref<SourceHealthItem[]>([])
-const sourcesDegraded = ref<string[]>([])
 
 const items = ref<PaperSearchItem[]>([])
 const total = ref(0)
@@ -93,12 +102,6 @@ function num(value: number | null | undefined): string {
   return value === null || value === undefined ? '未获取' : String(value)
 }
 
-function fmtTime(value: string | null | undefined): string {
-  if (!value) return '未记录'
-  const parsed = new Date(value)
-  return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString('zh-CN')
-}
-
 function sourceLabel(source: string | null | undefined): string {
   const map: Record<string, string> = {
     arxiv: 'arXiv',
@@ -107,6 +110,20 @@ function sourceLabel(source: string | null | undefined): string {
     github: 'GitHub',
   }
   return map[source ?? ''] ?? (source || '未记录')
+}
+
+/**
+ * 论文链接：标题下面**只给一个真实可点的链接**；接口没给链接就整行不渲染
+ * （不再打印「venue 未获取 / 引用 未获取」这类占位字）。
+ * 优先 arXiv 摘要页（比裸 PDF 更适合阅读）→ DOI 解析 → 接口给的 pdf_url。
+ */
+function paperLink(row: PaperSearchItem): string | null {
+  if (row.source === 'arxiv' && row.external_id) {
+    return `https://arxiv.org/abs/${row.external_id}`
+  }
+  if (row.doi) return `https://doi.org/${row.doi}`
+  if (row.pdf_url) return row.pdf_url
+  return null
 }
 
 function parseBadge(row: PaperSearchItem): { text: string; cls: string } {
@@ -122,18 +139,6 @@ async function loadOverview(): Promise<void> {
   } catch (error) {
     overview.value = null
     overviewError.value = error instanceof Error ? error.message : String(error)
-  }
-}
-
-async function loadSources(): Promise<void> {
-  try {
-    const data = await get<{ sources?: Record<string, SourceHealthItem>; degraded_sources?: string[] }>(
-      '/sources/health',
-    )
-    sources.value = Object.values(data.sources ?? {})
-    sourcesDegraded.value = data.degraded_sources ?? []
-  } catch {
-    sources.value = []
   }
 }
 
@@ -276,7 +281,6 @@ async function buildCardsForSelected(): Promise<void> {
 
 onMounted(() => {
   void loadOverview()
-  void loadSources()
   void loadList()
 })
 </script>
@@ -310,26 +314,6 @@ onMounted(() => {
     </div>
     <p v-if="overviewError" class="hint hint--err">统计获取失败：{{ overviewError }}</p>
 
-    <!-- 定时拉取系统状态 -->
-    <div class="card">
-      <div class="card__head">
-        <h2 class="card__title">定时拉取系统状态</h2>
-        <button class="btn" type="button" :disabled="busy === 'sync'" @click="sync">立即同步</button>
-      </div>
-      <div class="pills">
-        <span v-for="item in sources" :key="item.source" class="pill">
-          <span class="dot" :class="{ 'dot--warn': sourcesDegraded.includes(item.source) }" />
-          {{ item.label ?? item.source }}
-          <b>{{ sourcesDegraded.includes(item.source) ? '降级' : '可用' }}</b>
-        </span>
-        <span v-if="sources.length === 0" class="pill">来源状态未获取</span>
-      </div>
-      <div class="pills">
-        <span class="pill">最近同步 <b>{{ overview ? fmtTime(overview.last_sync_at) : '未获取' }}</b></span>
-        <span class="pill">近 24 小时新增 <b>{{ overview ? num(overview.papers_new_24h) : '未获取' }}</b></span>
-      </div>
-    </div>
-
     <!-- 检索与筛选 -->
     <div class="filters">
       <input
@@ -338,25 +322,10 @@ onMounted(() => {
         placeholder="搜索标题 / 摘要"
         @keyup.enter="applyFilters"
       />
-      <select v-model="field" class="select" @change="applyFilters">
-        <option value="">全部领域</option>
-        <option v-for="option in FIELD_OPTIONS" :key="option" :value="option">{{ option }}</option>
-      </select>
-      <select v-model="sourceFilter" class="select">
-        <option value="">全部来源（本页）</option>
-        <option value="arxiv">arXiv</option>
-        <option value="semantic_scholar">Semantic Scholar</option>
-        <option value="openalex">OpenAlex</option>
-      </select>
-      <select v-model="parseFilter" class="select">
-        <option value="">全部解析状态（本页）</option>
-        <option value="parsed">已解析</option>
-        <option value="unparsed">未解析</option>
-      </select>
-      <select v-model="sortKey" class="select">
-        <option value="published">按发表时间（本页）</option>
-        <option value="citation">按引用数（本页）</option>
-      </select>
+      <SmoothSelect v-model="field" :options="FIELD_SELECT_OPTIONS" @change="applyFilters" />
+      <SmoothSelect v-model="sourceFilter" :options="SOURCE_SELECT_OPTIONS" />
+      <SmoothSelect v-model="parseFilter" :options="PARSE_SELECT_OPTIONS" />
+      <SmoothSelect v-model="sortKey" :options="SORT_SELECT_OPTIONS" />
       <button class="btn" type="button" @click="applyFilters">检索</button>
     </div>
 
@@ -405,11 +374,13 @@ onMounted(() => {
           </td>
           <td class="title-cell">
             <a href="#" @click.prevent="openParse(row.id)">{{ row.title }}</a>
-            <div class="meta">
-              {{ row.source === 'arxiv' ? `arXiv:${row.external_id ?? '未获取'}` : `#${row.id}` }}
-              · {{ row.venue ?? 'venue 未获取' }}
-              · 引用 {{ num(row.citation_count) }}
-            </div>
+            <a
+              v-if="paperLink(row)"
+              class="title-cell__link"
+              :href="paperLink(row) ?? '#'"
+              target="_blank"
+              rel="noopener noreferrer"
+            >{{ paperLink(row) }}</a>
           </td>
           <td>{{ sourceLabel(row.source) }}</td>
           <td>{{ row.published_at ?? '未获取' }}</td>
@@ -547,40 +518,6 @@ onMounted(() => {
   font-size: var(--font-size-lg);
 }
 
-.pills {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-  margin-top: var(--space-2);
-}
-
-.pill {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: 2px var(--space-3);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-pill);
-  color: var(--color-text-secondary);
-  font-size: var(--font-size-xs);
-}
-
-.pill b {
-  color: var(--color-text-primary);
-  font-weight: 500;
-}
-
-.dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--color-success);
-}
-
-.dot--warn {
-  background: var(--color-warning);
-}
-
 .filters {
   display: flex;
   flex-wrap: wrap;
@@ -675,10 +612,15 @@ onMounted(() => {
   color: var(--color-brand);
 }
 
-.meta {
+.title-cell__link {
+  display: block;
   margin-top: 2px;
-  color: var(--color-text-secondary);
   font-size: var(--font-size-xs);
+  word-break: break-all;
+}
+
+.title-cell__link:hover {
+  text-decoration: underline;
 }
 
 .empty {

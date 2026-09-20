@@ -18,6 +18,12 @@
 新表由 alembic 迁移独立建/删，导入顺序与外键依赖为
 ``reader_documents → （papers）``、``reader_versions → reader_documents``、
 ``reader_annotations → reader_documents, reader_versions``。
+
+补充（全局设置，迁移 ``0005_app_settings``）
+--------------------------------------------
+``app_settings``（``scope`` 主键 + ``value`` JSONB）由 ``app/db/models/settings.py`` 定义，
+同样**不属于附录 A.0 的 30 张表**，``TABLE_BUILD_ORDER`` 保持原样不变。
+该表**没有任何外键**，建/删顺序无依赖。
 """
 
 from __future__ import annotations
@@ -61,6 +67,7 @@ from app.db.models.review import (
     ReviewScore,
     StageModelRouting,
 )
+from app.db.models.settings import AppSetting
 
 # 附录 A.0 权威建表顺序（projects 首表且先不含 taskbook_id）
 TABLE_BUILD_ORDER: tuple[str, ...] = (
@@ -109,6 +116,7 @@ __all__ = [
     "DEFERRED_FOREIGN_KEYS",
     "TABLE_BUILD_ORDER",
     "Aggregation",
+    "AppSetting",
     "Base",
     "DecisionLog",
     "DemoFixture",

@@ -51,6 +51,9 @@ class ModelConfigRecord:
     last_tested_at: datetime | None = None
     test_ok: bool | None = None
     created_at: datetime | None = None
+    #: 端点类型（``openai`` / ``anthropic`` / …）；None 表示按 OpenAI 兼容处理。
+    #: 字段名与 DB 列名 ``model_configs.type`` 保持一致。
+    type: str | None = None
 
     def find_model(self, model_id: str) -> dict[str, Any] | None:
         for entry in self.models or []:
@@ -79,7 +82,14 @@ class ModelRegistry(Protocol):
     async def list_configs(self) -> list[ModelConfigRecord]: ...
     async def get_config(self, config_id: int) -> ModelConfigRecord | None: ...
     async def create_config(
-        self, *, name: str, base_url: str, api_key_enc: str, models: list[dict[str, Any]], is_default: bool
+        self,
+        *,
+        name: str,
+        base_url: str,
+        api_key_enc: str,
+        models: list[dict[str, Any]],
+        is_default: bool,
+        type: str | None = None,
     ) -> int: ...
     async def update_config(self, config_id: int, fields: dict[str, Any]) -> None: ...
     async def delete_config(self, config_id: int) -> None: ...
@@ -109,7 +119,14 @@ class InMemoryModelRegistry:
         return self.configs.get(int(config_id))
 
     async def create_config(
-        self, *, name: str, base_url: str, api_key_enc: str, models: list[dict[str, Any]], is_default: bool
+        self,
+        *,
+        name: str,
+        base_url: str,
+        api_key_enc: str,
+        models: list[dict[str, Any]],
+        is_default: bool,
+        type: str | None = None,
     ) -> int:
         self._config_seq += 1
         config_id = self._config_seq
@@ -121,6 +138,7 @@ class InMemoryModelRegistry:
             models=list(models),
             is_default=is_default,
             created_at=datetime.now(),
+            type=type,
         )
         return config_id
 
@@ -186,7 +204,9 @@ class InMemoryModelRegistry:
 # --------------------------------------------------------------------------- #
 # SQL 实现
 # --------------------------------------------------------------------------- #
-_CONFIG_COLUMNS = "id, name, base_url, api_key_enc, models, is_default, last_tested_at, test_ok, created_at"
+_CONFIG_COLUMNS = (
+    "id, name, base_url, api_key_enc, models, is_default, last_tested_at, test_ok, created_at, type"
+)
 _ROUTING_COLUMNS = (
     "id, project_id, stage, purpose, model_config_id, model_id, temperature, max_tokens, created_at"
 )
@@ -231,7 +251,14 @@ class SqlModelRegistry:
         return _row_to_config(dict(row)) if row else None
 
     async def create_config(
-        self, *, name: str, base_url: str, api_key_enc: str, models: list[dict[str, Any]], is_default: bool
+        self,
+        *,
+        name: str,
+        base_url: str,
+        api_key_enc: str,
+        models: list[dict[str, Any]],
+        is_default: bool,
+        type: str | None = None,
     ) -> int:
         from sqlalchemy import text
 
@@ -239,8 +266,8 @@ class SqlModelRegistry:
         async with engine.begin() as conn:
             result = await conn.execute(
                 text(
-                    "INSERT INTO model_configs (name, base_url, api_key_enc, models, is_default) "
-                    "VALUES (:name, :base_url, :api_key_enc, CAST(:models AS JSONB), :is_default) "
+                    "INSERT INTO model_configs (name, base_url, api_key_enc, models, is_default, type) "
+                    "VALUES (:name, :base_url, :api_key_enc, CAST(:models AS JSONB), :is_default, :type) "
                     "RETURNING id"
                 ),
                 {
@@ -249,6 +276,7 @@ class SqlModelRegistry:
                     "api_key_enc": api_key_enc,
                     "models": json.dumps(models, ensure_ascii=False),
                     "is_default": is_default,
+                    "type": type,
                 },
             )
             row = result.first()
@@ -390,6 +418,7 @@ def _row_to_config(row: dict[str, Any]) -> ModelConfigRecord:
         last_tested_at=row.get("last_tested_at"),
         test_ok=row.get("test_ok"),
         created_at=row.get("created_at"),
+        type=row.get("type"),
     )
 
 

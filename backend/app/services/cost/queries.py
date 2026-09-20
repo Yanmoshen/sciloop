@@ -19,12 +19,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from app.llm.store import LLMStore, get_store
 
 #: 按 (stage, provider, model, is_replay) 分桶的只读聚合
+#:
+#: ``non_usd_*`` 两列识别「定价币种不是 USD」的行：这类行由 ``pricing.py`` 写成
+#: ``cost_usd = NULL`` + ``error LIKE '%non_usd_currency:%'``，因此**本来就不会**
+#: 进入 ``SUM(cost_usd)``（NULL 不参与求和），USD 总额天然不受影响。
+#: ``unknown_price_calls`` 显式排除它们，避免把「非 USD 定价」误报成「缺单价」。
 _BUCKET_SQL = """
 SELECT
     stage,
@@ -34,7 +39,14 @@ SELECT
     COALESCE(SUM(cost_usd), 0)                                      AS cost_usd,
     COUNT(*)                                                        AS calls,
     COUNT(*) FILTER (WHERE success IS FALSE)                        AS failed_calls,
-    COUNT(*) FILTER (WHERE success IS TRUE AND cost_usd IS NULL)    AS unknown_price_calls
+    COUNT(*) FILTER (
+        WHERE success IS TRUE
+          AND cost_usd IS NULL
+          AND error NOT LIKE '%non_usd_currency:%'
+    )                                                               AS unknown_price_calls,
+    COUNT(*) FILTER (WHERE error LIKE '%non_usd_currency:%')        AS non_usd_calls,
+    string_agg(DISTINCT substring(error from 'non_usd_currency:([A-Za-z]+)'), ',')
+        FILTER (WHERE error LIKE '%non_usd_currency:%')             AS non_usd_currencies
 FROM llm_call_logs
 WHERE (CAST(:project_id AS BIGINT) IS NULL OR project_id = CAST(:project_id AS BIGINT))
 GROUP BY stage, provider, model, is_replay
@@ -60,6 +72,31 @@ class CostBucket:
     calls: int
     failed_calls: int
     unknown_price_calls: int
+    #: 该桶中「定价币种非 USD」的调用数（cost_usd 为 NULL，未计入 USD 汇总）
+    non_usd_calls: int = 0
+    #: 该桶出现过的非 USD 币种（去重）
+    non_usd_currencies: list[str] = field(default_factory=list)
+
+
+_NON_USD_MARK = "non_usd_currency:"
+
+
+def _non_usd_currencies(text: Any) -> list[str]:
+    """从 ``error`` 文本里抠出 ``non_usd_currency:<币种>`` 的币种。"""
+    content = str(text or "")
+    if _NON_USD_MARK not in content:
+        return []
+    found: list[str] = []
+    for chunk in content.split(_NON_USD_MARK)[1:]:
+        token = ""
+        for char in chunk:
+            if char.isalpha():
+                token += char
+            else:
+                break
+        if token and token not in found:
+            found.append(token)
+    return found
 
 
 def _as_float(value: Any) -> float:
@@ -90,9 +127,15 @@ def _buckets_from_logs(logs: list[dict[str, Any]], project_id: int | None) -> li
         bucket.calls += 1
         if row.get("cost_usd") is not None:
             bucket.cost_usd += _as_float(row.get("cost_usd"))
+        currencies = _non_usd_currencies(row.get("error"))
+        if currencies:
+            bucket.non_usd_calls += 1
+            for currency in currencies:
+                if currency not in bucket.non_usd_currencies:
+                    bucket.non_usd_currencies.append(currency)
         if not row.get("success"):
             bucket.failed_calls += 1
-        elif row.get("cost_usd") is None:
+        elif row.get("cost_usd") is None and not currencies:
             bucket.unknown_price_calls += 1
     return list(buckets.values())
 
@@ -116,6 +159,10 @@ async def _buckets_from_sql(project_id: int | None) -> list[CostBucket]:
             calls=int(row["calls"]),
             failed_calls=int(row["failed_calls"]),
             unknown_price_calls=int(row["unknown_price_calls"]),
+            non_usd_calls=int(row["non_usd_calls"] or 0),
+            non_usd_currencies=[
+                item for item in str(row["non_usd_currencies"] or "").split(",") if item
+            ],
         )
         for row in rows
     ]
@@ -177,6 +224,8 @@ async def audit_cost_rows(
                 "is_replay": bucket.is_replay,
                 "calls": bucket.calls,
                 "raw_cost_usd": round(bucket.cost_usd, 6),
+                "non_usd_calls": bucket.non_usd_calls,
+                "non_usd_currencies": list(bucket.non_usd_currencies),
                 "classification": verdict.classification,
                 "matched": verdict.reason,
                 "counts_toward_used_usd": verdict.billable,

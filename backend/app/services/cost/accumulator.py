@@ -58,6 +58,8 @@ def _notes() -> str:
         "桩/验收夹具调用与回放调用保留原始 cost_usd 行以便审计，分别汇入 "
         "stub_saved_usd/stub_calls 与 replay_saved_usd/replay_calls，不计入 used_usd，"
         "也不参与 limit_exceeded / quota_exceeded 判定。"
+        "定价币种不是 USD 的调用（见 non_usd_calls/non_usd_models/non_usd_currencies）"
+        "不做汇率换算，cost_usd 为 null，同样不计入 used_usd。"
     )
 
 
@@ -80,6 +82,13 @@ class CostSummary:
     #: 被排除部分按环节的分解（traceability）
     stub_breakdown_by_stage: dict[str, float] = field(default_factory=dict)
     replay_breakdown_by_stage: dict[str, float] = field(default_factory=dict)
+    #: 定价币种不是 USD 的调用：**不做汇率换算**，cost_usd 为 null，未计入 used_usd。
+    #: 前端据此显示「非 USD，未计入护栏」徽标
+    non_usd_calls: int = 0
+    #: 出现过的非 USD 定价模型（``provider:model``，去重排序）
+    non_usd_models: list[str] = field(default_factory=list)
+    #: 出现过的非 USD 币种（去重排序，例如 ``["CNY"]``）
+    non_usd_currencies: list[str] = field(default_factory=list)
     notes: str = ""
     #: 附加审计信息（不属于契约必填字段）
     project_id: int | None = None
@@ -109,6 +118,10 @@ class CostSummary:
             "breakdown_by_provider": self.breakdown_by_provider,
             "stub_breakdown_by_stage": self.stub_breakdown_by_stage,
             "replay_breakdown_by_stage": self.replay_breakdown_by_stage,
+            # 非 USD 定价分桶（不改动任何既有 USD 字段的语义）
+            "non_usd_calls": self.non_usd_calls,
+            "non_usd_models": self.non_usd_models,
+            "non_usd_currencies": self.non_usd_currencies,
             "notes": self.notes or _notes(),
             # 审计信息
             "project_id": self.project_id,
@@ -203,6 +216,9 @@ async def accumulate(
     replay_saved = 0.0
     real_calls = stub_calls = replay_calls = total_calls = 0
     failed_calls = unknown = 0
+    non_usd_calls = 0
+    non_usd_models: set[str] = set()
+    non_usd_currencies: set[str] = set()
 
     for bucket in buckets:
         verdict = classify_call(
@@ -225,6 +241,8 @@ async def accumulate(
                 "models": [],
                 "classifications": [],
                 "counts_toward_used_usd": True,
+                "non_usd_calls": 0,
+                "non_usd_currencies": [],
             },
         )
         entry["calls"] += bucket.calls
@@ -232,6 +250,16 @@ async def accumulate(
         if verdict.classification not in entry["classifications"]:
             entry["classifications"].append(verdict.classification)
         total_calls += bucket.calls
+
+        if bucket.non_usd_calls:
+            # 非 USD 定价：不换算汇率、不计入 used_usd，只计数并标注币种/模型
+            non_usd_calls += bucket.non_usd_calls
+            non_usd_models.add(f"{bucket.provider or 'unknown'}:{bucket.model or 'unknown'}")
+            non_usd_currencies.update(bucket.non_usd_currencies)
+            entry["non_usd_calls"] = entry.get("non_usd_calls", 0) + bucket.non_usd_calls
+            entry["non_usd_currencies"] = sorted(
+                set(entry.get("non_usd_currencies", [])) | set(bucket.non_usd_currencies)
+            )
 
         if verdict.classification == CLASS_REAL:
             used += bucket.cost_usd
@@ -286,11 +314,20 @@ async def accumulate(
         failed_calls=failed_calls,
         unknown_price_calls=unknown,
         cost_complete=unknown == 0,
+        non_usd_calls=non_usd_calls,
+        non_usd_models=sorted(non_usd_models),
+        non_usd_currencies=sorted(non_usd_currencies),
     )
     if unknown:
         summary.warning = (
             f"{unknown} 次**真实**调用缺少单价，cost_usd 记为 null（禁止估算），"
             "实际花费可能高于 used_usd；请在设置页补齐供应商单价"
+        )
+    if non_usd_calls:
+        summary.warning = (summary.warning + " " if summary.warning else "") + (
+            f"另有 {non_usd_calls} 次真实调用使用非 USD 定价"
+            f"（币种 {'/'.join(sorted(non_usd_currencies)) or '未知'}）："
+            "不做汇率换算，cost_usd 记为 null，**未计入 used_usd 护栏**"
         )
     if summary.quota_exceeded and not summary.limit_exceeded:
         summary.warning = (summary.warning + " " if summary.warning else "") + (

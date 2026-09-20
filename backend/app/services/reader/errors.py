@@ -91,7 +91,11 @@ class NoSourceDocumentError(ReaderError):
 
 
 class VersionAlreadyRegisteredError(ReaderError):
-    """同 ``kind`` 的版本已登记；版本不可变，不覆盖既有记录。"""
+    """同一 ``(document_id, kind, task_id)`` 的版本已登记；版本不可变，不覆盖既有记录。
+
+    注意：同一 ``kind`` 的**不同** ``task_id`` 产物是允许追加的（迁移 0004），
+    只有「同一份产物重复登记」才报此错（幂等重入防护）。
+    """
 
     code = "version_already_registered"
     status_code = HTTP_409

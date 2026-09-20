@@ -129,6 +129,29 @@ def chat_completions_url(base_url: str) -> str:
     return f"{url}/v1/chat/completions"
 
 
+def models_url(base_url: str) -> str:
+    """把用户填写的 base_url 归一为 ``.../models``（OpenAI 兼容的模型列表端点）。
+
+    规则（与 :func:`chat_completions_url` 同口径，幂等）：
+
+    - 已是 ``.../models``：直接返回
+    - 以 ``/v1`` / ``/v4`` 结尾或含 ``/compatible-mode/v1``：用 ``{base}/models``
+    - 其余：用 ``{base}/v1/models``
+
+    之所以把 ``/v4`` 与 ``compatible-mode`` 一并计入：本项目预置的 zhipu
+    （``https://open.bigmodel.cn/api/paas/v4``）与 dashscope
+    （``.../compatible-mode/v1``）都属于「base_url 已带版本段」的形态。
+    """
+    url = (base_url or "").strip().rstrip("/")
+    if not url:
+        raise ValueError("base_url 不能为空")
+    if url.endswith("/models"):
+        return url
+    if url.endswith("/v1") or url.endswith("/v4") or "/compatible-mode/v1" in url:
+        return f"{url}/models"
+    return f"{url}/v1/models"
+
+
 def strategy_chain(capability: ProviderCapability) -> list[JsonStrategy]:
     """该供应商的降档链（从最强到最弱）。"""
     chain: list[JsonStrategy] = []
@@ -217,6 +240,7 @@ __all__ = [
     "detect_capability",
     "json_strategy",
     "looks_like_schema_rejection",
+    "models_url",
     "note_strategy_rejected",
     "rejected_strategies",
     "reset_strategy_memory",

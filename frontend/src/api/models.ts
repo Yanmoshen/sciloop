@@ -34,15 +34,36 @@ export { ApiError, getOwnerToken, setOwnerToken } from './client'
  * 供应商
  * ------------------------------------------------------------------ */
 
+/**
+ * 单价的一端（输入或输出）——**Cherry Studio 口径：每百万 token + 币种**。
+ *
+ * 旧口径（`input_price` / `output_price` / `price_unit`）已废弃，只在后端
+ * `parse_price_info()` 里保留读取兼容；前端一律只认本结构。
+ */
+export interface PricingSide {
+  currency: string
+  perMillionTokens: number | null
+}
+
+/** 模型定价。任一端缺失（或 `perMillionTokens` 为 null）视为「单价未配置」。 */
+export interface Pricing {
+  input?: PricingSide | null
+  output?: PricingSide | null
+}
+
 export interface ModelEntry {
   model_id: string
   label?: string | null
   context_window?: number | null
-  input_price?: number | null
-  output_price?: number | null
-  price_unit?: number | null
+  /** 缺任一端 = 未配置单价（后端 cost_usd 记 null，前端禁止猜价） */
+  pricing?: Pricing | null
   temperature?: number | null
   max_tokens?: number | null
+  /**
+   * 后端（`sync-models`）会原样合并上游条目，可能带 `cacheRead` 等 Cherry 原始键；
+   * 这里用索引签名承接，读取时按需取用，不丢字段。
+   */
+  [key: string]: unknown
 }
 
 export interface ModelConfig {
@@ -59,6 +80,8 @@ export interface ModelConfig {
   last_tested_at: string | null
   test_ok: boolean | null
   created_at: string | null
+  /** 端点类型（`openai` / `anthropic` / `google` / …）；null = 按 OpenAI 兼容处理 */
+  type: string | null
 }
 
 export interface ModelConfigList {
@@ -77,6 +100,23 @@ export interface ConnectivityResult {
   error_kind: string | null
   message: string | null
   logged_to: string
+}
+
+/**
+ * `POST /models/configs/{id}/sync-models` 的响应（后端如实回传上游计数）。
+ *
+ * 让前端能区分「拉到了但全是已有的」与「拉到并新增了 N 个」，不伪造结果。
+ */
+export interface SyncModelsResult {
+  /** 上游返回的模型总数 */
+  fetched: number
+  /** 本次新增并入本地的 model_id */
+  added: string[]
+  /** 上游返回但本地已存在的 model_id */
+  existing: string[]
+  /** 实际请求的上游 URL（不含任何凭据），排障用 */
+  endpoint: string
+  test_ok: boolean
 }
 
 /* ------------------------------------------------------------------ *
@@ -169,6 +209,13 @@ export interface CostSummary {
   stub_calls?: number
   /** 口径说明，用于 UI 展示「真实 / stub / replay 分桶」依据 */
   notes?: string | null
+  /**
+   * 非 USD 口径的调用数 / 模型 / 币种（Cherry 口径：不做汇率换算，也不进 USD 护栏）。
+   * 界面上用徽标标注「非 USD，未计入护栏」，**不得**并入任何 USD 小计。
+   */
+  non_usd_calls?: number
+  non_usd_models?: string[]
+  non_usd_currencies?: string[]
 }
 
 /**
@@ -192,13 +239,14 @@ export function listModelConfigs(page = 1, pageSize = 50): Promise<ModelConfigLi
   return get<ModelConfigList>('/models/configs', { query: { page, page_size: pageSize } })
 }
 
-/** 新建供应商（Owner 写操作） */
+/** 新建供应商（Owner 写操作）。`api_key` 后端必填（只上送、不回显）。 */
 export function createModelConfig(payload: {
   name: string
   base_url: string
   api_key: string
   models: ModelEntry[]
   is_default?: boolean
+  type?: string | null
 }): Promise<ModelConfig> {
   return post<ModelConfig>('/models/configs', { body: payload })
 }
@@ -223,6 +271,22 @@ export function testModelConfig(id: number, modelId?: string): Promise<Connectiv
     body: { model_id: modelId ?? null },
     timeoutMs: 120_000,
   })
+}
+
+/**
+ * 获取模型列表（Owner 写操作）：后端出网拉取该供应商的模型列表并合并。
+ *
+ * 失败一律如实抛出，**不伪造列表**：
+ * - `409 api_key_missing` 未配置 Key
+ * - `502 upstream_unreachable` 连不上 / 超时
+ * - `502 upstream_http_error` 上游非 2xx
+ * - `502 invalid_response` 响应不是 `{"data": [...]}`
+ *
+ * 新增模型的 `pricing` 留空（后端禁止猜价），前端必须显示为「单价未配置」。
+ * 该端点真实出网，超时同 `test` 放大到 120s。
+ */
+export function syncModels(id: number): Promise<SyncModelsResult> {
+  return post<SyncModelsResult>(`/models/configs/${id}/sync-models`, { timeoutMs: 120_000 })
 }
 
 /**

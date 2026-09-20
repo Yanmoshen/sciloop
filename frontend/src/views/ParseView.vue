@@ -19,7 +19,6 @@
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 
-import CoverageTag from '@/components/CoverageTag.vue'
 import ViewStatePanel from '@/components/ViewStatePanel.vue'
 import { ApiError } from '@/api/client'
 import { useSessionStore } from '@/stores/session'
@@ -38,7 +37,6 @@ import {
   type PaperDetail,
   type PaperSpan,
 } from '@/api/parse'
-import type { ParseStatus } from '@/api/feed'
 
 const route = useRoute()
 const session = useSessionStore()
@@ -87,14 +85,49 @@ const cardMissing = computed(() => cardError.value?.code === 'card_not_found')
 const cardErrorText = computed(() => (cardMissing.value ? null : (cardError.value?.message ?? null)))
 /** 权限拒绝：重新解析/建卡是写操作，public_demo 匿名面必然 403 */
 const rebuildDenied = computed(() => !session.isOwner)
-/** 降级：仅摘要级证据（无全文）或哈希命中但偏移不可校验 */
-const abstractOnly = computed(
-  () =>
-    (card.value?.available_scope ?? documents.value?.evidence_scope ?? null) === 'abstract_only' ||
-    coverageParseStatus.value === 'unavailable' ||
-    coverageParseStatus.value === 'partial' ||
-    coverageParseStatus.value === 'failed',
-)
+
+/** 标题下第一行：只给「作者 · 发布时间」，不列 id / 来源 / venue / 引用数（那些是检索面的事） */
+const subMeta = computed(() => {
+  const parts: string[] = []
+  const names = (paper.value?.authors ?? [])
+    .map((item) => (item?.name ?? '').trim())
+    .filter(Boolean)
+  if (names.length) parts.push(names.join('、'))
+  if (paper.value?.published_at) parts.push(`发布时间 ${paper.value.published_at}`)
+  return parts.join(' · ')
+})
+
+/**
+ * 解析状态（三态，放在标题下第二行）：
+ * ``parsing`` 建卡任务进行中 / ``parsed`` 卡片已产出（能解析论文就能解析成卡片，
+ * 所以「已解析」就是「卡片已生成」）/ ``unparsed`` 其余情况。
+ */
+const parseState = computed<{ text: string; tone: 'ok' | 'busy' | 'muted' }>(() => {
+  if (rebuilding.value) return { text: '解析中', tone: 'busy' }
+  if (card.value) return { text: '已解析', tone: 'ok' }
+  return { text: '未解析', tone: 'muted' }
+})
+
+/**
+ * AI 总结：内容**全部取自 AI 产出的卡片字段**（研究问题 / 核心方法 / 主要结论），
+ * 逐句可回溯，不做任何补写；卡片缺失时返回空串，由模板决定不渲染。
+ */
+const aiSummary = computed(() => {
+  const payload = card.value?.card
+  if (!payload) return []
+  const rows: Array<{ label: string; text: string }> = []
+  const research = String(payload.research_problem ?? '').trim()
+  if (research && !isUnknown(research)) rows.push({ label: '研究问题', text: research })
+  const method = String(payload.core_method ?? '').trim()
+  if (method && !isUnknown(method)) rows.push({ label: '核心方法', text: method })
+  const conclusions = Array.isArray(payload.main_conclusions) ? payload.main_conclusions : []
+  const first = conclusions
+    .map((item) => String(item?.conclusion ?? item?.point ?? '').trim())
+    .filter((text) => text && !isUnknown(text))
+    .join('；')
+  if (first) rows.push({ label: '主要结论', text: first })
+  return rows
+})
 
 const documentOptions = computed(() => {
   const list = (documents.value?.items ?? []).map((doc) => ({
@@ -108,30 +141,6 @@ const documentOptions = computed(() => {
     list.unshift({ value: cardVersion, label: `${cardVersion}（卡片定位版本）` })
   }
   return list
-})
-
-const selectedDocument = computed(
-  () =>
-    (documents.value?.items ?? []).find((doc) => doc.document_version === selectedVersion.value) ??
-    null,
-)
-
-const coverageParseStatus = computed<ParseStatus | null>(() => {
-  if (card.value?.parse_status) return card.value.parse_status
-  if (documents.value?.summary?.parse_status) return documents.value.summary.parse_status
-  // 卡片无 parse_status 但证据范围是 abstract_only（无全文文档）→ 按契约显示「证据覆盖范围：仅摘要」
-  const scope = card.value?.available_scope ?? documents.value?.evidence_scope ?? null
-  return scope === 'abstract_only' ? 'unavailable' : null
-})
-
-const coverageValue = computed(
-  () => card.value?.coverage ?? documents.value?.summary?.coverage ?? null,
-)
-
-const coverageTagText = computed(() => {
-  if (card.value?.coverage_tag) return `后端覆盖范围：${card.value.coverage_tag}`
-  if (documents.value?.coverage_note) return documents.value.coverage_note
-  return '覆盖范围未获取（未解析全文时仅摘要级证据）'
 })
 
 /** 当前高亮片段 */
@@ -176,11 +185,6 @@ function formatTime(value: string | null | undefined): string {
   return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString()
 }
 
-function formatPercent(value: number | null | undefined): string {
-  if (value === null || value === undefined) return '未获取'
-  return `${Math.round(value * 1000) / 10}%`
-}
-
 function isUnknown(value: string | null | undefined): boolean {
   return !value || value.trim().toLowerCase() === 'unknown'
 }
@@ -199,7 +203,7 @@ function entriesOf(def: CardFieldDef): CardEntry[] {
   return Array.isArray(value) ? (value as CardEntry[]) : []
 }
 
-/** 字段定位状态（优先用后端 by_field 统计，缺失则本地统计） */
+/** 字段定位状态（优先用后端 by_field 统计，缺失则本地统计）；无可说状态时返回空文本，模板不渲染 */
 function fieldStatus(def: CardFieldDef): {
   text: string
   tone: 'ok' | 'warn' | 'muted'
@@ -207,7 +211,7 @@ function fieldStatus(def: CardFieldDef): {
 } {
   if (def.kind === 'text' || def.kind === 'setup') {
     return {
-      text: '无独立引用条目',
+      text: '',
       tone: 'muted',
       detail: '该字段为卡片聚合字段，未附行内引用条目 → 以卡片文本为准，无定位区间',
     }
@@ -217,7 +221,7 @@ function fieldStatus(def: CardFieldDef): {
   const total = stats?.total ?? entries.length
   const located = stats?.located ?? entries.filter((entry) => entry.evidence_span).length
   const unlocated = stats?.unlocated ?? Math.max(total - located, 0)
-  if (total === 0) return { text: '无条目', tone: 'muted', detail: '卡片未产出该字段条目' }
+  if (total === 0) return { text: '', tone: 'muted', detail: '卡片未产出该字段条目' }
   if (located === 0) {
     return {
       text: `未定位 0/${total}`,
@@ -441,7 +445,7 @@ async function retryCard(): Promise<void> {
   if (cardMissing.value) {
     notice.value = rebuildDenied.value
       ? '该论文尚无解析卡片；建卡属 Owner 写操作，当前为 public_demo 只读面（403 owner_token_required）'
-      : '该论文尚无解析卡片：可点击右上角「重新解析并重建卡片」生成 version=1'
+      : '该论文尚无解析卡片：可点击右上角「解析并重建卡片」生成 version=1'
     return
   }
   await loadCard(selectedCardVersion.value)
@@ -469,15 +473,9 @@ onMounted(() => {
           <template v-if="paper">{{ paper.title }}</template>
           <template v-else>论文解析 #{{ paperId }}</template>
         </h1>
-        <p class="parse__meta sl-source-tag">
-          <template v-if="paper">
-            #{{ paper.id }} · {{ paper.source ?? '来源未获取' }} · {{ paper.external_id ?? '外部 ID 未获取' }} ·
-            发布时间 {{ paper.published_at ?? '未获取' }} · venue
-            {{ paper.venue ?? '未获取' }}
-            <template v-if="paper.venue_source">（venue_source={{ paper.venue_source }}）</template>
-            · 引用数 {{ paper.citation_count ?? '未获取' }}
-          </template>
-          <template v-else>论文详情未获取</template>
+        <p v-if="subMeta" class="parse__meta">{{ subMeta }}</p>
+        <p class="parse__status">
+          <span class="status-tag" :class="`status-tag--${parseState.tone}`">{{ parseState.text }}</span>
         </p>
       </div>
       <div class="parse__actions">
@@ -511,12 +509,9 @@ onMounted(() => {
             data-action="rebuild-card"
             @click="rebuild"
           >
-            重新解析并重建卡片
+            解析并重建卡片
           </el-button>
         </el-tooltip>
-        <span v-if="rebuildDenied" class="parse__denied">
-          只读面：写操作已前置禁用
-        </span>
       </div>
     </header>
 
@@ -544,22 +539,6 @@ onMounted(() => {
       :title="rebuildError ?? rebuildMessage ?? ''"
     />
 
-    <div class="parse__coverage sl-card">
-      <CoverageTag
-        :parse-status="coverageParseStatus"
-        :coverage="coverageValue"
-        :scope="card?.available_scope ?? documents?.evidence_scope ?? null"
-        :source="card?.document_version ? 'paper_cards' : (documents?.summary?.document_version ? 'paper_documents' : null)"
-        :note="coverageTagText"
-      />
-      <span class="parse__coverage-note">{{ coverageTagText }}</span>
-      <span class="parse__coverage-note sl-source-tag">
-        available_scope={{ card?.available_scope ?? '未获取' }} · 已定位
-        {{ card?.located_count ?? '未获取' }}/{{ (card?.located_count ?? 0) + (card?.unlocated_count ?? 0) }} ·
-        未定位 {{ card?.unlocated_count ?? '未获取' }}
-      </span>
-    </div>
-
     <el-alert
       v-if="cardErrorText"
       class="parse__alert"
@@ -571,26 +550,6 @@ onMounted(() => {
       <template #default>
         <span class="parse__alert-body">
           未建卡时不会显示任何字段内容（缺失不编造）。
-        </span>
-        <el-button size="small" text type="primary" @click="retryCard">重试读取卡片</el-button>
-      </template>
-    </el-alert>
-
-    <el-alert
-      v-else-if="cardMissing"
-      class="parse__alert"
-      type="info"
-      :closable="false"
-      show-icon
-      title="该论文尚无解析卡片（card_not_found）：8 字段卡片为空，不展示任何占位内容"
-    >
-      <template #default>
-        <span class="parse__alert-body">
-          {{
-            rebuildDenied
-              ? '建卡属 Owner 写操作：当前为 public_demo 只读面，后端会返回 403 owner_token_required；请在设置页填入 OWNER_TOKEN 后重试。'
-              : '可点击右上角「重新解析并重建卡片」生成 version=1 的卡片（旧版本会保留）。'
-          }}
         </span>
         <el-button size="small" text type="primary" @click="retryCard">重试读取卡片</el-button>
       </template>
@@ -610,6 +569,7 @@ onMounted(() => {
             <header class="field-card__head">
               <h2>{{ def.label }}</h2>
               <span
+                v-if="fieldStatus(def).text"
                 class="field-status"
                 :class="`field-status--${fieldStatus(def).tone}`"
                 :title="fieldStatus(def).detail"
@@ -729,7 +689,7 @@ onMounted(() => {
         </template>
       </div>
 
-      <!-- 右：原文 / 摘要视图 -->
+      <!-- 右：原文片段定位（无可定位片段时退化为 AI 总结，不放原始摘要） -->
       <aside class="parse__source sl-card scroll-y">
         <header class="source-head">
           <h2>原文片段视图</h2>
@@ -748,36 +708,6 @@ onMounted(() => {
             />
           </el-select>
         </header>
-
-        <dl class="source-meta sl-source-tag">
-          <div>
-            <dt>document_version</dt>
-            <dd>{{ selectedVersion ?? '未获取（尚未解析全文）' }}</dd>
-          </div>
-          <div>
-            <dt>parser</dt>
-            <dd>
-              {{ selectedDocument?.parser ?? documents?.summary?.parser ?? '未获取' }}
-              {{ selectedDocument?.parser_version ? `v${selectedDocument.parser_version}` : '' }}
-            </dd>
-          </div>
-          <div>
-            <dt>page_number</dt>
-            <dd>
-              <template v-if="target?.pageNumber !== null && target?.pageNumber !== undefined">
-                页 {{ target.pageNumber }}
-              </template>
-              <template v-else-if="selectedDocument">
-                页 {{ selectedDocument.page_count === 1 ? 1 : `1~${selectedDocument.page_count ?? '未获取'}` }}
-              </template>
-              <template v-else>未获取</template>
-            </dd>
-          </div>
-          <div>
-            <dt>覆盖率</dt>
-            <dd>{{ formatPercent(selectedDocument?.coverage ?? null) }}</dd>
-          </div>
-        </dl>
 
         <p class="locator-status" data-role="locator-status">
           <template v-if="target">
@@ -855,20 +785,16 @@ onMounted(() => {
           </article>
         </div>
 
-        <!-- 无可定位片段：摘要视图（仅摘要级证据） -->
+        <!-- 无可定位片段：AI 总结（内容全部取自 AI 产出的卡片字段，不展示原始摘要） -->
         <div v-else-if="!spansLoading" class="source-abstract">
-          <el-alert
-            type="warning"
-            :closable="false"
-            show-icon
-            title="证据覆盖范围：仅摘要 —— 无可定位全文片段，定位不可用，以引用文本为准"
-          />
-          <h3>摘要（abstract）</h3>
-          <p class="source-abstract__text">{{ paper?.abstract ?? '摘要未获取' }}</p>
-          <p class="sl-source-tag">
-            parse_status={{ coverageParseStatus ?? '未获取' }} · coverage={{ formatPercent(coverageValue) }}
-            （缺失显示为未获取，不代表 0）· 门禁：parse_status=ok 且 coverage≥0.60 才允许正文级证据
-          </p>
+          <h3>AI 总结</h3>
+          <template v-if="aiSummary.length">
+            <div v-for="row in aiSummary" :key="row.label" class="summary-row">
+              <span class="summary-row__label">{{ row.label }}</span>
+              <p class="summary-row__text">{{ row.text }}</p>
+            </div>
+          </template>
+          <p v-else class="summary-empty">该论文尚未生成解析卡片</p>
         </div>
       </aside>
     </div>
@@ -909,29 +835,33 @@ onMounted(() => {
   gap: var(--space-2);
 }
 
-.parse__denied {
+.parse__status {
+  margin: var(--space-1) 0 0;
+}
+
+/* 解析状态：三态徽标（未解析 / 解析中 / 已解析），不用灰色小字 */
+.status-tag {
+  display: inline-flex;
+  align-items: center;
   padding: 1px var(--space-2);
-  border: 1px dashed var(--color-border-strong);
+  border: 1px solid var(--color-border-strong);
   border-radius: var(--radius-pill);
-  color: var(--color-text-secondary);
   font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+
+.status-tag--ok {
+  border-color: var(--color-success);
+  color: var(--color-success);
+}
+
+.status-tag--busy {
+  border-color: var(--color-brand);
+  color: var(--color-brand);
 }
 
 .parse__version {
   width: 220px;
-}
-
-.parse__coverage {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-  flex-wrap: wrap;
-  padding: var(--space-2) var(--space-3);
-}
-
-.parse__coverage-note {
-  font-size: var(--font-size-xs);
-  color: var(--color-text-secondary);
 }
 
 .parse__alert-body {
@@ -1151,33 +1081,6 @@ onMounted(() => {
   width: 260px;
 }
 
-.source-meta {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: var(--space-1) var(--space-3);
-  margin: 0;
-}
-
-.source-meta div {
-  display: flex;
-  gap: var(--space-2);
-}
-
-.source-meta dt {
-  flex: 0 0 108px;
-  color: var(--color-text-secondary);
-}
-
-.source-meta dd {
-  margin: 0;
-  min-width: 0;
-  word-break: break-all;
-}
-
-.source-meta__note {
-  color: var(--color-warning);
-}
-
 .locator-status {
   margin: 0;
   padding: var(--space-1) var(--space-2);
@@ -1249,10 +1152,30 @@ onMounted(() => {
   font-size: var(--font-size-sm);
 }
 
-.source-abstract__text {
+.summary-row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: baseline;
+}
+
+.summary-row__label {
+  flex: 0 0 64px;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
+}
+
+.summary-row__text {
   margin: 0;
+  flex: 1;
+  min-width: 0;
   font-size: var(--font-size-sm);
   line-height: var(--line-height-base);
+}
+
+.summary-empty {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
 }
 
 .missing {
