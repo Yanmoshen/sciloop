@@ -61,6 +61,36 @@ const modelOptions = computed(() => {
 })
 
 const pickerOpen = ref(false)
+
+const answerModel = ref('')
+const copied = ref(false)
+const elapsed = ref(0)
+const doneText = ref('')
+let tick: number | null = null
+
+function fmtDuration(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000))
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  if (h > 0) return `${h}h${m}m${s}s`
+  if (m > 0) return `${m}m${s}s`
+  return `${s}s`
+}
+
+const elapsedText = computed(() => fmtDuration(elapsed.value))
+
+async function copyAnswer(): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(answer.value)
+    copied.value = true
+    window.setTimeout(() => {
+      copied.value = false
+    }, 1200)
+  } catch {
+    copied.value = false
+  }
+}
 const pickedLabel = computed(
   () => modelOptions.value.find((item) => item.value === pickedRef.value)?.label ?? 'auto',
 )
@@ -167,6 +197,14 @@ async function send(): Promise<void> {
   answer.value = ''
   userText.value = text
   phase.value = 'thinking'
+  answerModel.value = ''
+  doneText.value = ''
+  elapsed.value = 0
+  if (tick !== null) window.clearInterval(tick)
+  const startedAt = Date.now()
+  tick = window.setInterval(() => {
+    elapsed.value = Date.now() - startedAt
+  }, 200)
   // 发送即清空输入框（不等结果），避免旧文本残留在输入框里
   prompt.value = ''
   files.value = []
@@ -175,12 +213,23 @@ async function send(): Promise<void> {
     const result = await chatHome({ text, model_config_id: configId, model_id: modelId })
     answerTitle.value = result.title
     answer.value = result.reply
+    answerModel.value = result.model_id
+    if (tick !== null) {
+      window.clearInterval(tick)
+      tick = null
+    }
+    doneText.value = fmtDuration(elapsed.value)
     phase.value = 'answered'
     const created = await createProject({ name: result.title, note: text, fields: [] })
     await session.loadProjects()
     session.selectProject(created.id)
   } catch (err) {
     phase.value = 'idle'
+    if (tick !== null) {
+      window.clearInterval(tick)
+      tick = null
+    }
+    elapsed.value = 0
     // 失败要能重发：把原文放回输入框
     prompt.value = text
     const withCode = err as { code?: string; message?: string }
@@ -230,14 +279,43 @@ onMounted(async () => {
       <div class="convo__item">
         <span class="bubble bubble--user">{{ userText }}</span>
       </div>
-      <div v-if="phase === 'thinking'" class="dots" aria-label="正在思考">
-        <span class="dot" />
-        <span class="dot" />
-        <span class="dot" />
-      </div>
-      <div v-else-if="answer" class="convo__item">
-        <span v-if="answerTitle" class="pill pill--quiet">{{ answerTitle }}</span>
-        <p class="bubble bubble--ai">{{ answer }}</p>
+      <div v-if="phase !== 'idle' || answer" class="reply">
+        <span class="reply__model">{{ answerModel }}</span>
+        <span class="reply__time">{{ phase === 'thinking' ? elapsedText : `已完成 ${doneText}` }}</span>
+        <p v-if="answer" class="reply__text">{{ answer }}</p>
+        <div v-else class="dots" aria-label="正在思考">
+          <span class="dot" />
+          <span class="dot" />
+          <span class="dot" />
+        </div>
+        <div v-if="answer" class="reply__actions">
+          <button
+            class="icon-btn"
+            type="button"
+            :title="copied ? '已复制' : '复制回答'"
+            :aria-label="copied ? '已复制' : '复制回答'"
+            @click="copyAnswer"
+          >
+            <svg v-if="!copied" width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <rect x="5.5" y="5.5" width="8" height="8" rx="1.5" stroke="currentColor" stroke-width="1.3" />
+              <path
+                d="M10.5 5.5V4a1.5 1.5 0 0 0-1.5-1.5H4A1.5 1.5 0 0 0 2.5 4v5A1.5 1.5 0 0 0 4 10.5h1.5"
+                stroke="currentColor"
+                stroke-width="1.3"
+                stroke-linecap="round"
+              />
+            </svg>
+            <svg v-else width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path
+                d="M3 8.5 6.5 12 13 4.5"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
+          </button>
+        </div>
       </div>
     </div>
 
@@ -718,6 +796,13 @@ onMounted(async () => {
   min-height: 0;
   overflow-y: auto;
   margin-top: 8px;
+  padding-bottom: 28px; /* 与下方输入框拉开距离，避免最后一行贴着输入框 */
+  scroll-padding-bottom: 28px;
+}
+
+/* 输入框与对话区之间再留一道间距（此前最后一行会贴到输入框上沿） */
+.hero--active .composer {
+  margin-top: 12px;
 }
 
 .convo {
@@ -752,11 +837,32 @@ onMounted(async () => {
   color: var(--h-fg);
 }
 
-.bubble--ai {
-  background: var(--h-surface);
-  border: 1px solid var(--h-line);
+/* 回答：不用气泡、不加边框，直接输出文字（用户要求与参考图一致） */
+.reply {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+
+.reply__model,
+.reply__time {
+  color: var(--h-fg-muted);
+  font-size: var(--font-size-md);
+}
+
+.reply__text {
+  margin: 0;
   color: var(--h-fg);
-  max-width: 100%;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.reply__actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 2px;
 }
 
 /* 输入框工具行：右侧留出麦克风 + 发送按钮的位置，避免控件互相压住 */
