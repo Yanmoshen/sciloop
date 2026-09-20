@@ -868,8 +868,9 @@ onUnmounted(() => {
 /* ---------- 输入栏（Cherry 口径：整体一块圆角容器，上输入下工具栏） ---------- */
 .composer {
   flex: none;
-  width: min(720px, 100%);
-  margin: 0 auto;
+  /* 与上方标题 / 流程行 / 三张卡**同宽同左边界**：它们都占满 816px 的内容列，
+     输入框若收窄居中就会左右各缩进 48px，看起来"和上面的字对不齐"（2026-09-21 修）。 */
+  width: 100%;
   padding: 12px 12px 10px;
   display: flex;
   flex-direction: column;
