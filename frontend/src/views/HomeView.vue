@@ -797,20 +797,17 @@ onMounted(async () => {
   min-height: 0;
   overflow-y: auto;
   margin-top: 8px;
-  /* 留出比输入框更高的空间：这样任何一行都能滚到输入框上方，不会被永久遮住 */
-  padding-bottom: 172px;
-  scroll-padding-bottom: 172px;
+  padding-bottom: 24px;
 }
 
 /* 输入框与对话区之间再留一道间距（此前最后一行会贴到输入框上沿） */
 .hero--active .composer {
-  position: absolute; /* 浮在对话区之上，而不是占掉一整行 */
-  left: 50%;
-  bottom: 0;
-  z-index: 5;
-  width: min(720px, calc(100% - 24px)); /* 比内容列窄，两侧留边 */
-  transform: translateX(-50%);
-  box-shadow: 0 14px 36px rgb(0 0 0 / 18%);
+  /* 留在文档流里：这样对话区的可滚动区域天然止于输入框上沿，
+     文本永远不可能画到输入框所在区域（此前用 absolute 脱离文档流，正是文本"进框"的原因）。
+     宽度收窄到 720px 实现「不占满整行」，两侧自动留边。 */
+  flex: none;
+  width: min(720px, 100%);
+  margin: 12px auto 0;
 }
 
 .convo {
