@@ -16,8 +16,8 @@
  * - 关键词与领域走服务端检索；来源 / 解析状态 / 排序为**本页筛选**（下拉里已标注「本页」）；
  * - 写操作（触发抓取、建卡、创建聚合）都是 Owner 面，403 时如实提示需要 OWNER_TOKEN。
  */
-import { computed, onMounted, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 
 import { createAggregation } from '@/api/idea'
 import {
@@ -28,12 +28,38 @@ import {
 } from '@/api/papers'
 import { rebuildCard } from '@/api/parse'
 import SmoothSelect from '@/components/SmoothSelect.vue'
+import Pager from '@/components/Pager.vue'
+import PaperImportDialog from '@/components/PaperImportDialog.vue'
 import TaskMonitorDialog from '@/components/TaskMonitorDialog.vue'
 import { useSessionStore } from '@/stores/session'
 import { useTaskStore } from '@/stores/tasks'
 
+const route = useRoute()
 const router = useRouter()
 const session = useSessionStore()
+
+/** 论文导入弹窗（原独立页 /papers/import 已并入此弹窗，2026-09-20） */
+const importOpen = ref(false)
+
+function openImport(): void {
+  importOpen.value = true
+}
+
+/**
+ * 深链口径：`/papers?import=1` 打开弹窗（旧的 `/papers/import` 路由也重定向到这里）；
+ * 关闭时把参数抹掉，否则刷新页面又会被弹出来。
+ */
+watch(importOpen, (open) => {
+  if (open && !route.query.import) {
+    void router.replace({ query: { ...route.query, import: '1' } })
+    return
+  }
+  if (!open && route.query.import) {
+    const next = { ...route.query }
+    delete next.import
+    void router.replace({ query: next })
+  }
+})
 
 const PAGE_SIZE = 20
 const FIELD_OPTIONS = ['cs.AI', 'cs.CL', 'cs.CV', 'cs.LG']
@@ -280,6 +306,7 @@ async function buildCardsForSelected(): Promise<void> {
 }
 
 onMounted(() => {
+  if (route.query.import) importOpen.value = true
   void loadOverview()
   void loadList()
 })
@@ -289,6 +316,9 @@ onMounted(() => {
   <section class="papers">
     <header class="papers__head">
       <h1>文献总览</h1>
+      <div class="papers__actions">
+        <button class="btn btn--primary" type="button" @click="openImport">导入</button>
+      </div>
     </header>
 
     <p v-if="notice" class="notice">{{ notice }}</p>
@@ -327,6 +357,13 @@ onMounted(() => {
       <SmoothSelect v-model="parseFilter" :options="PARSE_SELECT_OPTIONS" />
       <SmoothSelect v-model="sortKey" :options="SORT_SELECT_OPTIONS" />
       <button class="btn" type="button" @click="applyFilters">检索</button>
+      <Pager
+        class="filters__pager"
+        :page="page"
+        :page-count="pageCount"
+        :disabled="loading"
+        @change="changePage"
+      />
     </div>
 
     <p v-if="listError" class="hint hint--err">列表获取失败：{{ listError }}</p>
@@ -398,19 +435,7 @@ onMounted(() => {
 
     <div class="foot">
       <span>共 {{ total }} 篇 · 第 {{ page }} / {{ pageCount }} 页</span>
-      <div class="pager">
-        <button class="btn" type="button" :disabled="page <= 1 || loading" @click="changePage(page - 1)">
-          上一页
-        </button>
-        <button
-          class="btn"
-          type="button"
-          :disabled="page >= pageCount || loading"
-          @click="changePage(page + 1)"
-        >
-          下一页
-        </button>
-      </div>
+      <Pager :page="page" :page-count="pageCount" :disabled="loading" @change="changePage" />
     </div>
 
     <div v-if="selected.length > 0" class="bulk">
@@ -438,6 +463,8 @@ onMounted(() => {
       @resume="controlTask('resume')"
       @cancel="controlTask('cancel')"
     />
+    <!-- 论文导入弹窗（原独立页 /papers/import 已并入此弹窗） -->
+    <PaperImportDialog v-model:open="importOpen" />
   </section>
 </template>
 
@@ -722,9 +749,8 @@ onMounted(() => {
   font-size: var(--font-size-xs);
 }
 
-.pager {
-  display: flex;
-  gap: var(--space-2);
+.filters__pager {
+  margin-left: var(--space-2);
 }
 
 .bulk {

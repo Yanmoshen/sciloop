@@ -49,11 +49,11 @@ const HOME_NAV: HomeNavItem[] = [
     key: 'literature',
     label: '文献调研',
     path: '/papers',
-    // 点「文献调研」在其下方展开这四项；子页高亮由 route.meta.module 决定
+    // 点「文献调研」在其下方展开这几项；子页高亮由 route.meta.module 决定
+    // （「论文导入」2026-09-20 起并入文献总览弹窗，已从导航除名）
     children: [
       { key: 'papers', label: '文献总览', path: '/papers' },
       { key: 'feed', label: '论文库', path: '/papers/feed' },
-      { key: 'import', label: '论文导入', path: '/papers/import' },
       { key: 'translate', label: '论文翻译', path: '/papers/translate' },
       { key: 'reader', label: '全文阅读', path: '/papers/reader' },
       { key: 'parse', label: '论文解析', path: '/papers/parse/demo' },

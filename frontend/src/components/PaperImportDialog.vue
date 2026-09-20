@@ -7,12 +7,15 @@
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * 论文导入（核心模块 ①）：上传 PDF（拖拽 / 选择）+ 按 DOI / arXiv ID 批量导入，
- * 下方是本轮任务的实时进度与导入历史。
+ * 论文导入（核心模块 ①）**弹窗版**：从「文献总览」标题行的「导入」按钮打开。
+ *
+ * 2026-09-20 改造：原本是 `/papers/import` 独立页，现整页搬进弹窗、独立页与左侧导航项撤掉，
+ * 旧路由保留为重定向（`/papers?import=1`）。**内部逻辑（上传 / 标识符 / 轮询进度 / 导入历史）一字未改**，
+ * 只加外壳与分栏：左侧导航 ① 导入（拖拽上传 + 按标识符 + 本次导入进度）② 导入历史（自带分页）。
  *
  * 写操作全部是 Owner 面：public_demo 匿名调用会拿到 403，界面如实提示去「设置」页填令牌。
  */
-import { computed, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 
 import {
   fetchImportHistory,
@@ -22,6 +25,12 @@ import {
   type ImportHistoryItem,
   type ImportJob,
 } from '@/api/imports'
+
+const props = withDefaults(defineProps<{ open: boolean }>(), { open: false })
+const emit = defineEmits<{ 'update:open': [open: boolean] }>()
+
+/** 弹窗左侧导航面板 */
+const pane = ref<'import' | 'history'>('import')
 
 const files = ref<File[]>([])
 const identifiers = ref('')
@@ -37,7 +46,6 @@ const historyLoading = ref(false)
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
 const TERMINAL = ['done', 'failed', 'cancelled', 'succeeded', 'partial']
-const isRunning = computed(() => !!job.value && !TERMINAL.includes(String(job.value.status)))
 const fileSummary = computed(() =>
   files.value.reduce((sum, file) => sum + file.size, 0) / 1048576,
 )
@@ -193,22 +201,68 @@ function timeOf(value: string | null | undefined): string {
 const counts = computed(() => job.value?.counts ?? {})
 const jobItems = computed(() => job.value?.items ?? [])
 
-void loadHistory(1)
+function close(): void {
+  emit('update:open', false)
+}
 
-onUnmounted(stopPolling)
+function onKeydown(event: KeyboardEvent): void {
+  if (event.key === 'Escape') close()
+}
+
+/** 打开时才拉历史（不给每个页面加一次无谓请求），并把面板复位到「导入」 */
+watch(
+  () => props.open,
+  (open) => {
+    if (!open) return
+    pane.value = 'import'
+    void loadHistory(1)
+  },
+)
+
+onMounted(() => document.addEventListener('keydown', onKeydown))
+onUnmounted(() => {
+  document.removeEventListener('keydown', onKeydown)
+  stopPolling()
+})
 </script>
 
 <template>
-  <section class="importer">
-    <header class="importer__head">
-      <h1>论文导入</h1>
-      <span class="badge" :class="isRunning ? 'badge--warn' : 'badge--ok'">
-        {{ isRunning ? '导入进行中' : '待导入' }}
-      </span>
-    </header>
+  <Teleport to="body">
+    <div v-if="open" class="imp-overlay" @click.self="close">
+      <section class="imp-dialog" role="dialog" aria-modal="true" aria-label="论文导入">
+        <header class="imp-dialog__head">
+          <h1 class="imp-dialog__title">论文导入</h1>
+          <span class="imp-dialog__spacer" />
+          <button class="imp-dialog__close" type="button" aria-label="关闭" @click="close">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+              <path d="M3.5 3.5l7 7M10.5 3.5l-7 7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+            </svg>
+          </button>
+        </header>
 
-    <p v-if="notice" class="notice">{{ notice }}</p>
+        <nav class="imp-dialog__nav" aria-label="导入导航">
+          <button
+            class="imp-nav__item"
+            :class="{ 'imp-nav__item--on': pane === 'import' }"
+            type="button"
+            @click="pane = 'import'"
+          >
+            导入
+          </button>
+          <button
+            class="imp-nav__item"
+            :class="{ 'imp-nav__item--on': pane === 'history' }"
+            type="button"
+            @click="pane = 'history'"
+          >
+            导入历史
+          </button>
+        </nav>
 
+        <div class="imp-dialog__body scroll-y">
+          <p v-if="notice" class="notice">{{ notice }}</p>
+
+          <template v-if="pane === 'import'">
     <div class="grid">
       <article class="panel">
         <div class="panel__head">
@@ -306,8 +360,10 @@ onUnmounted(stopPolling)
         </li>
       </ul>
     </article>
+          </template>
 
-    <article class="panel">
+          <!-- 面板 2：导入历史 -->
+          <article v-else class="panel">
       <div class="panel__head">
         <h2>导入历史</h2>
         <span class="chip">共 {{ historyTotal }} 条</span>
@@ -354,26 +410,138 @@ onUnmounted(stopPolling)
           下一页
         </button>
       </footer>
-    </article>
-  </section>
+          </article>
+        </div>
+      </section>
+    </div>
+  </Teleport>
 </template>
 
 <style scoped>
-.importer {
+/* ---------- 弹窗外壳 ---------- */
+.imp-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+  /* 与 ProjectCreateDialog 同口径：遮罩色与主题解耦，深色下加深 */
+  background: rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(8px) saturate(120%);
+  -webkit-backdrop-filter: blur(8px) saturate(120%);
+}
+
+:global(:root[data-theme='dark']) .imp-overlay {
+  background: rgba(0, 0, 0, 0.55);
+}
+
+/* 近正方形：宽度 960，高度撑满可用高度（内容多时内部滚动） */
+.imp-dialog {
+  width: min(960px, 100%);
+  height: min(820px, 100%);
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  background: var(--color-card-bg);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.4);
+  animation: imp-pop 160ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes imp-pop {
+  from {
+    opacity: 0;
+    transform: translateY(-8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.imp-dialog__head {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.imp-dialog__title {
+  margin: 0;
+  font-size: var(--font-size-lg);
+}
+
+.imp-dialog__spacer {
+  flex: 1;
+}
+
+.imp-dialog__close {
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: border-color 160ms, color 160ms;
+}
+
+.imp-dialog__close:hover {
+  border-color: var(--color-border-strong);
+  color: var(--color-text-primary);
+}
+
+.imp-dialog__nav {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: var(--space-3);
+  border-right: 1px solid var(--color-border);
+  background: var(--color-bg-subtle);
+}
+
+.imp-nav__item {
+  padding: 9px 12px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--color-text-primary);
+  font: inherit;
+  font-size: var(--font-size-md);
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 160ms, color 160ms;
+}
+
+.imp-nav__item:hover {
+  background: var(--color-bg-muted);
+}
+
+.imp-nav__item--on {
+  background: var(--color-brand-soft);
+  color: var(--color-brand);
+  box-shadow: inset 2px 0 0 var(--color-brand);
+  font-weight: 500;
+}
+
+.imp-dialog__body {
   padding: var(--space-4);
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
 }
-.importer__head {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-}
-.importer__head h1 {
-  margin: 0;
-  font-size: var(--font-size-xl);
-}
+
+/* ---------- 面板内容（沿用原独立页的样式口径） ---------- */
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));

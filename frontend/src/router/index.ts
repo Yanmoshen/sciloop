@@ -158,11 +158,13 @@ export const routes: RouteRecordRaw[] = [
         meta: { title: '知识资产', module: 'knowledge', homeNav: 'knowledge' },
       },
       // ---- 四个核心模块（EasyPaper 风格，本轮前端对接）----
+      // 论文导入已并入「文献总览」的弹窗（2026-09-20）：旧路径保留为重定向，
+      // 免得旧书签 / 演示脚本里的 /papers/import 直接 404。
       {
         path: 'papers/import',
         name: 'import',
-        component: () => import('@/views/ImportView.vue'),
-        meta: { title: '论文导入', module: 'import' },
+        redirect: { path: '/papers', query: { import: '1' } },
+        meta: { title: '论文导入', module: 'papers', homeNav: 'literature' },
       },
       {
         path: 'papers/translate',
