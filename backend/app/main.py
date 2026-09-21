@@ -110,6 +110,10 @@ ROUTER_REGISTRY: tuple[tuple[str, str, bool], ...] = (
     # 11.3) 会话（本轮新增，可选）：/conversations
     #       首页对话的多轮记录（JSON 落盘），刷新后据此恢复。
     ("app.api.v1.conversations", "/api/v1", False),
+    # 11.4) 研究节点编排层（本轮新增，可选）：/research
+    #       七节点图的程序主控执行（契约 + 硬规则 + 三类闸门），与六阶段引擎并行互不影响。
+    #       同样使用顶层字面前缀，规避「静态段被参数路由抢占 → 422」。
+    ("app.api.v1.research", "/api/v1", False),
     # 12) 模型配置与成本（WP02，自带 /models 与 /costs 前缀）
     ("app.api.v1.models_config", "/api/v1", True),
     ("app.api.v1.costs", "/api/v1", True),

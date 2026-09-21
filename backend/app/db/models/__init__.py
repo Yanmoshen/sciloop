@@ -24,6 +24,15 @@
 ``app_settings``（``scope`` 主键 + ``value`` JSONB）由 ``app/db/models/settings.py`` 定义，
 同样**不属于附录 A.0 的 30 张表**，``TABLE_BUILD_ORDER`` 保持原样不变。
 该表**没有任何外键**，建/删顺序无依赖。
+
+补充（研究节点编排层，迁移 ``0008_research_nodes``）
+---------------------------------------------------
+``research_node_runs`` / ``research_node_transitions`` 由
+``app/db/models/research.py`` 定义，同样**不属于附录 A.0 的 30 张表**，
+``TABLE_BUILD_ORDER`` 保持原样不变。两表都只依赖 ``projects``，
+建表顺序为 ``research_node_runs`` → ``research_node_transitions``（互不依赖）。
+本层**不新增业务实体表**：证据落 ``evidences``、假设落 ``ideas``、
+可行性落 ``feasibilities``、实验协议落 ``taskbooks``。
 """
 
 from __future__ import annotations
@@ -53,6 +62,15 @@ from app.db.models.reader import (
     ReaderDocument,
     ReaderState,
     ReaderVersion,
+)
+from app.db.models.research import (
+    IMPLEMENTED_NODES,
+    NODE_STATUSES,
+    RESEARCH_NODES,
+    TRANSITION_KINDS,
+    TRANSITION_TRIGGERS,
+    ResearchNodeRun,
+    ResearchNodeTransition,
 )
 from app.db.models.review import (
     DecisionLog,
@@ -114,7 +132,12 @@ DEFERRED_FOREIGN_KEYS: tuple[str, ...] = (
 
 __all__ = [
     "DEFERRED_FOREIGN_KEYS",
+    "IMPLEMENTED_NODES",
+    "NODE_STATUSES",
+    "RESEARCH_NODES",
     "TABLE_BUILD_ORDER",
+    "TRANSITION_KINDS",
+    "TRANSITION_TRIGGERS",
     "Aggregation",
     "AppSetting",
     "Base",
@@ -146,6 +169,8 @@ __all__ = [
     "ReaderDocument",
     "ReaderState",
     "ReaderVersion",
+    "ResearchNodeRun",
+    "ResearchNodeTransition",
     "ReviewCalibration",
     "ReviewScore",
     "StageModelRouting",
