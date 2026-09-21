@@ -38,7 +38,12 @@ from llm.errors import (
     ModelRoutingError,
     ReplayMissError,
 )
-from llm.http_client import OpenAICompatibleClient, extract_delta, extract_usage
+from llm.http_client import (
+    OpenAICompatibleClient,
+    extract_delta,
+    extract_tool_call_deltas,
+    extract_usage,
+)
 from llm.pricing import PRICE_MISSING_WARNING, compute_cost_usd, is_non_usd_reason
 from llm.providers import (
     detect_capability,
@@ -87,9 +92,8 @@ async def chat(
     :param json_schema: 传入即启用结构化输出校验与自动重试
     :param tools: OpenAI 兼容的工具声明（`[{"type":"function","function":{...}}]`）；
         传了之后模型的 `tool_calls` 会在 ``LLMResult.tool_calls`` 里回来。
-        ⚠️ **当前只对非流式链路生效**：流式响应的 tool_call 是分片下发的，需要跨 chunk
-        累积拼装，那一步还没做。所以走流式时就算传了 tools，也不会带回 tool_calls ——
-        这是**已知限制**，不是静默丢弃：调用方若必须用工具，请走非流式。
+        非流式与**流式都支持** —— 流式下 tool_calls 按 index 分片下发，
+        由 `_merge_tool_call_deltas` 边收边拼接（arguments 是字符串拼接，不是覆盖）。
     :param stage: 六环节 / 前置环节名（写入 ``llm_call_logs.stage``）
     :param purpose: 更细的用途标签（写入 ``llm_call_logs.purpose``）
     :param allow_fallback: 传输层失败是否按链降级到备用模型
@@ -577,6 +581,8 @@ async def chat_stream(
         started = time.perf_counter()
         parts: list[str] = []
         reasoning_parts: list[str] = []
+        # 工具调用在流式里是**分片**下发的，必须边收边按 index 拼接（见 _merge_tool_call_deltas）
+        tool_calls_acc: list[dict[str, Any]] = []
         finish_reason: str | None = None
         usage = Usage()
         model_returned: str | None = None
@@ -594,6 +600,8 @@ async def chat_stream(
                         if chunk_usage is not None:
                             usage = chunk_usage
                         text, reasoning, chunk_finish = extract_delta(chunk)
+                        # 工具增量与正文并行收集：模型可能一边说话一边要求调工具
+                        _merge_tool_call_deltas(tool_calls_acc, extract_tool_call_deltas(chunk))
                         if chunk_finish:
                             finish_reason = chunk_finish
                         if reasoning:
@@ -724,6 +732,7 @@ async def chat_stream(
                 http_calls=1,
                 is_replay=False,
                 finish_reason=finish_reason,
+                tool_calls=list(tool_calls_acc),
                 stage=stage,
                 purpose=purpose,
                 prompt_hash=prompt_hash,
@@ -812,6 +821,43 @@ def _build_payload(
     if tools:
         payload["tools"] = tools
     return payload, effective_messages
+
+
+def _merge_tool_call_deltas(acc: list[dict[str, Any]], deltas: Any) -> list[dict[str, Any]]:
+    """把流式分片合并进累积列表（原地更新并返回）。
+
+    **为什么不能"后一个覆盖前一个"**：OpenAI 兼容流的 tool_calls 是**按 index 分片**下发的 ——
+    首片带 `id` 与 `function.name`，后续片**只带 `function.arguments` 的片段**。
+    所以必须按 index 归位、把 arguments **字符串拼接**，否则拿到的一定是半截 JSON
+    （表现为"参数解析失败"或"工具名对、参数空"，极难定位）。
+
+    没有 `index` 的网关（少数实现）：按到达顺序当新的一条追加。
+    """
+
+    if not isinstance(deltas, list):
+        return acc
+    for raw in deltas:
+        if not isinstance(raw, dict):
+            continue
+        index = raw.get("index")
+        if not isinstance(index, int) or index < 0:
+            index = len(acc)
+        # 分片可能跳号（有的网关只发变化的那一条），补齐空洞再归位
+        while len(acc) <= index:
+            acc.append({"id": None, "type": "function", "function": {"name": "", "arguments": ""}})
+        slot = acc[index]
+        if raw.get("id"):
+            slot["id"] = raw["id"]
+        if raw.get("type"):
+            slot["type"] = raw["type"]
+        fn = raw.get("function")
+        if isinstance(fn, dict):
+            if fn.get("name"):
+                slot["function"]["name"] = fn["name"]
+            args = fn.get("arguments")
+            if isinstance(args, str) and args:
+                slot["function"]["arguments"] += args
+    return acc
 
 
 def _extract_tool_calls(source: Any) -> list[dict[str, Any]]:

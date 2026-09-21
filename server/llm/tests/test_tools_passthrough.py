@@ -17,7 +17,10 @@
 
 from __future__ import annotations
 
-from llm.adapter import _build_payload, _extract_tool_calls
+import json
+
+from llm.adapter import _build_payload, _extract_tool_calls, _merge_tool_call_deltas
+from llm.http_client import extract_tool_call_deltas
 from llm.types import LLMResult, ResolvedModel
 
 MODEL = ResolvedModel(
@@ -133,3 +136,78 @@ def test_extract_never_fabricates_on_malformed_response() -> None:
 def test_llm_result_defaults_to_no_tool_calls() -> None:
     result = LLMResult(content="hi", model_ref="ds:x", provider="ds", model_id="x")
     assert result.tool_calls == []
+
+
+# --------------------------------------------------------------------------- #
+# 3) 流式分片累积（最容易出错的一段）
+# --------------------------------------------------------------------------- #
+def test_stream_arguments_are_concatenated_not_overwritten() -> None:
+    """**这是最关键的一条**：arguments 分三片到达，必须拼成完整 JSON。
+
+    如果实现写成"后一片覆盖前一片"，拿到的会是半截 JSON —— 表现是
+    「工具名对、参数解析失败」，最难定位的一类故障。
+    """
+
+    acc: list[dict] = []
+    _merge_tool_call_deltas(
+        acc, [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "query_library"}}]
+    )
+    _merge_tool_call_deltas(acc, [{"index": 0, "function": {"arguments": '{"to'}}])
+    _merge_tool_call_deltas(acc, [{"index": 0, "function": {"arguments": 'pic":"a"}'}}])
+
+    assert len(acc) == 1
+    assert acc[0]["id"] == "call_1"
+    assert acc[0]["function"]["name"] == "query_library"
+    assert acc[0]["function"]["arguments"] == '{"topic":"a"}'
+    json.loads(acc[0]["function"]["arguments"])  # 必须是合法 JSON
+
+
+def test_stream_keeps_id_and_name_from_first_fragment() -> None:
+    """后续分片不带 id/name，不能被清空。"""
+
+    acc: list[dict] = []
+    _merge_tool_call_deltas(acc, [{"index": 0, "id": "c1", "function": {"name": "f", "arguments": "{"}}])
+    _merge_tool_call_deltas(acc, [{"index": 0, "function": {"arguments": "}"}}])
+    assert (acc[0]["id"], acc[0]["function"]["name"]) == ("c1", "f")
+
+
+def test_stream_multiple_calls_are_kept_apart_by_index() -> None:
+    acc: list[dict] = []
+    _merge_tool_call_deltas(acc, [{"index": 0, "id": "a", "function": {"name": "x"}}])
+    _merge_tool_call_deltas(acc, [{"index": 1, "id": "b", "function": {"name": "y"}}])
+    _merge_tool_call_deltas(acc, [{"index": 0, "function": {"arguments": "1"}}])
+    _merge_tool_call_deltas(acc, [{"index": 1, "function": {"arguments": "2"}}])
+    assert [c["function"]["arguments"] for c in acc] == ["1", "2"]
+
+
+def test_stream_tolerates_gapped_and_missing_index() -> None:
+    """跳号的 index 要补齐空洞；没有 index 的网关按到达顺序追加。"""
+
+    acc: list[dict] = []
+    _merge_tool_call_deltas(acc, [{"index": 2, "id": "c2", "function": {"name": "z"}}])
+    assert len(acc) == 3 and acc[2]["id"] == "c2"
+    assert acc[0]["function"]["arguments"] == ""
+
+    _merge_tool_call_deltas(acc, [{"function": {"name": "noidx"}}])
+    assert acc[-1]["function"]["name"] == "noidx"
+
+
+def test_stream_merge_ignores_garbage() -> None:
+    acc: list[dict] = []
+    for junk in (None, "nope", 42, [1, "x", None], [{"index": "bad"}]):
+        _merge_tool_call_deltas(acc, junk)
+    # `[{"index": "bad"}]` 会按「无 index」追加一条，其余全部忽略
+    assert len(acc) == 1
+    assert acc[0]["function"]["arguments"] == ""
+
+
+def test_extract_tool_call_deltas_shapes() -> None:
+    chunk = {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "c1"}]}}]}
+    assert extract_tool_call_deltas(chunk) == [{"index": 0, "id": "c1"}]
+    # 正文分片里没有 tool_calls → 空列表，而不是报错
+    assert extract_tool_call_deltas({"choices": [{"delta": {"content": "hi"}}]}) == []
+    assert extract_tool_call_deltas({"choices": [{"delta": {"tool_calls": "nope"}}]}) == []
+    assert extract_tool_call_deltas({}) == []
+    assert extract_tool_call_deltas({"choices": [{"delta": {"tool_calls": [1, {"index": 0}]}}]}) == [
+        {"index": 0}
+    ]

@@ -446,6 +446,30 @@ def _parse_sse_line(line: str) -> Any:
     return _safe_json(data)
 
 
+def extract_tool_call_deltas(chunk: dict[str, Any]) -> list[dict[str, Any]]:
+    """从流式分片里取出**工具调用增量**（原始分片，不做合并）。
+
+    单独一个函数而不是塞进 `extract_delta`：后者的返回是三元组
+    `(正文, 思考, finish)`，再加第四项会让所有既有调用点都要改签名；
+    而工具增量只有流式累加器关心。取不到即空列表 —— 「这一片没有工具增量」，
+    不是「不支持」。合并规则见 `adapter._merge_tool_call_deltas`。
+    """
+
+    choices = chunk.get("choices") or []
+    if not choices:
+        return []
+    first = choices[0]
+    if not isinstance(first, dict):
+        return []
+    delta = first.get("delta")
+    if not isinstance(delta, dict):
+        return []
+    calls = delta.get("tool_calls")
+    if not isinstance(calls, list):
+        return []
+    return [call for call in calls if isinstance(call, dict)]
+
+
 def extract_delta(chunk: dict[str, Any]) -> tuple[str, str, str | None]:
     """从流式分片里取出 ``(正文增量, 思考增量, finish_reason)``。
 
