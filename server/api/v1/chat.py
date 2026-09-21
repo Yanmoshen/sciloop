@@ -394,6 +394,9 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
 
         buffer: list[str] = []
         reasoning_buffer: list[str] = []
+        # 工具调用过程行也要**落盘**：只发 SSE 不落盘的话，刷新后这段过程凭空消失，
+        # 而库里只剩一句结论 —— 正是「显示与落盘必须一致」要防的那种不一致。
+        tool_rows: list[dict[str, Any]] = []
         started = time.perf_counter()
         result: Any = None
         error_info: dict[str, Any] | None = None
@@ -458,16 +461,15 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
                     )
                 )
                 for call in calls:
-                    yield _sse("row", {"row": agent_tools.tool_row(call, "start")})
+                    start_row = agent_tools.tool_row(call, "start")
+                    tool_rows.append(start_row)
+                    yield _sse("row", {"row": start_row})
                     payload_out, summary = await agent_tools.run_tool_call(call)
-                    yield _sse(
-                        "row",
-                        {
-                            "row": agent_tools.tool_row(
-                                call, "ok" if payload_out.get("ok") else "err", summary
-                            )
-                        },
+                    end_row = agent_tools.tool_row(
+                        call, "ok" if payload_out.get("ok") else "err", summary
                     )
+                    tool_rows.append(end_row)
+                    yield _sse("row", {"row": end_row})
                     messages_now.append(
                         {
                             "role": "tool",
@@ -523,6 +525,7 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
                             if result is not None
                             else duration_ms,
                             "reasoning": reasoning_text or None,
+                            "rows": tool_rows,
                             "interrupted": bool(error_info),
                         },
                     ],
