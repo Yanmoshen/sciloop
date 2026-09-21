@@ -31,7 +31,6 @@ import ResearchFlowDrawer from '@/components/home/ResearchFlowDrawer.vue'
 import ProjectCreateDialog from '@/components/ProjectCreateDialog.vue'
 import type { CreatedProject } from '@/api/projects'
 import { useConversationStore } from '@/stores/conversations'
-import { usePipelineDrawerStore } from '@/stores/pipelineDrawer'
 import { useSessionStore } from '@/stores/session'
 import { useSettingsStore } from '@/stores/settings'
 import { consumeEntrance } from '@/utils/pageEntrance'
@@ -59,7 +58,6 @@ const router = useRouter()
 const session = useSessionStore()
 const settings = useSettingsStore()
 const conversations = useConversationStore()
-const pipelineDrawer = usePipelineDrawerStore()
 
 const prompt = ref('')
 const files = ref<Array<{ name: string }>>([])
@@ -659,11 +657,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <section
-    class="chat"
-    :class="{ 'chat--active': active, 'chat--enter': entranceOn }"
-    :style="{ '--rfd-shift': pipelineDrawer.open ? `${pipelineDrawer.width}px` : '0px' }"
-  >
+  <section class="chat" :class="{ 'chat--active': active, 'chat--enter': entranceOn }">
     <!-- 开场区展开/收起统一走 .fold（双向高度过渡），替掉原来的 max-height 硬编码
          —— 内容不足 420px 时旧写法会"空跑"一段，收展节奏不匀。 -->
     <div class="fold" :class="{ 'fold--open': !active }">
@@ -1049,15 +1043,16 @@ onUnmounted(() => {
 
 <style scoped>
 .chat {
-  width: 100%;
-  max-width: 880px;
+  /* 宽度用 min(880, 100% - 60) 而不是 width:100% + max-width：
+     后者配上 margin-left 会让整列超出容器 30px（压到抽屉底下）。 */
+  width: min(880px, calc(100% - 60px));
   display: flex;
   flex-direction: column;
   min-height: 100%;
   padding: 64px 32px 0;
-  /* 研究流程抽屉滑出时，正文整体左移（把抽屉宽度加进右内边距） */
-  padding-right: calc(32px + var(--rfd-shift, 0px));
-  transition: padding-right 340ms var(--motion-ease-out);
+  /* 空间够时居中；右侧抽屉越宽容器越窄 → 正文自然往左靠，但**始终保留 30px 左边距** */
+  align-self: flex-start;
+  margin-left: max(30px, calc((100% - 880px) / 2));
 }
 
 /* 有对话时：hero 收起，thread 吃掉剩余高度，输入栏留在文档流最后一行

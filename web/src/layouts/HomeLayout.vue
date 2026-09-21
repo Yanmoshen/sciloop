@@ -1276,11 +1276,11 @@ onUnmounted(() => {
       />
     </aside>
 
-    <div class="main">
-      <header
-        class="topbar"
-        :style="{ '--rfd-shift': pipelineDrawer.open ? `${pipelineDrawer.width}px` : '0px' }"
-      >
+    <div
+      class="main"
+      :style="{ '--rfd-shift': pipelineDrawer.open ? `${pipelineDrawer.width}px` : '0px' }"
+    >
+      <header class="topbar">
         <!-- 折叠后，同一个开关挪到这里：搜索框左边。展开时它回左栏品牌行右侧。 -->
         <button
           v-if="railCollapsed"
@@ -1321,29 +1321,6 @@ onUnmounted(() => {
         </div>
 
         <div class="topbar__spacer" />
-
-        <!-- 研究流程入口：只有图标、没有外层框；展开时框内竖条滑到左侧 -->
-        <button
-          class="topbar__plain"
-          type="button"
-          title="研究流程"
-          aria-label="研究流程"
-          :aria-expanded="pipelineDrawer.open ? 'true' : 'false'"
-          @click="pipelineDrawer.toggle()"
-        >
-          <svg width="18" height="18" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <rect x="1.9" y="3.1" width="12.2" height="9.8" rx="3" stroke="currentColor" stroke-width="1.5" />
-            <rect
-              class="topbar__plainBar"
-              x="10.2"
-              y="5.9"
-              width="1.8"
-              height="4.2"
-              rx="0.9"
-              fill="currentColor"
-            />
-          </svg>
-        </button>
 
         <button
           class="theme-toggle theme-toggle--task"
@@ -1418,6 +1395,23 @@ onUnmounted(() => {
       <main class="content" :class="{ 'content--page': !isHomeLike }">
         <RouterView />
       </main>
+
+      <!-- 研究流程入口：贴在内容区右上角（顶栏下方）。抽屉打开后它就让位给抽屉右上角那个折叠按钮。
+           放在 .content 之外（.content 是滚动容器，绝对定位子元素会跟着滚走）。
+           无外框，只有图标；随抽屉宽度左移。 -->
+      <button
+        v-if="isHomeLike && !pipelineDrawer.open"
+        class="panel-entry"
+        type="button"
+        title="研究流程"
+        aria-label="研究流程"
+        @click="pipelineDrawer.toggle()"
+      >
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <rect x="1.9" y="3.1" width="12.2" height="9.8" rx="3" stroke="currentColor" stroke-width="1.5" />
+          <rect x="10.2" y="5.9" width="1.8" height="4.2" rx="0.9" fill="currentColor" />
+        </svg>
+      </button>
     </div>
 
     <ProjectRenameDialog
@@ -2032,6 +2026,7 @@ onUnmounted(() => {
 
 /* ---------- 主区 ---------- */
 .main {
+  position: relative;
   flex: 1;
   min-width: 0;
   display: flex;
@@ -2082,7 +2077,12 @@ onUnmounted(() => {
 }
 
 /* 无框图标按钮（与旁边带框的主题/任务按钮区分：这里刻意不加边框与底色） */
-.topbar__plain {
+.panel-entry {
+  position: absolute;
+  /* 顶栏高 64px：入口贴在顶栏下方的内容区右上角 */
+  top: 78px;
+  right: calc(20px + var(--rfd-shift, 0px));
+  z-index: 5;
   width: 32px;
   height: 32px;
   display: grid;
@@ -2091,20 +2091,11 @@ onUnmounted(() => {
   background: transparent;
   color: var(--h-fg-muted);
   cursor: pointer;
-  transition: color 160ms var(--motion-ease);
+  transition: color 160ms var(--motion-ease), right 340ms var(--motion-ease-out);
 }
 
-.topbar__plain:hover {
+.panel-entry:hover {
   color: var(--h-fg);
-}
-
-/* 竖条随展开状态左右滑动：收起在右侧、展开滑到左侧 */
-.topbar__plainBar {
-  transition: transform 280ms var(--motion-ease-out);
-}
-
-.topbar__plain[aria-expanded='true'] .topbar__plainBar {
-  transform: translateX(-5.8px);
 }
 .theme-toggle {
   width: 36px;
@@ -2229,6 +2220,9 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   align-items: center;
+  /* 研究流程抽屉滑出时，把它的宽度从内容区里让出来 —— 子元素（正文列）据此重新定位 */
+  padding-right: var(--rfd-shift, 0px);
+  transition: padding-right 340ms var(--motion-ease-out);
 }
 
 /* 非首页（文献调研 / 知识库 / 工作台等）：铺满 + 与原模块壳层一致的内边距 */

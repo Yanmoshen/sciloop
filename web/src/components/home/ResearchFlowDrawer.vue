@@ -135,8 +135,21 @@ const resizing = ref(false)
 let dragFrom = 0
 let dragWidth = 0
 
+/** 正文最小宽度保护：面板再宽也要给正文留 ~420px（加上左右边距约 480px），
+    上限取「用户设的 600」与「视口能给的」中较小者，避免正文被压成一条。 */
+const viewportMax = ref(Number.POSITIVE_INFINITY)
+
+function refreshViewportMax(): void {
+  const rail = document.querySelector('.rail')
+  const railWidth = rail ? rail.getBoundingClientRect().width : 248
+  viewportMax.value = Math.max(260, Math.round(window.innerWidth - railWidth - 480))
+}
+
+const effectiveMax = computed(() => Math.min(ui.WIDTH_MAX, viewportMax.value))
+
 function startDrag(event: MouseEvent): void {
   event.preventDefault()
+  refreshViewportMax()
   resizing.value = true
   dragFrom = event.clientX
   dragWidth = ui.width
@@ -144,7 +157,7 @@ function startDrag(event: MouseEvent): void {
 
 function onMove(event: MouseEvent): void {
   if (!resizing.value) return
-  ui.setWidth(dragWidth + (dragFrom - event.clientX))
+  ui.setWidth(Math.min(dragWidth + (dragFrom - event.clientX), effectiveMax.value))
 }
 
 function endDrag(): void {
@@ -170,6 +183,8 @@ watch(
 onMounted(() => {
   document.addEventListener('mousemove', onMove)
   document.addEventListener('mouseup', endDrag)
+  refreshViewportMax()
+  window.addEventListener('resize', refreshViewportMax)
   timer = setInterval(() => {
     if (ui.open) void loadChain()
   }, 4000)
@@ -178,6 +193,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   document.removeEventListener('mousemove', onMove)
   document.removeEventListener('mouseup', endDrag)
+  window.removeEventListener('resize', refreshViewportMax)
   if (timer) clearInterval(timer)
   timer = null
   abortCtl.value?.abort()
@@ -188,7 +204,7 @@ onBeforeUnmount(() => {
   <aside
     class="rfd"
     :class="{ 'rfd--open': ui.open, 'rfd--resizing': resizing }"
-    :style="{ '--rfd-w': `${ui.width}px` }"
+    :style="{ '--rfd-w': `${ui.width}px`, '--rfd-max': `${effectiveMax}px` }"
     aria-label="研究流程"
   >
     <div class="rfd__resizer" role="separator" aria-orientation="vertical" @mousedown="startDrag" />
@@ -196,14 +212,9 @@ onBeforeUnmount(() => {
     <header class="rfd__head">
       <div class="rfd__title">研究流程</div>
       <button class="rfd__icon" type="button" title="收起" aria-label="收起" @click="ui.close()">
-        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-          <path
-            d="M6 3.5 10.5 8 6 12.5"
-            stroke="currentColor"
-            stroke-width="1.6"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-          />
+        <svg width="18" height="18" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+          <rect x="1.9" y="3.1" width="12.2" height="9.8" rx="3" stroke="currentColor" stroke-width="1.5" />
+          <rect x="10.2" y="5.9" width="1.8" height="4.2" rx="0.9" fill="currentColor" />
         </svg>
       </button>
       <p class="rfd__meta">{{ headline }}</p>
@@ -285,6 +296,7 @@ onBeforeUnmount(() => {
   right: 0;
   z-index: 30;
   width: var(--rfd-w);
+  max-width: var(--rfd-max, 100%);
   height: 100%;
   display: flex;
   flex-direction: column;
