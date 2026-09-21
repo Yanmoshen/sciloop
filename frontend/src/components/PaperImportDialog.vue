@@ -42,6 +42,13 @@ const canImport = computed(() => session.isOwner)
 /** 弹窗左侧导航面板 */
 const pane = ref<'import' | 'history'>('import')
 
+/** 导入方式（下划线 tab 切换，默认上传 PDF） */
+const IMPORT_MODES = [
+  { key: 'file' as const, label: '上传 PDF' },
+  { key: 'ids' as const, label: '按标识符导入' },
+]
+const importMode = ref<'file' | 'ids'>('file')
+
 const files = ref<File[]>([])
 const identifiers = ref('')
 const dragging = ref(false)
@@ -277,94 +284,102 @@ onUnmounted(() => {
           <p v-if="notice" class="notice">{{ notice }}</p>
 
           <template v-if="pane === 'import'">
-            <!-- 能不能导入：在用户拖文件之前就说清楚（评审第 5 条） -->
-            <div class="perm" :class="canImport ? 'perm--ok' : 'perm--readonly'">
+            <!-- 只读面才提示（能导入时不再占用一行：正常状态不用解释自己正常） -->
+            <div v-if="!canImport" class="perm perm--readonly">
               <span class="perm__dot" aria-hidden="true" />
-              <span class="perm__text">
-                {{
-                  canImport
-                    ? '当前可导入：已启用编辑，上传 PDF 与标识符都会真实写入论文库。'
-                    : '当前为浏览模式：导入是写操作，需先在「设置」里启用编辑才能导入。'
-                }}
-              </span>
-              <button v-if="!canImport" class="btn btn--primary" type="button" @click="openSettings">
-                去设置
-              </button>
+              <span class="perm__text">当前为浏览模式：导入是写操作，需先在「设置」里启用编辑才能导入。</span>
+              <button class="btn btn--primary" type="button" @click="openSettings">去设置</button>
             </div>
-    <div class="grid">
-      <article class="panel">
-        <div class="panel__head">
-          <h2>上传 PDF</h2>
-          <span class="chip">{{ files.length }} 个 · {{ fileSummary.toFixed(1) }} MB</span>
-        </div>
 
-        <label
-          class="dropzone"
-          :class="{ 'dropzone--on': dragging }"
-          @dragover.prevent="dragging = true"
-          @dragleave.prevent="dragging = false"
-          @drop.prevent="onDrop"
-        >
-          <input
-            class="dropzone__input"
-            type="file"
-            accept="application/pdf,.pdf"
-            multiple
-            @change="addFiles(($event.target as HTMLInputElement).files)"
-          />
-          <span class="dropzone__mark">PDF</span>
-          <span class="dropzone__text">拖拽 PDF 到这里，或点击选择文件</span>
-        </label>
+            <!-- 导入方式切换：设置页那种「顶部选项 + 一条横线」的下划线 tab（不是按钮形状） -->
+            <nav class="imptabs" aria-label="导入方式">
+              <button
+                v-for="tab in IMPORT_MODES"
+                :key="tab.key"
+                class="imptabs__btn"
+                :class="{ 'imptabs__btn--on': importMode === tab.key }"
+                type="button"
+                :aria-current="importMode === tab.key ? 'true' : undefined"
+                @click="importMode = tab.key"
+              >
+                {{ tab.label }}
+              </button>
+            </nav>
 
-        <ul v-if="files.length" class="filelist scroll-y">
-          <li v-for="(file, index) in files" :key="`${file.name}-${index}`" class="filelist__item">
-            <span class="filelist__name">{{ file.name }}</span>
-            <span class="filelist__size">{{ (file.size / 1048576).toFixed(2) }} MB</span>
-            <button class="icon-btn" type="button" title="移除" aria-label="移除" @click="removeFile(index)">
-              <svg width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true">
-                <path d="M3.5 3.5l7 7M10.5 3.5l-7 7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-              </svg>
-            </button>
-          </li>
-        </ul>
+            <!-- 上传 PDF -->
+            <article v-if="importMode === 'file'" class="panel">
+              <div class="panel__head">
+                <h2>上传 PDF</h2>
+                <span class="chip">{{ files.length }} 个 · {{ fileSummary.toFixed(1) }} MB</span>
+              </div>
 
-        <footer class="panel__foot">
-          <button
-            class="btn btn--primary"
-            type="button"
-            :disabled="files.length === 0 || busy === 'files' || !canImport"
-            :title="canImport ? 'POST /papers/import' : '浏览模式下无法导入：需先启用编辑'"
-            @click="submitFiles"
-          >
-            {{ busy === 'files' ? '提交中…' : '开始导入' }}
-          </button>
-          <button v-if="files.length" class="btn" type="button" @click="files = []">清空</button>
-        </footer>
-      </article>
+              <label
+                class="dropzone dropzone--tall"
+                :class="{ 'dropzone--on': dragging }"
+                @dragover.prevent="dragging = true"
+                @dragleave.prevent="dragging = false"
+                @drop.prevent="onDrop"
+              >
+                <input
+                  class="dropzone__input"
+                  type="file"
+                  accept="application/pdf,.pdf"
+                  multiple
+                  @change="addFiles(($event.target as HTMLInputElement).files)"
+                />
+                <span class="dropzone__mark">PDF</span>
+                <span class="dropzone__text">拖拽 PDF 到这里，或点击选择文件</span>
+              </label>
 
-      <article class="panel">
-        <div class="panel__head">
-          <h2>按标识符导入</h2>
-        </div>
-        <textarea
-          v-model="identifiers"
-          class="ids scroll-y"
-          rows="7"
-          placeholder="每行一个 DOI 或 arXiv ID，例如：&#10;10.48550/arXiv.2609.20756&#10;2609.20756"
-        />
-        <footer class="panel__foot">
-          <button
-            class="btn btn--primary"
-            type="button"
-            :disabled="!identifiers.trim() || busy === 'ids' || !canImport"
-            :title="canImport ? 'POST /papers/import/identifiers' : '浏览模式下无法导入：需先启用编辑'"
-            @click="submitIdentifiers"
-          >
-            {{ busy === 'ids' ? '提交中…' : '导入标识符' }}
-          </button>
-        </footer>
-      </article>
-    </div>
+              <ul v-if="files.length" class="filelist scroll-y">
+                <li v-for="(file, index) in files" :key="`${file.name}-${index}`" class="filelist__item">
+                  <span class="filelist__name">{{ file.name }}</span>
+                  <span class="filelist__size">{{ (file.size / 1048576).toFixed(2) }} MB</span>
+                  <button class="icon-btn" type="button" title="移除" aria-label="移除" @click="removeFile(index)">
+                    <svg width="13" height="13" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+                      <path d="M3.5 3.5l7 7M10.5 3.5l-7 7" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
+                    </svg>
+                  </button>
+                </li>
+              </ul>
+
+              <footer class="panel__foot">
+                <button
+                  class="btn btn--primary"
+                  type="button"
+                  :disabled="files.length === 0 || busy === 'files' || !canImport"
+                  :title="canImport ? '' : '浏览模式下无法导入：需先启用编辑'"
+                  @click="submitFiles"
+                >
+                  {{ busy === 'files' ? '提交中…' : '开始导入' }}
+                </button>
+                <button v-if="files.length" class="btn" type="button" @click="files = []">清空</button>
+              </footer>
+            </article>
+
+            <!-- 按标识符导入 -->
+            <article v-else class="panel">
+              <div class="panel__head">
+                <h2>按标识符导入</h2>
+              </div>
+              <textarea
+                v-model="identifiers"
+                class="ids scroll-y"
+                rows="9"
+                placeholder="每行一个 DOI 或 arXiv ID，例如：&#10;10.48550/arXiv.2609.20756&#10;2609.20756"
+              />
+              <footer class="panel__foot">
+                <button
+                  class="btn btn--primary"
+                  type="button"
+                  :disabled="!identifiers.trim() || busy === 'ids' || !canImport"
+                  :title="canImport ? '' : '浏览模式下无法导入：需先启用编辑'"
+                  @click="submitIdentifiers"
+                >
+                  {{ busy === 'ids' ? '提交中…' : '导入标识符' }}
+                </button>
+              </footer>
+            </article>
 
     <article v-if="job" class="panel">
       <div class="panel__head">
@@ -573,12 +588,6 @@ onUnmounted(() => {
   font-size: var(--font-size-sm);
 }
 
-.perm--ok {
-  border-color: var(--color-success);
-  background: var(--color-success-soft);
-  color: var(--color-success);
-}
-
 .perm--readonly {
   border-color: var(--color-warning);
   background: var(--color-warning-soft);
@@ -601,11 +610,44 @@ onUnmounted(() => {
   flex: none;
   height: 28px;
 }
-.grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-  gap: var(--space-4);
+/* 导入方式切换：与设置页同款「顶部选项 + 一条横线」下划线 tab（不是按钮形状） */
+.imptabs {
+  display: flex;
+  gap: 24px;
+  border-bottom: 1px solid var(--color-border);
 }
+
+.imptabs__btn {
+  position: relative;
+  padding: 8px 2px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font: inherit;
+  font-size: var(--font-size-md);
+  cursor: pointer;
+  transition: color 160ms;
+}
+
+.imptabs__btn:hover {
+  color: var(--color-text-primary);
+}
+
+.imptabs__btn--on {
+  color: var(--color-text-primary);
+  font-weight: 500;
+}
+
+.imptabs__btn--on::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -1px;
+  height: 2px;
+  background: var(--color-brand);
+}
+
 .panel {
   padding: var(--space-4);
   background: var(--color-card-bg);
@@ -650,6 +692,11 @@ onUnmounted(() => {
   border-color: var(--color-brand);
   background: var(--color-brand-soft);
   transform: translateY(-1px);
+}
+
+/* 不再与"按标识符"并排 → 独占整宽，顺势把投放区放大（拖拽更好瞄、文件多也看得下） */
+.dropzone--tall {
+  min-height: 260px;
 }
 .dropzone__input {
   position: absolute;
