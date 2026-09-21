@@ -13,12 +13,17 @@
 | [05-results-analysis.md](05-results-analysis.md) | 判断实验结果能支持哪些结论 | 有效性检查、比较与不确定性、误差分析、论点证据表 |
 | [06-paper-writing.md](06-paper-writing.md) | 根据经过核验的材料撰写论文 | 论文草稿、图表引用、贡献边界、缺口清单 |
 | [07-research-retrospective.md](07-research-retrospective.md) | 对整项研究进行复盘和交接 | 假设结论、成功与失败经验、产物索引、后续路线 |
+| [08-three-node-contract-prompts.md](08-three-node-contract-prompts.md) | 想在 SciLoop 之外自己跑一遍前三个节点 | 与编排层契约对齐的可粘贴提示词（字段名 + 会被校验的规则 + 自检清单） |
+
+> **01–07 与 08 的区别**：01–07 是方法说明，字段由你自己组织；**08 是「契约对齐版」**，
+> 字段名、取值、必填项与程序里强制的完全一致（含 R1–R14 的原文），适合用来对照
+> 「程序到底会怎么判我这一份产出」。两者不冲突，按需要挑一份用。
 
 ## 2. 两种入口与返回路径
 
 ### 论文驱动
 
-阅读新文章 → 文献调研 → 提取灵感 → idea 与可行性 → 实验与数据准备 → 执行实验 → 结果分析 → 论文写作 → 研究复盘。
+阅读新文章 → 文献调研 → 提取灵感 → idea 与可行性 → 实验与数据准备 → 执行实验 → 结果分析 → 论文写作 → **论文评审**。
 
 ### Idea 驱动
 
@@ -36,7 +41,7 @@
 | 程序成功但未达到研究预期 | 结果分析 | 完整结果，包括负结果，不将其标为技术失败 |
 | 结果提示需要补对照或消融 | 实验准备 | 补实验目的、协议变更及额外预算 |
 | 写作发现论点缺证据 | 调研或结果分析；必要时再准备实验 | 哪个论点缺什么证据、为何现有材料不足 |
-| 预算耗尽、不可恢复或研究者终止 | 研究复盘 | 停止原因、已取得成果、未完成事项 |
+| 预算耗尽、不可恢复或研究者终止 | 研究复盘（收尾动作） | 停止原因、已取得成果、未完成事项 |
 
 任何节点都可以形成阶段性复盘，不必为了走完流程而制造结果。
 
@@ -81,7 +86,15 @@ SciLoop 提供文献导入与检索、全文和解析卡片、聚合对比、构
 | `blocked` | 已知资源或工具障碍阻止关键工作；给出解除条件 |
 | `stopped` | 按研究者决定或已确认的停止条件结束 |
 
-这些状态是本套文档的交接约定，不覆盖 SciLoop 的实际接口状态。节点标识统一使用：`literature_review`、`idea_and_feasibility`、`experiment_and_data_preparation`、`experiment_execution_and_retries`、`results_analysis`、`paper_writing`、`research_retrospective`。流程结束时，`next_stage` 填 `end`。
+这些状态是本套文档的交接约定，不覆盖 SciLoop 的实际接口状态。节点标识统一使用：`literature_review`、`idea_and_feasibility`、`experiment_and_data_preparation`、`experiment_execution_and_retries`、`results_analysis`、`paper_writing`、`paper_review`。流程结束时，`next_stage` 填 `end`。
+
+> **第 7 个节点是论文评审，不是研究复盘。** 研究复盘（`research_retrospective`，见 [07](07-research-retrospective.md)）
+> 是**收尾动作**：任意节点都能触发，不占节点位——中途停下、预算耗尽、假设被否定时都可以做一次。
+> 不必为了「走完七个节点」而制造结果。
+>
+> 论文评审目前没有单独的提示词文档：评审要与生成隔离（换一个模型/另一次独立评审），
+> 且需要「可写论点 / 尚不可写论点」清单作为输入——先用 [06-paper-writing.md](06-paper-writing.md)
+> 末尾的缺口清单接续即可。
 
 如需本地编号，可使用论文 `P01`、证据 `E01`、假设 `H01`、实验 `EXP01`、运行 `RUN01`、论点 `C01`。编号在同一研究中保持稳定；实验版本、修复重试和计划内重复实验分别记录。
 
