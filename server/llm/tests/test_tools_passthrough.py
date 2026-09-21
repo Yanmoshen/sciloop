@@ -19,7 +19,12 @@ from __future__ import annotations
 
 import json
 
-from llm.adapter import _build_payload, _extract_tool_calls, _merge_tool_call_deltas
+from llm.adapter import (
+    _build_payload,
+    _extract_tool_calls,
+    _merge_tool_call_deltas,
+    _normalize_messages,
+)
 from llm.http_client import extract_tool_call_deltas
 from llm.types import LLMResult, ResolvedModel
 
@@ -211,3 +216,41 @@ def test_extract_tool_call_deltas_shapes() -> None:
     assert extract_tool_call_deltas({"choices": [{"delta": {"tool_calls": [1, {"index": 0}]}}]}) == [
         {"index": 0}
     ]
+
+
+# --------------------------------------------------------------------------- #
+# 4) 工具回合的消息字段不能被 _normalize_messages 洗掉（真因就在这）
+# --------------------------------------------------------------------------- #
+def test_normalize_keeps_tool_calls_and_tool_call_id() -> None:
+    """这是本轮端到端的真根因，必须锁住。
+
+    `_normalize_messages` 原本只保留 role/content/name，于是 assistant 的 `tool_calls`
+    与 tool 的 `tool_call_id` 被**静默洗掉**，供应商报的是
+    `missing field tool_call_id` / `bad_request` —— 报错指向错误的方向，极难定位。
+    """
+
+    normalized = _normalize_messages(
+        [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"},
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "call_0", "type": "function",
+                                "function": {"name": "query_library", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call_0", "content": "{}"},
+        ]
+    )
+    assert normalized[2]["tool_calls"][0]["id"] == "call_0"
+    assert normalized[3]["tool_call_id"] == "call_0"
+    # 要求调工具时 content 本就该缺省 —— 硬塞空串会被部分兼容端判参数错
+    assert "content" not in normalized[2]
+
+
+def test_normalize_keeps_plain_messages_unchanged() -> None:
+    """普通消息的行为一个字节都不变：仍然补 content=""、仍然带 name。"""
+
+    normalized = _normalize_messages([{"role": "user"}, {"role": "user", "content": "x", "name": "n"}])
+    assert normalized[0] == {"role": "user", "content": ""}
+    assert normalized[1] == {"role": "user", "content": "x", "name": "n"}
+    assert _normalize_messages("hi") == [{"role": "user", "content": "hi"}]

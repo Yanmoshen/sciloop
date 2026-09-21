@@ -131,3 +131,43 @@ def test_tool_schemas_come_from_a_real_mcp_handshake(monkeypatch) -> None:
     for item in schemas:
         assert item["type"] == "function"
         assert item["function"]["parameters"].get("type") == "object"
+
+
+# --------------------------------------------------------------------------- #
+# 回喂消息的形状（实测在这里踩过 bad_request）
+# --------------------------------------------------------------------------- #
+def test_normalize_fills_missing_id_and_type() -> None:
+    """`id` 缺失时不能带 `null` 出去 —— 部分兼容端直接判参数错。"""
+
+    calls = mcp_tools.normalize_tool_calls(
+        [{"function": {"name": "query_library", "arguments": "{}"}}]
+    )
+    assert calls[0]["id"] == "call_0"
+    assert calls[0]["type"] == "function"
+
+
+def test_normalize_drops_nameless_calls_and_serializes_arguments() -> None:
+    calls = mcp_tools.normalize_tool_calls(
+        [
+            {"id": "a", "function": {"arguments": "{}"}},  # 没 name → 无法执行，丢掉
+            {"id": "b", "function": {"name": "fetch_url", "arguments": {"url": "u"}}},
+        ]
+    )
+    assert [c["id"] for c in calls] == ["b"]
+    # dict 形式的 arguments 要序列化成字符串（协议要求 string）
+    assert json.loads(calls[0]["function"]["arguments"]) == {"url": "u"}
+
+
+def test_normalize_ignores_garbage() -> None:
+    assert mcp_tools.normalize_tool_calls(None) == []
+    assert mcp_tools.normalize_tool_calls("nope") == []
+    assert mcp_tools.normalize_tool_calls([1, "x", None]) == []
+
+
+def test_assistant_tool_message_omits_empty_content() -> None:
+    """**空 content 整个字段都不写** —— 写成 `content: ""` 会被判 bad_request，
+    随后降级链切到没 key 的供应商，报成一句与真因无关的「env 未配置 API Key」。"""
+
+    calls = mcp_tools.normalize_tool_calls([{"function": {"name": "query_library"}}])
+    assert "content" not in mcp_tools.assistant_tool_message("", calls)
+    assert mcp_tools.assistant_tool_message("先说一句", calls)["content"] == "先说一句"

@@ -1073,13 +1073,24 @@ def _normalize_messages(messages: list[Message] | str) -> list[Message]:
         if isinstance(message, str):
             normalized.append({"role": "user", "content": message})
         elif isinstance(message, dict):
-            normalized.append(
-                {
-                    "role": str(message.get("role", "user")),
-                    "content": message.get("content", ""),
-                    **({"name": message["name"]} if message.get("name") else {}),
-                }
-            )
+            item: Message = {
+                "role": str(message.get("role", "user")),
+                "content": message.get("content", ""),
+            }
+            if message.get("name"):
+                item["name"] = message["name"]
+            # **工具回合的字段必须原样带过去**。此前这里只留 role/content/name，
+            # 于是 assistant 的 `tool_calls` 与 tool 的 `tool_call_id` 被静默洗掉 ——
+            # 供应商看到的是「一条普通文本 + 一条来路不明的 tool 消息」，报的是
+            # `missing field tool_call_id` / `bad_request`，而真因（字段被归一化丢掉）
+            # 完全看不出来。属于最坏的一类 bug：**报错指向错误的方向**。
+            for key in ("tool_calls", "tool_call_id"):
+                if message.get(key):
+                    item[key] = message[key]
+            if item.get("tool_calls") and "content" not in message:
+                # 要求调工具时 content 本就该缺省；硬塞空串会被部分兼容端判参数错
+                item.pop("content", None)
+            normalized.append(item)
         else:
             raise ValueError(f"messages 元素必须是 dict 或 str，收到 {type(message).__name__}")
     return normalized

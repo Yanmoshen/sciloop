@@ -425,7 +425,10 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
                     model_ref=ref,
                     purpose="home_reply",
                     max_tokens=REPLY_MAX_TOKENS,
-                    allow_fallback=True,
+                    # 首轮与原有行为一致；**工具轮回喂时关掉降级**：实测降级链会切到
+                    # 没配 key 的供应商，把真正的 `bad_request` 掩盖成一句无关的
+                    # 「env 未配置 API Key」。宁可如实报第一跳的错，也不要换一家继续跑。
+                    allow_fallback=round_index == 0,
                     tools=tool_defs or None,
                 ):
                     if update.kind == "delta":
@@ -442,17 +445,17 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
 
                 if round_result is not None:
                     result = round_result
-                calls = list(getattr(round_result, "tool_calls", None) or [])
+                calls = agent_tools.normalize_tool_calls(
+                    getattr(round_result, "tool_calls", None) or []
+                )
                 if not calls or round_index >= agent_tools.MAX_TOOL_ROUNDS:
                     break
 
                 # 模型要求调工具：先把这一轮如实记进消息（含它已说的话），再逐个执行
                 messages_now.append(
-                    {
-                        "role": "assistant",
-                        "content": getattr(round_result, "content", "") or "",
-                        "tool_calls": calls,
-                    }
+                    agent_tools.assistant_tool_message(
+                        getattr(round_result, "content", "") or "", calls
+                    )
                 )
                 for call in calls:
                     yield _sse("row", {"row": agent_tools.tool_row(call, "start")})

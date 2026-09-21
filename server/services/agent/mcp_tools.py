@@ -178,6 +178,54 @@ def _summarize(name: str, data: dict[str, Any]) -> str:
     return "完成"
 
 
+def normalize_tool_calls(calls: Any) -> list[dict[str, Any]]:
+    """把模型给的 tool_calls 收拾成**回喂时能被供应商接受**的形状。
+
+    两处实测踩出来的坑（caused `bad_request`，日志里表现为"流式调用 ds 建连失败（bad_request）"）：
+    - `id` 缺失时会带上 `null`，部分兼容端直接判参数错 → **补一个稳定的 id**；
+      我们随后写 `tool_call_id` 用的是同一个值，配对仍然成立。
+    - 缺 `name` 的条目无法执行 → 直接丢掉（留着只会让回喂永远失败）。
+    """
+
+    out: list[dict[str, Any]] = []
+    if not isinstance(calls, list):
+        return out
+    for index, raw in enumerate(calls):
+        if not isinstance(raw, dict):
+            continue
+        fn = raw.get("function")
+        fn = fn if isinstance(fn, dict) else {}
+        name = str(fn.get("name") or "").strip()
+        if not name:
+            continue
+        args = fn.get("arguments")
+        out.append(
+            {
+                "id": str(raw.get("id") or f"call_{index}"),
+                "type": str(raw.get("type") or "function"),
+                "function": {
+                    "name": name,
+                    "arguments": args if isinstance(args, str) else json.dumps(args or {}, ensure_ascii=False),
+                },
+            }
+        )
+    return out
+
+
+def assistant_tool_message(content: str, calls: list[dict[str, Any]]) -> dict[str, Any]:
+    """构造「模型要求调工具」那一轮的 assistant 消息。
+
+    **content 为空时整个字段都不写**：写成 `content: ""` 会被部分兼容端判为 `bad_request`
+    （实测：紧接着的降级链会切到没配 key 的供应商，最后报成一句与真因无关的
+    「供应商 env 未配置 API Key」，极难定位）。
+    """
+
+    message: dict[str, Any] = {"role": "assistant", "tool_calls": calls}
+    if content:
+        message["content"] = content
+    return message
+
+
 def tool_message_content(payload: dict[str, Any]) -> str:
     """把工具结果转成 `role=tool` 消息的正文。**截断但不撒谎**。"""
 
