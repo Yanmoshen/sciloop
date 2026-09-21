@@ -36,6 +36,10 @@ dependencies = [
     "pymupdf>=1.24,<2.0",
     # --- 调度 ---
     "apscheduler>=3.10,<4.0",
+    # --- agent 工具通道：规范 MCP 协议（自建 server 暴露自家能力给自家 agent）---
+    # 注意：2.x 起 FastMCP 已改名为 MCPServer（from mcp.server.mcpserver import MCPServer），
+    # 网上大量 v1 教程的写法在 2.x 会 ModuleNotFoundError。
+    "mcp>=2.2,<3.0",
 ]
 
 [project.optional-dependencies]
