@@ -269,14 +269,16 @@ onBeforeUnmount(() => {
           v-for="(node, index) in nodes"
           :key="node.node"
           class="rflow__node"
-          :class="`rflow__node--${visuals[index]}`"
+          :class="[`rflow__node--${visuals[index]}`, { 'rflow__node--first': index === 0 }]"
         >
           <span class="rflow__mark">
             <span class="rflow__dot" />
-            <span class="rflow__sweep" />
           </span>
           <span class="rflow__dash" />
           <span class="rflow__name">{{ node.label }}</span>
+          <!-- 流光：整段严格等于「上一个圆心 → 本圆心」（高度 100% = 一行的行高 = 相邻圆心间距），
+               并用 overflow 裁掉光点，光绝不会越出这段跑到列表上方 -->
+          <span class="rflow__sweep"><span class="rflow__spark" /></span>
         </li>
       </ol>
 
@@ -587,13 +589,10 @@ onBeforeUnmount(() => {
   display: none;
   position: absolute;
   left: 5px;
-  bottom: 50%;
+  bottom: 50%; /* 底边 = 本节点圆心 */
+  height: 100%; /* 顶边 = 上一个节点圆心（行高 = 相邻圆心间距，随字号自适配） */
   width: 5px;
-  height: 42px;
-  border-radius: 3px;
-  background: linear-gradient(180deg, transparent, var(--rfd-sweep), transparent);
-  filter: drop-shadow(0 0 6px var(--rfd-sweep-glow));
-  animation: rfdSweep 1.5s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  overflow: hidden; /* 关键：光点裁在这一段内，绝不会跑到列表上方 */
   pointer-events: none;
   --rfd-sweep: var(--h-primary);
   --rfd-sweep-glow: rgba(238, 79, 39, 0.35);
@@ -608,9 +607,21 @@ onBeforeUnmount(() => {
   display: block;
 }
 
+/* 光点本体：从线段顶端（上一个圆心）滑到底端（本圆心） */
+.rflow__spark {
+  position: absolute;
+  left: 0;
+  width: 100%;
+  height: 26px;
+  border-radius: 3px;
+  background: linear-gradient(180deg, transparent, var(--rfd-sweep) 58%, transparent);
+  filter: drop-shadow(0 0 6px var(--rfd-sweep-glow));
+  animation: rfdSweep 1.5s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
 @keyframes rfdSweep {
   0% {
-    transform: translateY(-46px) scaleY(0.7);
+    transform: translateY(-26px) scaleY(0.7);
     opacity: 0;
   }
   18% {
@@ -620,7 +631,33 @@ onBeforeUnmount(() => {
     opacity: 1;
   }
   100% {
-    transform: translateY(10px) scaleY(1);
+    transform: translateY(100%) scaleY(1);
+    opacity: 0;
+  }
+}
+
+/* 第一个节点：上方没有连线，光就**从圆心本身冒出来**（同样不外溢） */
+.rflow__node--first .rflow__sweep {
+  height: 26px;
+  bottom: calc(50% - 13px);
+  border-radius: 999px;
+}
+
+.rflow__node--first .rflow__spark {
+  height: 100%;
+  animation-name: rfdEmit;
+}
+
+@keyframes rfdEmit {
+  0% {
+    transform: scaleY(0.35);
+    opacity: 0;
+  }
+  25% {
+    opacity: 0.95;
+  }
+  100% {
+    transform: scaleY(1.25);
     opacity: 0;
   }
 }
