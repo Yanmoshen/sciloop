@@ -23,14 +23,45 @@ export interface PapersOverview {
   documents_ok: number
   cards_total: number
   cards_papers: number
+  /** 统一口径：既有解析成功的全文、又有解析卡片（2026-09-21 与产品确认） */
+  papers_parsed: number
+  papers_unparsed: number
   aggregations_total: number
   last_sync_at: string | null
   checked_at: string
   note: string
+  parsed_definition?: string
 }
 
 export function fetchPapersOverview(signal?: AbortSignal): Promise<PapersOverview> {
   return get<PapersOverview>('/papers/overview', { signal })
+}
+
+/** GET /papers/trends（文献总览折线图数据源：逐日/逐周的 5 条序列） */
+export interface PapersTrends {
+  axis: string[]
+  granularity: 'day' | 'week'
+  window_days: number
+  series: {
+    total: number[]
+    parsed: number[]
+    unparsed: number[]
+    new_papers: number[]
+    new_parsed: number[]
+  }
+  definitions: Record<string, string>
+  checked_at: string
+  note: string
+}
+
+export function fetchPaperTrends(
+  params: { days?: number; bucket?: 'day' | 'week' } = {},
+  signal?: AbortSignal,
+): Promise<PapersTrends> {
+  return get<PapersTrends>('/papers/trends', {
+    query: { days: params.days ?? 7, bucket: params.bucket ?? 'day' },
+    signal,
+  })
 }
 
 /** 本地检索条目（与后端 paper_to_item 对齐，缺失字段为 null） */

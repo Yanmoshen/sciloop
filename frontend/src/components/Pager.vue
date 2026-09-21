@@ -31,9 +31,6 @@ const props = withDefaults(
 
 const emit = defineEmits<{ change: [page: number] }>()
 
-/** 当前页左右各保留的页数 */
-const WINDOW = 2
-
 const normalizedPage = computed(() => clamp(props.page))
 const jumpDraft = ref(String(normalizedPage.value))
 
@@ -49,24 +46,25 @@ function clamp(value: number): number {
   return Math.min(Math.max(next, 1), total)
 }
 
-/** 首尾 + 当前页窗口；中间断开处插一个省略号 */
+/**
+ * 分页槽位：**恒为 7 个**（首末页始终可见，中间用固定宽度的「…」占位）。
+ *
+ * 为什么不用"首尾 + 当前页窗口"的动态集合：那样子项数量会随当前页变化
+ * （第 1 页是 `1 2 3 4 5 … 39`，第 20 页变成 `1 … 18 19 20 21 22 … 39`），
+ * 后面的按钮会被整体推着左右平移 —— 用户实测到的"点下一页按钮会飘"。
+ * 下面三种形态的子项数量完全相同，所以总宽度恒定：
+ *   靠前 [1 2 3 4 5 … N] ｜ 中间 [1 … p-1 p p+1 … N] ｜ 靠后 [1 … N-4 N-3 N-2 N-1 N]
+ * 总页数 ≤ 7 时直接铺满（此时本来不存在位移问题）。
+ */
 const pages = computed<Array<number | 'gap'>>(() => {
   const total = Math.max(1, Math.trunc(props.pageCount) || 1)
   const current = normalizedPage.value
-  const picked = new Set<number>([1, total])
-  for (let offset = -WINDOW; offset <= WINDOW; offset += 1) {
-    const value = current + offset
-    if (value >= 1 && value <= total) picked.add(value)
+  if (total <= 7) {
+    return Array.from({ length: total }, (_, index) => index + 1)
   }
-  const sorted = [...picked].sort((left, right) => left - right)
-  const out: Array<number | 'gap'> = []
-  let previous = 0
-  sorted.forEach((value) => {
-    if (previous !== 0 && value - previous > 1) out.push('gap')
-    out.push(value)
-    previous = value
-  })
-  return out
+  if (current <= 4) return [1, 2, 3, 4, 5, 'gap', total]
+  if (current >= total - 3) return [1, 'gap', total - 4, total - 3, total - 2, total - 1, total]
+  return [1, 'gap', current - 1, current, current + 1, 'gap', total]
 })
 
 function go(target: number): void {
@@ -156,7 +154,10 @@ function submitJump(): void {
 }
 
 .pager__page {
-  min-width: 32px;
+  /* 定宽而不是 min-width：页码从 1 位变 2 位时按钮会宽 1px，累计起来整条分页器仍会轻微位移 */
+  width: 34px;
+  padding: 0;
+  text-align: center;
 }
 
 .pager__step {
@@ -185,9 +186,15 @@ function submitJump(): void {
   color: var(--color-text-inverse);
 }
 
+/* 省略号占位：宽高与页码按钮一致，"槽位固定"才真的等于"总宽度固定" */
 .pager__gap {
-  padding: 0 var(--space-1);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 32px;
   color: var(--color-text-secondary);
+  user-select: none;
 }
 
 .pager__jump {

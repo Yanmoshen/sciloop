@@ -34,7 +34,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import Text, cast, func, or_, select
+from sqlalchemy import Text, cast, exists, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -522,6 +522,24 @@ def papers_overview(session: DbSession) -> dict[str, Any]:
         session.execute(select(func.count()).select_from(Aggregation)).scalar_one() or 0
     )
 
+    # 「已解析」统一口径（2026-09-21 与产品确认）：**既有解析成功的全文、又有解析卡片**。
+    # 这样"看起来解析过、其实没产出卡片"的论文不会被算进已解析，与 /papers/trends 完全一致。
+    parsed_papers = int(
+        session.execute(
+            select(func.count())
+            .select_from(Paper)
+            .where(
+                exists(
+                    select(PaperDocument.id).where(
+                        PaperDocument.paper_id == Paper.id, PaperDocument.parse_status == "ok"
+                    )
+                ),
+                exists(select(PaperCard.id).where(PaperCard.paper_id == Paper.id)),
+            )
+        ).scalar_one()
+        or 0
+    )
+
     last_sync_at = session.execute(select(func.max(PaperSourceRecord.fetched_at))).scalar_one_or_none()
 
     return {
@@ -532,13 +550,175 @@ def papers_overview(session: DbSession) -> dict[str, Any]:
         "documents_ok": documents_ok,
         "cards_total": cards_total,
         "cards_papers": cards_papers,
+        "papers_parsed": parsed_papers,
+        "papers_unparsed": max(papers_total - parsed_papers, 0),
         "aggregations_total": aggregations_total,
         "last_sync_at": _iso(last_sync_at),
         "checked_at": now.isoformat(),
         "note": "全部为库内真实计数；null 表示取不到该统计，不做估算",
+        "parsed_definition": "既有解析成功的全文文档、又有解析卡片（两件都做到才算解析完成）",
     }
 
 
+# --------------------------------------------------------------------------------------
+# GET /papers/trends（文献总览折线图的数据源；**必须注册在 /papers/{paper_id} 之前**，
+# 否则 "trends" 会被当成 paper_id 去解析 → 422 int_parsing，这是本项目踩过三次的坑）
+# --------------------------------------------------------------------------------------
+@router.get("/papers/trends", summary="论文与解析趋势（按天/周分桶）")
+def paper_trends(
+    session: DbSession,
+    days: int = Query(7, ge=0, le=180, description="窗口天数；0 = 全部历史"),
+    bucket: str = Query("day", pattern="^(day|week)$", description="分桶粒度：day / week"),
+) -> dict[str, Any]:
+    """总论文 / 已解析 / 未解析 / 新增论文 / 新增已解析 的逐日（或逐周）序列。
+
+    **「已解析」口径与 `/papers/overview` 完全一致**：既有解析成功的全文文档、又有解析卡片；
+    解析发生的时刻取该论文**最早一张卡片的创建时间**（卡片在全文解析成功后生成，即那次解析操作的完成时刻）。
+
+    缺失一律补 0（不猜测、不插值），保证折线连续可读。
+    """
+    from datetime import date, time, timedelta
+
+    from app.db.models import PaperCard, PaperDocument
+
+    now = datetime.now(UTC)
+    # 窗口起点取「当天 00:00」，并让窗口**正好包含 days 个日历日**（含今天）——
+    # 之前用 now-days 会多出一天（"近 7 天"画成 8 个点）。
+    since: datetime | None = None
+    if days:
+        start_day = (now - timedelta(days=days - 1)).date()
+        since = datetime.combine(start_day, time.min, tzinfo=UTC)
+
+    # 逐日新增论文（按入库时间）
+    new_stmt = (
+        select(func.date_trunc("day", Paper.created_at).label("day"), func.count().label("n"))
+        .where(Paper.created_at.isnot(None))
+        .group_by("day")
+        .order_by("day")
+    )
+    if since is not None:
+        new_stmt = new_stmt.where(Paper.created_at >= since)
+    new_by_day = {row.day.date(): int(row.n) for row in session.execute(new_stmt).all()}
+
+    # 逐日新增"已解析"（有卡片 且 有解析成功全文）
+    ok_docs = (
+        select(PaperDocument.paper_id)
+        .where(PaperDocument.parse_status == "ok")
+        .distinct()
+        .subquery()
+    )
+    first_card = (
+        select(
+            PaperCard.paper_id.label("paper_id"),
+            func.min(PaperCard.created_at).label("parsed_at"),
+        )
+        .group_by(PaperCard.paper_id)
+        .subquery()
+    )
+    parsed_stmt = (
+        select(func.date_trunc("day", first_card.c.parsed_at).label("day"), func.count().label("n"))
+        .select_from(first_card)
+        .join(ok_docs, ok_docs.c.paper_id == first_card.c.paper_id)
+        .where(first_card.c.parsed_at.isnot(None))
+        .group_by("day")
+        .order_by("day")
+    )
+    if since is not None:
+        parsed_stmt = parsed_stmt.where(first_card.c.parsed_at >= since)
+    parsed_by_day = {row.day.date(): int(row.n) for row in session.execute(parsed_stmt).all()}
+
+    # 窗口之前的基数（累计线的起点）。
+    # ⚠️ days=0（全部历史）时**没有窗口之外的数据**，基数必须是 0 ——
+    # 否则会把全库再当一遍基数，累计线会翻倍（实测 389 篇被算成 778）。
+    if since is not None:
+        base_total = int(
+            session.execute(
+                select(func.count())
+                .select_from(Paper)
+                .where(Paper.created_at.isnot(None), Paper.created_at < since)
+            ).scalar_one()
+            or 0
+        )
+        base_parsed = int(
+            session.execute(
+                select(func.count())
+                .select_from(first_card)
+                .join(ok_docs, ok_docs.c.paper_id == first_card.c.paper_id)
+                .where(first_card.c.parsed_at < since)
+            ).scalar_one()
+            or 0
+        )
+    else:
+        base_total = 0
+        base_parsed = 0
+
+    if since is not None:
+        start = since.date()
+    else:
+        candidates = list(new_by_day) + list(parsed_by_day)
+        start = min(candidates) if candidates else now.date()
+    end = now.date()
+
+    axis_days: list[date] = []
+    cursor = start
+    while cursor <= end:
+        axis_days.append(cursor)
+        cursor += timedelta(days=1)
+    if not axis_days:
+        axis_days = [end]
+
+    total, parsed = base_total, base_parsed
+    s_total: list[int] = []
+    s_parsed: list[int] = []
+    s_new: list[int] = []
+    s_new_parsed: list[int] = []
+    for day in axis_days:
+        total += new_by_day.get(day, 0)
+        parsed += parsed_by_day.get(day, 0)
+        s_total.append(total)
+        s_parsed.append(parsed)
+        s_new.append(new_by_day.get(day, 0))
+        s_new_parsed.append(parsed_by_day.get(day, 0))
+
+    axis = [d.strftime("%m-%d") for d in axis_days]
+    if bucket == "week":
+        w_axis: list[str] = []
+        w_total: list[int] = []
+        w_parsed: list[int] = []
+        w_new: list[int] = []
+        w_new_parsed: list[int] = []
+        for i in range(0, len(axis_days), 7):
+            last = min(i + 6, len(axis_days) - 1)
+            w_axis.append(axis_days[i].strftime("%m-%d") + " 起")
+            w_total.append(s_total[last])
+            w_parsed.append(s_parsed[last])
+            w_new.append(sum(s_new[i : last + 1]))
+            w_new_parsed.append(sum(s_new_parsed[i : last + 1]))
+        axis, s_total, s_parsed, s_new, s_new_parsed = w_axis, w_total, w_parsed, w_new, w_new_parsed
+
+    return {
+        "axis": axis,
+        "granularity": bucket,
+        "window_days": days,
+        "series": {
+            "total": s_total,
+            "parsed": s_parsed,
+            "unparsed": [t - p for t, p in zip(s_total, s_parsed, strict=True)],
+            "new_papers": s_new,
+            "new_parsed": s_new_parsed,
+        },
+        "definitions": {
+            "parsed": "既有解析成功的全文文档、又有解析卡片；时间取该论文最早一张卡片的创建时间",
+            "new_papers": "按论文入库时间计入",
+        },
+        "checked_at": now.isoformat(),
+        "note": "缺失一律补 0，不做插值；口径与 /papers/overview 的 papers_parsed 一致",
+    }
+
+
+# --------------------------------------------------------------------------------------
+# GET /papers/{paper_id}
+# --------------------------------------------------------------------------------------
 @router.get("/papers/{paper_id}", summary="论文详情")
 def get_paper(
     paper_id: int,
