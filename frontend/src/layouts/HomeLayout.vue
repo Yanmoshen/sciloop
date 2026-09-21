@@ -22,7 +22,7 @@
  * 主题沿用 session store 的 `sciloop.theme`（localStorage 持久化），此处不再自造一份。
  * 进入项目后由 ShellLayout（模块壳层）接管，7 个模块页保持原样。
  */
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { writeDenied } from '@/utils/messages'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
@@ -40,6 +40,7 @@ import { useConversationStore } from '@/stores/conversations'
 import { useSessionStore } from '@/stores/session'
 import { useTaskStore } from '@/stores/tasks'
 import { requestEntrance } from '@/utils/pageEntrance'
+import { orderProjectsForRail } from '@/utils/projectOrder'
 
 const session = useSessionStore()
 const conversations = useConversationStore()
@@ -240,6 +241,9 @@ const archivedTotal = computed(
 /** 展开/收起某个项目下的对话（点项目行 = 展开，不再直接跳工作台） */
 const expandedProjects = ref<number[]>([])
 
+/** 左栏唯一的滚动容器（新建项目后要滚回顶部，否则用户以为"建了但没出现"） */
+const railScrollEl = ref<HTMLElement | null>(null)
+
 function isExpanded(projectId: number): boolean {
   return expandedProjects.value.includes(projectId)
 }
@@ -343,9 +347,21 @@ async function onMoved(): Promise<void> {
   await conversations.load()
 }
 
+/**
+ * 左栏「项目」分组的**显示顺序**（排序规则与理由见 `utils/projectOrder.ts`）。
+ *
+ * 一句话：后端按手册 B.5 的 `id ASC` 返回，新建项目会掉到最后一行；
+ * 左栏改成「非演示项目最新在最上、演示夹具退到底部」，新建的项目固定出现在第一行。
+ */
+const displayProjects = computed(() => orderProjectsForRail(session.projects))
+
 async function onProjectCreated(project: CreatedProject): Promise<void> {
   await session.loadProjects()
   expandedProjects.value = [...expandedProjects.value, project.id]
+  // 新项目现在固定排在最上面（见 displayProjects），但左栏可能正滚在下面 ——
+  // 不滚回去的话用户会以为"建了但没出现"。
+  await nextTick()
+  railScrollEl.value?.scrollTo({ top: 0, behavior: 'smooth' })
 }
 
 // --------------------------------------------------------------------------- //
@@ -577,7 +593,7 @@ onUnmounted(() => {
       <!-- 分块线：固定区到此为止，下面是唯一会滚的那块 -->
       <div class="rail__divider" />
 
-      <div class="rail__scroll">
+      <div ref="railScrollEl" class="rail__scroll">
         <nav class="nav nav--modules" aria-label="模块导航">
           <RouterLink
             v-for="item in MODULE_NAV"
@@ -686,7 +702,7 @@ onUnmounted(() => {
           <p v-if="session.projects.length === 0" class="group__empty">
             {{ session.projectsError || '暂无项目' }}
           </p>
-          <template v-for="p in session.projects" :key="p.id">
+          <template v-for="p in displayProjects" :key="p.id">
             <div class="crow crow--project" :class="{ 'crow--open': moreOpen === p.id }">
               <button
                 class="crow__item crow__item--project"

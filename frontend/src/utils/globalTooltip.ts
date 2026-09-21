@@ -26,6 +26,9 @@
  * - 可达性不靠"拖长宽限期"，而靠**几何走廊**：指针在「目标 ∪ 浮层 ∪ 两者之间」这个
  *   外扩 HOVER_BRIDGE_PX 的连通区域内就不收起 → 能走到浮层上，但一走开立刻消失；
  * - 指针在浮层内**选中文字**时强制不收（用户可能正要复制）。
+ * - 显示延迟（120ms）内**指针只要还在目标上就绝不取消** —— 早期实现在那段窗口恒判"已离开"，
+ *   会把待显示的定时器清掉且 mouseover 不再触发，表现为「悬停提示有时不出来、再试一遍才有」
+ *   （2026-09-21 修，详见 `pointerInHoverRegion` 的注释）。
  *
  * 覆盖范围：任意层（总览壳层、模块壳层、弹窗、抽屉）——因为是 document 级委托。
  */
@@ -86,12 +89,21 @@ function pointIn(x: number, y: number, rect: DOMRect, pad: number): boolean {
  *
  * 为什么用几何而不是"长宽限期"：宽限期只能靠拖时间兼顾可达性，代价是**移开后提示赖着不消失**；
  * 几何判定把两件事解耦 —— 走在走廊里就不收（够得着），一旦拐弯走开就立刻收（不拖沓）。
+ *
+ * ⚠️ 浮层**还没弹出来**的 120ms 延迟期内必须退化成"只判目标自身矩形"（2026-09-21 修）：
+ * 那时 `tipEl.hidden === true`，若像以前那样直接返回 false，兜底的 mousemove 就会把
+ * "指针还在目标上"误判成"已经离开"，进而调 `scheduleHide()` —— 而它会顺手清掉待执行的
+ * 显示定时器，且 `mouseover` 不会二次触发（指针始终停在同一个元素上）→ 提示被永久取消。
+ * 用户实测到的「悬停有时有提示、再试一遍就没有了」就是它（取决于那 120ms 内鼠标有没有动）。
  */
 function pointerInHoverRegion(event: MouseEvent): boolean {
-  if (!tipEl || tipEl.hidden || !activeTarget) return false
-  if (insideTip(event.target)) return true
+  if (!activeTarget) return false
   if (!activeTarget.isConnected) return false
   const targetRect = activeTarget.getBoundingClientRect()
+  if (!tipEl || tipEl.hidden) {
+    return pointIn(event.clientX, event.clientY, targetRect, HOVER_BRIDGE_PX)
+  }
+  if (insideTip(event.target)) return true
   const tipRect = tipEl.getBoundingClientRect()
   const left = Math.min(targetRect.left, tipRect.left)
   const top = Math.min(targetRect.top, tipRect.top)
