@@ -80,6 +80,10 @@ wordpress-theme/
 # 例：scripts/verify/_dbg.err、_openapi_paths.txt —— 排查过程产生的中间产物，非交付内容。
 scripts/verify/_*
 
+# ===== 界面草稿 / 参考页面（本地文件，非交付内容）=====
+# example.html：写界面时用来对照的参考页面（体积大、非本项目资产），只留本地。
+example.html
+
 # ===== 非运行必需内容（保留在本地，但永不入库）=====
 # 开源仓库只保留「能跑起来的最小集合」：server/ web/ prompts/ docker-compose.yml config/
 # .env.example LICENSE README.md。以下目录对运行程序不是必需的，一律不入库：
