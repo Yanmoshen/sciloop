@@ -107,6 +107,15 @@ export interface StreamDone {
   /** 节点分支：下一个应执行的节点，以及它**是否真的实装**（未实装要停住，不假装往下走） */
   next_node?: string | null
   next_implemented?: boolean
+  /**
+   * 非空 = 这一轮**没有答完，在等研究者批准**。
+   *
+   * 与"正常答完"必须分开：混在一起，界面会显示一个"答完了但什么都没有"的空回复。
+   */
+  awaiting_approval?: ApprovalCard | null
+  /** 裁决流专属：本次裁决的结果与请求 id */
+  decision?: ApprovalDecision
+  request_id?: string
 }
 
 export interface StreamTitle {
@@ -152,12 +161,55 @@ export interface ResultBlock {
 
 export type ChatBlock = ChoiceBlock | ResultBlock
 
+/** 过程行的语气（决定颜色，不决定语义） */
+export type SystemTone = 'idle' | 'info' | 'ok' | 'warn' | 'err'
+
 /** 节点执行的紧凑系统行 */
 export interface SystemRow {
-  kind: 'system'
-  label: string
+  kind: 'system' | 'tool'
+  /** 分类标签（节点过程行有；工具行由后端给的 text 自带工具名） */
+  label?: string
   text: string
-  tone?: 'idle' | 'info' | 'ok' | 'warn' | 'err'
+  tone?: SystemTone
+}
+
+/** 研究者裁决的结果 */
+export type ApprovalDecision = 'approve' | 'deny'
+
+/** 批准请求的状态：只有 `pending` 是可点的 */
+export type ApprovalStatus = 'pending' | 'approved' | 'denied' | 'expired'
+
+/**
+ * 批准卡：模型提出了一次写盘/执行请求，**在研究者点「批准」之前它一次都不会跑**。
+ *
+ * 它同时是**过程行**（`kind: 'approval'`）——后端把同一份内容既发 SSE 也写进会话记录，
+ * 所以刷新后前端能凭记录里的这一行把卡片按原状态重建，而不是让卡片凭空消失。
+ */
+export interface ApprovalCard {
+  kind: 'approval'
+  tone?: SystemTone
+  text: string
+  request_id: string
+  /** 工具名（如 run_command） */
+  tool: string
+  /** 工具的中文名（后端给的展示名，前端不改写） */
+  label: string
+  /** 要执行什么：给人看的一行，研究者看的就是它 */
+  preview: string
+  cwd?: string | null
+  status: ApprovalStatus
+  created_at?: string | null
+  expires_at?: string | null
+  decided_at?: string | null
+  /** 裁决备注（后端可能留痕） */
+  note?: string | null
+}
+
+/** 过程行可能是普通行，也可能是一张批准卡 */
+export type TurnRow = SystemRow | ApprovalCard
+
+export function isApprovalCard(row: TurnRow): row is ApprovalCard {
+  return row.kind === 'approval'
 }
 
 export interface StreamHandlers {
@@ -168,7 +220,9 @@ export interface StreamHandlers {
   /** 结构化块：引导词的可点选项 / 查询结果卡片 */
   onBlocks?: (blocks: ChatBlock[]) => void
   /** 节点执行过程的一条系统行 */
-  onRow?: (row: SystemRow) => void
+  onRow?: (row: TurnRow) => void
+  /** 一张批准卡（同一 request_id 会以新状态再次到达 → 按 id 替换，不要追加） */
+  onApproval?: (card: ApprovalCard) => void
   /**
    * 思考过程的增量。
    *
@@ -207,6 +261,47 @@ export async function streamChatHome(
     body: JSON.stringify(input),
     signal,
   })
+  await consumeSse(response, handlers)
+}
+
+export interface ApprovalDecisionInput {
+  conversation_id: string
+  request_id: string
+  decision: ApprovalDecision
+  /** 可选备注，随裁决一起留痕 */
+  note?: string
+  /** 批准后续答用哪个模型；不传 = 后端沿用会话记录的模型 */
+  model_config_id?: number
+  model_id?: string
+}
+
+/**
+ * 研究者裁决一次写盘/执行请求。
+ *
+ * **前提是 Owner**：批准入口如果对匿名开放，那道门就白设了。
+ * 校验失败（请求不存在 / 已批过 / 已过期）后端回 4xx，这里**抛出** `ApiError`
+ * —— 由视图层按 `error.code` 如实说明，不在这里编一句含糊的"操作失败"。
+ */
+export async function streamApprovalDecision(
+  input: ApprovalDecisionInput,
+  handlers: StreamHandlers,
+  signal?: AbortSignal,
+): Promise<void> {
+  const response = await fetch(apiUrl('/chat/approvals/decide'), {
+    method: 'POST',
+    headers: {
+      Accept: 'text/event-stream',
+      'Content-Type': 'application/json',
+      ...ownerHeader(),
+    },
+    body: JSON.stringify(input),
+    signal,
+  })
+  await consumeSse(response, handlers)
+}
+
+/** 读 SSE 响应体并逐帧派发（`streamChatHome` 与裁决流共用同一套解析口径）。 */
+async function consumeSse(response: Response, handlers: StreamHandlers): Promise<void> {
   if (!response.ok) throw await parseError(response)
   if (!response.body) {
     throw new Error('浏览器不支持流式响应（response.body 为空）')
@@ -268,9 +363,12 @@ function dispatch(frame: string, handlers: StreamHandlers): void {
       handlers.onBlocks?.((payload as { blocks?: ChatBlock[] }).blocks ?? [])
       break
     case 'row':
-      if ((payload as { row?: SystemRow }).row) {
-        handlers.onRow?.((payload as { row: SystemRow }).row)
+      if ((payload as { row?: TurnRow }).row) {
+        handlers.onRow?.((payload as { row: TurnRow }).row)
       }
+      break
+    case 'approval':
+      handlers.onApproval?.(payload as ApprovalCard)
       break
     case 'reasoning':
       handlers.onReasoning?.((payload as { text?: string }).text ?? '')

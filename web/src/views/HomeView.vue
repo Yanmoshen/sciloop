@@ -22,8 +22,16 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { writeDenied } from '@/utils/messages'
 import { useRoute, useRouter } from 'vue-router'
 
-import { streamChatHome } from '@/api/chat'
-import type { ChatBlock, StreamDone, SystemRow } from '@/api/chat'
+import { isApprovalCard, streamApprovalDecision, streamChatHome } from '@/api/chat'
+import type {
+  ApprovalCard,
+  ApprovalDecision,
+  ApprovalStatus,
+  ChatBlock,
+  StreamDone,
+  StreamHandlers,
+  TurnRow,
+} from '@/api/chat'
 import { getConversation } from '@/api/conversations'
 import MarkdownText from '@/components/MarkdownText.vue'
 import ConfirmDialog from '@/components/home/ConfirmDialog.vue'
@@ -35,7 +43,8 @@ import { useSessionStore } from '@/stores/session'
 import { useSettingsStore } from '@/stores/settings'
 import { consumeEntrance } from '@/utils/pageEntrance'
 
-type TurnStatus = 'streaming' | 'done' | 'interrupted'
+/** `waiting` = 这一轮没有答完，**在等研究者批准**（不是"已完成"） */
+type TurnStatus = 'streaming' | 'waiting' | 'done' | 'interrupted'
 
 interface Turn {
   role: 'user' | 'assistant'
@@ -45,12 +54,16 @@ interface Turn {
   status?: TurnStatus
   /** 结构化块：可点选项（引导词）与结果卡片（本地查询） */
   blocks?: ChatBlock[]
-  /** 节点执行过程的紧凑系统行（进入 / 驳回 / 重试 / 回退 / 迁移） */
-  rows?: SystemRow[]
+  /** 过程行：节点执行 / 工具调用 / 批准卡 */
+  rows?: TurnRow[]
   /** 思考过程：**不是答复**，折叠展示在耗时那一行下面 */
   reasoning?: string
   /** 本轮的判定结果（执行 / 引导 / 查询 / 普通对话），用于角标 */
   routing?: string
+  /** 待研究者裁决的批准请求（非空 = 界面要停在这里等人） */
+  awaiting?: ApprovalCard | null
+  /** 正文是**系统说明**而不是模型说的话（`note_only`）→ 有卡时就不重复渲染 */
+  noteOnly?: boolean
 }
 
 const route = useRoute()
@@ -154,6 +167,8 @@ function fmtDuration(ms: number): string {
 function durationText(turn: Turn): string {
   if (turn.role !== 'assistant') return ''
   if (turn.status === 'streaming') return `${Math.floor(elapsedMs.value / 1000)}s`
+  // 停在批准上**不能说"已完成"**：这一轮其实还没答完，人没裁决之前它不会往前走
+  if (turn.status === 'waiting') return '等待研究者批准'
   if (turn.durationMs) return `已完成 ${fmtDuration(turn.durationMs)}`
   return ''
 }
@@ -268,19 +283,34 @@ async function loadConversation(id: string): Promise<void> {
     conversationTitle.value = detail.title ?? ''
     projectId.value = detail.project_id ?? null
     archived.value = detail.archived
-    turns.value = (detail.turns ?? []).map((turn) => ({
-      role: turn.role,
-      content: turn.content,
-      model: turn.model_id,
-      durationMs: turn.duration_ms,
-      status: turn.interrupted ? 'interrupted' : 'done',
-      // 磁盘里存的结构化块 / 系统行 / 思考过程要一并还原，
-      // 否则刷新后引导词的选项、节点的过程行、思考折叠都会消失
-      blocks: (turn as { blocks?: ChatBlock[] }).blocks,
-      rows: (turn as { rows?: SystemRow[] }).rows,
-      reasoning: (turn as { reasoning?: string }).reasoning ?? undefined,
-      routing: (turn as { routing?: string }).routing,
-    }))
+    turns.value = (detail.turns ?? []).map((turn) => {
+      // 磁盘里存的结构化块 / 过程行 / 思考过程要一并还原，
+      // 否则刷新后引导词的选项、节点的过程行、思考折叠都会消失。
+      const rows = (turn as { rows?: TurnRow[] }).rows
+      // 批准卡也在过程行里 —— 所以刷新后它照样在，并且还能接着裁决；
+      // 后端才是真正认账的地方（一次性、带有效期），这里只负责显示。
+      const pending = (rows ?? []).find(
+        (row) => isApprovalCard(row) && row.status === 'pending',
+      ) as ApprovalCard | undefined
+      const status: TurnStatus = pending
+        ? 'waiting'
+        : (turn as { interrupted?: boolean }).interrupted
+          ? 'interrupted'
+          : 'done'
+      return {
+        role: turn.role,
+        content: turn.content,
+        model: turn.model_id,
+        durationMs: turn.duration_ms,
+        status,
+        blocks: (turn as { blocks?: ChatBlock[] }).blocks,
+        rows,
+        reasoning: (turn as { reasoning?: string }).reasoning ?? undefined,
+        routing: (turn as { routing?: string }).routing,
+        awaiting: pending ?? null,
+        noteOnly: (turn as { note_only?: boolean }).note_only === true,
+      }
+    })
     await scrollToBottom()
   } catch (error) {
     turns.value = []
@@ -323,6 +353,124 @@ function pickedModel(): PickedModel | null {
   return { configId, modelId }
 }
 
+/** 卡片终态文案：后端只回状态码，给人看的话统一在前端说 */
+const APPROVAL_STATUS_TEXT: Record<ApprovalStatus, string> = {
+  pending: '等待研究者批准',
+  approved: '已批准并执行',
+  denied: '研究者已拒绝',
+  expired: '已过期（超时未裁决）',
+}
+
+/** 卡片左上角那个徽标：**跟着状态走**，别让已批准的卡还挂着「需批准」 */
+const APPROVAL_TAG_TEXT: Record<ApprovalStatus, string> = {
+  pending: '需批准',
+  approved: '已批准',
+  denied: '已拒绝',
+  expired: '已过期',
+}
+
+/** 裁决时刻只给出「时:分」，完整时间戳留给 tooltip（界面上不摆机器格式） */
+function clockText(value?: string | null): string {
+  if (!value) return ''
+  const at = new Date(value)
+  if (Number.isNaN(at.getTime())) return ''
+  return at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+}
+
+/** 同一 request_id 只留一张卡：后端在裁决后会把**同一张卡**以新状态再发一次。 */
+function upsertApprovalRow(rows: TurnRow[], card: ApprovalCard): TurnRow[] {  const index = rows.findIndex((row) => isApprovalCard(row) && row.request_id === card.request_id)
+  if (index < 0) return [...rows, card]
+  const next = [...rows]
+  next[index] = card
+  return next
+}
+
+/**
+ * 一轮流式回答的公共处理。
+ *
+ * 发送 / 编辑重开 / **批准后续答**三处共用同一套口径 —— 三份复制粘贴迟早会分叉，
+ * 而"显示与落盘不一致"正是这个项目已经栽过三次的坑。
+ *
+ * `approvalIndex` = **卡片所在那一轮**的下标。批准/拒绝的后续流渲染在新一轮里，
+ * 但卡片必须回到原来那一轮换状态 —— 否则同一张卡会在两轮里各出现一次。
+ */
+function streamHandlers(assistantIndex: number, approvalIndex = assistantIndex): StreamHandlers {
+  const target = (): Turn | undefined => turns.value[assistantIndex]
+  const cardOwner = (): Turn | undefined => turns.value[approvalIndex]
+  return {
+    onMeta: (meta) => {
+      conversationId.value = meta.conversation_id
+      projectId.value = meta.project_id
+      conversationTitle.value = meta.title ?? ''
+      if (meta.turn_count === 0) syncStore()
+    },
+    onDelta: (delta) => {
+      const current = target()
+      if (!current) return
+      current.content += delta
+      void scrollToBottom()
+    },
+    onReasoning: (delta) => {
+      // 思考过程**不拼进正文**：单独累积，渲染时折叠在耗时那一行下面
+      const current = target()
+      if (!current) return
+      current.reasoning = (current.reasoning ?? '') + delta
+      void scrollToBottom()
+    },
+    onRow: (row) => {
+      const current = target()
+      if (!current) return
+      // 批准卡也走 row 通道落盘，这里按 id 去重，免得同一张卡出现两次
+      current.rows = isApprovalCard(row)
+        ? upsertApprovalRow(current.rows ?? [], row)
+        : [...(current.rows ?? []), row]
+      void scrollToBottom()
+    },
+    onApproval: (card) => {
+      const owner = cardOwner()
+      if (!owner) return
+      owner.rows = upsertApprovalRow(owner.rows ?? [], card)
+      // 只有 pending 才停在等人；批准/拒绝后同一张卡换成终态，不再拦着界面
+      owner.awaiting = card.status === 'pending' ? card : null
+      void scrollToBottom()
+    },
+    onBlocks: (blocks) => {
+      const current = target()
+      if (!current) return
+      current.blocks = [...(current.blocks ?? []), ...blocks]
+      void scrollToBottom()
+    },
+    onDone: (done) => {
+      const current = target()
+      if (!current) return
+      if (done.content) current.content = done.content
+      if (done.model_id) current.model = done.model_id
+      if (done.duration_ms) current.durationMs = done.duration_ms
+      if (done.routing) current.routing = done.routing
+      // **等批准 ≠ 答完**：这一轮停在人那里，不能标成"已完成"
+      current.awaiting = done.awaiting_approval ?? null
+      current.status = current.awaiting ? 'waiting' : 'done'
+      void scrollToBottom()
+      // 后端此时已把这一轮落盘：整表刷新一次，左栏顺序/轮次数与磁盘一致
+      void conversations.load()
+      maybeAutoContinue(done)
+    },
+    onTitle: (payload) => {
+      conversationTitle.value = payload.title
+      syncStore()
+      if (payload.title_source === 'fallback' && payload.title_note) {
+        errorText.value = payload.title_note
+      }
+    },
+    onError: (streamError) => {
+      const current = target()
+      if (current) current.status = 'interrupted'
+      errorText.value = `${streamError.code}：${streamError.message}`
+      void conversations.load()
+    },
+  }
+}
+
 /**
  * 跑一轮真流式对话（发送与「编辑重开」共用）。
  *
@@ -345,65 +493,7 @@ async function runStream(
         project_id: conversationId.value ? undefined : (projectId.value ?? undefined),
         replace_from: replaceFrom,
       },
-      {
-        onMeta: (meta) => {
-          conversationId.value = meta.conversation_id
-          projectId.value = meta.project_id
-          conversationTitle.value = meta.title ?? ''
-          if (meta.turn_count === 0) syncStore()
-        },
-        onDelta: (delta) => {
-          const target = turns.value[assistantIndex]
-          if (!target) return
-          target.content += delta
-          void scrollToBottom()
-        },
-        onReasoning: (delta) => {
-          // 思考过程**不拼进正文**：单独累积，渲染时折叠在耗时那一行下面
-          const target = turns.value[assistantIndex]
-          if (!target) return
-          target.reasoning = (target.reasoning ?? '') + delta
-          void scrollToBottom()
-        },
-        onRow: (row) => {
-          const target = turns.value[assistantIndex]
-          if (!target) return
-          target.rows = [...(target.rows ?? []), row]
-          void scrollToBottom()
-        },
-        onBlocks: (blocks) => {
-          const target = turns.value[assistantIndex]
-          if (!target) return
-          target.blocks = [...(target.blocks ?? []), ...blocks]
-          void scrollToBottom()
-        },
-        onDone: (done) => {
-          const target = turns.value[assistantIndex]
-          if (!target) return
-          if (done.content) target.content = done.content
-          if (done.model_id) target.model = done.model_id
-          if (done.duration_ms) target.durationMs = done.duration_ms
-          if (done.routing) target.routing = done.routing
-          target.status = 'done'
-          void scrollToBottom()
-          // 后端此时已把这一轮落盘：整表刷新一次，左栏顺序/轮次数与磁盘一致
-          void conversations.load()
-          maybeAutoContinue(done)
-        },
-        onTitle: (payload) => {
-          conversationTitle.value = payload.title
-          syncStore()
-          if (payload.title_source === 'fallback' && payload.title_note) {
-            errorText.value = payload.title_note
-          }
-        },
-        onError: (streamError) => {
-          const target = turns.value[assistantIndex]
-          if (target) target.status = 'interrupted'
-          errorText.value = `${streamError.code}：${streamError.message}`
-          void conversations.load()
-        },
-      },
+      streamHandlers(assistantIndex),
     )
   } catch (error) {
     const target = turns.value[assistantIndex]
@@ -426,6 +516,107 @@ async function runStream(
     stopTicker()
     phase.value = 'idle'
   }
+}
+
+/**
+ * 研究者裁决一次批准请求（点「批准」或「拒绝」）。
+ *
+ * **批准入口只对 Owner 开放**，与后端 Owner 校验对齐：前端这层是提前拦住，
+ * 真正的边界在后端 —— 这里放行不等于后端会放行。
+ */
+async function decideApprovalCard(card: ApprovalCard, decision: ApprovalDecision): Promise<void> {
+  if (phase.value === 'thinking') return
+  if (!session.isOwner) {
+    errorText.value = writeDenied(decision === 'approve' ? '批准执行' : '拒绝执行')
+    return
+  }
+  const id = conversationId.value
+  if (!id) {
+    errorText.value = '会话还没建立，无法裁决'
+    return
+  }
+  // 拒绝路径不调模型，所以不需要模型可用；批准要续答，必须先有模型
+  const model = decision === 'approve' ? pickedModel() : null
+  if (decision === 'approve' && !model) return
+
+  errorText.value = ''
+  phase.value = 'thinking'
+  startTicker()
+  const assistantIndex = turns.value.length
+  // 卡片所在的那一轮：裁决流渲染在新一轮，但卡片要回到这里换状态
+  const cardIndex = turns.value.findIndex((turn) =>
+    (turn.rows ?? []).some((row) => isApprovalCard(row) && row.request_id === card.request_id),
+  )
+  // 裁决的后续动作（执行 / 拒绝说明 / 续答）**作为新一轮**流式回来，
+  // 与卡片所在的那一轮分开显示：卡片留在原地换状态，回答新起一条。
+  turns.value = [...turns.value, { role: 'assistant', content: '', status: 'streaming', rows: [] }]
+  await scrollToBottom()
+
+  try {
+    await streamApprovalDecision(
+      {
+        conversation_id: id,
+        request_id: card.request_id,
+        decision,
+        model_config_id: model?.configId,
+        model_id: model?.modelId,
+      },
+      streamHandlers(assistantIndex, cardIndex >= 0 ? cardIndex : assistantIndex),
+    )
+  } catch (error) {
+    const target = turns.value[assistantIndex]
+    const withCode = error as { code?: string; message?: string }
+    if (target && !target.content && !(target.rows ?? []).length) {
+      turns.value = turns.value.filter((_, index) => index !== assistantIndex)
+    } else if (target) {
+      target.status = 'interrupted'
+    }
+    // 409 / 404 = 这条请求已经不在待批状态（批过 / 拒过 / 过期）：如实说出来，
+    // 同时**按后端的说法把卡片收掉**，免得界面上留着一张永远点不动的卡
+    const code = withCode?.code ?? ''
+    if (code.startsWith('approval_')) {
+      const closed: ApprovalCard = {
+        ...card,
+        status: code === 'approval_approved' ? 'approved' : code === 'approval_denied' ? 'denied' : 'expired',
+      }
+      const owner = turns.value.find((turn) =>
+        (turn.rows ?? []).some((row) => isApprovalCard(row) && row.request_id === card.request_id),
+      )
+      if (owner) {
+        owner.rows = upsertApprovalRow(owner.rows ?? [], closed)
+        owner.awaiting = null
+      }
+    }
+    errorText.value = withCode?.message
+      ? `${withCode.code ?? 'failed'}：${withCode.message}`
+      : error instanceof Error
+        ? error.message
+        : String(error)
+  } finally {
+    stopTicker()
+    phase.value = 'idle'
+  }
+}
+
+/** 本轮里是否还有待裁决的卡（有就**不要**显示"正在生成"的省略号） */
+function pendingCard(turn: Turn): ApprovalCard | null {
+  return turn.awaiting ?? null
+}
+
+/** 本轮里有没有批准卡（有卡时，那句"只输出了思考过程"的说明就是多余的噪声） */
+function hasApprovalCard(turn: Turn): boolean {
+  return (turn.rows ?? []).some((row) => isApprovalCard(row))
+}
+
+/**
+ * 正文该不该渲染。
+ *
+ * `note_only` 是**系统说明**（模型没给正文时的如实交代），不是模型说的话；
+ * 而这一轮已经有卡了 —— 卡片本身就说明了"停在哪、等谁"，再叠一句说明只是噪声。
+ */
+function showContent(turn: Turn): boolean {
+  if (!turn.content) return false
+  return !(turn.noteOnly && hasApprovalCard(turn))
 }
 
 /* ------------------------------------------------------------------ *
@@ -788,15 +979,49 @@ onUnmounted(() => {
               <pre class="reason__body">{{ turn.reasoning }}</pre>
             </div>
           </div>
-          <!-- 节点执行过程：紧凑系统行，先于结论出现 -->
+          <!-- 过程行：节点执行 / 工具调用 / **批准卡**（先于结论出现） -->
           <div v-if="turn.rows?.length" class="rows">
-            <div v-for="(row, rowIndex) in turn.rows" :key="rowIndex" class="row" :class="`row--${row.tone ?? 'idle'}`">
-              <span class="row__kind">{{ row.label }}</span>
-              <span class="row__text">{{ row.text }}</span>
-            </div>
+            <template v-for="(row, rowIndex) in turn.rows" :key="rowIndex">
+              <div v-if="isApprovalCard(row)" class="approval" :class="`approval--${row.status}`">
+                <div class="approval__head">
+                  <span class="approval__kind">{{ APPROVAL_TAG_TEXT[row.status] }}</span>
+                  <span class="approval__label">{{ row.label }}</span>
+                </div>
+                <code class="approval__cmd">{{ row.preview }}</code>
+                <div v-if="row.status === 'pending'" class="approval__actions">
+                  <button
+                    class="approval__btn approval__btn--primary"
+                    type="button"
+                    :disabled="phase === 'thinking' || !session.isOwner"
+                    @click="decideApprovalCard(row, 'approve')"
+                  >
+                    批准执行
+                  </button>
+                  <button
+                    class="approval__btn"
+                    type="button"
+                    :disabled="phase === 'thinking' || !session.isOwner"
+                    @click="decideApprovalCard(row, 'deny')"
+                  >
+                    拒绝
+                  </button>
+                </div>
+                <div v-else class="approval__done">
+                  {{ APPROVAL_STATUS_TEXT[row.status] }}
+                  <span v-if="row.decided_at" class="approval__stamp" :title="row.decided_at">
+                    {{ clockText(row.decided_at) }}
+                  </span>
+                </div>
+              </div>
+              <div v-else class="row" :class="`row--${row.tone ?? 'idle'}`">
+                <span class="row__kind">{{ row.label }}</span>
+                <span class="row__text">{{ row.text }}</span>
+              </div>
+            </template>
           </div>
-          <MarkdownText v-if="turn.content" :content="turn.content" />
-          <div v-else class="dots" aria-label="正在生成">
+          <MarkdownText v-if="showContent(turn)" :content="turn.content" />
+          <!-- 等批准时**不要转省略号**：它不是"正在生成"，是停着等人 -->
+          <div v-else-if="!pendingCard(turn) && !turn.content" class="dots" aria-label="正在生成">
             <span class="dot" />
             <span class="dot" />
             <span class="dot" />
@@ -1264,6 +1489,141 @@ onUnmounted(() => {
 .row--info .row__kind {
   border-color: var(--h-primary);
   color: var(--h-primary);
+}
+
+/* ------------------------------------------------------------------ *
+ * 批准卡：模型提出了一次写盘/执行请求，等研究者裁决
+ * 它是**这一轮的主角**，所以不缩在小字里——要执行什么必须一眼看清。
+ * ------------------------------------------------------------------ */
+.approval {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 2px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--h-line);
+  border-left: 3px solid var(--h-warn);
+  border-radius: 6px;
+  background: var(--h-surface);
+}
+
+.approval--approved {
+  border-left-color: var(--h-ok);
+}
+
+.approval--denied,
+.approval--expired {
+  border-left-color: var(--h-line);
+}
+
+.approval__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.approval__kind {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px solid var(--h-warn);
+  border-radius: 4px;
+  font-size: var(--font-size-xs);
+  color: var(--h-warn);
+}
+
+.approval--approved .approval__kind {
+  border-color: var(--h-ok);
+  color: var(--h-ok);
+}
+
+.approval--denied .approval__kind,
+.approval--expired .approval__kind {
+  border-color: var(--h-line);
+  color: var(--h-fg-muted);
+}
+
+.approval__label {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--h-fg);
+}
+
+/* 要跑的就是这一行：等宽字体，原样呈现，不做任何转义/美化 */
+.approval__cmd {
+  display: block;
+  padding: 6px 8px;
+  border: 1px solid var(--h-line);
+  border-radius: 4px;
+  background: var(--h-surface-raised);
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-sm);
+  color: var(--h-fg);
+  word-break: break-all;
+}
+
+.approval__actions {
+  display: flex;
+  gap: 8px;
+}
+
+.approval__btn {
+  padding: 4px 12px;
+  border: 1px solid var(--h-line);
+  border-radius: 4px;
+  background: var(--h-surface-raised);
+  font-size: var(--font-size-sm);
+  color: var(--h-fg);
+  cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    color 0.15s ease,
+    background-color 0.15s ease;
+}
+
+.approval__btn:hover:not(:disabled) {
+  border-color: var(--h-line-strong);
+}
+
+.approval__btn:active:not(:disabled) {
+  background: var(--h-hover);
+}
+
+.approval__btn:focus-visible {
+  outline: 2px solid var(--h-primary);
+  outline-offset: 2px;
+}
+
+.approval__btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.approval__btn--primary {
+  border-color: var(--h-primary);
+  background: var(--h-primary);
+  color: var(--h-primary-fg);
+}
+
+.approval__btn--primary:hover:not(:disabled) {
+  border-color: var(--h-primary);
+  filter: brightness(1.08);
+}
+
+.approval__btn--primary:active:not(:disabled) {
+  filter: brightness(0.94);
+}
+
+.approval__done {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: var(--font-size-sm);
+  color: var(--h-fg-muted);
+}
+
+.approval__stamp {
+  font-size: var(--font-size-xs);
+  color: var(--h-fg-muted);
 }
 
 /* ------------------------------------------------------------------ *
