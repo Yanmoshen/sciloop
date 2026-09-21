@@ -21,9 +21,9 @@ SERVER_DIR = Path(__file__).resolve().parents[1]
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
+import db.models  # noqa: E402,F401  注册全部模型
 from core.config import get_settings  # noqa: E402
 from db.base import Base  # noqa: E402
-import db.models  # noqa: E402,F401  注册全部模型
 
 config = context.config
 
