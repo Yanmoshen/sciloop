@@ -40,7 +40,8 @@ RUN pip install --no-cache-dir "setuptools>=68" \
         "pytest>=8.2,<9.0" \
         "pytest-asyncio>=0.23,<1.0" \
         "ruff>=0.5,<1.0" \
-        "black>=24.4,<25.0"
+        "black>=24.4,<25.0" \
+        "mcp>=2.2,<3.0"
 
 COPY . .
 
