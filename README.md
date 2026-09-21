@@ -36,10 +36,11 @@ docker compose exec backend alembic downgrade base     # 回滚
 
 | 目录 | 职责 |
 |---|---|
-| `backend/` | FastAPI + SQLAlchemy 2.x + Alembic；领域服务、LLM 适配层、进程内受限执行器 |
-| `frontend/` | Vue 3 + Vite + TypeScript + Pinia + Element Plus + ECharts |
+| `server/` | FastAPI + SQLAlchemy 2.x + Alembic。顶层按层分目录：`api/`（路由）、`services/`（领域服务：ingest / parsing / aggregation / ideation / feasibility / experiment / writing / review / translate / reader / export / research）、`db/`（会话与 ORM 模型）、`schemas/`（Pydantic DTO）、`core/`（配置与安全）、`llm/`（OpenAI 兼容适配与按环节路由）、`executor/`（进程内受限执行器）、`tasks/`（后台作业）、`migrations/`（迁移链） |
+| `web/` | Vue 3 + Vite + TypeScript + Pinia + Element Plus + ECharts（`api/` `views/` `components/` `stores/` `router/` `layouts/` `styles/` `utils/`） |
+| `prompts/` | 研究工作流长文档提示词（程序侧契约在 `server/services/research/`） |
 | `config/` | 非机密静态配置（`app.yaml`、`venue_whitelist.json`） |
-| `docker-compose.yml` | 三服务编排：`db`（PostgreSQL 16）/ `backend` / `frontend`（nginx） |
+| `docker-compose.yml` | 三服务编排：`db`（PostgreSQL 16）/ `backend`（server/ 镜像）/ `frontend`（web/ 镜像，nginx） |
 
 ## 环境变量
 

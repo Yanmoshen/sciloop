@@ -20,8 +20,10 @@ dist/
 
 # ===== Node / 前端 =====
 node_modules/
-frontend/dist/
-frontend/.vite/
+# 迁移/修复过程中产生的 node_modules 变体（node_modules.__probe 等），一律不入库
+node_modules.*/
+web/dist/
+web/.vite/
 *.local
 .vite/
 
@@ -30,7 +32,7 @@ frontend/.vite/
 logs/
 .artifacts/
 artifacts/
-backend/.coverage
+server/.coverage
 .coverage
 htmlcov/
 
@@ -39,6 +41,9 @@ htmlcov/
 .cache/
 *.sqlite3
 *.db
+
+# ===== 重构迁移待清单（.cleanup-todo/）：改名冲突时挪进来的旧目录/垃圾，处理完可整目录删除 =====
+.cleanup-todo/
 
 # ===== 宿主侧持久化数据（容器 bind mount 的目标，禁止入库）=====
 # 例：./.data/fulltext-cache —— 归一全文文本缓存，WP01 持久化后让容器重建
@@ -76,7 +81,7 @@ wordpress-theme/
 scripts/verify/_*
 
 # ===== 非运行必需内容（保留在本地，但永不入库）=====
-# 开源仓库只保留「能跑起来的最小集合」：backend/ frontend/ docker-compose.yml config/
+# 开源仓库只保留「能跑起来的最小集合」：server/ web/ prompts/ docker-compose.yml config/
 # .env.example LICENSE README.md。以下目录对运行程序不是必需的，一律不入库：
 #   assets/       项目计划书、附录、任务包（含 WP01–WP17）
 #   docs/         主计划、工程说明、部署手册、决策记录、运行态报告、截图
@@ -86,12 +91,14 @@ scripts/verify/_*
 #   preview/      设计稿 HTML
 # 注意：gitignore 不支持行尾注释，模式必须独占一行；且只禁止入库，
 # **不要删除本地文件** —— 它们仍参与本地开发与验收。
-assets/
-docs/
-tests/
-scripts/
-deliverables/
-preview/
+# 这些模式**必须根锚定**（前导 /）：不锚定的 `tests/` 会连
+# server/services/fulltext/tests/ 这类源码内子目录一并忽略，导致源码掉出仓库。
+/assets/
+/docs/
+/tests/
+/scripts/
+/deliverables/
+/preview/
 
 
 # ===== 本地开发专用覆盖文件（不入库）=====
