@@ -163,6 +163,10 @@ class LLMResult:
     finish_reason: str | None = None
     #: json_schema 校验通过后的解析结果
     parsed: Any = None
+    #: 模型要求调用的工具（OpenAI 兼容格式：`[{"id","type","function":{"name","arguments"}}]`）。
+    #: 空列表 = 模型没要求调工具，**不是**"不支持"。当前只有非流式链路会填充；
+    #: 流式的 tool_call 分片累积尚未实现（见 `adapter.chat` 的 tools 参数说明）。
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
     stage: str | None = None
     purpose: str | None = None
     prompt_hash: str | None = None

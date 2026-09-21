@@ -66,6 +66,7 @@ async def chat(
     max_tokens: int | None = None,
     json_schema: dict[str, Any] | None = None,
     *,
+    tools: list[dict[str, Any]] | None = None,
     project_id: int | None = None,
     stage: str | None = None,
     purpose: str | None = None,
@@ -84,6 +85,11 @@ async def chat(
     :param messages: 对话消息（``[{"role","content"}]``）或纯文本
     :param model_ref: 显式模型 ``provider:model_id``；为 ``None`` 时按 ``stage`` 路由
     :param json_schema: 传入即启用结构化输出校验与自动重试
+    :param tools: OpenAI 兼容的工具声明（`[{"type":"function","function":{...}}]`）；
+        传了之后模型的 `tool_calls` 会在 ``LLMResult.tool_calls`` 里回来。
+        ⚠️ **当前只对非流式链路生效**：流式响应的 tool_call 是分片下发的，需要跨 chunk
+        累积拼装，那一步还没做。所以走流式时就算传了 tools，也不会带回 tool_calls ——
+        这是**已知限制**，不是静默丢弃：调用方若必须用工具，请走非流式。
     :param stage: 六环节 / 前置环节名（写入 ``llm_call_logs.stage``）
     :param purpose: 更细的用途标签（写入 ``llm_call_logs.purpose``）
     :param allow_fallback: 传输层失败是否按链降级到备用模型
@@ -142,6 +148,7 @@ async def chat(
                 messages=msg_list,
                 prompt_hash=prompt_hash,
                 json_schema=json_schema,
+                tools=tools,
                 temperature=temperature,
                 max_tokens=max_tokens,
                 json_retry=json_retry,
@@ -213,6 +220,7 @@ async def _live_call(
     messages: list[Message],
     prompt_hash: str,
     json_schema: dict[str, Any] | None,
+    tools: list[dict[str, Any]] | None,
     temperature: float | None,
     max_tokens: int | None,
     json_retry: int | None,
@@ -253,6 +261,7 @@ async def _live_call(
                 strategy=current_strategy,
                 stage=stage,
                 purpose=purpose,
+                tools=tools,
             )
 
         try:
@@ -349,6 +358,7 @@ async def _live_call(
                 http_calls=len(all_attempts),
                 is_replay=False,
                 finish_reason=outcome.finish_reason,
+                tool_calls=_extract_tool_calls(outcome),
                 parsed=parsed,
                 stage=stage,
                 purpose=purpose,
@@ -773,6 +783,7 @@ def _build_payload(
     strategy: str,
     stage: str | None,
     purpose: str | None,
+    tools: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], list[Message]]:
     effective_messages = messages
     payload: dict[str, Any] = {
@@ -797,7 +808,33 @@ def _build_payload(
         else:  # prompt_only
             effective_messages = with_schema_hint(messages, json_schema)
     payload["messages"] = effective_messages
+    # 工具声明：不传就一个字段都不加（现有调用的请求体逐字节不变）
+    if tools:
+        payload["tools"] = tools
     return payload, effective_messages
+
+
+def _extract_tool_calls(source: Any) -> list[dict[str, Any]]:
+    """从响应里取 `tool_calls`（OpenAI 兼容格式）。
+
+    **取不到就返回空列表，绝不臆造**：这是"模型没要求调工具"，不是"我们没解析出来"。
+    入参允许是原始响应 dict，或任何带 `.raw` 的响应对象 —— 传输层两者都会出现。
+    """
+
+    data = source if isinstance(source, dict) else getattr(source, "raw", None)
+    if not isinstance(data, dict):
+        return []
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return []
+    first = choices[0] if isinstance(choices[0], dict) else {}
+    message = first.get("message")
+    if not isinstance(message, dict):
+        return []
+    calls = message.get("tool_calls")
+    if not isinstance(calls, list):
+        return []
+    return [call for call in calls if isinstance(call, dict)]
 
 
 def _schema_name(stage: str | None, purpose: str | None) -> str:
