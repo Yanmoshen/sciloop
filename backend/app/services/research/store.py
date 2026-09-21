@@ -36,6 +36,13 @@ from app.services.research.rules import LibraryFacts
 
 logger = logging.getLogger("sciloop.research.store")
 
+#: 候选集上限：**只作防御性护栏**，不用来「选优」。
+#: 本库仅 389 篇，命中通常几十到几百行；真正的排序在 Python 里按相关度做。
+CANDIDATE_CAP = 2000
+
+#: 每篇命中论文附带的代表性原文片段数（供模型填 `paper_span_id`）
+SPAN_SAMPLES_PER_PAPER = 4
+
 __all__ = [
     "count_revisits",
     "count_total_reverts",
@@ -324,7 +331,15 @@ async def search_library(
     """关键词语义无关检索：``papers.title/abstract`` + 解析卡片字段。
 
     首版**不引入向量召回**（成本与迁移代价高）：用关键词匹配，
-    命中即带 ``card_field`` 与可定位片段；未解析的如实标注。
+    命中即带可定位来源（解析卡片字段 + 可引用的原文片段）；未解析的如实标注。
+
+    候选集的两条硬规则（都是实机踩出来的）
+    ------------------------------------
+    1. **绝不按 id 倒序截断候选集**：解析卡片恰好是给**最早入库**的论文做的，
+       而那批论文 id 最低。实测 276 篇命中里，唯一带卡片的 5 篇（id 123–128）
+       全部落在 ``ORDER BY id DESC LIMIT 200`` 的截断线之外（该批最小 id 227），
+       于是节点永远拿不到可核验来源、R2 必然驳回。
+    2. **带卡片的命中一律保底保留**：即使候选上限将来被触及也不能丢掉它们。
     """
 
     terms = [t for t in _tokenize(query) if len(t) >= 2][:8]
@@ -337,7 +352,9 @@ async def search_library(
         conditions.append(Paper.title.ilike(pattern))
         conditions.append(Paper.abstract.ilike(pattern))
 
-    # 解析卡片正文也参与匹配：只搜标题/摘要会漏掉「已解析且方法描述里提到关键词」的论文
+    # 解析卡片正文也参与匹配：只搜标题/摘要会漏掉「已解析且方法描述里提到关键词」的论文。
+    # 这里**不设 limit**：这批论文是唯一能提供 card_field 这种可定位来源的，
+    # 截断它们等于把可核验的材料丢掉（旧写法 `limit(limit*2)` 同样有这个毛病）。
     card_conditions = []
     for pattern in patterns:
         card_conditions.append(PaperCard.research_problem.ilike(pattern))
@@ -346,10 +363,7 @@ async def search_library(
         int(pid)
         for pid in (
             await session.execute(
-                select(PaperCard.paper_id)
-                .where(or_(*card_conditions))
-                .distinct()
-                .limit(max(1, limit * 2))
+                select(PaperCard.paper_id).where(or_(*card_conditions)).distinct()
             )
         )
         .scalars()
@@ -358,19 +372,23 @@ async def search_library(
     if card_ids:
         conditions.append(Paper.id.in_(card_ids))
 
-    # 候选集放大到 200 行再在 Python 里按**相关度**重排。
-    # 为什么不靠 SQL 的 ORDER BY 取前 N：全库 389 篇、影响力分普遍为 NULL 时，
-    # ORDER BY id DESC 只会捞出「最新的一批」，真正相关但入库较早的论文（低 id）
-    # 会被直接截断掉——实测把一篇明显相关的老论文挤出了货架。
     paper_stmt = (
         select(Paper.id, Paper.title, Paper.abstract, Paper.is_parsed, Paper.influence_score)
         .where(or_(*conditions))
-        .order_by(Paper.id.desc())
-        .limit(200)
+        .limit(CANDIDATE_CAP)
     )
     rows = list((await session.execute(paper_stmt)).all())
     if not rows:
         return []
+
+    # 保底：把命中的卡片论文补回来（正常路径下它们已在 rows 里，这里只防上限被触及）
+    present = {int(r[0]) for r in rows}
+    missing_card = [pid for pid in card_ids if pid not in present]
+    if missing_card:
+        extra_stmt = select(
+            Paper.id, Paper.title, Paper.abstract, Paper.is_parsed, Paper.influence_score
+        ).where(Paper.id.in_(missing_card))
+        rows.extend((await session.execute(extra_stmt)).all())
 
     paper_ids = [int(r[0]) for r in rows]
     card_map: dict[int, dict[str, Any]] = {}
@@ -408,6 +426,13 @@ async def search_library(
     rows.sort(key=sort_key)
     rows = rows[: max(1, min(limit, 30))]
 
+    # 给最终入选的论文附上**可引用的原文片段**。
+    # 契约允许用 `paper_span_id` 当可定位来源，但模型必须先知道合法 id 才能引用它 ——
+    # 不提供就等于这条路走不通：实测命中的 12 篇里 0 篇带卡片、8 篇带片段，
+    # 于是 8 篇本可核验的论文因为「拿不到 id」而全部不可引用，R2 数学上无法满足。
+    top_ids = [int(r[0]) for r in rows]
+    spans_map = await _span_samples(session, top_ids)
+
     hits: list[dict[str, Any]] = []
     for pid, title, abstract, is_parsed, influence in rows:
         pid = int(pid)
@@ -420,9 +445,46 @@ async def search_library(
                 "span_count": span_count.get(pid, 0),
                 "influence_score": float(influence) if influence is not None else None,
                 "card": card_map.get(pid),
+                "spans": spans_map.get(pid, []),
             }
         )
     return hits
+
+
+async def _span_samples(
+    session: AsyncSession, paper_ids: list[int], *, per_paper: int = SPAN_SAMPLES_PER_PAPER
+) -> dict[int, list[dict[str, Any]]]:
+    """每篇论文取前 ``per_paper`` 个原文片段（id + 章节 + 页码 + 引文节选）。
+
+    取「前几个」而不是随机取样：同一 query 下结果稳定，便于复现与核对。
+    """
+
+    if not paper_ids:
+        return {}
+    stmt = (
+        select(
+            PaperSpan.id,
+            PaperSpan.paper_id,
+            PaperSpan.section_name,
+            PaperSpan.page_number,
+            func.left(PaperSpan.quote_text, 180),
+        )
+        .where(PaperSpan.paper_id.in_(paper_ids))
+        .order_by(PaperSpan.paper_id, PaperSpan.id)
+    )
+    out: dict[int, list[dict[str, Any]]] = {}
+    for span_id, pid, section, page, quote in (await session.execute(stmt)).all():
+        bucket = out.setdefault(int(pid), [])
+        if len(bucket) < per_paper:
+            bucket.append(
+                {
+                    "paper_span_id": int(span_id),
+                    "section_name": section,
+                    "page_number": page,
+                    "quote_text": quote,
+                }
+            )
+    return out
 
 
 def _card_text(card: dict[str, Any] | None) -> str:

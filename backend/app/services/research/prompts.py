@@ -52,7 +52,10 @@ _NODE_DOC_FILES: dict[str, str] = {
 NODE_GUIDES: dict[str, str] = {
     "literature_review": (
         "先按研究问题拆出检索词，在给出论文库材料范围内检索；\n"
-        "每条证据必须能回到原文：填 card_field（解析卡片字段名）或 paper_span_id；\n"
+        "每条证据必须能回到原文，二选一：\n"
+        "  ① 填 card_field —— 只能填该论文「解析卡片」里**真实存在的字段名**；\n"
+        "  ② 填 paper_span_id —— **只能从该论文「可引用的原文片段」列表里取**，不得自己编号；\n"
+        "材料里没有可定位来源的论文，就不要拿它当证据（改写进 limits 说明缺什么）。\n"
         "必须给出最接近的工作，并同时写明重合点与仍存差异；\n"
         "没有查到合适论文时，如实写出覆盖范围与盲区，并给出后续检索建议——\n"
         "**不要把「没查到」写成「该方向不存在」**；\n"
@@ -178,11 +181,23 @@ def _format_hits(hits: list[dict[str, Any]]) -> str:
         card_text = (
             json.dumps(card, ensure_ascii=False, indent=2) if card else "（未解析，无卡片字段）"
         )
+        spans = hit.get("spans") or []
+        if spans:
+            span_lines = "\n".join(
+                f"  - paper_span_id={s['paper_span_id']}"
+                f"｜{s.get('section_name') or '未标注章节'}"
+                f"｜第 {s.get('page_number') if s.get('page_number') is not None else '?'} 页"
+                f"｜“{(s.get('quote_text') or '')[:120]}”"
+                for s in spans
+            )
+        else:
+            span_lines = "  （这篇没有可引用的原文片段）"
         blocks.append(
             f"### 论文 {hit['paper_id']}｜{hit.get('title') or '（无标题）'}\n"
-            f"- 是否已解析：{hit.get('is_parsed')}（原文片段 {hit.get('span_count', 0)} 段）\n"
+            f"- 是否已解析：{hit.get('is_parsed')}（共 {hit.get('span_count', 0)} 段原文片段）\n"
             f"- 摘要节选：{_truncate(str(hit.get('abstract_excerpt') or ''), 400)}\n"
-            f"- 解析卡片：\n{_truncate(card_text, 1200)}"
+            f"- 解析卡片：\n{_truncate(card_text, 1200)}\n"
+            f"- **可引用的原文片段**（`paper_span_id` 只能从这个列表里取）：\n{span_lines}"
         )
     return "\n\n".join(blocks)
 
