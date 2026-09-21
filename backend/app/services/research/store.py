@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -51,6 +51,7 @@ __all__ = [
     "get_node_run",
     "get_project_settings",
     "list_node_runs",
+    "list_orphan_node_runs",
     "list_transitions",
     "library_facts",
     "library_overview",
@@ -79,28 +80,42 @@ row_to_dict = _row_to_dict
 
 
 # --------------------------------------------------------------------------- #
-# 节点实例
+# 节点实例（链的身份是**对话**，project_id 只是可空元信息）
 # --------------------------------------------------------------------------- #
 async def upsert_node_run(
     session: AsyncSession,
     *,
-    project_id: int,
+    conversation_id: str,
     node: str,
     entry_index: int,
+    project_id: int | None = None,
     **fields: Any,
 ) -> dict[str, Any]:
-    """写入 / 更新一条节点实例（幂等）。返回落库后的行。"""
+    """写入 / 更新一条节点实例（幂等）。返回落库后的行。
 
-    values = {"project_id": project_id, "node": node, "entry_index": entry_index, **fields}
+    冲突目标是 ``(conversation_id, node, entry_index)`` 上的**部分唯一索引**
+    （``WHERE conversation_id IS NOT NULL``），所以这里必须带上 ``index_where``，
+    否则 PostgreSQL 匹配不到索引、直接报错。
+    """
+
+    values = {
+        "conversation_id": conversation_id,
+        "project_id": project_id,
+        "node": node,
+        "entry_index": entry_index,
+        **fields,
+    }
     stmt = pg_insert(ResearchNodeRun).values(**values)
     update_cols = {
         key: getattr(stmt.excluded, key)
         for key in values
-        if key not in ("project_id", "node", "entry_index")
+        if key not in ("conversation_id", "node", "entry_index")
     }
     update_cols["updated_at"] = func.now()
     stmt = stmt.on_conflict_do_update(
-        index_elements=["project_id", "node", "entry_index"], set_=update_cols
+        index_elements=["conversation_id", "node", "entry_index"],
+        index_where=text("conversation_id IS NOT NULL"),
+        set_=update_cols,
     ).returning(ResearchNodeRun)
     result = await session.execute(stmt)
     await session.commit()
@@ -108,10 +123,10 @@ async def upsert_node_run(
 
 
 async def get_node_run(
-    session: AsyncSession, *, project_id: int, node: str, entry_index: int
+    session: AsyncSession, *, conversation_id: str, node: str, entry_index: int
 ) -> dict[str, Any] | None:
     stmt = select(ResearchNodeRun).where(
-        ResearchNodeRun.project_id == project_id,
+        ResearchNodeRun.conversation_id == conversation_id,
         ResearchNodeRun.node == node,
         ResearchNodeRun.entry_index == entry_index,
     )
@@ -120,12 +135,12 @@ async def get_node_run(
 
 
 async def delete_node_run(
-    session: AsyncSession, *, project_id: int, node: str, entry_index: int
+    session: AsyncSession, *, conversation_id: str, node: str, entry_index: int
 ) -> None:
     """删除一条节点实例（回退时清掉本次进入，让下次进入成为新的 entry_index）。"""
 
     stmt = select(ResearchNodeRun).where(
-        ResearchNodeRun.project_id == project_id,
+        ResearchNodeRun.conversation_id == conversation_id,
         ResearchNodeRun.node == node,
         ResearchNodeRun.entry_index == entry_index,
     )
@@ -135,13 +150,30 @@ async def delete_node_run(
         await session.commit()
 
 
-async def list_node_runs(session: AsyncSession, *, project_id: int) -> list[dict[str, Any]]:
-    """该项目全部节点实例（按节点、进入次序）。"""
+async def list_node_runs(
+    session: AsyncSession, *, conversation_id: str
+) -> list[dict[str, Any]]:
+    """该对话全部节点实例（按进入次序）。"""
 
     stmt = (
         select(ResearchNodeRun)
-        .where(ResearchNodeRun.project_id == project_id)
+        .where(ResearchNodeRun.conversation_id == conversation_id)
         .order_by(ResearchNodeRun.id)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    return [_row_to_dict(r) for r in rows]
+
+
+async def list_orphan_node_runs(
+    session: AsyncSession, *, limit: int = 30
+) -> list[dict[str, Any]]:
+    """0009 之前的历史链（``conversation_id IS NULL``）——界面标「无对话归属（早期记录）」。"""
+
+    stmt = (
+        select(ResearchNodeRun)
+        .where(ResearchNodeRun.conversation_id.is_(None))
+        .order_by(ResearchNodeRun.id.desc())
+        .limit(max(1, min(limit, 100)))
     )
     rows = (await session.execute(stmt)).scalars().all()
     return [_row_to_dict(r) for r in rows]
@@ -153,19 +185,21 @@ async def list_node_runs(session: AsyncSession, *, project_id: int) -> list[dict
 async def record_transition(
     session: AsyncSession,
     *,
-    project_id: int,
+    conversation_id: str,
     from_node: str | None,
     to_node: str,
     kind: str,
     trigger: str,
     reason: str,
+    project_id: int | None = None,
     required_carried: dict[str, Any] | None = None,
     budget_snapshot: dict[str, Any] | None = None,
     actor: str = "system",
 ) -> dict[str, Any]:
-    """闸门 G3：写迁移留痕。**无条件执行**——这是不是可选项。"""
+    """闸门 G3：写迁移留痕。**无条件执行**——这不是可选项。"""
 
     row = ResearchNodeTransition(
+        conversation_id=conversation_id,
         project_id=project_id,
         from_node=from_node,
         to_node=to_node,
@@ -183,11 +217,11 @@ async def record_transition(
 
 
 async def list_transitions(
-    session: AsyncSession, *, project_id: int, limit: int = 50
+    session: AsyncSession, *, conversation_id: str, limit: int = 50
 ) -> list[dict[str, Any]]:
     stmt = (
         select(ResearchNodeTransition)
-        .where(ResearchNodeTransition.project_id == project_id)
+        .where(ResearchNodeTransition.conversation_id == conversation_id)
         .order_by(ResearchNodeTransition.id.desc())
         .limit(max(1, min(limit, 200)))
     )
@@ -195,21 +229,21 @@ async def list_transitions(
     return [_row_to_dict(r) for r in rows]
 
 
-async def count_total_reverts(session: AsyncSession, *, project_id: int) -> int:
+async def count_total_reverts(session: AsyncSession, *, conversation_id: str) -> int:
     """整条链已发生的回退次数（闸门 G2）。"""
 
     stmt = select(func.count()).select_from(ResearchNodeTransition).where(
-        ResearchNodeTransition.project_id == project_id,
+        ResearchNodeTransition.conversation_id == conversation_id,
         ResearchNodeTransition.kind == "revert",
     )
     return int((await session.execute(stmt)).scalar_one() or 0)
 
 
-async def count_revisits(session: AsyncSession, *, project_id: int, node: str) -> int:
+async def count_revisits(session: AsyncSession, *, conversation_id: str, node: str) -> int:
     """某节点被回退进入的次数（闸门 G2）。"""
 
     stmt = select(func.count()).select_from(ResearchNodeTransition).where(
-        ResearchNodeTransition.project_id == project_id,
+        ResearchNodeTransition.conversation_id == conversation_id,
         ResearchNodeTransition.kind == "revert",
         ResearchNodeTransition.to_node == node,
     )

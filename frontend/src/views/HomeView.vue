@@ -88,7 +88,7 @@ const PIPELINE =
  * 研究流程面板作用的项目：已打开的对话用它的项目；项目内新建对话用 `?project=` 那个。
  * 两者都没有（真正的空白首页）就不显示可执行按钮 —— 研究链挂在项目上，没有项目就没有链。
  */
-const flowProjectId = computed(() => projectId.value ?? pendingProjectId.value)
+
 
 const active = computed(() => turns.value.length > 0 || phase.value === 'thinking')
 const canSend = computed(() => prompt.value.trim().length > 0 || files.value.length > 0)
@@ -710,7 +710,7 @@ onUnmounted(() => {
 
     <!-- 研究流程（七节点 + 程序校验 + 迁移留痕）。放在输入栏上方：
          项目内不论是新对话还是打开已有对话，它都在同一条内容列上。 -->
-    <ResearchFlowPanel :project-id="flowProjectId" />
+    <ResearchFlowPanel :conversation-id="conversationId" />
 
     <div class="composer rise-in rise-step-3" :class="{ 'composer--hero': !active }">
       <textarea

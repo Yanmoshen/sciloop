@@ -121,13 +121,23 @@ class PreflightResult:
         }
 
 
-def preflight_dir(project_id: int) -> Path:
+def workdir_key(conversation_id: str, project_id: int | None = None) -> str:
+    """预检产物的目录键。
+
+    有项目时按项目归（同一项目的多个对话可共享预检产物）；没有项目时按对话归
+    —— 无项目对话也能跑节点，预检不能因此没有落脚点。
+    """
+
+    return str(project_id) if project_id else f"conv-{conversation_id}"
+
+
+def preflight_dir(conversation_id: str, project_id: int | None = None) -> Path:
     """预检产物目录（与 conversations 同样的 .cache 约定）。"""
 
     base = os.environ.get("RESEARCH_PREFLIGHT_DIR") or str(
         Path(__file__).resolve().parents[3] / ".cache" / "research"
     )
-    path = Path(base) / str(project_id)
+    path = Path(base) / workdir_key(conversation_id, project_id)
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -197,7 +207,8 @@ def _apply_limits() -> bool:
 
 async def run_preflight(
     *,
-    project_id: int,
+    conversation_id: str,
+    project_id: int | None = None,
     command: str,
     cwd: str | None = None,
     timeout_s: int = 120,
@@ -228,9 +239,9 @@ async def run_preflight(
     except ValueError as exc:  # pragma: no cover - 上面已校验
         return PreflightResult(level=level, command=command, exit_code=-1, note=str(exc))
 
-    workdir = cwd or str(preflight_dir(project_id))
+    workdir = cwd or str(preflight_dir(conversation_id, project_id))
     if not Path(workdir).is_dir():
-        workdir = str(preflight_dir(project_id))
+        workdir = str(preflight_dir(conversation_id, project_id))
 
     started = time.perf_counter()
     limits_ok = _apply_limits()
@@ -266,7 +277,7 @@ async def run_preflight(
     stdout = (stdout_b or b"").decode("utf-8", errors="replace")
     stderr = (stderr_b or b"").decode("utf-8", errors="replace")
 
-    directory = preflight_dir(project_id)
+    directory = preflight_dir(conversation_id, project_id)
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
     log_path = directory / f"preflight-{stamp}.log"
     log_path.write_text(
@@ -311,10 +322,12 @@ async def run_preflight(
     return result
 
 
-def list_preflights(project_id: int, *, limit: int = 10) -> list[dict[str, Any]]:
+def list_preflights(
+    conversation_id: str, project_id: int | None = None, *, limit: int = 10
+) -> list[dict[str, Any]]:
     """列出该项目历史预检记录（新到旧）。"""
 
-    directory = preflight_dir(project_id)
+    directory = preflight_dir(conversation_id, project_id)
     files = sorted(directory.glob("preflight-*.json"), reverse=True)[: max(1, min(limit, 50))]
     out: list[dict[str, Any]] = []
     for path in files:
@@ -325,10 +338,12 @@ def list_preflights(project_id: int, *, limit: int = 10) -> list[dict[str, Any]]
     return out
 
 
-def latest_preflight(project_id: int) -> dict[str, Any] | None:
+def latest_preflight(
+    conversation_id: str, project_id: int | None = None
+) -> dict[str, Any] | None:
     """最近一次预检记录；没有则 None（节点会因此过不了 R13）。"""
 
-    records = list_preflights(project_id, limit=1)
+    records = list_preflights(conversation_id, project_id, limit=1)
     return records[0] if records else None
 
 

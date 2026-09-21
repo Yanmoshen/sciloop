@@ -475,8 +475,11 @@ async def _replay_call(
 class StreamUpdate:
     """流式链路的一帧。
 
-    ``kind='delta'`` → ``text`` 是本次新增的正文（前端直接追加渲染）；
-    ``kind='done'``  → ``result`` 是收尾后的 :class:`LLMResult`（含用量 / 成本 / 耗时）。
+    ``kind='delta'``     → ``text`` 是本次新增的**正文**（前端直接追加渲染）；
+    ``kind='reasoning'`` → ``text`` 是本次新增的**思考过程**。它**不是答复**，
+                           必须走独立通道（前端折叠展示、落盘单独字段），
+                           混进正文会让用户把模型的自述当成结论。
+    ``kind='done'``      → ``result`` 是收尾后的 :class:`LLMResult`（含用量 / 成本 / 耗时）。
     中途出错**不吞**：抛 ``LLMError``，调用方保留已渲染的部分并如实标注。
     """
 
@@ -585,6 +588,9 @@ async def chat_stream(
                             finish_reason = chunk_finish
                         if reasoning:
                             reasoning_parts.append(reasoning)
+                            # 走独立通道：思考过程不是答复。此前只收集不推送，
+                            # 结果它只能在收尾时被塞进 content 冒充正文（见下方 done 分支）。
+                            yield StreamUpdate(kind="reasoning", text=reasoning)
                         if text:
                             parts.append(text)
                             emitted = True
@@ -647,10 +653,18 @@ async def chat_stream(
 
         duration_ms = int((time.perf_counter() - started) * 1000)
         content = "".join(parts)
-        if not content.strip():
-            # 与 `_extract_content` 同一兜底口径：思考型模型可能只吐 reasoning_content，
-            # 此时 content 为空但 token 照记 —— 不改读就会出现「已完成但没有任何输出」。
-            content = "".join(reasoning_parts)
+        reasoning_text = "".join(reasoning_parts)
+        if not content.strip() and reasoning_text.strip():
+            # **不再拿思考过程冒充正文**。此前这里把 reasoning 塞进 content，
+            # 于是界面上出现的「回答」其实是模型的自述，而调用方以为那是结论。
+            # 现在正文保持为空（如实），思考过程放进 raw["reasoning"] 由调用方
+            # 走独立通道展示；调用方要说清「这次只有思考过程、没有正文」。
+            logger.warning(
+                "环节 %s 模型 %s 只输出了思考过程（%d 字），没有正文；已如实留空不冒充",
+                stage,
+                model.model_ref,
+                len(reasoning_text),
+            )
 
         attempt = AttemptRecord(
             index=1,
@@ -705,7 +719,13 @@ async def chat_stream(
                 prompt_hash=prompt_hash,
                 resolved_from=model.source,
                 fallback_from=list(fallback_from),
-                raw={"strategy": "stream", "model_returned": model_returned, "metadata": dict(metadata or {})},
+                raw={
+                    "strategy": "stream",
+                    "model_returned": model_returned,
+                    # 思考过程走独立字段，调用方据此折叠展示 / 单独落盘
+                    "reasoning": reasoning_text,
+                    "metadata": dict(metadata or {}),
+                },
             ),
         )
         return

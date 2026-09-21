@@ -214,6 +214,22 @@ def rename(conversation_id: str, title: str) -> dict[str, Any] | None:
     return record
 
 
+def set_fields(conversation_id: str, **fields: Any) -> dict[str, Any] | None:
+    """局部更新会话记录里的任意字段（读改写，只动传入的键）。
+
+    用途：记录「本对话已声明为普通对话（不走研究流程）」这类**对话级状态**。
+    故意做成通用而不是给每个状态各写一个函数——否则每加一个状态就要动这个热点文件。
+    """
+
+    record = read(conversation_id)
+    if record is None:
+        return None
+    record.update(fields)
+    record["updated_at"] = _now()
+    write(record)
+    return record
+
+
 def delete(conversation_id: str) -> bool:
     path = locate(conversation_id)
     if path is None:
@@ -342,6 +358,7 @@ __all__ = [
     "read",
     "rename",
     "set_archived",
+    "set_fields",
     "summary",
     "write",
 ]

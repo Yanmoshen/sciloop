@@ -42,12 +42,15 @@ from app.llm.errors import LLMError
 from app.llm.registry import get_registry
 from app.llm.types import slugify_provider
 from app.services import conversations
+from app.services.research import dialog, messages
 
 logger = logging.getLogger("sciloop.chat")
 
 router = APIRouter(tags=["chat"])
 
 TITLE_MAX_CHARS = 20
+#: 思考过程的落盘上限（超长截断）：它可能比正文长几倍，全存会让会话文件迅速膨胀
+REASONING_MAX_CHARS = 6000
 #: 64 太小：思考型模型会把预算全花在 reasoning 上，content 为空 → 标题静默降级。
 TITLE_MAX_TOKENS = 400
 
@@ -59,9 +62,17 @@ TITLE_PROMPT = (
 
 REPLY_SYSTEM = (
     "你是 SciLoop 的科研助手，帮助研究者把模糊的研究需求整理成可执行的研究方案。\n"
-    "回答要求：结构清晰、直指要点；如果信息不足，就直接列出你需要用户补充的关键信息；"
-    "不要编造文献、数据或结论。"
+    "回答要求：结构清晰、直指要点。\n"
+    "信息不足时**最多集中提出 3 个问题**，且每个问题都要给出一个可用的默认值；"
+    "如果研究者说「随便」「你帮我定」，就按默认值继续推进，并在回答里标明你用的是什么假设。\n"
+    "**不要输出你的思考过程、推理草稿或自我对话**（例如「我们需要回答用户……」「让我想想……」），"
+    "只输出给研究者看的最终答复。\n"
+    "不要编造文献、数据或结论；没有实际查过本地数据就不要声称查过。"
 )
+
+#: 通用回答的输出上限。默认 1536 会被思考型模型的长思考吃光，正文只挤出半句就断
+#: （实测有一轮只落了 26 个字符）。放宽到 4096 让正文有地方落。
+REPLY_MAX_TOKENS = 4096
 
 
 class HomeChatRequest(BaseModel):
@@ -107,6 +118,16 @@ def _error(status_code: int, code: str, message: str, detail: Any = None) -> HTT
 
 def _sse(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _streaming(source: AsyncIterator[str]) -> StreamingResponse:
+    """统一的 SSE 响应包装（对话各条分支共用同一组响应头）。"""
+
+    return StreamingResponse(
+        source,
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "Connection": "keep-alive"},
+    )
 
 
 async def _resolve_model_ref(model_config_id: int, model_id: str) -> str:
@@ -314,6 +335,43 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
     conversation_id = str(conversation["id"])
     history = conversations.context_messages(conversation)
 
+    # ------------------------------------------------------------------ #
+    # 意图路由：**对话就是 agent 的入口**
+    #   guide  → 模糊引导词且还没开链：给引导词 + 三个可点出口
+    #   node   → 明确执行意图（「开始文献调研」）：直接跑节点，过程回到对话
+    #   query  → 查询本地数据：确定性只读查询 + 结果卡片
+    #   其余    → 通用回答（下面原有的流式路径）
+    # 前三条都是**确定性**的（不再多花一次模型调用去措辞），费用与措辞都可控。
+    # ------------------------------------------------------------------ #
+    scope: dict[str, Any] = {
+        "conversation": conversation,
+        "project_id": conversation.get("project_id"),
+        "text": text,
+    }
+
+    if dialog.is_plain_chat_reply(text):
+        return _streaming(
+            dialog.stream_plain_chat(conversation_id=conversation_id, scope=scope)
+        )
+
+    routing = await dialog.route(
+        text, conversation_id, force_plain=bool(conversation.get("plain_chat"))
+    )
+    if routing.kind == "guide":
+        return _streaming(dialog.stream_guide(conversation_id=conversation_id, scope=scope))
+    if routing.kind == "node":
+        return _streaming(
+            dialog.stream_node(
+                conversation_id=conversation_id, text=text, scope=scope, routing=routing
+            )
+        )
+    if routing.kind == "query":
+        return _streaming(
+            dialog.stream_query(
+                conversation_id=conversation_id, text=text, scope=scope, routing=routing
+            )
+        )
+
     async def event_source() -> AsyncIterator[str]:
         # 首帧：前端拿到会话 id 就能立刻把这条对话挂到左栏
         yield ": connected\n\n"
@@ -335,6 +393,7 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
             title_task = asyncio.create_task(_generate_title(text, ref))
 
         buffer: list[str] = []
+        reasoning_buffer: list[str] = []
         started = time.perf_counter()
         result: Any = None
         error_info: dict[str, Any] | None = None
@@ -348,11 +407,18 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
                 ],
                 model_ref=ref,
                 purpose="home_reply",
+                max_tokens=REPLY_MAX_TOKENS,
                 allow_fallback=True,
             ):
                 if update.kind == "delta":
                     buffer.append(update.text)
                     yield _sse("delta", {"text": update.text})
+                elif update.kind == "reasoning":
+                    # **思考过程走独立通道**：它不是答复。前端折叠展示在耗时那一行下面，
+                    # 落盘也单独存一个字段。此前它只被收集、最后被塞进 content 冒充正文，
+                    # 结果「界面上看到的回答」和「库里存的」不是同一个东西。
+                    reasoning_buffer.append(update.text)
+                    yield _sse("reasoning", {"text": update.text})
                 elif update.kind == "done":
                     result = update.result
         except LLMError as exc:
@@ -374,6 +440,18 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
                 title_task.cancel()
             duration_ms = int((time.perf_counter() - started) * 1000)
             generated = "".join(buffer)
+            # **显示与落盘必须一致**：部分供应商只在收尾帧给正文（delta 为空），
+            # 旧代码只存 delta buffer，于是界面上有内容、库里是空串。
+            if not generated and result is not None:
+                generated = str(getattr(result, "content", "") or "")
+            reasoning_text = "".join(reasoning_buffer)
+            if not reasoning_text and result is not None:
+                reasoning_text = str((getattr(result, "raw", None) or {}).get("reasoning") or "")
+            if len(reasoning_text) > REASONING_MAX_CHARS:
+                reasoning_text = reasoning_text[:REASONING_MAX_CHARS] + "\n…（思考过程过长，已截断）"
+            if not generated and reasoning_text and error_info is None:
+                # 模型只给了思考过程：如实说明，**不拿思考过程冒充答复**
+                generated = messages.NODE_ONLY_REASONING_TEXT
             # 有正文 → 追加本轮；无正文且无错误 → 模型真的返回空，也要如实记一条。
             # 编辑重开时**无条件落盘**：用户改过的正文必须留痕，否则刷新后改动就凭空消失了。
             if generated or error_info is None or is_edit:
@@ -390,6 +468,7 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
                             "duration_ms": getattr(result, "duration_ms", duration_ms)
                             if result is not None
                             else duration_ms,
+                            "reasoning": reasoning_text or None,
                             "interrupted": bool(error_info),
                         },
                     ],

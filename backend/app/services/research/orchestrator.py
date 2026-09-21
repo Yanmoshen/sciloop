@@ -200,11 +200,11 @@ async def _load_project(session: AsyncSession, project_id: int) -> _ProjectView 
 
 
 async def _latest_run(
-    session: AsyncSession, *, project_id: int, node: str
+    session: AsyncSession, *, conversation_id: str, node: str
 ) -> dict[str, Any] | None:
     stmt = (
         select(ResearchNodeRun)
-        .where(ResearchNodeRun.project_id == project_id, ResearchNodeRun.node == node)
+        .where(ResearchNodeRun.conversation_id == conversation_id, ResearchNodeRun.node == node)
         .order_by(ResearchNodeRun.entry_index.desc())
         .limit(1)
     )
@@ -212,7 +212,7 @@ async def _latest_run(
     return store.row_to_dict(row) if row is not None else None
 
 
-async def current_node(session: AsyncSession, *, project_id: int) -> str:
+async def current_node(session: AsyncSession, *, conversation_id: str) -> str:
     """当前应当执行的节点。
 
     判定顺序：
@@ -224,7 +224,7 @@ async def current_node(session: AsyncSession, *, project_id: int) -> str:
     3. 一个都没完成 → 第一个节点。
     """
 
-    latest = await store.list_transitions(session, project_id=project_id, limit=1)
+    latest = await store.list_transitions(session, conversation_id=conversation_id, limit=1)
     if latest:
         row = latest[0]
         if str(row.get("kind")) == "revert":
@@ -234,7 +234,7 @@ async def current_node(session: AsyncSession, *, project_id: int) -> str:
         if str(row.get("kind")) == "stop":
             return str(row.get("to_node") or _DEFAULT_ORDER[0])
 
-    runs = await store.list_node_runs(session, project_id=project_id)
+    runs = await store.list_node_runs(session, conversation_id=conversation_id)
     last_index = -1
     for row in runs:
         if str(row.get("status")) != "done":
@@ -247,7 +247,9 @@ async def current_node(session: AsyncSession, *, project_id: int) -> str:
     return graph.next_node(_DEFAULT_ORDER[last_index]) or _DEFAULT_ORDER[last_index]
 
 
-async def resolve_entry_index(session: AsyncSession, *, project_id: int, node: str) -> int:
+async def resolve_entry_index(
+    session: AsyncSession, *, conversation_id: str, node: str
+) -> int:
     """本次进入的 ``entry_index``。
 
     - 从未进入 → 1
@@ -255,7 +257,7 @@ async def resolve_entry_index(session: AsyncSession, *, project_id: int, node: s
     - 上一次已 ``done`` / ``failed`` / ``blocked`` → 递增（回退或重跑）
     """
 
-    latest = await _latest_run(session, project_id=project_id, node=node)
+    latest = await _latest_run(session, conversation_id=conversation_id, node=node)
     if latest is None:
         return 1
     current = int(latest.get("entry_index") or 1)
@@ -264,7 +266,9 @@ async def resolve_entry_index(session: AsyncSession, *, project_id: int, node: s
     return current + 1
 
 
-async def _upstream_payload(session: AsyncSession, *, project_id: int, node: str) -> dict[str, Any]:
+async def _upstream_payload(
+    session: AsyncSession, *, conversation_id: str, node: str
+) -> dict[str, Any]:
     """上游成果。
 
     两种情况都要覆盖：
@@ -279,7 +283,7 @@ async def _upstream_payload(session: AsyncSession, *, project_id: int, node: str
         return {}
     index = _DEFAULT_ORDER.index(node)
     for prev in reversed(_DEFAULT_ORDER[:index]):
-        latest = await _latest_run(session, project_id=project_id, node=prev)
+        latest = await _latest_run(session, conversation_id=conversation_id, node=prev)
         if latest and str(latest.get("status")) == "done":
             return {
                 "node": prev,
@@ -291,7 +295,7 @@ async def _upstream_payload(session: AsyncSession, *, project_id: int, node: str
     # 回退场景：取下游里最近完成的一个（通常就是提出回退的那个节点）
     best: tuple[int, dict[str, Any]] | None = None
     for later in _DEFAULT_ORDER[index + 1 :]:
-        latest = await _latest_run(session, project_id=project_id, node=later)
+        latest = await _latest_run(session, conversation_id=conversation_id, node=later)
         if latest and str(latest.get("status")) == "done":
             order_key = int(latest.get("id") or 0)
             if best is None or order_key > best[0]:
@@ -308,10 +312,12 @@ async def _upstream_payload(session: AsyncSession, *, project_id: int, node: str
     return best[1] if best is not None else {}
 
 
-async def chain_state(session: AsyncSession, *, project_id: int) -> dict[str, Any]:
+async def chain_state(
+    session: AsyncSession, *, conversation_id: str, project_id: int | None = None
+) -> dict[str, Any]:
     """整条链的状态（前端状态条与状态查询都用它）。"""
 
-    runs = await store.list_node_runs(session, project_id=project_id)
+    runs = await store.list_node_runs(session, conversation_id=conversation_id)
     by_node: dict[str, dict[str, Any]] = {}
     for row in runs:
         by_node[str(row["node"])] = row  # 后者覆盖前者 = 取最新进入
@@ -338,13 +344,20 @@ async def chain_state(session: AsyncSession, *, project_id: int) -> dict[str, An
         )
 
     return {
+        "conversation_id": conversation_id,
         "project_id": project_id,
+        "has_chain": bool(runs),
         "nodes": nodes,
-        "current_node": await current_node(session, project_id=project_id),
-        "transitions": await store.list_transitions(session, project_id=project_id, limit=30),
-        "total_reverts": await store.count_total_reverts(session, project_id=project_id),
+        "current_node": await current_node(session, conversation_id=conversation_id),
+        "transitions": await store.list_transitions(
+            session, conversation_id=conversation_id, limit=30
+        ),
+        "total_reverts": await store.count_total_reverts(
+            session, conversation_id=conversation_id
+        ),
         "max_total_reverts": graph.MAX_TOTAL_REVERTS,
-        "preflight": preflight_mod.latest_preflight(project_id),
+        "workdir": preflight_mod.workdir_key(conversation_id, project_id),
+        "preflight": preflight_mod.latest_preflight(conversation_id, project_id),
     }
 
 
@@ -374,9 +387,17 @@ async def _persist_evidences(
 
 
 async def _persist_idea_and_feasibility(
-    session: AsyncSession, *, project_id: int, node_run_id: int, out: IdeaAndFeasibilityOutput
+    session: AsyncSession,
+    *,
+    project_id: int | None,
+    node_run_id: int,
+    out: IdeaAndFeasibilityOutput,
 ) -> dict[str, Any]:
-    """idea 与可行性写进既有 ``ideas`` / ``feasibilities`` 表。"""
+    """idea 与可行性写进既有 ``ideas`` / ``feasibilities`` 表。
+
+    ``ideas.project_id`` 可空，所以**无项目对话也能落**：产出如实归属这次研究，
+    不替用户造项目。
+    """
 
     hyp = out.hypothesis
     idea = Idea(
@@ -423,12 +444,20 @@ async def _persist_idea_and_feasibility(
 async def _persist_taskbook(
     session: AsyncSession,
     *,
-    project_id: int,
+    project_id: int | None,
     node_run_id: int,
     out: ExperimentPrepOutput,
     question: str,
 ) -> dict[str, Any]:
-    """实验协议写进既有 ``taskbooks``（校验通过即 locked）。"""
+    """实验协议写进既有 ``taskbooks``（校验通过即 locked）。
+
+    ``taskbooks.project_id`` 是 **NOT NULL**（既有表结构，本层不改它），
+    所以无项目对话**落不了任务书**——这时如实返回 ``no_project`` 而不是
+    偷偷造一个项目，也不假装写过。
+    """
+
+    if project_id is None:
+        return {"taskbook_id": None, "taskbook_skipped": "no_project"}
 
     idea = (
         await session.execute(
@@ -466,7 +495,7 @@ async def _persist_outputs(
     session: AsyncSession,
     *,
     node: str,
-    project_id: int,
+    project_id: int | None,
     node_run_id: int,
     payload: dict[str, Any],
     question: str,
@@ -580,14 +609,14 @@ def _salvage_from_json_error(exc: Exception) -> str | None:
 
 
 async def _budget_snapshot(
-    session: AsyncSession, *, project_id: int, node: str, retry_count: int
+    session: AsyncSession, *, conversation_id: str, node: str, retry_count: int
 ) -> dict[str, Any]:
     return {
         "retry_count": retry_count,
         "max_retry": graph.MAX_RETRY_PER_ENTRY,
-        "revisit_count": await store.count_revisits(session, project_id=project_id, node=node),
+        "revisit_count": await store.count_revisits(session, conversation_id=conversation_id, node=node),
         "max_revisit": graph.MAX_REVISIT_PER_NODE,
-        "total_reverts": await store.count_total_reverts(session, project_id=project_id),
+        "total_reverts": await store.count_total_reverts(session, conversation_id=conversation_id),
         "max_total_reverts": graph.MAX_TOTAL_REVERTS,
     }
 
@@ -598,25 +627,29 @@ async def _budget_snapshot(
 async def run_node(
     session_factory: Any,
     *,
-    project_id: int,
+    conversation_id: str,
     node: str | None = None,
     text: str = "",
+    project_id: int | None = None,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """执行一次节点（生成器，逐条产出事件）。
 
-    事件：``meta`` / ``node`` / ``attempt`` / ``validation`` / ``revert`` /
-    ``migrated`` / ``waiting_human`` / ``error`` / ``done``
+    事件：``meta`` / ``node`` / ``attempt`` / ``validation`` / ``notice`` /
+    ``revert`` / ``migrated`` / ``waiting_human`` / ``error`` / ``done``
+
+    **链挂在对话上**，所以本函数**不要求项目存在**：对话可以完全没有项目。
+    ``project_id`` 只在拿得到时作为元信息写入，并用于读取项目级执行授权；
+    拿不到就按 ``ask`` 处理——不替用户造项目，也不因此拦住他。
 
     失败一律如实上报：任何异常都转成 ``error`` 事件，**不返回伪造的成功**。
     """
 
     async with session_factory() as session:
-        project = await _load_project(session, project_id)
-        if project is None:
-            yield "error", {"code": "project_not_found", "message": f"项目 {project_id} 不存在"}
-            return
+        project = await _load_project(session, project_id) if project_id else None
+        project_name = project.name if project is not None else ""
+        execution_access = project.execution_access if project is not None else "ask"
 
-        fallback = await current_node(session, project_id=project_id)
+        fallback = await current_node(session, conversation_id=conversation_id)
         detected, keyword = detect_node(text, fallback=fallback)
         target = node or detected
         if target not in _DEFAULT_ORDER:
@@ -627,14 +660,19 @@ async def run_node(
             }
             return
 
-        entry_index = await resolve_entry_index(session, project_id=project_id, node=target)
+        entry_index = await resolve_entry_index(
+            session, conversation_id=conversation_id, node=target
+        )
         max_retry = graph.MAX_RETRY_PER_ENTRY
-        budget = await _budget_snapshot(session, project_id=project_id, node=target, retry_count=0)
+        budget = await _budget_snapshot(
+            session, conversation_id=conversation_id, node=target, retry_count=0
+        )
         model_ref = await resolve_model_ref(target, project_id)
 
         yield "meta", {
+            "conversation_id": conversation_id,
             "project_id": project_id,
-            "project_name": project.name,
+            "project_name": project_name,
             "requested_node": node,
             "detected_node": detected,
             "detect_keyword": keyword,
@@ -642,7 +680,7 @@ async def run_node(
             "node_label": graph.NODE_LABELS.get(target, target),
             "entry_index": entry_index,
             "implemented": target in IMPLEMENTED_NODES,
-            "execution_access": project.execution_access,
+            "execution_access": execution_access,
             "max_retry": max_retry,
             "budget": budget,
             "model_ref": model_ref,
@@ -651,6 +689,7 @@ async def run_node(
         if model_ref is None:
             await store.upsert_node_run(
                 session,
+                conversation_id=conversation_id,
                 project_id=project_id,
                 node=target,
                 entry_index=entry_index,
@@ -679,6 +718,7 @@ async def run_node(
 
         await store.upsert_node_run(
             session,
+            conversation_id=conversation_id,
             project_id=project_id,
             node=target,
             entry_index=entry_index,
@@ -695,11 +735,69 @@ async def run_node(
             "implemented": target in IMPLEMENTED_NODES,
         }
 
-        upstream = await _upstream_payload(session, project_id=project_id, node=target)
+        upstream = await _upstream_payload(session, conversation_id=conversation_id, node=target)
         research_question = str((upstream.get("payload") or {}).get("research_question") or text or "")
         library = await store.library_overview(session)
         hits = await store.search_library(session, query=text or research_question)
-        real_preflight = preflight_mod.latest_preflight(project_id)
+        real_preflight = preflight_mod.latest_preflight(conversation_id, project_id)
+
+        # 缺研究问题就别硬跑：拿 3 次重试去撞一个注定失败的检索，既费钱又给出
+        # 「修复重试达上限」这种**误导性**结论（真正的原因是缺输入，不是模型修不好）。
+        if len(research_question.strip()) < 4 and not upstream:
+            await store.upsert_node_run(
+                session,
+                conversation_id=conversation_id,
+                project_id=project_id,
+                node=target,
+                entry_index=entry_index,
+                status="waiting_human",
+                retry_count=0,
+                validation={
+                    "ok": False,
+                    "level": "L1",
+                    "rules": ["needs_input"],
+                    "items": [
+                        {
+                            "rule": "needs_input",
+                            "level": "L1",
+                            "message": "缺少研究问题，无法开始本节点",
+                            "path": "research_question",
+                        }
+                    ],
+                },
+                finished_at=_utcnow(),
+            )
+            await store.record_transition(
+                session,
+                conversation_id=conversation_id,
+                project_id=project_id,
+                from_node=target,
+                to_node=target,
+                kind="stop",
+                trigger="program",
+                reason="缺少研究问题，未执行（没有把输入缺失当成模型失败）",
+                budget_snapshot={"retry_count": 0, "max_retry": max_retry},
+            )
+            yield "waiting_human", {
+                "node": target,
+                "node_label": graph.NODE_LABELS.get(target, target),
+                "retry_count": 0,
+                "items": [],
+                "needs_input": "research_question",
+                "message": (
+                    f"要跑「{graph.NODE_LABELS.get(target, target)}」，我需要一个研究问题——"
+                    "一句话说明你想搞清楚什么，例如「某方法在什么场景下解决什么问题」。"
+                    "给我这句话我立刻开始。"
+                ),
+            }
+            yield "done", {
+                "node": target,
+                "status": "waiting_human",
+                "display_status": graph.display_status("waiting_human"),
+                "cost_usd": 0.0,
+                "llm_call_count": 0,
+            }
+            return
 
     payload: dict[str, Any] | None = None
     total_cost = 0.0
@@ -723,7 +821,7 @@ async def run_node(
             node=target,
             user_text=text,
             research_question=research_question,
-            project_name=project.name,
+            project_name=project_name,
             upstream=upstream,
             library=library,
             hits=hits or [],
@@ -814,6 +912,7 @@ async def run_node(
                 async with session_factory() as session:
                     await store.upsert_node_run(
                         session,
+                        conversation_id=conversation_id,
                         project_id=project_id,
                         node=target,
                         entry_index=entry_index,
@@ -825,7 +924,7 @@ async def run_node(
                         cost_usd=round(total_cost, 6),
                     )
                     budget = await _budget_snapshot(
-                        session, project_id=project_id, node=target, retry_count=attempt + 1
+                        session, conversation_id=conversation_id, node=target, retry_count=attempt + 1
                     )
                 repair = (
                     "上一次模型调用没有成功返回可用结果。请直接输出符合契约的完整 JSON 对象，"
@@ -836,6 +935,7 @@ async def run_node(
             async with session_factory() as session:
                 await store.upsert_node_run(
                     session,
+                    conversation_id=conversation_id,
                     project_id=project_id,
                     node=target,
                     entry_index=entry_index,
@@ -921,6 +1021,7 @@ async def run_node(
             async with session_factory() as session:
                 await store.upsert_node_run(
                     session,
+                    conversation_id=conversation_id,
                     project_id=project_id,
                     node=target,
                     entry_index=entry_index,
@@ -948,6 +1049,7 @@ async def run_node(
         async with session_factory() as session:
             await store.upsert_node_run(
                 session,
+                conversation_id=conversation_id,
                 project_id=project_id,
                 node=target,
                 entry_index=entry_index,
@@ -959,7 +1061,7 @@ async def run_node(
                 cost_usd=round(total_cost, 6),
             )
             budget = await _budget_snapshot(
-                session, project_id=project_id, node=target, retry_count=attempt + 1
+                session, conversation_id=conversation_id, node=target, retry_count=attempt + 1
             )
         repair = validation.repair_instruction()
 
@@ -969,6 +1071,7 @@ async def run_node(
         async with session_factory() as session:
             await store.upsert_node_run(
                 session,
+                conversation_id=conversation_id,
                 project_id=project_id,
                 node=target,
                 entry_index=entry_index,
@@ -982,6 +1085,7 @@ async def run_node(
             )
             await store.record_transition(
                 session,
+                conversation_id=conversation_id,
                 project_id=project_id,
                 from_node=target,
                 to_node=target,
@@ -1011,7 +1115,7 @@ async def run_node(
 
     # 通过：落业务实体 + 处理迁移
     async with session_factory() as session:
-        run = await _latest_run(session, project_id=project_id, node=target)
+        run = await _latest_run(session, conversation_id=conversation_id, node=target)
         node_run_id = int((run or {}).get("id") or 0)
         refs = await _persist_outputs(
             session,
@@ -1029,6 +1133,7 @@ async def run_node(
             # G3：无条件落痕
             await store.record_transition(
                 session,
+                conversation_id=conversation_id,
                 project_id=project_id,
                 from_node=target,
                 to_node=target_node,
@@ -1052,6 +1157,7 @@ async def run_node(
             next_target = graph.next_node(target) or "end"
             await store.record_transition(
                 session,
+                conversation_id=conversation_id,
                 project_id=project_id,
                 from_node=target,
                 to_node=next_target,

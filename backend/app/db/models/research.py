@@ -10,7 +10,8 @@
 - 本层只记录「哪个节点、第几次进入、什么状态、校验结果、花了多少」，
   以及「从哪个节点迁到哪个节点、为什么、带了什么信息」。
 
-``uq_node_run_once`` = ``(project_id, node, entry_index)`` 是幂等基石：
+``uq_node_run_once`` = ``(conversation_id, node, entry_index)``（**一个对话一条链**；
+部分唯一索引，历史行 ``conversation_id IS NULL`` 不受约束）。
 回退只让 ``entry_index`` 递增，**永不新建链**；重复提交走
 ``ON CONFLICT DO UPDATE``，不会出现两条 ``running``，也不会重复计成本。
 """
@@ -30,8 +31,8 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
-    UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -74,13 +75,21 @@ TRANSITION_TRIGGERS: tuple[str, ...] = ("program", "model", "researcher")
 
 
 class ResearchNodeRun(Base):
-    """节点实例（一次「进入」一行）。"""
+    """节点实例（一次「进入」一行）。
+
+    链的身份是 ``(conversation_id, node, entry_index)`` —— **一个对话一条链**。
+    ``project_id`` 只是可空元信息：对话可以完全没有项目（用户是在对话里说
+    「开始文献调研」，不是在项目里点按钮），这时不应拦着他，也不该替他造项目。
+    """
 
     __tablename__ = "research_node_runs"
 
     id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
-    project_id: Mapped[int] = mapped_column(
-        BIGINT, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    #: 链的归属：对话 id（`.data/conversations/` 的文件名，定长 16，这里给 64 留余量）
+    conversation_id: Mapped[str | None] = mapped_column(String(64))
+    #: **可空元信息**，不参与链的身份判定；无项目对话时为 NULL
+    project_id: Mapped[int | None] = mapped_column(
+        BIGINT, ForeignKey("projects.id", ondelete="CASCADE")
     )
     node: Mapped[str] = mapped_column(String(48), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="pending")
@@ -110,8 +119,17 @@ class ResearchNodeRun(Base):
     )
 
     __table_args__ = (
-        UniqueConstraint("project_id", "node", "entry_index", name="uq_node_run_once"),
-        Index("idx_node_runs_project", "project_id", "node"),
+        # 部分唯一索引（WHERE conversation_id IS NOT NULL）由迁移 0009 建立：
+        # 声明式 UniqueConstraint 无法表达部分索引，所以这里用 Index + postgresql_where。
+        Index(
+            "uq_node_run_once",
+            "conversation_id",
+            "node",
+            "entry_index",
+            unique=True,
+            postgresql_where=text("conversation_id IS NOT NULL"),
+        ),
+        Index("idx_node_runs_chain", "conversation_id", "node"),
     )
 
 
@@ -121,8 +139,9 @@ class ResearchNodeTransition(Base):
     __tablename__ = "research_node_transitions"
 
     id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
-    project_id: Mapped[int] = mapped_column(
-        BIGINT, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False
+    conversation_id: Mapped[str | None] = mapped_column(String(64))
+    project_id: Mapped[int | None] = mapped_column(
+        BIGINT, ForeignKey("projects.id", ondelete="CASCADE")
     )
     from_node: Mapped[str | None] = mapped_column(String(48))
     to_node: Mapped[str] = mapped_column(String(48), nullable=False)
@@ -138,4 +157,4 @@ class ResearchNodeTransition(Base):
         DateTime(timezone=True), server_default=func.now()
     )
 
-    __table_args__ = (Index("idx_transitions_project", "project_id", "created_at"),)
+    __table_args__ = (Index("idx_transitions_chain", "conversation_id", "created_at"),)

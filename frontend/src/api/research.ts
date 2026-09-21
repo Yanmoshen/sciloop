@@ -79,7 +79,9 @@ export interface PreflightRecord {
 }
 
 export interface ChainState {
-  project_id: number
+  conversation_id: string
+  project_id: number | null
+  has_chain: boolean
   nodes: ResearchNode[]
   current_node: string
   transitions: Transition[]
@@ -147,16 +149,16 @@ export async function fetchNodes(): Promise<NodesCatalog> {
   return (await response.json()) as NodesCatalog
 }
 
-export async function fetchChainState(projectId: number): Promise<ChainState> {
-  const response = await fetch(apiUrl(`/research/projects/${projectId}/state`), {
+export async function fetchChainState(conversationId: string): Promise<ChainState> {
+  const response = await fetch(apiUrl(`/research/conversations/${conversationId}/state`), {
     headers: { Accept: 'application/json' },
   })
   if (!response.ok) throw await parseError(response)
   return (await response.json()) as ChainState
 }
 
-export async function fetchPreflights(projectId: number): Promise<PreflightRecord[]> {
-  const response = await fetch(apiUrl(`/research/projects/${projectId}/preflight`), {
+export async function fetchPreflights(conversationId: string): Promise<PreflightRecord[]> {
+  const response = await fetch(apiUrl(`/research/conversations/${conversationId}/preflight`), {
     headers: { Accept: 'application/json' },
   })
   if (!response.ok) throw await parseError(response)
@@ -165,10 +167,10 @@ export async function fetchPreflights(projectId: number): Promise<PreflightRecor
 }
 
 export async function runPreflight(
-  projectId: number,
+  conversationId: string,
   input: PreflightInput,
 ): Promise<PreflightRecord> {
-  const response = await fetch(apiUrl(`/research/projects/${projectId}/preflight`), {
+  const response = await fetch(apiUrl(`/research/conversations/${conversationId}/preflight`), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...ownerHeader() },
     body: JSON.stringify(input),
@@ -178,7 +180,7 @@ export async function runPreflight(
 }
 
 export async function requestRevert(
-  projectId: number,
+  conversationId: string,
   input: {
     from_node: string
     target: string
@@ -186,7 +188,7 @@ export async function requestRevert(
     carried: Record<string, unknown>
   },
 ): Promise<Record<string, unknown>> {
-  const response = await fetch(apiUrl(`/research/projects/${projectId}/revert`), {
+  const response = await fetch(apiUrl(`/research/conversations/${conversationId}/revert`), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...ownerHeader() },
     body: JSON.stringify(input),
@@ -196,9 +198,9 @@ export async function requestRevert(
 }
 
 export async function fetchAccessMode(
-  projectId: number,
+  conversationId: string,
 ): Promise<{ execution_access: 'ask' | 'trusted' }> {
-  const response = await fetch(apiUrl(`/research/projects/${projectId}/access`), {
+  const response = await fetch(apiUrl(`/research/conversations/${conversationId}/access`), {
     headers: { Accept: 'application/json' },
   })
   if (!response.ok) throw await parseError(response)
@@ -206,10 +208,10 @@ export async function fetchAccessMode(
 }
 
 export async function setAccessMode(
-  projectId: number,
+  conversationId: string,
   mode: 'ask' | 'trusted',
 ): Promise<void> {
-  const response = await fetch(apiUrl(`/research/projects/${projectId}/access`), {
+  const response = await fetch(apiUrl(`/research/conversations/${conversationId}/access`), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json', ...ownerHeader() },
     body: JSON.stringify({ execution_access: mode }),
@@ -233,12 +235,12 @@ export interface RunNodeHandlers {
  * `error` 事件回来（此时 HTTP 已是 200，因为响应头早已发送）。
  */
 export async function streamRunNode(
-  projectId: number,
+  conversationId: string,
   input: RunNodeInput,
   handlers: RunNodeHandlers,
   signal?: AbortSignal,
 ): Promise<void> {
-  const response = await fetch(apiUrl(`/research/projects/${projectId}/run`), {
+  const response = await fetch(apiUrl(`/research/conversations/${conversationId}/run`), {
     method: 'POST',
     headers: {
       Accept: 'text/event-stream',

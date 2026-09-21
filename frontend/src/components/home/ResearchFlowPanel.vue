@@ -40,7 +40,7 @@ import {
   type ResearchNode,
 } from '@/api/research'
 
-const props = defineProps<{ projectId: number | null }>()
+const props = defineProps<{ conversationId: string | null }>()
 
 /**
  * 报错文案统一出口：**不把后端实现细节抛给研究者**。
@@ -90,16 +90,16 @@ async function loadCatalog(): Promise<void> {
 }
 
 async function loadChain(): Promise<void> {
-  if (!props.projectId) {
+  if (!props.conversationId) {
     chain.value = null
     preflights.value = []
     return
   }
   try {
     const [state, records, access] = await Promise.all([
-      fetchChainState(props.projectId),
-      fetchPreflights(props.projectId),
-      fetchAccessMode(props.projectId),
+      fetchChainState(props.conversationId),
+      fetchPreflights(props.conversationId),
+      fetchAccessMode(props.conversationId),
     ])
     chain.value = state
     preflights.value = records
@@ -110,7 +110,7 @@ async function loadChain(): Promise<void> {
 }
 
 watch(
-  () => props.projectId,
+  () => props.conversationId,
   () => {
     events.value = []
     manualNode.value = null
@@ -126,14 +126,14 @@ function toggleExpand(): void {
 }
 
 async function runNode(): Promise<void> {
-  if (!props.projectId || busy.value) return
+  if (!props.conversationId || busy.value) return
   busy.value = true
   errorText.value = ''
   events.value = []
   abortCtl.value = new AbortController()
   try {
     await streamRunNode(
-      props.projectId,
+      props.conversationId,
       { node: manualNode.value, text: promptText.value },
       {
         onEvent: (event) => {
@@ -156,10 +156,10 @@ function stopRun(): void {
 }
 
 async function applyAccess(): Promise<void> {
-  if (!props.projectId) return
+  if (!props.conversationId) return
   const next = accessMode.value === 'trusted' ? 'ask' : 'trusted'
   try {
-    await setAccessMode(props.projectId, next)
+    await setAccessMode(props.conversationId, next)
     accessMode.value = next
   } catch (err) {
     errorText.value = readableError(err, RESEARCH_TEXT.accessDenied)
@@ -167,11 +167,11 @@ async function applyAccess(): Promise<void> {
 }
 
 async function doPreflight(): Promise<void> {
-  if (!props.projectId) return
+  if (!props.conversationId) return
   busy.value = true
   errorText.value = ''
   try {
-    await runPreflight(props.projectId, {
+    await runPreflight(props.conversationId, {
       command: preflightCommand.value,
       approved: preflightApproved.value,
     })
@@ -263,7 +263,7 @@ function textOf(event: ResearchEvent, key: string): string {
 
     <div class="fold" :class="{ 'fold--open': expanded }">
       <div class="rf__body">
-        <div v-if="!props.projectId" class="rf__empty">{{ RESEARCH_TEXT.needProject }}</div>
+        <div v-if="!props.conversationId" class="rf__empty">{{ RESEARCH_TEXT.needProject }}</div>
 
         <template v-else>
           <div class="rf__row">
