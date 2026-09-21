@@ -343,6 +343,25 @@ def test_grant_from_env_reads_net_settings() -> None:
     assert grant_from_env({}).allow_net is False
 
 
+def test_server_params_propagates_the_net_grant() -> None:
+    """**授权链不能断在中间**：`Guard` 只认 `SCILOOP_MCP_*`，而子进程的环境由
+    `server_params()` 构造 —— 漏写一个键，"白名单配了"和"子进程里 allow_net=False"
+    就会错位：工具摆得出去、一调必被拒，而且两边单看都"对"。
+
+    这条测试盯的正是那个缝：**从构造参数到子进程 Grant，一路走通**。
+    """
+
+    params = server_params(allow_net=True, allowed_hosts=("arxiv.org",))
+    grant = grant_from_env(dict(params.env))
+    assert grant.allow_net is True
+    assert grant.allowed_hosts == ("arxiv.org",)
+
+    # 默认值必须是**默认拒绝**，而不是"不限制"
+    conservative = grant_from_env(dict(server_params().env))
+    assert conservative.allow_net is False
+    assert conservative.allowed_hosts == ()
+
+
 def test_end_to_end_fetch_url_is_registered() -> None:
     params = server_params(python=sys.executable, repo_server_dir=REPO_SERVER_DIR)
     names = {item["name"] for item in _run(list_tools(params))}

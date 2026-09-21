@@ -49,16 +49,25 @@ def server_params(
     workspace: str | os.PathLike[str] | None = None,
     read_roots: tuple[str, ...] = (),
     allow_exec: bool = False,
+    allow_net: bool = False,
+    allowed_hosts: tuple[str, ...] = (),
     approval_tokens: tuple[str, ...] = (),
     actor: str = "agent",
     python: str | None = None,
     repo_server_dir: str | os.PathLike[str] | None = None,
 ) -> StdioServerParameters:
-    """构造启动参数。**授权只在这里给出**，与被调用方隔离。"""
+    """构造启动参数。**授权只在这里给出**，与被调用方隔离。
+
+    ⚠️ 每个门读的环境变量都必须在**这里**写进去：`guard.grant_from_env()` 只认
+    `SCILOOP_MCP_*`，而子进程的环境由本函数构造。此前漏了 `ALLOW_NET` / `ALLOWED_HOSTS`，
+    于是"配了白名单就把 fetch_url 摆给模型"与"子进程里 allow_net 恒为 False"两边错位 ——
+    工具摆得出去、调用必被 `tool_denied`。授权链断在最不起眼的一环。
+    """
 
     env = {
         "SCILOOP_MCP_ACTOR": actor,
         "SCILOOP_MCP_ALLOW_EXEC": "1" if allow_exec else "0",
+        "SCILOOP_MCP_ALLOW_NET": "1" if allow_net else "0",
         "SCILOOP_MCP_APPROVAL_TOKENS": ",".join(approval_tokens),
         "PYTHONUNBUFFERED": "1",
     }
@@ -66,6 +75,8 @@ def server_params(
         env["SCILOOP_MCP_WORKSPACE"] = str(workspace)
     if read_roots:
         env["SCILOOP_MCP_READ_ROOTS"] = os.pathsep.join(read_roots)
+    if allowed_hosts:
+        env["SCILOOP_MCP_ALLOWED_HOSTS"] = ",".join(allowed_hosts)
 
     return StdioServerParameters(
         command=python or sys.executable,
@@ -76,13 +87,25 @@ def server_params(
 
 
 async def list_tools(params: StdioServerParameters) -> list[dict[str, Any]]:
-    """按协议列出工具声明（不是读本地代码，是走一次 MCP 握手）。"""
+    """按协议列出工具声明（不是读本地代码，是走一次 MCP 握手）。
+
+    ⚠️ **`input_schema` 必须带回去**（mcp 2.x 是蛇形字段名，旧教程里的 `inputSchema`
+    在 Pydantic 模型上取不到）。少了它，模型看到的声明就是"一个不接受任何参数的工具"：
+    它只能从描述文字里猜参数名，猜错就被协议层按 schema 拒（`rejected arguments`），
+    而现象是"工具明明在，却总调不对" —— 链条上最不起眼的一环又一次把授权/信息吞掉了。
+    """
 
     async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
         await session.initialize()
         listed = await session.list_tools()
         return [
-            {"name": tool.name, "description": tool.description or ""}
+            {
+                "name": tool.name,
+                "description": tool.description or "",
+                "input_schema": getattr(tool, "input_schema", None)
+                or getattr(tool, "inputSchema", None)
+                or {"type": "object"},
+            }
             for tool in listed.tools
         ]
 

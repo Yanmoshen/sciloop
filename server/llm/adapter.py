@@ -1084,7 +1084,12 @@ def _normalize_messages(messages: list[Message] | str) -> list[Message]:
             # 供应商看到的是「一条普通文本 + 一条来路不明的 tool 消息」，报的是
             # `missing field tool_call_id` / `bad_request`，而真因（字段被归一化丢掉）
             # 完全看不出来。属于最坏的一类 bug：**报错指向错误的方向**。
-            for key in ("tool_calls", "tool_call_id"):
+            #
+            # `reasoning_content` 同理，而且是**思考型供应商的硬性要求**：实测
+            # deepseek 系列在 `assistant.tool_calls` 回合会直接 400 ——
+            # `The reasoning_content in the thinking mode must be passed back to the API`。
+            # 它跟 tool_calls 一样属于"协议字段"，白名单式归一化必须放行。
+            for key in ("tool_calls", "tool_call_id", "reasoning_content"):
                 if message.get(key):
                     item[key] = message[key]
             if item.get("tool_calls") and "content" not in message:

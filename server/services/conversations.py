@@ -21,7 +21,13 @@
 ``{"id", "title", "project_id", "model_ref", "created_at", "updated_at",
    "archived", "turns": [...]}``
 其中 ``turns`` 元素：``{"role": "user"|"assistant", "content", "ts"}``，
-assistant 额外带 ``model_id`` / ``duration_ms``。
+assistant 额外带 ``model_id`` / ``duration_ms`` / ``reasoning`` / ``rows`` / ``approvals``：
+
+- ``rows``：过程行（节点进度、工具调用、**批准卡**）。它们与正文同等落盘——
+  只发 SSE 不落盘的后果，就是刷新后界面上那段过程凭空消失，而库里只剩一句结论。
+- ``approvals``：本轮里模型的写盘/执行请求（``services/agent/approvals.py`` 的
+  ``new_request``）。**批准本身也是一条要留痕的事实**，与 turns 同源落这里，
+  不另建表。
 
 红线
 ----
@@ -313,12 +319,23 @@ def latest(project_id: Any = "any") -> dict[str, Any] | None:
 
 
 def context_messages(record: dict[str, Any], limit: int = MAX_TURNS_FOR_CONTEXT) -> list[dict[str, str]]:
-    """把最近若干轮整理成 OpenAI 兼容的 messages（实现「接着上次继续」）。"""
+    """把最近若干轮整理成 OpenAI 兼容的 messages（实现「接着上次继续」）。
+
+    两条**不进上下文**的轮次（都是"这一轮并没有真的说话"的情形）：
+
+    - 正文为空（模型只要求调工具 / 只等批准）；
+    - 正文是**系统说明**（``note_only``，例如"模型只给了思考过程"）。
+      它是界面上的如实说明，不是模型说的话 —— 当成 assistant 的历史喂回去，
+      模型会以为自己说过那句话。
+    """
+
     turns = record.get("turns") or []
     messages: list[dict[str, str]] = []
     for turn in turns[-limit:]:
         role = turn.get("role")
         content = turn.get("content")
+        if turn.get("note_only"):
+            continue
         if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
             messages.append({"role": role, "content": content})
     return messages

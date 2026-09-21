@@ -30,7 +30,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -42,6 +42,7 @@ from llm.errors import LLMError
 from llm.registry import get_registry
 from llm.types import slugify_provider
 from services import conversations
+from services.agent import approvals as agent_approvals
 from services.research import dialog, messages
 
 logger = logging.getLogger("sciloop.chat")
@@ -118,6 +119,113 @@ def _error(status_code: int, code: str, message: str, detail: Any = None) -> HTT
 
 def _sse(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _agent_loop(
+    messages_now: list[dict[str, Any]],
+    *,
+    ref: str,
+    tool_defs: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
+    approvals_out: list[dict[str, Any]],
+    state: dict[str, Any],
+    allow_fallback_first: bool = True,
+) -> AsyncIterator[str]:
+    """agent 循环：模型 → 工具 → 结果回喂 → 再模型（轮数有上限，防死循环）。
+
+    两类工具待遇不同，**这条边界只在这里落实一次**：
+
+    - 只读工具（`AUTONOMOUS_TOOLS`）：直接执行，过程与结果都回报。
+    - 写盘/执行类（`APPROVABLE_TOOLS`）：**只建批准请求，一次都不执行** —— 发一张卡、
+      结束本轮、等研究者裁决。模型可以提出，但没有资格替自己批准。
+
+    主对话与批准后续答共用本函数。**状态通过 `state` 写回**（`text` / `reasoning` /
+    `result` / `pending`），而不是靠生成器返回值 —— 调用方在两处需要同一份口径，
+    复制一份出来迟早会分叉。
+    """
+
+    from services.agent import mcp_tools as agent_tools
+
+    for round_index in range(agent_tools.MAX_TOOL_ROUNDS + 1):
+        round_result: Any = None
+        async for update in adapter.chat_stream(
+            messages_now,
+            model_ref=ref,
+            purpose="home_reply",
+            max_tokens=REPLY_MAX_TOKENS,
+            # 首轮与原有行为一致；**工具轮回喂时关掉降级**：实测降级链会切到
+            # 没配 key 的供应商，把真正的 `bad_request` 掩盖成一句无关的
+            # 「env 未配置 API Key」。宁可如实报第一跳的错，也不要换一家继续跑。
+            #
+            # 批准后的续答同理：它**不是**用户的第一句，`allow_fallback_first=False`
+            # 才能把真因如实报出来（实测这里真因是"assistant 的 tool_calls 没带
+            # reasoning_content"，被降级链掩盖成了一句无关的 auth 错误）。
+            allow_fallback=allow_fallback_first and round_index == 0,
+            tools=tool_defs or None,
+        ):
+            if update.kind == "delta":
+                state["text"].append(update.text)
+                yield _sse("delta", {"text": update.text})
+            elif update.kind == "reasoning":
+                # **思考过程走独立通道**：它不是答复。前端折叠展示在耗时那一行下面，
+                # 落盘也单独存一个字段。此前它只被收集、最后被塞进 content 冒充正文，
+                # 结果「界面上看到的回答」和「库里存的」不是同一个东西。
+                state["reasoning"].append(update.text)
+                yield _sse("reasoning", {"text": update.text})
+            elif update.kind == "done":
+                round_result = update.result
+
+        if round_result is not None:
+            state["result"] = round_result
+        calls = agent_tools.normalize_tool_calls(getattr(round_result, "tool_calls", None) or [])
+        if not calls or round_index >= agent_tools.MAX_TOOL_ROUNDS:
+            break
+
+        # 模型要求调工具：先把这一轮如实记进消息（含它已说的话），再逐个处理
+        messages_now.append(
+            agent_tools.assistant_tool_message(getattr(round_result, "content", "") or "", calls)
+        )
+        stopped_for_approval = False
+        for call in calls:
+            tool_name = str((call.get("function") or {}).get("name") or "")
+            if agent_tools.requires_approval(tool_name):
+                # 写盘/执行类：**只建请求，不执行**。连一次 MCP 调用都不发出去。
+                arguments = agent_tools.arguments_of(call)
+                cwd = arguments.get("cwd")
+                request = agent_approvals.new_request(
+                    tool=tool_name,
+                    args=arguments,
+                    cwd=cwd if isinstance(cwd, str) else None,
+                    call_id=str(call.get("id") or "") or None,
+                )
+                approvals_out.append(request)
+                # **行即卡片**：卡片本身就是那一条过程行。同一份内容既发 row（用来落盘，
+                # 刷新后凭它重建）也发 approval（前端据此渲染按钮）——
+                # 只发 SSE 不落盘的话，刷新后卡片刻凭空消失，而库里留着一句"等待批准"。
+                card = agent_tools.approval_row(request)
+                rows.append(card)
+                yield _sse("row", {"row": card})
+                yield _sse("approval", card)
+                state["pending"] = request
+                stopped_for_approval = True
+                break
+            start_row = agent_tools.tool_row(call, "start")
+            rows.append(start_row)
+            yield _sse("row", {"row": start_row})
+            payload_out, summary = await agent_tools.run_tool_call(call)
+            end_row = agent_tools.tool_row(call, "ok" if payload_out.get("ok") else "err", summary)
+            rows.append(end_row)
+            yield _sse("row", {"row": end_row})
+            messages_now.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": str(call.get("id") or ""),
+                    "content": agent_tools.tool_message_content(payload_out),
+                }
+            )
+        if stopped_for_approval:
+            # 等研究者裁决：这一轮到此为止，绝不"先跑了再补批准"
+            break
 
 
 def _streaming(source: AsyncIterator[str]) -> StreamingResponse:
@@ -397,15 +505,24 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
         # 工具调用过程行也要**落盘**：只发 SSE 不落盘的话，刷新后这段过程凭空消失，
         # 而库里只剩一句结论 —— 正是「显示与落盘必须一致」要防的那种不一致。
         tool_rows: list[dict[str, Any]] = []
+        #: 本轮里模型的**写盘/执行请求**（尚未执行）。与正文同源落进这一轮，
+        #: 这样刷新后卡片还能按原状态重建，而不是"界面上一张卡、库里什么都没有"。
+        approval_requests: list[dict[str, Any]] = []
+        #: 停下来等研究者裁决的那一条（非空 = 这一轮没有答完，在等人）
+        pending_approval: dict[str, Any] | None = None
+        #: 本轮正文是**系统说明**（模型只给了思考过程）而不是模型说的话
+        note_only = False
         started = time.perf_counter()
         result: Any = None
         error_info: dict[str, Any] | None = None
         aborted = False
         try:
             # ------------------------------------------------------------ #
-            # agent 循环：把只读工具摆给模型 → 收 tool_calls → 经 MCP 执行 →
-            # 结果以 role=tool 喂回 → 再调一次，直到模型不再要求调工具（上限防死循环）。
+            # agent 循环：把工具摆给模型 → 收 tool_calls → 只读的经 MCP 执行、
+            # 写/执行类**只建批准请求** → 结果以 role=tool 喂回 → 再调一次，
+            # 直到模型不再要求调工具（上限防死循环）。
             # 工具跑在 `mcp_server` 那个进程里（stdio 标准协议），边界也在那边。
+            # 循环体在 `_agent_loop`，与批准后续答共用同一份口径。
             # 局部导入：与六环节的写法一致，避免无工具场景引入导入期依赖。
             # ------------------------------------------------------------ #
             from services.agent import mcp_tools as agent_tools
@@ -421,62 +538,23 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
                 logger.warning("工具声明获取失败，本轮按无工具回答：%s", exc)
                 tool_defs = []
 
-            for round_index in range(agent_tools.MAX_TOOL_ROUNDS + 1):
-                round_result: Any = None
-                async for update in adapter.chat_stream(
-                    messages_now,
-                    model_ref=ref,
-                    purpose="home_reply",
-                    max_tokens=REPLY_MAX_TOKENS,
-                    # 首轮与原有行为一致；**工具轮回喂时关掉降级**：实测降级链会切到
-                    # 没配 key 的供应商，把真正的 `bad_request` 掩盖成一句无关的
-                    # 「env 未配置 API Key」。宁可如实报第一跳的错，也不要换一家继续跑。
-                    allow_fallback=round_index == 0,
-                    tools=tool_defs or None,
-                ):
-                    if update.kind == "delta":
-                        buffer.append(update.text)
-                        yield _sse("delta", {"text": update.text})
-                    elif update.kind == "reasoning":
-                        # **思考过程走独立通道**：它不是答复。前端折叠展示在耗时那一行下面，
-                        # 落盘也单独存一个字段。此前它只被收集、最后被塞进 content 冒充正文，
-                        # 结果「界面上看到的回答」和「库里存的」不是同一个东西。
-                        reasoning_buffer.append(update.text)
-                        yield _sse("reasoning", {"text": update.text})
-                    elif update.kind == "done":
-                        round_result = update.result
-
-                if round_result is not None:
-                    result = round_result
-                calls = agent_tools.normalize_tool_calls(
-                    getattr(round_result, "tool_calls", None) or []
-                )
-                if not calls or round_index >= agent_tools.MAX_TOOL_ROUNDS:
-                    break
-
-                # 模型要求调工具：先把这一轮如实记进消息（含它已说的话），再逐个执行
-                messages_now.append(
-                    agent_tools.assistant_tool_message(
-                        getattr(round_result, "content", "") or "", calls
-                    )
-                )
-                for call in calls:
-                    start_row = agent_tools.tool_row(call, "start")
-                    tool_rows.append(start_row)
-                    yield _sse("row", {"row": start_row})
-                    payload_out, summary = await agent_tools.run_tool_call(call)
-                    end_row = agent_tools.tool_row(
-                        call, "ok" if payload_out.get("ok") else "err", summary
-                    )
-                    tool_rows.append(end_row)
-                    yield _sse("row", {"row": end_row})
-                    messages_now.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": str(call.get("id") or ""),
-                            "content": agent_tools.tool_message_content(payload_out),
-                        }
-                    )
+            state: dict[str, Any] = {
+                "text": buffer,
+                "reasoning": reasoning_buffer,
+                "result": None,
+                "pending": None,
+            }
+            async for frame in _agent_loop(
+                messages_now,
+                ref=ref,
+                tool_defs=tool_defs,
+                rows=tool_rows,
+                approvals_out=approval_requests,
+                state=state,
+            ):
+                yield frame
+            result = state["result"]
+            pending_approval = state["pending"]
         except LLMError as exc:
             aborted = True
             error_info = {
@@ -508,9 +586,14 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
             if not generated and reasoning_text and error_info is None:
                 # 模型只给了思考过程：如实说明，**不拿思考过程冒充答复**
                 generated = messages.NODE_ONLY_REASONING_TEXT
+                # 这句是"系统在说话"，不是模型说的话 —— 标记出来，别让它以 assistant 的身份
+                # 进下一轮的上下文（模型会以为那是自己说过的话）。
+                note_only = True
             # 有正文 → 追加本轮；无正文且无错误 → 模型真的返回空，也要如实记一条。
             # 编辑重开时**无条件落盘**：用户改过的正文必须留痕，否则刷新后改动就凭空消失了。
-            if generated or error_info is None or is_edit:
+            # 等批准时也**无条件落盘**：卡片本身就是这一轮的产出（哪怕一个字都没有），
+            # 不落盘就会出现"界面上有一张待批的卡、刷新后它不见了、而工具也永远没跑"。
+            if generated or error_info is None or is_edit or pending_approval is not None:
                 conversations.append_turns(
                     conversation,
                     [
@@ -526,6 +609,11 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
                             else duration_ms,
                             "reasoning": reasoning_text or None,
                             "rows": tool_rows,
+                            # 批准请求随轮次落盘：裁决端点要凭它认账（一次性、带有效期）
+                            "approvals": approval_requests,
+                            "awaiting_approval": pending_approval["id"] if pending_approval else None,
+                            # 正文是系统说明（不是模型说的话）→ 别让它进下一轮的上下文
+                            "note_only": note_only or None,
                             "interrupted": bool(error_info),
                         },
                     ],
@@ -561,6 +649,11 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
                 if result is not None
                 else None,
                 "finish_reason": getattr(result, "finish_reason", None) if result is not None else None,
+                # 停在「等研究者批准」：前端据此把这一轮标成待裁决，**而不是**当成正常答完。
+                # 两者混起来，界面会显示一个"答完了但什么都没有"的空回复。
+                "awaiting_approval": agent_tools.approval_row(pending_approval)
+                if pending_approval is not None
+                else None,
                 "usage": {
                     "prompt_tokens": getattr(usage, "prompt_tokens", None),
                     "completion_tokens": getattr(usage, "completion_tokens", None),
@@ -597,6 +690,334 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
             "X-Accel-Buffering": "no",
         },
     )
+
+
+class ApprovalDecisionRequest(BaseModel):
+    """研究者对一条**写盘/执行请求**的裁决。
+
+    谁有资格裁决：`X-Owner-Token` 的唯一持有人（即研究者本人）。所以本端点与
+    ``/chat/home/stream`` 一样是 Owner 专属 —— 批准入口如果对匿名开放，那道门就白设了。
+    """
+
+    conversation_id: str = Field(min_length=1, max_length=64)
+    #: 待裁决请求的 id（来自 `approval` 事件 / 过程行里的 `request_id`）
+    request_id: str = Field(min_length=1, max_length=64)
+    decision: Literal["approve", "deny"]
+    #: 可选备注，随裁决一起留痕（例如"只跑这次，下次同样的再说"）
+    note: str | None = Field(default=None, max_length=500)
+    #: 续答用哪个模型；不传 = 沿用会话记录里的 `model_ref`（通常够用）
+    model_config_id: int | None = None
+    model_id: str | None = Field(default=None, max_length=200)
+
+
+#: 请求"已经不在待批状态"时的如实说明。**不能合并成一句"无效"** ——
+#: 「批过了」「拒过了」「过期了」对研究者是三件不同的事，混起来他会以为是自己点错了。
+_APPROVAL_CLOSED_REASONS = {
+    "approved": "这条请求已经批准过了（一次性：同一批准不能重复执行）",
+    "denied": "这条请求已被拒绝",
+    "expired": "这条请求已过期（超过有效期未裁决）；需要的话让助手重新发起一次",
+}
+
+#: 拒绝后的确定性答复。**不花一次模型调用**：这句话不是模型的观点，是系统在陈述事实。
+APPROVAL_DENIED_REPLY = "已记录你的拒绝，本次不执行「{label}」。需要换个做法的话，直接告诉我要怎么做。"
+
+
+def _replace_approval_card(record: dict[str, Any], turn_index: int, card: dict[str, Any]) -> None:
+    """把轮次里那张卡**换成新状态**（同一 request_id 只留一张，不追加第二张）。
+
+    否则一次流程下来会攒出三四张卡，每一张都是同一次调用 —— 那不是留痕，那是噪声。
+    """
+
+    turns = record.get("turns") or []
+    if turn_index >= len(turns):
+        return
+    turn = turns[turn_index]
+    rows = list(turn.get("rows") or [])
+    for index, row in enumerate(rows):
+        if row.get("kind") == "approval" and row.get("request_id") == card.get("request_id"):
+            rows[index] = card
+            break
+    else:  # pragma: no cover - 正常路径上卡片一定已经由主流程写进这一轮
+        rows.append(card)
+    turn["rows"] = rows
+
+
+async def _approval_stream(
+    record: dict[str, Any],
+    turn_index: int,
+    request: dict[str, Any],
+    payload: ApprovalDecisionRequest,
+    ref: str,
+) -> AsyncIterator[str]:
+    """裁决事件的流：批准就真的执行并继续回答，拒绝就如实记下来。
+
+    **执行与否只由这里决定**，模型没有任何路径能自己把写盘/执行类工具跑掉。
+    """
+
+    from services.agent import mcp_tools as agent_tools
+
+    conversation_id = str(record["id"])
+    request_id = str(request["id"])
+    tool = str(request["tool"])
+    label = agent_tools.TOOL_LABELS.get(tool, tool)
+
+    yield ": connected\n\n"
+    yield _sse(
+        "meta",
+        {
+            "conversation_id": conversation_id,
+            "project_id": record.get("project_id"),
+            "model_ref": ref,
+            "title": record.get("title"),
+            "turn_count": len(record.get("turns") or []),
+            "routing": "approval",
+        },
+    )
+
+    rows: list[dict[str, Any]] = []
+    buffer: list[str] = []
+    reasoning_buffer: list[str] = []
+    #: 续答里模型**新提出**的批准请求：它们属于这一轮（新的一轮），不属于原来那一轮
+    approvals_out: list[dict[str, Any]] = []
+    pending: dict[str, Any] | None = None
+    #: 本次裁决后那张卡的新状态（在 finally 里无条件换上去，**哪怕后面续答失败了**）
+    card: dict[str, Any] | None = None
+    result: Any = None
+    error_info: dict[str, Any] | None = None
+    started = time.perf_counter()
+
+    try:
+        if payload.decision == "deny":
+            agent_approvals.decide(
+                record, request_id, status="denied", actor="owner", note=payload.note
+            )
+            card = agent_tools.approval_row(request)
+            decision_row = {
+                "kind": "tool",
+                "tone": "warn",
+                "text": f"研究者已拒绝「{label}」" + (f"：{payload.note}" if payload.note else ""),
+            }
+            rows.append(decision_row)
+            yield _sse("row", {"row": decision_row})
+            yield _sse("approval", card)
+            text = APPROVAL_DENIED_REPLY.format(label=label)
+            buffer.append(text)
+            yield _sse("delta", {"text": text})
+        else:
+            # ① 先签发**一次性**令牌并存指纹：会话文件里永远不会出现可用凭据
+            token = agent_approvals.issue_token(request_id)
+            agent_approvals.decide(
+                record,
+                request_id,
+                status="approved",
+                actor="owner",
+                note=payload.note,
+                token=token,
+            )
+            card = agent_tools.approval_row(request)
+            yield _sse("approval", card)
+            decision_row = {"kind": "tool", "tone": "ok", "text": f"研究者已批准「{label}」"}
+            rows.append(decision_row)
+            yield _sse("row", {"row": decision_row})
+
+            # ② 按**原样参数**执行（参数在批准时就冻结了，不能在这之后再被改）
+            call = {
+                # 沿用模型当时给的 id：`tool_calls` 与 `tool` 结果严格配对，
+                # 也是"批准的到底是哪一次调用"最直接的凭证
+                "id": str(request.get("call_id") or f"call_{request_id}"),
+                "type": "function",
+                "function": {
+                    "name": tool,
+                    "arguments": json.dumps(request.get("args") or {}, ensure_ascii=False),
+                },
+            }
+            start_row = agent_tools.tool_row(call, "start")
+            rows.append(start_row)
+            yield _sse("row", {"row": start_row})
+            payload_out, summary = await agent_tools.run_tool_call(call, approval_token=token)
+            # 无论跑成没跑成，这次批准都**已经用掉了**（一次性）：不让"失败就再来一次"
+            # 变成不受限的重试 —— 那等于把一次性批准变成了长期开关。
+            agent_approvals.mark_consumed(record, request_id)
+            end_row = agent_tools.tool_row(
+                call, "ok" if payload_out.get("ok") else "err", summary
+            )
+            rows.append(end_row)
+            yield _sse("row", {"row": end_row})
+
+            # ③ 把「提了 → 批了 → 跑了」整条链补进消息再让模型回答：
+            # 直接把结果塞成一句用户消息，模型就不知道这是工具跑出来的，会当成用户说的话。
+            calls = agent_tools.normalize_tool_calls([call])
+            # **把上一跳的思考过程原样带回**：思考型供应商（实测 deepseek 系列）在
+            # `assistant.tool_calls` 回合会硬性要求 `reasoning_content`，缺了直接 400。
+            # 它就在这一轮记录里（`turn["reasoning"]`），没理由不带。
+            assistant_call_msg = agent_tools.assistant_tool_message("", calls)
+            reasoning_before = str(((record.get("turns") or [])[turn_index] or {}).get("reasoning") or "")
+            if reasoning_before:
+                assistant_call_msg["reasoning_content"] = reasoning_before
+            messages_now: list[dict[str, Any]] = [
+                {"role": "system", "content": REPLY_SYSTEM},
+                *conversations.context_messages(record),
+                assistant_call_msg,
+                {
+                    "role": "tool",
+                    "tool_call_id": str(calls[0]["id"]),
+                    "content": agent_tools.tool_message_content(payload_out),
+                },
+            ]
+            # 续答**照旧把工具摆上**：模型看到结果后常常要提下一条命令，
+            # 那就再冒一张卡、再等一次裁决 —— 每条命令各批一次，这正是我们要的节奏。
+            # （实测：不摆工具时，思考型供应商会因为"assistant 的 tool_calls 没带
+            #   reasoning_content"直接 400，把续答整段打断。）
+            try:
+                tool_defs = await agent_tools.tool_schemas()
+            except Exception as exc:  # noqa: BLE001 - 工具侧不可用不该拖垮续答
+                logger.warning("续答时工具声明获取失败，本轮按无工具回答：%s", exc)
+                tool_defs = []
+            state: dict[str, Any] = {
+                "text": buffer,
+                "reasoning": reasoning_buffer,
+                "result": None,
+                "pending": None,
+            }
+            async for frame in _agent_loop(
+                messages_now,
+                ref=ref,
+                tool_defs=tool_defs,
+                rows=rows,
+                approvals_out=approvals_out,
+                state=state,
+                allow_fallback_first=False,
+            ):
+                yield frame
+            result = state["result"]
+            pending = state["pending"]
+    except LLMError as exc:
+        error_info = {
+            "code": getattr(exc, "code", "llm_failed") or "llm_failed",
+            "message": str(exc),
+            "kind": type(exc).__name__,
+        }
+        logger.warning("批准裁决后续答失败 conversation=%s：%s", conversation_id, exc)
+    except asyncio.CancelledError:
+        error_info = {"code": "client_disconnected", "message": "客户端已断开", "kind": "Cancelled"}
+        raise
+    finally:
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        # **裁决这件事必须留在记录里，哪怕续答失败**：卡片的终态先换上。
+        # 放在 finally 而不是分支末尾，是因为"续答炸了"和"裁决没发生"完全是两件事，
+        # 不能让前者的异常把后者的痕迹一起抹掉。
+        if card is not None:
+            _replace_approval_card(record, turn_index, card)
+        answer = "".join(buffer)
+        if not answer and result is not None:
+            answer = str(getattr(result, "content", "") or "")
+        reasoning_text = "".join(reasoning_buffer)
+        if not reasoning_text and result is not None:
+            reasoning_text = str((getattr(result, "raw", None) or {}).get("reasoning") or "")
+        if len(reasoning_text) > REASONING_MAX_CHARS:
+            reasoning_text = reasoning_text[:REASONING_MAX_CHARS] + "\n…（思考过程过长，已截断）"
+        # 裁决 + 卡片状态 + 这一轮答复**一次写入**：`append_turns` 写的就是整份记录，
+        # 所以不会出现"批准记下了、卡片没更新"或反过来的半成品状态。
+        if answer or rows:
+            conversations.append_turns(
+                record,
+                [
+                    {
+                        "role": "assistant",
+                        "content": answer,
+                        "model_id": getattr(result, "model_id", "") if result is not None else "",
+                        "duration_ms": getattr(result, "duration_ms", duration_ms)
+                        if result is not None
+                        else duration_ms,
+                        "reasoning": reasoning_text or None,
+                        "rows": rows,
+                        # 续答里模型又提出的请求，随**这一轮**落盘（可能要再批一次）
+                        "approvals": approvals_out,
+                        "awaiting_approval": pending["id"] if pending else None,
+                        "routing": "approval",
+                        "interrupted": bool(error_info),
+                    }
+                ],
+            )
+        else:  # pragma: no cover - 兜底：一个字都没有、也没有行，至少把裁决写下
+            conversations.write(record)
+
+    if error_info is not None:
+        yield _sse("error", {**error_info, "interrupted": True, "generated_chars": len("".join(buffer))})
+        return
+
+    usage = getattr(result, "usage", None)
+    yield _sse(
+        "done",
+        {
+            "conversation_id": conversation_id,
+            "content": "".join(buffer) or (getattr(result, "content", "") if result is not None else ""),
+            "duration_ms": getattr(result, "duration_ms", 0) if result is not None else 0,
+            "model_id": getattr(result, "model_id", "") if result is not None else "",
+            "model_ref": getattr(result, "model_ref", ref) if result is not None else ref,
+            "provider": getattr(result, "provider", "") if result is not None else "",
+            "cost_usd": getattr(result, "cost_usd", None) if result is not None else None,
+            "cost_unknown_reason": getattr(result, "cost_unknown_reason", None)
+            if result is not None
+            else None,
+            "routing": "approval",
+            "decision": payload.decision,
+            "request_id": request_id,
+            # 本次裁决已收口；但**续答里模型可能又提了一条**，那就继续等下一次裁决
+            "awaiting_approval": agent_tools.approval_row(pending) if pending else None,
+            "usage": {
+                "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                "completion_tokens": getattr(usage, "completion_tokens", None),
+                "total_tokens": getattr(usage, "total_tokens", None),
+            },
+        },
+    )
+
+
+@router.post(
+    "/chat/approvals/decide",
+    summary="研究者裁决一次写盘/执行请求（approve 则执行并续答；deny 则如实记录）",
+    dependencies=[Depends(require_owner)],
+)
+async def decide_approval(payload: ApprovalDecisionRequest) -> StreamingResponse:
+    """批准入口 —— 合规 8.3「关键动作需人工接管」的落点。
+
+    校验从严，不做猜测：
+
+    - 会话不存在 → 404；请求不存在 → 404
+    - 请求**已批准/已拒绝/已过期** → 409，且**分别给出不同的 code 与说明**
+      （合并成一句"无效"会让研究者以为是自己点错了）
+    - 只有 `pending` 且未过期才可裁决
+
+    裁决成功后由 ``_approval_stream`` 决定后续动作：批准 → 签发一次性令牌 → 经 MCP
+    执行（令牌进 Guard 的门 3）→ 结果回喂模型 → 继续回答；拒绝 → 确定性答复，不花模型调用。
+    """
+
+    record = agent_approvals.load(payload.conversation_id)
+    if record is None:
+        raise _error(404, "conversation_not_found", "会话不存在（可能已被删除）")
+
+    found = agent_approvals.find_pending(record, payload.request_id)
+    if found is None:
+        existing = agent_approvals.find(record, payload.request_id)
+        if existing is None:
+            raise _error(404, "approval_not_found", "这条批准请求不存在")
+        status = agent_approvals.effective_status(existing[1])
+        raise _error(
+            409,
+            f"approval_{status}",
+            _APPROVAL_CLOSED_REASONS.get(status, f"这条请求当前不可裁决（状态：{status}）"),
+            {"request_id": payload.request_id, "status": status},
+        )
+
+    turn_index, request = found
+    ref = str(record.get("model_ref") or "")
+    if payload.model_config_id is not None and payload.model_id:
+        ref = await _resolve_model_ref(payload.model_config_id, payload.model_id)
+    if not ref:
+        raise _error(409, "no_model", "会话没有记录可用模型，请重新发送一次对话再裁决")
+
+    return _streaming(_approval_stream(record, turn_index, request, payload, ref))
 
 
 __all__ = ["router"]
