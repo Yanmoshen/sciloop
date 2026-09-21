@@ -27,10 +27,11 @@ import type { ChatBlock, StreamDone, SystemRow } from '@/api/chat'
 import { getConversation } from '@/api/conversations'
 import MarkdownText from '@/components/MarkdownText.vue'
 import ConfirmDialog from '@/components/home/ConfirmDialog.vue'
-import ResearchFlowPanel from '@/components/home/ResearchFlowPanel.vue'
+import ResearchFlowDrawer from '@/components/home/ResearchFlowDrawer.vue'
 import ProjectCreateDialog from '@/components/ProjectCreateDialog.vue'
 import type { CreatedProject } from '@/api/projects'
 import { useConversationStore } from '@/stores/conversations'
+import { usePipelineDrawerStore } from '@/stores/pipelineDrawer'
 import { useSessionStore } from '@/stores/session'
 import { useSettingsStore } from '@/stores/settings'
 import { consumeEntrance } from '@/utils/pageEntrance'
@@ -58,6 +59,7 @@ const router = useRouter()
 const session = useSessionStore()
 const settings = useSettingsStore()
 const conversations = useConversationStore()
+const pipelineDrawer = usePipelineDrawerStore()
 
 const prompt = ref('')
 const files = ref<Array<{ name: string }>>([])
@@ -657,7 +659,11 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <section class="chat" :class="{ 'chat--active': active, 'chat--enter': entranceOn }">
+  <section
+    class="chat"
+    :class="{ 'chat--active': active, 'chat--enter': entranceOn }"
+    :style="{ '--rfd-shift': pipelineDrawer.open ? `${pipelineDrawer.width}px` : '0px' }"
+  >
     <!-- 开场区展开/收起统一走 .fold（双向高度过渡），替掉原来的 max-height 硬编码
          —— 内容不足 420px 时旧写法会"空跑"一段，收展节奏不匀。 -->
     <div class="fold" :class="{ 'fold--open': !active }">
@@ -874,9 +880,8 @@ onUnmounted(() => {
 
     <p v-if="errorText" class="state state--error">{{ errorText }}</p>
 
-    <!-- 研究流程（七节点 + 程序校验 + 迁移留痕）。放在输入栏上方：
-         项目内不论是新对话还是打开已有对话，它都在同一条内容列上。 -->
-    <ResearchFlowPanel :conversation-id="conversationId" />
+    <!-- 研究流程已改为右侧控制台抽屉（见文件末尾 <ResearchFlowDrawer>），
+         这里不再占用内容列。 -->
 
     <div class="composer rise-in rise-step-3" :class="{ 'composer--hero': !active }">
       <textarea
@@ -1037,6 +1042,9 @@ onUnmounted(() => {
       @confirm="confirmEditRestart"
     />
   </section>
+
+  <!-- 研究流程：右侧控制台抽屉（固定定位挂在 .chat 之外，避免被 .chat 的 overflow/animation 裁剪） -->
+  <ResearchFlowDrawer :conversation-id="conversationId" />
 </template>
 
 <style scoped>
@@ -1047,6 +1055,9 @@ onUnmounted(() => {
   flex-direction: column;
   min-height: 100%;
   padding: 64px 32px 0;
+  /* 研究流程抽屉滑出时，正文整体左移（把抽屉宽度加进右内边距） */
+  padding-right: calc(32px + var(--rfd-shift, 0px));
+  transition: padding-right 340ms var(--motion-ease-out);
 }
 
 /* 有对话时：hero 收起，thread 吃掉剩余高度，输入栏留在文档流最后一行

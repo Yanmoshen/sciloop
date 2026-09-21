@@ -40,6 +40,7 @@ import TaskMonitorDialog from '@/components/TaskMonitorDialog.vue'
 import { useConversationStore } from '@/stores/conversations'
 import { useSessionStore } from '@/stores/session'
 import { useTaskStore } from '@/stores/tasks'
+import { usePipelineDrawerStore } from '@/stores/pipelineDrawer'
 import { requestEntrance } from '@/utils/pageEntrance'
 import { orderProjectsForRail } from '@/utils/projectOrder'
 
@@ -546,6 +547,7 @@ function projectMessageOf(error: unknown): string {
 
 // ---- 任务：顶栏按钮 → 历史 → 打开某一条的完整监控窗口 ----
 const tasks = useTaskStore()
+const pipelineDrawer = usePipelineDrawerStore()
 const monitorOpen = ref(false)
 
 async function openTaskMonitor(taskId: string): Promise<void> {
@@ -1275,7 +1277,10 @@ onUnmounted(() => {
     </aside>
 
     <div class="main">
-      <header class="topbar">
+      <header
+        class="topbar"
+        :style="{ '--rfd-shift': pipelineDrawer.open ? `${pipelineDrawer.width}px` : '0px' }"
+      >
         <!-- 折叠后，同一个开关挪到这里：搜索框左边。展开时它回左栏品牌行右侧。 -->
         <button
           v-if="railCollapsed"
@@ -1316,6 +1321,29 @@ onUnmounted(() => {
         </div>
 
         <div class="topbar__spacer" />
+
+        <!-- 研究流程入口：只有图标、没有外层框；展开时框内竖条滑到左侧 -->
+        <button
+          class="topbar__plain"
+          type="button"
+          title="研究流程"
+          aria-label="研究流程"
+          :aria-expanded="pipelineDrawer.open ? 'true' : 'false'"
+          @click="pipelineDrawer.toggle()"
+        >
+          <svg width="18" height="18" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <rect x="1.9" y="3.1" width="12.2" height="9.8" rx="3" stroke="currentColor" stroke-width="1.5" />
+            <rect
+              class="topbar__plainBar"
+              x="10.2"
+              y="5.9"
+              width="1.8"
+              height="4.2"
+              rx="0.9"
+              fill="currentColor"
+            />
+          </svg>
+        </button>
 
         <button
           class="theme-toggle theme-toggle--task"
@@ -2017,6 +2045,9 @@ onUnmounted(() => {
   gap: 24px;
   padding: 0 32px;
   border-bottom: 1px solid var(--h-line);
+  /* 研究流程抽屉滑出时，右侧按钮组跟着左移 —— 否则主题/任务/入口会被抽屉盖住点不到 */
+  padding-right: calc(32px + var(--rfd-shift, 0px));
+  transition: padding-right 340ms var(--motion-ease-out);
 }
 .search {
   flex: 1;
@@ -2048,6 +2079,32 @@ onUnmounted(() => {
 }
 .topbar__spacer {
   flex: 1;
+}
+
+/* 无框图标按钮（与旁边带框的主题/任务按钮区分：这里刻意不加边框与底色） */
+.topbar__plain {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  background: transparent;
+  color: var(--h-fg-muted);
+  cursor: pointer;
+  transition: color 160ms var(--motion-ease);
+}
+
+.topbar__plain:hover {
+  color: var(--h-fg);
+}
+
+/* 竖条随展开状态左右滑动：收起在右侧、展开滑到左侧 */
+.topbar__plainBar {
+  transition: transform 280ms var(--motion-ease-out);
+}
+
+.topbar__plain[aria-expanded='true'] .topbar__plainBar {
+  transform: translateX(-5.8px);
 }
 .theme-toggle {
   width: 36px;
