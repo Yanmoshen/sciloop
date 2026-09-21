@@ -508,6 +508,7 @@ async def chat_stream(
     temperature: float | None = None,
     max_tokens: int | None = None,
     *,
+    tools: list[dict[str, Any]] | None = None,
     stage: str | None = None,
     purpose: str | None = None,
     project_id: int | None = None,
@@ -576,6 +577,7 @@ async def chat_stream(
             temperature=resolved_temperature,
             max_tokens=resolved_max_tokens,
             with_usage=True,
+            tools=tools,
         )
 
         started = time.perf_counter()
@@ -759,6 +761,7 @@ def _build_stream_payload(
     temperature: float,
     max_tokens: int,
     with_usage: bool,
+    tools: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model.model_id,
@@ -770,6 +773,9 @@ def _build_stream_payload(
     if with_usage:
         # 不带这个参数时，多数供应商在流式模式下压根不返回 usage（成本只能记 null）
         payload["stream_options"] = {"include_usage": True}
+    # 工具声明：不传就一个字段都不加（现有流式调用的请求体逐字节不变）
+    if tools:
+        payload["tools"] = tools
     return payload
 
 

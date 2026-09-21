@@ -399,28 +399,79 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
         error_info: dict[str, Any] | None = None
         aborted = False
         try:
-            async for update in adapter.chat_stream(
-                [
-                    {"role": "system", "content": REPLY_SYSTEM},
-                    *history,
-                    {"role": "user", "content": text},
-                ],
-                model_ref=ref,
-                purpose="home_reply",
-                max_tokens=REPLY_MAX_TOKENS,
-                allow_fallback=True,
-            ):
-                if update.kind == "delta":
-                    buffer.append(update.text)
-                    yield _sse("delta", {"text": update.text})
-                elif update.kind == "reasoning":
-                    # **思考过程走独立通道**：它不是答复。前端折叠展示在耗时那一行下面，
-                    # 落盘也单独存一个字段。此前它只被收集、最后被塞进 content 冒充正文，
-                    # 结果「界面上看到的回答」和「库里存的」不是同一个东西。
-                    reasoning_buffer.append(update.text)
-                    yield _sse("reasoning", {"text": update.text})
-                elif update.kind == "done":
-                    result = update.result
+            # ------------------------------------------------------------ #
+            # agent 循环：把只读工具摆给模型 → 收 tool_calls → 经 MCP 执行 →
+            # 结果以 role=tool 喂回 → 再调一次，直到模型不再要求调工具（上限防死循环）。
+            # 工具跑在 `mcp_server` 那个进程里（stdio 标准协议），边界也在那边。
+            # 局部导入：与六环节的写法一致，避免无工具场景引入导入期依赖。
+            # ------------------------------------------------------------ #
+            from services.agent import mcp_tools as agent_tools
+
+            messages_now: list[dict[str, Any]] = [
+                {"role": "system", "content": REPLY_SYSTEM},
+                *history,
+                {"role": "user", "content": text},
+            ]
+            try:
+                tool_defs = await agent_tools.tool_schemas()
+            except Exception as exc:  # noqa: BLE001 - 工具侧不可用不该拖垮整段对话
+                logger.warning("工具声明获取失败，本轮按无工具回答：%s", exc)
+                tool_defs = []
+
+            for round_index in range(agent_tools.MAX_TOOL_ROUNDS + 1):
+                round_result: Any = None
+                async for update in adapter.chat_stream(
+                    messages_now,
+                    model_ref=ref,
+                    purpose="home_reply",
+                    max_tokens=REPLY_MAX_TOKENS,
+                    allow_fallback=True,
+                    tools=tool_defs or None,
+                ):
+                    if update.kind == "delta":
+                        buffer.append(update.text)
+                        yield _sse("delta", {"text": update.text})
+                    elif update.kind == "reasoning":
+                        # **思考过程走独立通道**：它不是答复。前端折叠展示在耗时那一行下面，
+                        # 落盘也单独存一个字段。此前它只被收集、最后被塞进 content 冒充正文，
+                        # 结果「界面上看到的回答」和「库里存的」不是同一个东西。
+                        reasoning_buffer.append(update.text)
+                        yield _sse("reasoning", {"text": update.text})
+                    elif update.kind == "done":
+                        round_result = update.result
+
+                if round_result is not None:
+                    result = round_result
+                calls = list(getattr(round_result, "tool_calls", None) or [])
+                if not calls or round_index >= agent_tools.MAX_TOOL_ROUNDS:
+                    break
+
+                # 模型要求调工具：先把这一轮如实记进消息（含它已说的话），再逐个执行
+                messages_now.append(
+                    {
+                        "role": "assistant",
+                        "content": getattr(round_result, "content", "") or "",
+                        "tool_calls": calls,
+                    }
+                )
+                for call in calls:
+                    yield _sse("row", {"row": agent_tools.tool_row(call, "start")})
+                    payload_out, summary = await agent_tools.run_tool_call(call)
+                    yield _sse(
+                        "row",
+                        {
+                            "row": agent_tools.tool_row(
+                                call, "ok" if payload_out.get("ok") else "err", summary
+                            )
+                        },
+                    )
+                    messages_now.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": str(call.get("id") or ""),
+                            "content": agent_tools.tool_message_content(payload_out),
+                        }
+                    )
         except LLMError as exc:
             aborted = True
             error_info = {
