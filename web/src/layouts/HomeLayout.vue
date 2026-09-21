@@ -1278,7 +1278,9 @@ onUnmounted(() => {
 
     <div
       class="main"
-      :style="{ '--rfd-shift': pipelineDrawer.open ? `${pipelineDrawer.width}px` : '0px' }"
+      :style="{
+        '--rfd-shift': isHomeLike && pipelineDrawer.open ? `${pipelineDrawer.width}px` : '0px',
+      }"
     >
       <header class="topbar">
         <!-- 折叠后，同一个开关挪到这里：搜索框左边。展开时它回左栏品牌行右侧。 -->
