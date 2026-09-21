@@ -69,3 +69,8 @@ export function setConversationArchived(id: string, archived: boolean): Promise<
 export function moveConversation(id: string, projectId: number | null): Promise<ConversationDetail> {
   return patch<ConversationDetail>(`/conversations/${id}`, { body: { project_id: projectId } })
 }
+
+/** 重命名（Owner）：与项目重命名同一口径 `PATCH /conversations/{id}`，空标题在输入框侧先拦一次 */
+export function renameConversation(id: string, title: string): Promise<ConversationDetail> {
+  return patch<ConversationDetail>(`/conversations/${id}`, { body: { title: title.trim() } })
+}

@@ -31,6 +31,7 @@ import { setConversationArchived, type ConversationBrief } from '@/api/conversat
 import type { CreatedProject } from '@/api/projects'
 import { setProjectArchived } from '@/api/projects'
 import ConfirmDialog from '@/components/home/ConfirmDialog.vue'
+import ConversationRenameDialog from '@/components/ConversationRenameDialog.vue'
 import MoveConversationDialog from '@/components/home/MoveConversationDialog.vue'
 import ProjectNameDialog from '@/components/home/ProjectNameDialog.vue'
 import ProjectRenameDialog from '@/components/ProjectRenameDialog.vue'
@@ -195,10 +196,14 @@ function closeMore(): void {
 
 function onDocumentClick(): void {
   closeMore()
+  closeConvMore()
 }
 
 function onDocumentKeydown(event: KeyboardEvent): void {
-  if (event.key === 'Escape') closeMore()
+  if (event.key === 'Escape') {
+    closeMore()
+    closeConvMore()
+  }
 }
 
 // --------------------------------------------------------------------------- //
@@ -305,6 +310,37 @@ const archiveBusy = ref(false)
 function askArchive(conversation: ConversationBrief): void {
   archiveTarget.value = conversation
   archiveOpen.value = true
+}
+
+/* ---------- 对话行的「更多」菜单 + 重命名（2026-09-21）----------
+   行内动作固定为两个：① 移入项目（未分组对话才有）② 更多（⋯ = 重命名 / 归档）。
+   菜单与项目行同一套做法：**行内 .fold 块**，不做绝对定位浮层（左栏滚动区会裁掉浮层）。 */
+const convMoreOpen = ref<string | null>(null)
+
+function toggleConvMore(id: string, event: MouseEvent): void {
+  // 必须 stopPropagation：document 上挂了"点任意处收起菜单"，不拦会刚开就被关掉
+  event.stopPropagation()
+  // 同时只允许一个菜单展开（项目行那个也要收起，否则两块菜单一起摊开很乱）
+  moreOpen.value = null
+  convMoreOpen.value = convMoreOpen.value === id ? null : id
+}
+
+function closeConvMore(): void {
+  convMoreOpen.value = null
+}
+
+const convRenameOpen = ref(false)
+const convRenameTarget = ref<ConversationBrief | null>(null)
+
+function openConvRename(conversation: ConversationBrief): void {
+  closeConvMore()
+  convRenameTarget.value = conversation
+  convRenameOpen.value = true
+}
+
+async function onConversationRenamed(): Promise<void> {
+  // 标题落到左栏 + 对话页顶部的唯一来源是 store，改完重新拉一次，不做本地假改
+  await conversations.load()
 }
 
 async function confirmArchive(): Promise<void> {
@@ -645,8 +681,18 @@ onUnmounted(() => {
           <p v-if="conversations.ungrouped.length === 0" class="group__empty">
             {{ conversations.error || '暂无未分组对话' }}
           </p>
-          <div v-for="c in conversations.ungrouped" :key="c.id" class="crow">
-            <button class="crow__item" :class="{ 'crow__item--on': isCurrentConversation(c.id) }" type="button" :title="c.title || '未命名对话'" @click="openConversation(c)">
+          <div v-for="c in conversations.ungrouped" :key="c.id" class="crow-block">
+            <div
+              class="crow"
+              :class="{ 'crow--on': isCurrentConversation(c.id), 'crow--open': convMoreOpen === c.id }"
+            >
+            <button
+              class="crow__item"
+              :class="{ 'crow__item--on': isCurrentConversation(c.id) }"
+              type="button"
+              :title="c.title || '未命名对话'"
+              @click="openConversation(c)"
+            >
               {{ c.title || '未命名对话' }}
             </button>
             <span class="crow__acts">
@@ -655,7 +701,7 @@ onUnmounted(() => {
                 type="button"
                 title="移入项目"
                 aria-label="移入项目"
-                @click="openMove(c)"
+                @click.stop="openMove(c)"
               >
                 <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
                   <path
@@ -667,19 +713,63 @@ onUnmounted(() => {
                   <path d="M8 8.4v3.4M6.4 10h3.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
                 </svg>
               </button>
-              <button class="icon-btn" type="button" title="归档" aria-label="归档" @click="askArchive(c)">
+              <button
+                class="icon-btn"
+                type="button"
+                title="更多"
+                aria-label="更多"
+                aria-haspopup="menu"
+                :aria-expanded="convMoreOpen === c.id ? 'true' : 'false'"
+                @click="toggleConvMore(c.id, $event)"
+              >
                 <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                  <path
-                    d="M2.6 5.6h10.8v7a.8.8 0 0 1-.8.8H3.4a.8.8 0 0 1-.8-.8v-7Z"
-                    stroke="currentColor"
-                    stroke-width="1.3"
-                    stroke-linejoin="round"
-                  />
-                  <path d="M2 3.4h12v2.2H2z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
-                  <path d="M6.6 8.4h2.8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                  <circle cx="3.4" cy="8" r="1.3" fill="currentColor" />
+                  <circle cx="8" cy="8" r="1.3" fill="currentColor" />
+                  <circle cx="12.6" cy="8" r="1.3" fill="currentColor" />
                 </svg>
               </button>
             </span>
+            </div>
+
+            <!-- 行内展开的菜单：与项目行同一做法（.fold 与 .crow 平级，不做绝对定位浮层） -->
+            <div class="fold" :class="{ 'fold--open': convMoreOpen === c.id }">
+              <ul class="pmenu" role="menu">
+                <li>
+                  <button class="pmenu__item" type="button" role="menuitem" @click="openConvRename(c)">
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <path
+                        d="M11.4 2.6a1.35 1.35 0 0 1 1.9 1.9l-7.6 7.6-2.7.8.8-2.7 7.6-7.6Z"
+                        stroke="currentColor"
+                        stroke-width="1.3"
+                        stroke-linejoin="round"
+                      />
+                      <path d="M10.3 3.7 12.3 5.7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                    </svg>
+                    重命名
+                  </button>
+                </li>
+                <li>
+                  <button
+                    class="pmenu__item"
+                    type="button"
+                    role="menuitem"
+                    @click="closeConvMore(); askArchive(c)"
+                  >
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <path
+                        d="M2.6 5.6h10.8v7a.8.8 0 0 1-.8.8H3.4a.8.8 0 0 1-.8-.8v-7Z"
+                        stroke="currentColor"
+                        stroke-width="1.3"
+                        stroke-linejoin="round"
+                      />
+                      <path d="M2 3.4h12v2.2H2z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
+                      <path d="M6.6 8.4h2.8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                    </svg>
+                    归档
+                  </button>
+                </li>
+              </ul>
+            </div>
           </div>
         </div>
 
@@ -817,9 +907,14 @@ onUnmounted(() => {
                 <p v-if="conversations.forProject(p.id).length === 0" class="group__empty group__empty--child">
                   该项目暂无对话
                 </p>
-                <div v-for="c in conversations.forProject(p.id)" :key="c.id" class="crow crow--child">
+                <div v-for="c in conversations.forProject(p.id)" :key="c.id" class="crow-block">
+                  <div
+                    class="crow crow--child"
+                    :class="{ 'crow--on': isCurrentConversation(c.id), 'crow--open': convMoreOpen === c.id }"
+                  >
                   <button
-                    class="crow__item" :class="{ 'crow__item--on': isCurrentConversation(c.id) }"
+                    class="crow__item"
+                    :class="{ 'crow__item--on': isCurrentConversation(c.id) }"
                     type="button"
                     :title="c.title || '未命名对话'"
                     @click="openConversation(c)"
@@ -827,19 +922,63 @@ onUnmounted(() => {
                     {{ c.title || '未命名对话' }}
                   </button>
                   <span class="crow__acts">
-                    <button class="icon-btn" type="button" title="归档" aria-label="归档" @click="askArchive(c)">
+                    <!-- 已在项目里，所以行内只留「更多」（重命名 / 归档）；移入别的项目走「更多」之外不做，避免误操作 -->
+                    <button
+                      class="icon-btn"
+                      type="button"
+                      title="更多"
+                      aria-label="更多"
+                      aria-haspopup="menu"
+                      :aria-expanded="convMoreOpen === c.id ? 'true' : 'false'"
+                      @click="toggleConvMore(c.id, $event)"
+                    >
                       <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                        <path
-                          d="M2.6 5.6h10.8v7a.8.8 0 0 1-.8.8H3.4a.8.8 0 0 1-.8-.8v-7Z"
-                          stroke="currentColor"
-                          stroke-width="1.3"
-                          stroke-linejoin="round"
-                        />
-                        <path d="M2 3.4h12v2.2H2z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
-                        <path d="M6.6 8.4h2.8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                        <circle cx="3.4" cy="8" r="1.3" fill="currentColor" />
+                        <circle cx="8" cy="8" r="1.3" fill="currentColor" />
+                        <circle cx="12.6" cy="8" r="1.3" fill="currentColor" />
                       </svg>
                     </button>
                   </span>
+                  </div>
+
+                  <div class="fold" :class="{ 'fold--open': convMoreOpen === c.id }">
+                    <ul class="pmenu pmenu--child" role="menu">
+                      <li>
+                        <button class="pmenu__item" type="button" role="menuitem" @click="openConvRename(c)">
+                          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                            <path
+                              d="M11.4 2.6a1.35 1.35 0 0 1 1.9 1.9l-7.6 7.6-2.7.8.8-2.7 7.6-7.6Z"
+                              stroke="currentColor"
+                              stroke-width="1.3"
+                              stroke-linejoin="round"
+                            />
+                            <path d="M10.3 3.7 12.3 5.7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                          </svg>
+                          重命名
+                        </button>
+                      </li>
+                      <li>
+                        <button
+                          class="pmenu__item"
+                          type="button"
+                          role="menuitem"
+                          @click="closeConvMore(); askArchive(c)"
+                        >
+                          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                            <path
+                              d="M2.6 5.6h10.8v7a.8.8 0 0 1-.8.8H3.4a.8.8 0 0 1-.8-.8v-7Z"
+                              stroke="currentColor"
+                              stroke-width="1.3"
+                              stroke-linejoin="round"
+                            />
+                            <path d="M2 3.4h12v2.2H2z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
+                            <path d="M6.6 8.4h2.8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                          </svg>
+                          归档
+                        </button>
+                      </li>
+                    </ul>
+                  </div>
                 </div>
               </div>
             </div>
@@ -1087,6 +1226,12 @@ onUnmounted(() => {
       v-model="renameOpen"
       :project-id="renameTargetId"
       :project-name="renameTargetName"
+    />
+    <ConversationRenameDialog
+      v-model="convRenameOpen"
+      :conversation-id="convRenameTarget?.id ?? null"
+      :conversation-title="convRenameTarget?.title ?? ''"
+      @renamed="onConversationRenamed"
     />
     <ProjectNameDialog v-model="createProjectOpen" @created="onProjectCreated" />
     <MoveConversationDialog
@@ -1414,6 +1559,11 @@ onUnmounted(() => {
   transition: background-color 180ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
+/* 每行外面包一层块，让行内菜单（.fold）落在行的下一行而不是挤进 flex 行 */
+.crow-block {
+  display: block;
+}
+
 .crow:hover {
   background: var(--h-hover);
 }
@@ -1479,6 +1629,7 @@ onUnmounted(() => {
 .crow:hover .crow__acts,
 .crow:focus-within .crow__acts,
 .crow--open .crow__acts,
+.crow--on .crow__acts,
 .crow__acts--always {
   opacity: 1;
   pointer-events: auto;
@@ -1489,13 +1640,16 @@ onUnmounted(() => {
   background: var(--h-hover);
 }
 
-/* 当前正在看的那条对话：对话页顶栏标题已移除，这个高亮是唯一的方位标识。
-   用 inset box-shadow 画左侧竖条，不引入定位/伪元素（.crow__item 里没有 position）。 */
+/* 当前正在看的那条对话：**整块中性泛白**（与「开始使用」同一档 --h-hover）。
+   以前是品牌色底 + 左侧 3px 橙条，且高亮只加在标题按钮上 —— 右侧两个行内图标看着"在块外"。
+   现在高亮加在 .crow 上（整行，含图标），也不再用品牌色做底。 */
+.crow--on {
+  background: var(--h-hover);
+}
+
 .crow__item--on {
   color: var(--h-fg);
   font-weight: 600;
-  background: var(--h-active);
-  box-shadow: inset 3px 0 0 var(--h-primary);
 }
 
 /* 项目行的「更多」菜单：行内块（不做绝对定位浮层，避免被滚动区裁掉） */
@@ -1509,6 +1663,11 @@ onUnmounted(() => {
   border: 1px solid var(--h-line-strong);
   border-radius: 10px;
   background: var(--h-surface-raised);
+}
+
+/* 项目内对话的菜单：外层 .ckids 已经缩进过，这里不再加左边距（避免双重缩进） */
+.pmenu--child {
+  margin-left: 0;
 }
 
 .pmenu__item {
