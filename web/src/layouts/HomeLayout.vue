@@ -105,6 +105,80 @@ function toggleRail(): void {
   localStorage.setItem(RAIL_COLLAPSED_KEY, railCollapsed.value ? '1' : '0')
 }
 
+/* ------------------------------------------------------------------ *
+ * 左栏宽度：右边缘可拖拽（200–400px，宽高存 localStorage）
+ * ------------------------------------------------------------------ */
+const RAIL_WIDTH_KEY = 'sciloop.railWidth'
+const RAIL_MIN = 200
+const RAIL_MAX = 400
+const RAIL_DEFAULT = 248
+/** 键盘微调的步长（方向键按一下挪这么多） */
+const RAIL_STEP = 16
+
+function clampRailWidth(value: number): number {
+  if (!Number.isFinite(value)) return RAIL_DEFAULT
+  return Math.min(RAIL_MAX, Math.max(RAIL_MIN, Math.round(value)))
+}
+
+/** 读盘时就 clamp 一次：存进来的脏值（手改过 localStorage / 旧版本写的）不该把布局撑坏。
+ *  ⚠️ 不要写成 `Number(localStorage.getItem(...))`：键不存在时 `getItem` 返回 `null`，
+ *  而 `Number(null)` 是 **0**（不是 NaN），会被 clamp 成最窄的 200 —— 实测踩过。 */
+function readStoredRailWidth(): number {
+  const raw = localStorage.getItem(RAIL_WIDTH_KEY)
+  if (raw === null || raw.trim() === '') return RAIL_DEFAULT
+  return clampRailWidth(Number(raw))
+}
+
+const railWidth = ref(readStoredRailWidth())
+
+const railResizing = ref(false)
+let resizeStartX = 0
+let resizeStartWidth = RAIL_DEFAULT
+
+/**
+ * 按下即 `setPointerCapture`：指针移出那 8px 热区后 `pointermove` 仍会派发到本元素，
+ * 于是不用往 window 上挂监听、也就没有卸载时的泄漏与重复绑定。
+ */
+function startRailResize(event: PointerEvent): void {
+  if (railCollapsed.value) return
+  const handle = event.currentTarget as HTMLElement | null
+  try {
+    handle?.setPointerCapture?.(event.pointerId)
+  } catch {
+    // 指针已失效（极快的点击/抬起）时会抛 InvalidPointerId；捕获失败不影响拖拽本身，
+    // 因为 move 事件照样会派发到本元素（指针仍在它上面）。
+  }
+  // **必须 preventDefault**：不拦的话，按住往右拖会移过左栏里的文字，浏览器随即启动
+  // 原生文本选择/拖拽，并发出 `pointercancel` 把我们的拖拽打断 —— 实测表现是
+  // 「只能拖动一小段，之后宽度再也不跟手」。
+  event.preventDefault()
+  railResizing.value = true
+  resizeStartX = event.clientX
+  resizeStartWidth = railWidth.value
+}
+
+function moveRailResize(event: PointerEvent): void {
+  if (!railResizing.value) return
+  railWidth.value = clampRailWidth(resizeStartWidth + (event.clientX - resizeStartX))
+}
+
+function endRailResize(event?: PointerEvent): void {
+  if (!railResizing.value) return
+  railResizing.value = false
+  const handle = event?.currentTarget as HTMLElement | null
+  if (handle?.hasPointerCapture?.(event?.pointerId ?? -1)) {
+    handle.releasePointerCapture(event?.pointerId ?? -1)
+  }
+  localStorage.setItem(RAIL_WIDTH_KEY, String(railWidth.value))
+}
+
+/** 键盘可达：焦点在分隔条上时用 ←/→ 微调（与鼠标拖拽同一套 clamp 与落盘） */
+function nudgeRail(delta: number): void {
+  if (railCollapsed.value) return
+  railWidth.value = clampRailWidth(railWidth.value + delta)
+  localStorage.setItem(RAIL_WIDTH_KEY, String(railWidth.value))
+}
+
 /** 当前高亮的主入口；未标注 homeNav 的页面不高亮 */
 const activeKey = computed(() => (route.meta?.homeNav as string | undefined) ?? '')
 /** 当前高亮的模块页（二级入口） */
@@ -517,10 +591,16 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="sl-home">
+  <div class="sl-home" :class="{ 'sl-home--resizing': railResizing }">
     <!-- `inert`：折叠后左栏整体滑出可视区，但里面的几十个链接仍会拦键盘 Tab，
          所以折叠时把它整块对键盘/读屏关掉（`:inert` 传 undefined 才会真正摘掉属性）。 -->
-    <aside id="rail" class="rail" :class="{ 'rail--collapsed': railCollapsed }" :inert="railCollapsed || undefined">
+    <aside
+      id="rail"
+      class="rail"
+      :class="{ 'rail--collapsed': railCollapsed, 'rail--dragging': railResizing }"
+      :style="{ '--rail-w': `${railWidth}px` }"
+      :inert="railCollapsed || undefined"
+    >
       <div class="brand">
         <div class="brand__mark">SL</div>
         <div class="brand__name">SciLoop</div>
@@ -533,14 +613,19 @@ onUnmounted(() => {
           :aria-expanded="!railCollapsed"
           @click="toggleRail"
         >
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
-            <path
-              d="M8.6 2.8 4.4 7l4.2 4.2"
+          <!-- 面板图标（外框 + 内侧靠左实心竖条）：展开/折叠两态共用一个，
+               靠 tooltip 区分 —— 同形不同义比翻转箭头更不容易误判。 -->
+          <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+            <rect
+              x="2"
+              y="3"
+              width="16"
+              height="14"
+              rx="4"
               stroke="currentColor"
               stroke-width="1.6"
-              stroke-linecap="round"
-              stroke-linejoin="round"
             />
+            <rect x="5.2" y="6.2" width="2.2" height="7.6" rx="1.1" fill="currentColor" />
           </svg>
         </button>
       </div>
@@ -1164,6 +1249,29 @@ onUnmounted(() => {
           </div>
         </div>
       </div>
+
+      <!-- 拖拽热区：贴在左栏右边缘（`.rail` 是 position:relative，整块滑出视口时它跟着走，
+           所以折叠态自然拖不到 —— 折叠与调宽职责分开，不会误触）。
+           键盘可达：Tab 到它以后 ←/→ 微调，符合分隔条（separator）的 ARIA 惯例。 -->
+      <div
+        class="rail-resizer"
+        :class="{ 'rail-resizer--on': railResizing }"
+        role="separator"
+        aria-orientation="vertical"
+        data-focus-plain
+        :aria-label="`调整左侧导航宽度（${RAIL_MIN} 到 ${RAIL_MAX} 像素）`"
+        :aria-valuenow="railWidth"
+        :aria-valuemin="RAIL_MIN"
+        :aria-valuemax="RAIL_MAX"
+        :tabindex="railCollapsed ? -1 : 0"
+        @pointerdown="startRailResize"
+        @pointermove="moveRailResize"
+        @pointerup="endRailResize"
+        @pointercancel="endRailResize"
+        @lostpointercapture="endRailResize"
+        @keydown.left.prevent="nudgeRail(-RAIL_STEP)"
+        @keydown.right.prevent="nudgeRail(RAIL_STEP)"
+      />
     </aside>
 
     <div class="main">
@@ -1179,14 +1287,17 @@ onUnmounted(() => {
           :aria-expanded="!railCollapsed"
           @click="toggleRail"
         >
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
-            <path
-              d="M5.4 2.8 9.6 7l-4.2 4.2"
+          <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+            <rect
+              x="2"
+              y="3"
+              width="16"
+              height="14"
+              rx="4"
               stroke="currentColor"
               stroke-width="1.6"
-              stroke-linecap="round"
-              stroke-linejoin="round"
             />
+            <rect x="5.2" y="6.2" width="2.2" height="7.6" rx="1.1" fill="currentColor" />
           </svg>
         </button>
 
@@ -1363,9 +1474,10 @@ onUnmounted(() => {
    整页不滚（.sl-home 已 height:100vh/overflow:hidden），左栏自己也不再整列滚动，
    只有 .rail__scroll 会滚——否则"哪块在滚"会随内容长度漂移。 */
 .rail {
-  /* 宽度只在这里定义一次：折叠位移要用同一个值（calc 取负），
-     写两遍 248px 迟早会漂。 */
+  /* 宽度的**默认值**只在这里定义一次；拖拽时由行内样式覆盖同一个自定义属性
+     （行内样式优先级高于类规则），折叠位移继续用 calc 取负 —— 一处定义、三处复用。 */
   --rail-w: 248px;
+  position: relative;
   width: var(--rail-w);
   flex: none;
   overflow: hidden;
@@ -1378,16 +1490,60 @@ onUnmounted(() => {
   /* 这里必须把换色那三档也一并写上：本规则在共享换色规则之后，
      `transition` 是简写、会整体覆盖，漏掉就会让左栏切换主题时硬跳。 */
   transition:
+    width var(--motion-dur) var(--motion-ease),
     margin-left var(--motion-dur) var(--motion-ease),
     background-color 300ms cubic-bezier(0.4, 0, 0.2, 1),
     color 300ms cubic-bezier(0.4, 0, 0.2, 1),
     border-color 300ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+/* 拖拽过程中掐掉过渡：否则宽度会追着鼠标做 260ms 缓动，手感发黏（像拖着一根橡皮筋）。
+   这也正是上一条要单独列出 `width` 过渡的原因 —— 双击/键盘微调时它又需要平滑。 */
+.rail--dragging {
+  transition: none;
 }
 /* 折叠：整块向左滑出（位移而不是压宽度 —— 压宽会把栏内文字挤成换行）。
    边框同时转透明，否则归位到 x=0 时会在最左边留一条 1px 竖线。 */
 .rail--collapsed {
   margin-left: calc(var(--rail-w) * -1);
   border-right-color: transparent;
+}
+/* 拖拽分隔条：8px 热区叠在左栏内边距上（16px 的右内边距够放），不遮挡任何内容。
+   平时完全透明，hover / 拖拽中 / 键盘聚焦时显一条 2px 品牌色细线作为抓手提示。 */
+.rail-resizer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 8px;
+  cursor: col-resize;
+  touch-action: none;
+}
+.rail-resizer::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 2px;
+  border-radius: 2px;
+  background: var(--h-primary);
+  opacity: 0;
+  transition: opacity var(--motion-dur-fast) var(--motion-ease);
+}
+/* 焦点态复用同一条品牌色细线当指示器（元素挂了 `data-focus-plain`，
+   走站内既有的「自带焦点指示」机制）：8px 宽、通高的元素套一圈全局描边会很怪。 */
+.rail-resizer:hover::after,
+.rail-resizer--on::after,
+.rail-resizer:focus-visible::after {
+  opacity: 1;
+}
+/* 拖拽中把光标与选区锁住：指针很容易甩出那 8px，
+   不锁的话光标会在 col-resize 与默认之间闪，而且会误选中栏内文字。
+   `cursor`/`user-select` 都是可继承属性，写在父级即可覆盖整棵子树——
+   不用 `* { … !important }`（那会顺带把其它过渡也打死）。 */
+.sl-home--resizing {
+  cursor: col-resize;
+  user-select: none;
 }
 .rail__fixed {
   flex: none;
