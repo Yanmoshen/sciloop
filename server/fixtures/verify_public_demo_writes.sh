@@ -13,9 +13,9 @@
 #   - 冒烟用例第 12 条（public_demo 匿名写操作被拒）
 #
 # 用法（宿主机 Git Bash / Linux 均可）：
-#   bash backend/app/fixtures/verify_public_demo_writes.sh
-#   BASE=http://localhost:8000 OWNER_TOKEN=change_me bash backend/app/fixtures/verify_public_demo_writes.sh
-#   PROBE_ALL=1 bash backend/app/fixtures/verify_public_demo_writes.sh   # 额外逐条探测运行时发现的全部写路由
+#   bash server/fixtures/verify_public_demo_writes.sh
+#   BASE=http://localhost:8000 OWNER_TOKEN=change_me bash server/fixtures/verify_public_demo_writes.sh
+#   PROBE_ALL=1 bash server/fixtures/verify_public_demo_writes.sh   # 额外逐条探测运行时发现的全部写路由
 #
 # 输出：每个探针一行 `[PASS|FAIL] STATUS  METHOD PATH  code=...`，末尾给出汇总。
 # 退出码：0 = 全部通过；1 = 存在未被拒绝的写操作（回归！）。

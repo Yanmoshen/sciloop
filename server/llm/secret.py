@@ -74,7 +74,7 @@ def _fernet(secret: str) -> object:
     except ImportError as exc:  # pragma: no cover - 依赖缺失时给出可执行提示
         raise SecretBackendUnavailable(
             "缺少 cryptography 依赖，无法加密存储 API Key。"
-            "请在 backend/pyproject.toml 增加 cryptography，或在设置页使用 env:变量名 引用方式。",
+            "请在 server/pyproject.toml 增加 cryptography，或在设置页使用 env:变量名 引用方式。",
             detail={"missing": "cryptography"},
         ) from exc
     key = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), _SALT, _PBKDF2_ITERATIONS, dklen=32)

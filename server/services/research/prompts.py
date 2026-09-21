@@ -101,7 +101,7 @@ def _candidate_dirs() -> list[Path]:
     if env:
         dirs.append(Path(env))
     here = Path(__file__).resolve()
-    # backend/app/services/research/prompts.py → 上溯到仓库根
+    # server/services/research/prompts.py → 逐级上溯找 prompts/（抗目录深度变化）
     for base in list(here.parents)[:6]:
         dirs.append(base / "prompts")
     return dirs

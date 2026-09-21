@@ -73,7 +73,7 @@ def default_upload_dir() -> Path:
     """默认上传目录：``<server_root>/.cache/uploads``。
 
     ``services/ingest/storage.py`` → parents[2] == ``<server_root>``，
-    容器内即 ``/app/server``（与 compose 的挂载点一致），本地跑则是 ``backend/``。
+    容器内即 ``/app/server``（与 compose 的挂载点一致），本地跑则是 ``server/``。
     """
     override = os.environ.get("IMPORT_UPLOAD_DIR")
     if override:

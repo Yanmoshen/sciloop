@@ -114,7 +114,7 @@ def _get_pymupdf():  # pragma: no cover - 依赖运行环境
             import fitz as pymupdf  # type: ignore
         except ImportError as exc:
             raise RuntimeError(
-                "缺少 pymupdf：全文阅读器解析需要 pymupdf 依赖（backend/pyproject.toml 已声明）"
+                "缺少 pymupdf：全文阅读器解析需要 pymupdf 依赖（server/pyproject.toml 已声明）"
             ) from exc
     return pymupdf
 

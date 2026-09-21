@@ -109,7 +109,7 @@ async def owner_write_endpoints(request: Request) -> dict[str, Any]:
         "acceptance": {
             "smoke_case": "public_demo 匿名写操作被拒（401/403）",
             "runtime_evidence": (
-                "bash backend/app/fixtures/verify_public_demo_writes.sh "
+                "bash server/fixtures/verify_public_demo_writes.sh "
                 "（匿名 curl 逐条打 contracts.owner_only，输出状态码矩阵）"
             ),
         },

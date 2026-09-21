@@ -19,9 +19,9 @@
 # 所有取数都是真实 arXiv / OpenAlex 调用，**不写入任何编造的论文元数据**。
 #
 # 用法（仓库根目录）：
-#   bash backend/app/fixtures/prewarm_papers.sh                 # 默认目标 320 篇
-#   TARGET=300 WINDOWS="2026-09-10 2026-09-17" bash backend/app/fixtures/prewarm_papers.sh
-#   PARSE_BATCH=8 bash backend/app/fixtures/prewarm_papers.sh   # 顺带补 8 篇全文解析
+#   bash server/fixtures/prewarm_papers.sh                 # 默认目标 320 篇
+#   TARGET=300 WINDOWS="2026-09-10 2026-09-17" bash server/fixtures/prewarm_papers.sh
+#   PARSE_BATCH=8 bash server/fixtures/prewarm_papers.sh   # 顺带补 8 篇全文解析
 
 set -uo pipefail
 
@@ -66,10 +66,10 @@ while [ "${count:-0}" -lt "$TARGET" ]; do
 
   echo "-- 第 $i 轮：window=$from..$to"
   if [ -z "$to" ]; then
-    in_container python -m app.tasks.jobs.fetch_papers --no-skip-existing --limit 100 \
+    in_container python -m tasks.jobs.fetch_papers --no-skip-existing --limit 100 \
       --date-from "$from" --sources arxiv,openalex --out "/tmp/prewarm_$i.json" >/dev/null 2>&1
   else
-    in_container python -m app.tasks.jobs.fetch_papers --no-skip-existing --limit 100 \
+    in_container python -m tasks.jobs.fetch_papers --no-skip-existing --limit 100 \
       --date-from "$from" --date-to "$to" --sources arxiv,openalex --out "/tmp/prewarm_$i.json" >/dev/null 2>&1
   fi
   summary=$(in_container python -c "
@@ -94,7 +94,7 @@ echo "== 预热结果：papers=$count（目标 $TARGET） =="
 
 if [ "${PARSE_BATCH:-0}" -gt 0 ]; then
   echo "== 顺带补全文解析（小批量 $PARSE_BATCH 篇；WP05 的 parse_fulltext job） =="
-  in_container python -m app.tasks.jobs.parse_fulltext --limit "$PARSE_BATCH" \
+  in_container python -m tasks.jobs.parse_fulltext --limit "$PARSE_BATCH" \
     --delay-seconds 1.5 --out /tmp/prewarm_parse.json 2>&1 | tail -3
   in_container python -c "
 import json

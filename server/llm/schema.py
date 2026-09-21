@@ -62,7 +62,7 @@ def _validator_module() -> Any:
     except ImportError as exc:  # pragma: no cover
         raise LLMError(
             "缺少 jsonschema 依赖，无法执行结构化输出校验。"
-            "请确认 backend/pyproject.toml 已包含 jsonschema。",
+            "请确认 server/pyproject.toml 已包含 jsonschema。",
             detail={"missing": "jsonschema"},
         ) from exc
     return jsonschema

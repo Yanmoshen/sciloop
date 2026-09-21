@@ -7,7 +7,7 @@
 """全文解析的纯数据结构与哈希工具（无 ORM / 无网络依赖）。
 
 这些 dataclass 是解析器与持久化层之间的唯一契约，因此可以脱离数据库、
-脱离 FastAPI 单独做单元测试（``backend/app/services/fulltext/tests``）。
+脱离 FastAPI 单独做单元测试（``server/services/fulltext/tests``）。
 """
 
 from __future__ import annotations
