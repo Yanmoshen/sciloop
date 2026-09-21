@@ -89,6 +89,22 @@ const MODULE_NAV = [
 
 const keyword = ref('')
 
+/**
+ * 左栏折叠。
+ *
+ * 折叠后左栏整体滑出（用 `margin-left` 位移，而不是把宽度压到 0）：
+ * 压宽度会让栏内文字跟着挤压换行，看着像"被揉皱"；位移则是一整块平滑滑走。
+ * 折叠按钮有两个落点，见模板：展开时在品牌行右侧，折叠后挪到顶栏搜索框左边。
+ * 状态存 localStorage —— 不存的话每次进页面都要再折一次。
+ */
+const RAIL_COLLAPSED_KEY = 'sciloop.railCollapsed'
+const railCollapsed = ref(localStorage.getItem(RAIL_COLLAPSED_KEY) === '1')
+
+function toggleRail(): void {
+  railCollapsed.value = !railCollapsed.value
+  localStorage.setItem(RAIL_COLLAPSED_KEY, railCollapsed.value ? '1' : '0')
+}
+
 /** 当前高亮的主入口；未标注 homeNav 的页面不高亮 */
 const activeKey = computed(() => (route.meta?.homeNav as string | undefined) ?? '')
 /** 当前高亮的模块页（二级入口） */
@@ -502,10 +518,31 @@ onUnmounted(() => {
 
 <template>
   <div class="sl-home">
-    <aside class="rail">
+    <!-- `inert`：折叠后左栏整体滑出可视区，但里面的几十个链接仍会拦键盘 Tab，
+         所以折叠时把它整块对键盘/读屏关掉（`:inert` 传 undefined 才会真正摘掉属性）。 -->
+    <aside id="rail" class="rail" :class="{ 'rail--collapsed': railCollapsed }" :inert="railCollapsed || undefined">
       <div class="brand">
         <div class="brand__mark">SL</div>
         <div class="brand__name">SciLoop</div>
+        <button
+          class="rail-toggle"
+          type="button"
+          title="折叠左栏（折叠后按钮移到顶部搜索框左侧）"
+          aria-label="折叠左栏"
+          aria-controls="rail"
+          :aria-expanded="!railCollapsed"
+          @click="toggleRail"
+        >
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+            <path
+              d="M8.6 2.8 4.4 7l4.2 4.2"
+              stroke="currentColor"
+              stroke-width="1.6"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </button>
       </div>
 
       <div class="rail__fixed">
@@ -1131,6 +1168,28 @@ onUnmounted(() => {
 
     <div class="main">
       <header class="topbar">
+        <!-- 折叠后，同一个开关挪到这里：搜索框左边。展开时它回左栏品牌行右侧。 -->
+        <button
+          v-if="railCollapsed"
+          class="rail-toggle pop-in"
+          type="button"
+          title="展开左栏"
+          aria-label="展开左栏"
+          aria-controls="rail"
+          :aria-expanded="!railCollapsed"
+          @click="toggleRail"
+        >
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+            <path
+              d="M5.4 2.8 9.6 7l-4.2 4.2"
+              stroke="currentColor"
+              stroke-width="1.6"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </button>
+
         <div class="search">
           <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
             <circle cx="7" cy="7" r="4.6" stroke="currentColor" stroke-width="1.4" />
@@ -1304,7 +1363,10 @@ onUnmounted(() => {
    整页不滚（.sl-home 已 height:100vh/overflow:hidden），左栏自己也不再整列滚动，
    只有 .rail__scroll 会滚——否则"哪块在滚"会随内容长度漂移。 */
 .rail {
-  width: 248px;
+  /* 宽度只在这里定义一次：折叠位移要用同一个值（calc 取负），
+     写两遍 248px 迟早会漂。 */
+  --rail-w: 248px;
+  width: var(--rail-w);
   flex: none;
   overflow: hidden;
   padding: 24px 16px 8px;
@@ -1313,6 +1375,19 @@ onUnmounted(() => {
   gap: 12px;
   background: var(--h-surface);
   border-right: 1px solid var(--h-line);
+  /* 这里必须把换色那三档也一并写上：本规则在共享换色规则之后，
+     `transition` 是简写、会整体覆盖，漏掉就会让左栏切换主题时硬跳。 */
+  transition:
+    margin-left var(--motion-dur) var(--motion-ease),
+    background-color 300ms cubic-bezier(0.4, 0, 0.2, 1),
+    color 300ms cubic-bezier(0.4, 0, 0.2, 1),
+    border-color 300ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+/* 折叠：整块向左滑出（位移而不是压宽度 —— 压宽会把栏内文字挤成换行）。
+   边框同时转透明，否则归位到 x=0 时会在最左边留一条 1px 竖线。 */
+.rail--collapsed {
+  margin-left: calc(var(--rail-w) * -1);
+  border-right-color: transparent;
 }
 .rail__fixed {
   flex: none;
@@ -1356,6 +1431,39 @@ onUnmounted(() => {
   font-size: var(--font-size-xl);
   font-weight: 600;
   letter-spacing: 0.2px;
+}
+/* 折叠开关（展开时在品牌行右侧，折叠后同一颗挪到顶栏搜索框左边）。
+   靠 margin-left:auto 顶到行尾 —— 不用 space-between，那会把「SL」和「SciLoop」拆开。 */
+.brand > .rail-toggle {
+  margin-left: auto;
+}
+.rail-toggle {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  /* 用 fg-muted 而不是 fg-subtle：它是这套交互唯一的入口，
+     太浅会读成装饰而不是按钮（与左栏导航图标同一档）。 */
+  color: var(--h-fg-muted);
+  cursor: pointer;
+  transition:
+    transform var(--motion-dur-fast) var(--motion-ease-out),
+    background-color var(--motion-dur) var(--motion-ease),
+    border-color var(--motion-dur) var(--motion-ease),
+    color var(--motion-dur) var(--motion-ease);
+}
+.rail-toggle:hover {
+  border-color: var(--h-line);
+  background: var(--h-surface-input);
+  color: var(--h-fg);
+}
+.rail-toggle:active {
+  transform: scale(var(--motion-press));
 }
 .nav {
   display: flex;

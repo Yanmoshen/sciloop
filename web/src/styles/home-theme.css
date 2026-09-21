@@ -49,6 +49,17 @@
   --h-active: rgba(238, 79, 39, 0.16);
 }
 
+/* ---------- 状态色：别名到 tokens.css 的语义色 ----------
+ * 壳层原本只有 primary / secondary，没有「成功 / 警示 / 危险」，
+ * 于是对话里的节点过程行只能自造变量名（写出来是无效声明，颜色静默失效）。
+ * 这里不新造调色板，直接引用语义色令牌：同一语义全站同色，
+ * 且天然跟随明/暗两档（tokens.css 已分别定义，不用在这里再写一遍）。 */
+.sl-home {
+  --h-ok: var(--color-success);
+  --h-warn: var(--color-warning);
+  --h-err: var(--color-danger);
+}
+
 /* ---------- 滚动条：仅总览页范围内美化，禁用系统箭头按钮 ---------- */
 .sl-home ::-webkit-scrollbar,
 .sl-home::-webkit-scrollbar {
