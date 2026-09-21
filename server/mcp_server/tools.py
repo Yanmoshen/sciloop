@@ -25,6 +25,7 @@ import subprocess
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
+from urllib.parse import urlsplit
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError as McpToolError
@@ -40,6 +41,9 @@ ALLOWED_BINARIES = (
 
 #: 单次执行可回传的输出上限。
 MAX_OUTPUT_BYTES = 32 * 1024
+
+#: 单次抓取回传的字节上限。
+MAX_FETCH_BYTES = 256 * 1024
 
 
 async def _through_guard(
@@ -199,6 +203,50 @@ def register(server: MCPServer, guard: Guard) -> None:
             }
 
         return await _through_guard(guard, "run_command", params, body)
+
+    @server.tool(
+        name="fetch_url",
+        description=(
+            "抓取一个网址的内容（只允许授权白名单内的主机）。"
+            "**不自动跟随重定向** —— 否则一个 302 就能绕过白名单。"
+        ),
+    )
+    async def fetch_url(url: str, max_bytes: int | None = None) -> dict[str, Any]:
+        params = {"url": url, "max_bytes": max_bytes}
+
+        async def body() -> dict[str, Any]:
+            guard.require("fetch_url", ("net",))
+            parsed = urlsplit(url)
+            if parsed.scheme not in ("http", "https") or not parsed.hostname:
+                raise GuardError("tool_bad_params", f"只接受 http/https 绝对网址，收到：{url}")
+            guard.assert_host("fetch_url", parsed.hostname, parsed.port)
+
+            # 延迟导入：抓取才需要 httpx，门禁类测试（拒绝路径）不该被依赖拖住
+            import httpx
+
+            limit = max(1, min(int(max_bytes or MAX_FETCH_BYTES), MAX_FETCH_BYTES))
+            try:
+                async with httpx.AsyncClient(
+                    follow_redirects=False,  # 见 assert_host：跟重定向等于让白名单失效
+                    timeout=httpx.Timeout(20.0),
+                ) as client:
+                    response = await client.get(url)
+            except httpx.HTTPError as exc:
+                raise GuardError("tool_failed", f"抓取失败：{type(exc).__name__}: {exc}") from exc
+
+            raw = response.content[:limit]
+            return {
+                "url": str(response.url),
+                "status_code": response.status_code,
+                "content_type": response.headers.get("content-type", ""),
+                "bytes": len(raw),
+                "truncated": len(response.content) > len(raw),
+                "text": raw.decode("utf-8", errors="replace"),
+                "redirect_to": response.headers.get("location"),
+                "touched": [],
+            }
+
+        return await _through_guard(guard, "fetch_url", params, body)
 
 
 def _clip(raw: bytes) -> tuple[str, bool]:

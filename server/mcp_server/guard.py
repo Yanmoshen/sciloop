@@ -77,11 +77,14 @@ def grant_from_env(env: dict[str, str] | None = None) -> Grant:
         if item is not None
     )
     tokens = tuple(t.strip() for t in source.get("SCILOOP_MCP_APPROVAL_TOKENS", "").split(",") if t.strip())
+    hosts = tuple(h.strip().lower() for h in source.get("SCILOOP_MCP_ALLOWED_HOSTS", "").split(",") if h.strip())
     return Grant(
         actor=source.get("SCILOOP_MCP_ACTOR", "agent"),
         workspace=workspace,
         extra_read_roots=extra,
         allow_exec=source.get("SCILOOP_MCP_ALLOW_EXEC") == "1",
+        allow_net=source.get("SCILOOP_MCP_ALLOW_NET") == "1",
+        allowed_hosts=hosts,
         approval_tokens=tokens,
     )
 
@@ -95,6 +98,8 @@ class Grant:
     extra_read_roots: tuple[Path, ...] = ()
     allow_exec: bool = False
     allow_net: bool = False
+    #: 出网白名单（小写主机名或 host:port）。空 = 一个都不许出，而不是"不限制"。
+    allowed_hosts: tuple[str, ...] = ()
     write_limit_bytes: int = 1 << 20
     approval_tokens: tuple[str, ...] = ()
 
@@ -167,6 +172,35 @@ class Guard:
     def assert_binary(self, tool: str, name: str, allowed: tuple[str, ...]) -> None:
         if name not in allowed:
             raise GuardError("tool_denied", f"「{name}」不在可执行白名单内；允许：{list(allowed)}")
+
+    def assert_host(self, tool: str, host: str, port: int | None = None) -> None:
+        """出网目标必须在授权白名单内。
+
+        **只比对 host，不跟随后续重定向** —— 重定向到白名单外的主机必须在客户端被拦下，
+        否则"白名单"会被一个 302 直接绕过。所以调用方要关掉自动重定向。
+        空白名单 = 一个都不许出（不是"不限制"）：默认拒绝，才是边界该有的默认值。
+        """
+
+        if not self.grant.allow_net:
+            raise GuardError(
+                "tool_denied",
+                f"工具「{tool}」需要出网权限，当前授权未授予（SCILOOP_MCP_ALLOW_NET 未开启）",
+            )
+        if not self.grant.allowed_hosts:
+            raise GuardError(
+                "tool_denied",
+                f"工具「{tool}」需要出网，但授权未配置任何允许主机（SCILOOP_MCP_ALLOWED_HOSTS 为空）",
+            )
+        wanted = host.strip().lower()
+        candidates = {wanted}
+        if port is not None:
+            candidates.add(f"{wanted}:{port}")
+        if not candidates & set(self.grant.allowed_hosts):
+            raise GuardError(
+                "tool_denied",
+                f"「{host}」不在出网白名单内；允许：{list(self.grant.allowed_hosts)}",
+                host=host,
+            )
 
     # ---- 门 3：审批 ----
     def require_approval(self, tool: str, token: str | None) -> None:

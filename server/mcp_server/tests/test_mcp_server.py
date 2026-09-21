@@ -299,3 +299,51 @@ def test_end_to_end_nonzero_exit_is_not_a_tool_failure(tmp_path: Path) -> None:
     assert result.ok is True
     assert result.data["exit_code"] == 3
     assert result.data["ok"] is False
+
+
+# --------------------------------------------------------------------------- #
+# 联网门（需求追加：允许 fetch / github 这类会出网的工具）
+# --------------------------------------------------------------------------- #
+def test_net_denied_without_net_grant() -> None:
+    guard = Guard(grant=Grant(allow_net=False, allowed_hosts=("example.com",)))
+    with pytest.raises(GuardError) as exc:
+        guard.assert_host("fetch_url", "example.com")
+    assert exc.value.code == "tool_denied"
+
+
+def test_net_denied_when_allowlist_is_empty() -> None:
+    """空白名单 = **一个都不许出**（默认拒绝），不是"不限制"。"""
+
+    guard = Guard(grant=Grant(allow_net=True, allowed_hosts=()))
+    with pytest.raises(GuardError) as exc:
+        guard.assert_host("fetch_url", "example.com")
+    assert exc.value.code == "tool_denied"
+
+
+def test_net_host_must_be_in_allowlist() -> None:
+    guard = Guard(grant=Grant(allow_net=True, allowed_hosts=("arxiv.org",)))
+    guard.assert_host("fetch_url", "arxiv.org")  # 命中即通过
+    with pytest.raises(GuardError) as exc:
+        guard.assert_host("fetch_url", "evil.example")
+    assert exc.value.code == "tool_denied"
+    assert exc.value.detail["host"] == "evil.example"
+
+
+def test_net_host_matches_with_port() -> None:
+    guard = Guard(grant=Grant(allow_net=True, allowed_hosts=("api.example:8443",)))
+    guard.assert_host("fetch_url", "api.example", 8443)
+
+
+def test_grant_from_env_reads_net_settings() -> None:
+    grant = grant_from_env(
+        {"SCILOOP_MCP_ALLOW_NET": "1", "SCILOOP_MCP_ALLOWED_HOSTS": "A.org, b.org"}
+    )
+    assert grant.allow_net is True
+    assert grant.allowed_hosts == ("a.org", "b.org")
+    assert grant_from_env({}).allow_net is False
+
+
+def test_end_to_end_fetch_url_is_registered() -> None:
+    params = server_params(python=sys.executable, repo_server_dir=REPO_SERVER_DIR)
+    names = {item["name"] for item in _run(list_tools(params))}
+    assert "fetch_url" in names, names
