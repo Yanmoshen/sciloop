@@ -68,6 +68,14 @@ def _label_of(node: str) -> str:
     return graph.NODE_LABELS.get(node, node)
 
 
+def _implemented(node: str) -> bool:
+    """该节点是否真的实装了（决定自动连续跑能不能往下走）。"""
+
+    from app.services.research import graph
+
+    return graph.is_implemented(node)
+
+
 def _research_text(text: str, conversation: dict[str, Any]) -> str:
     """把「命令」还原成「研究问题」，给检索与提示词用。
 
@@ -239,6 +247,7 @@ async def stream_node(
     refs: dict[str, Any] = {}
     status = "failed"
     total_cost = 0.0
+    persisted_rows: list[dict[str, Any]] = []
 
     if AsyncSessionLocal is None:  # pragma: no cover
         yield _sse("error", {"code": "db_unavailable", "message": "数据库会话不可用"})
@@ -261,13 +270,37 @@ async def stream_node(
                        "waiting_human", "error"):
             row = _system_row_for(event, data)
             if row is not None:
+                persisted_rows.append(row)
                 yield _sse("row", {"row": row})
 
     summary = _conclusion(label=label, status=status, events=events, refs=refs)
+    next_node = next((d.get("next_node") for e, d in events if e == "done"), None)
+
+    if status == "done" and next_node and next_node != "end" and not _implemented(next_node):
+        # **不假装往下走**：后面几个节点首版未实装，自动连续跑必须在这里停住并说明，
+        # 否则它们会依次「通过」，等于伪造「实验做完了、论文写好了」。
+        summary += (
+            f"\n\n下一节点是「{_label_of(next_node)}」，**首版尚未实装**："
+            "它既不会校验产出，也不会真的执行实验。我不会替你把它标记成完成。"
+        )
+        yield _sse(
+            "row",
+            {
+                "row": messages.system_row(
+                    "stopped",
+                    f"「{_label_of(next_node)}」尚未实装，已停止继续推进",
+                    tone="warn",
+                )
+            },
+        )
+        persisted_rows.append(
+            messages.system_row(
+                "stopped", f"「{_label_of(next_node)}」尚未实装，已停止继续推进", tone="warn"
+            )
+        )
 
     yield _sse("delta", {"text": summary})
 
-    next_node = next((d.get("next_node") for e, d in events if e == "done"), None)
     conversations_service.append_turns(
         scope["conversation"],
         [
@@ -280,6 +313,8 @@ async def stream_node(
                 "node_status": status,
                 "cost_usd": total_cost,
                 "duration_ms": 0,
+                # 过程行也要落盘：否则刷新后节点过程整段消失，只剩一句结论
+                "rows": persisted_rows,
                 "interrupted": status == "failed",
             },
         ],
@@ -293,6 +328,7 @@ async def stream_node(
             "node_status": status,
             "cost_usd": total_cost,
             "next_node": next_node,
+            "next_implemented": bool(next_node) and _implemented(next_node),
         },
     )
 

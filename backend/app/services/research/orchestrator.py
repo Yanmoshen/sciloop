@@ -799,6 +799,67 @@ async def run_node(
             }
             return
 
+        # 检索命中 0 篇：**不要拿 3 次重试去撞同一堵墙**。
+        # 材料没变、模型没有新信息可用，重试注定还是「证据 0 条」，
+        # 只会白花钱，并把**材料不足**说成「模型修不好」，属于误导。
+        if target == "literature_review" and not hits:
+            await store.upsert_node_run(
+                session,
+                conversation_id=conversation_id,
+                project_id=project_id,
+                node=target,
+                entry_index=entry_index,
+                status="waiting_human",
+                retry_count=0,
+                validation={
+                    "ok": False,
+                    "level": "L1",
+                    "rules": ["no_library_hits"],
+                    "items": [
+                        {
+                            "rule": "no_library_hits",
+                            "level": "L1",
+                            "message": "论文库检索命中 0 篇，缺少可用材料",
+                            "path": "evidence",
+                        }
+                    ],
+                },
+                finished_at=_utcnow(),
+            )
+            await store.record_transition(
+                session,
+                conversation_id=conversation_id,
+                project_id=project_id,
+                from_node=target,
+                to_node=target,
+                kind="stop",
+                trigger="program",
+                reason="论文库检索命中 0 篇，未执行（没有把材料不足当成模型失败）",
+                budget_snapshot={"retry_count": 0, "max_retry": max_retry},
+            )
+            yield "waiting_human", {
+                "node": target,
+                "node_label": graph.NODE_LABELS.get(target, target),
+                "retry_count": 0,
+                "items": [],
+                "needs_input": "library_material",
+                "message": (
+                    f"论文库里没有命中与「{research_question[:40]}」相关的材料，本次不执行——"
+                    "没有材料就没有证据，重试也不会变出材料来。\n\n"
+                    "三个可行的下一步：① 换更常见的英文关键词（当前库以英文论文为主，"
+                    "例如把「语料似然」写成 corpus likelihood）；② 先往论文库补一批相关论文；"
+                    "③ 直接说「从 idea 生成开始」，跳过文献核查先做可行性分析。"
+                ),
+            }
+            yield "done", {
+                "node": target,
+                "status": "waiting_human",
+                "display_status": graph.display_status("waiting_human"),
+                "cost_usd": 0.0,
+                "llm_call_count": 0,
+            }
+            return
+
     payload: dict[str, Any] | None = None
     total_cost = 0.0
     llm_calls = 0

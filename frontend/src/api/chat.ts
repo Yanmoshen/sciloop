@@ -80,20 +80,33 @@ export interface StreamMeta {
 
 export interface StreamDone {
   conversation_id: string
-  /** 完整正文（前端可用它校正自己拼出来的增量文本） */
-  content: string
-  duration_ms: number
-  model_id: string
-  model_ref: string
-  provider: string
-  cost_usd: number | null
-  cost_unknown_reason: string | null
-  finish_reason: string | null
-  usage: {
+  /**
+   * 完整正文（前端可用它校正自己拼出来的增量文本）。
+   *
+   * **可缺省**：节点执行 / 引导词 / 本地查询这三条分支是**确定性**的，
+   * 收尾事件只带状态与费用，不带模型用量——它们本来就没调模型。
+   */
+  content?: string
+  duration_ms?: number
+  model_id?: string
+  model_ref?: string
+  provider?: string
+  cost_usd?: number | null
+  cost_unknown_reason?: string | null
+  finish_reason?: string | null
+  usage?: {
     prompt_tokens: number | null
     completion_tokens: number | null
     total_tokens: number | null
   }
+  /** 本轮走的是哪条分支：node / guide / query / plain_chat（通用回答时不带） */
+  routing?: string
+  /** 节点分支：本节点结束状态（done / waiting_human / failed） */
+  node_status?: string
+  node?: string
+  /** 节点分支：下一个应执行的节点，以及它**是否真的实装**（未实装要停住，不假装往下走） */
+  next_node?: string | null
+  next_implemented?: boolean
 }
 
 export interface StreamTitle {
@@ -111,11 +124,58 @@ export interface StreamError {
   generated_chars?: number
 }
 
+/** 引导词里的一个可点出口 */
+export interface BlockOption {
+  id: string
+  label: string
+  /** 点下去实际发送的文本（由后端给定，前端不改写） */
+  send: string
+  tone?: 'primary' | 'default' | 'quiet'
+}
+
+/** 可点选项块（模糊引导词时给出「文献调研 / 从 idea 开始 / 普通对话」） */
+export interface ChoiceBlock {
+  kind: 'choice'
+  prompt: string
+  options: BlockOption[]
+}
+
+/** 查询结果卡片 */
+export interface ResultBlock {
+  kind: 'result'
+  title: string
+  summary: string
+  columns: string[]
+  rows: Array<Array<string | number | null>>
+  total: number
+}
+
+export type ChatBlock = ChoiceBlock | ResultBlock
+
+/** 节点执行的紧凑系统行 */
+export interface SystemRow {
+  kind: 'system'
+  label: string
+  text: string
+  tone?: 'idle' | 'info' | 'ok' | 'warn' | 'err'
+}
+
 export interface StreamHandlers {
   onMeta?: (meta: StreamMeta) => void
   onDelta?: (text: string) => void
   onDone?: (done: StreamDone) => void
   onTitle?: (title: StreamTitle) => void
+  /** 结构化块：引导词的可点选项 / 查询结果卡片 */
+  onBlocks?: (blocks: ChatBlock[]) => void
+  /** 节点执行过程的一条系统行 */
+  onRow?: (row: SystemRow) => void
+  /**
+   * 思考过程的增量。
+   *
+   * **它不是答复**：必须折叠展示（在耗时那一行下面），绝不能拼进正文里——
+   * 之前正是因为它被当成正文，界面上出现了模型的自言自语。
+   */
+  onReasoning?: (text: string) => void
   /** 建连失败或流中途断线；**已收到的增量仍然有效**（后端已把它落盘） */
   onError?: (error: StreamError) => void
 }
@@ -203,6 +263,17 @@ function dispatch(frame: string, handlers: StreamHandlers): void {
       break
     case 'title':
       handlers.onTitle?.(payload as StreamTitle)
+      break
+    case 'blocks':
+      handlers.onBlocks?.((payload as { blocks?: ChatBlock[] }).blocks ?? [])
+      break
+    case 'row':
+      if ((payload as { row?: SystemRow }).row) {
+        handlers.onRow?.((payload as { row: SystemRow }).row)
+      }
+      break
+    case 'reasoning':
+      handlers.onReasoning?.((payload as { text?: string }).text ?? '')
       break
     case 'error':
       handlers.onError?.(payload as StreamError)

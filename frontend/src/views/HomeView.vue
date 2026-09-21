@@ -23,6 +23,7 @@ import { writeDenied } from '@/utils/messages'
 import { useRoute, useRouter } from 'vue-router'
 
 import { streamChatHome } from '@/api/chat'
+import type { ChatBlock, StreamDone, SystemRow } from '@/api/chat'
 import { getConversation } from '@/api/conversations'
 import MarkdownText from '@/components/MarkdownText.vue'
 import ConfirmDialog from '@/components/home/ConfirmDialog.vue'
@@ -42,6 +43,14 @@ interface Turn {
   model?: string
   durationMs?: number
   status?: TurnStatus
+  /** 结构化块：可点选项（引导词）与结果卡片（本地查询） */
+  blocks?: ChatBlock[]
+  /** 节点执行过程的紧凑系统行（进入 / 驳回 / 重试 / 回退 / 迁移） */
+  rows?: SystemRow[]
+  /** 思考过程：**不是答复**，折叠展示在耗时那一行下面 */
+  reasoning?: string
+  /** 本轮的判定结果（执行 / 引导 / 查询 / 普通对话），用于角标 */
+  routing?: string
 }
 
 const route = useRoute()
@@ -147,6 +156,12 @@ function durationText(turn: Turn): string {
   if (turn.status === 'streaming') return `${Math.floor(elapsedMs.value / 1000)}s`
   if (turn.durationMs) return `已完成 ${fmtDuration(turn.durationMs)}`
   return ''
+}
+
+/** 思考过程折叠入口的文案：进行中「思考中…」，结束后「已思考 Ns」 */
+function reasonLabel(turn: Turn): string {
+  if (turn.status === 'streaming') return '思考中…'
+  return turn.durationMs ? `已思考 ${fmtDuration(turn.durationMs)}` : '思考过程'
 }
 
 function pickModel(value: string): void {
@@ -259,6 +274,12 @@ async function loadConversation(id: string): Promise<void> {
       model: turn.model_id,
       durationMs: turn.duration_ms,
       status: turn.interrupted ? 'interrupted' : 'done',
+      // 磁盘里存的结构化块 / 系统行 / 思考过程要一并还原，
+      // 否则刷新后引导词的选项、节点的过程行、思考折叠都会消失
+      blocks: (turn as { blocks?: ChatBlock[] }).blocks,
+      rows: (turn as { rows?: SystemRow[] }).rows,
+      reasoning: (turn as { reasoning?: string }).reasoning ?? undefined,
+      routing: (turn as { routing?: string }).routing,
     }))
     await scrollToBottom()
   } catch (error) {
@@ -337,16 +358,37 @@ async function runStream(
           target.content += delta
           void scrollToBottom()
         },
+        onReasoning: (delta) => {
+          // 思考过程**不拼进正文**：单独累积，渲染时折叠在耗时那一行下面
+          const target = turns.value[assistantIndex]
+          if (!target) return
+          target.reasoning = (target.reasoning ?? '') + delta
+          void scrollToBottom()
+        },
+        onRow: (row) => {
+          const target = turns.value[assistantIndex]
+          if (!target) return
+          target.rows = [...(target.rows ?? []), row]
+          void scrollToBottom()
+        },
+        onBlocks: (blocks) => {
+          const target = turns.value[assistantIndex]
+          if (!target) return
+          target.blocks = [...(target.blocks ?? []), ...blocks]
+          void scrollToBottom()
+        },
         onDone: (done) => {
           const target = turns.value[assistantIndex]
           if (!target) return
           if (done.content) target.content = done.content
-          target.model = done.model_id
-          target.durationMs = done.duration_ms
+          if (done.model_id) target.model = done.model_id
+          if (done.duration_ms) target.durationMs = done.duration_ms
+          if (done.routing) target.routing = done.routing
           target.status = 'done'
           void scrollToBottom()
           // 后端此时已把这一轮落盘：整表刷新一次，左栏顺序/轮次数与磁盘一致
           void conversations.load()
+          maybeAutoContinue(done)
         },
         onTitle: (payload) => {
           conversationTitle.value = payload.title
@@ -386,11 +428,66 @@ async function runStream(
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * 思考过程的折叠（展示在耗时那一行下面）
+ * 它**不是答复**：后端走独立通道送到这里，与正文完全分开。
+ * ------------------------------------------------------------------ */
+const reasonOpen = ref<Set<number>>(new Set())
+
+function isReasonOpen(index: number): boolean {
+  return reasonOpen.value.has(index)
+}
+
+function toggleReason(index: number): void {
+  const next = new Set(reasonOpen.value)
+  if (next.has(index)) next.delete(index)
+  else next.add(index)
+  reasonOpen.value = next
+}
+
+/* ------------------------------------------------------------------ *
+ * 引导词的可点选项：点一下就把它对应的那句话发出去
+ * ------------------------------------------------------------------ */
+function pickOption(text: string): void {
+  if (phase.value === 'thinking') return
+  prompt.value = text
+  void send()
+}
+
+/* ------------------------------------------------------------------ *
+ * 自动连续跑（输入栏开关，默认关）
+ * ------------------------------------------------------------------ */
+const AUTO_RUN_KEY = 'sciloop.autoRun'
+const autoRun = ref(localStorage.getItem(AUTO_RUN_KEY) === '1')
+
+function toggleAutoRun(): void {
+  autoRun.value = !autoRun.value
+  localStorage.setItem(AUTO_RUN_KEY, autoRun.value ? '1' : '0')
+}
+
+/**
+ * 只在「节点真的跑完，且下一节点真的实装」时才自动继续。
+ *
+ * 三种情况一律停住：节点没跑完（转人工 / 失败）、没有下一节点、下一节点是占位。
+ * 尤其是占位节点——让它们依次「通过」等于伪造「实验做完了、论文写好了」。
+ */
+function maybeAutoContinue(done: StreamDone): void {
+  if (!autoRun.value) return
+  if (done.routing !== 'node') return
+  if (done.node_status !== 'done') return
+  if (!done.next_node || done.next_node === 'end') return
+  if (done.next_implemented === false) return
+  setTimeout(() => {
+    if (phase.value !== 'idle') return
+    prompt.value = '继续'
+    void send()
+  }, 600)
+}
+
 async function send(): Promise<void> {
   if (!canSend.value || phase.value === 'thinking') return
   const text = prompt.value.trim() || files.value.map((file) => file.name).join('、')
   if (!text) return
-
   const model = pickedModel()
   if (!model) return
 
@@ -667,11 +764,80 @@ onUnmounted(() => {
             <span class="meta__model">{{ turn.model }}</span>
             <span class="meta__time">{{ durationText(turn) }}</span>
           </div>
+          <!-- 思考过程：折叠在耗时那一行下面，**不是答复** -->
+          <div v-if="turn.reasoning" class="reason">
+            <button
+              class="reason__head"
+              type="button"
+              :aria-expanded="isReasonOpen(index)"
+              @click="toggleReason(index)"
+            >
+              <svg
+                class="reason__caret"
+                :class="{ 'reason__caret--open': isReasonOpen(index) }"
+                width="10"
+                height="10"
+                viewBox="0 0 10 10"
+                aria-hidden="true"
+              >
+                <path d="M3 1.5 6.5 5 3 8.5" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+              </svg>
+              <span>{{ reasonLabel(turn) }}</span>
+            </button>
+            <div class="fold" :class="{ 'fold--open': isReasonOpen(index) }">
+              <pre class="reason__body">{{ turn.reasoning }}</pre>
+            </div>
+          </div>
+          <!-- 节点执行过程：紧凑系统行，先于结论出现 -->
+          <div v-if="turn.rows?.length" class="rows">
+            <div v-for="(row, rowIndex) in turn.rows" :key="rowIndex" class="row" :class="`row--${row.tone ?? 'idle'}`">
+              <span class="row__kind">{{ row.label }}</span>
+              <span class="row__text">{{ row.text }}</span>
+            </div>
+          </div>
           <MarkdownText v-if="turn.content" :content="turn.content" />
           <div v-else class="dots" aria-label="正在生成">
             <span class="dot" />
             <span class="dot" />
             <span class="dot" />
+          </div>
+          <!-- 结构化块：引导词的可点出口 / 本地查询的结果卡片 -->
+          <div v-if="turn.blocks?.length" class="blocks">
+            <template v-for="(block, blockIndex) in turn.blocks" :key="blockIndex">
+              <div v-if="block.kind === 'choice'" class="choices">
+                <button
+                  v-for="option in block.options"
+                  :key="option.id"
+                  class="choice"
+                  :class="`choice--${option.tone ?? 'default'}`"
+                  type="button"
+                  :disabled="phase === 'thinking'"
+                  @click="pickOption(option.send)"
+                >
+                  {{ option.label }}
+                </button>
+              </div>
+              <div v-else class="rcard">
+                <div class="rcard__head">
+                  <span class="rcard__name">{{ block.title }}</span>
+                  <span class="rcard__count">{{ block.total }} 条</span>
+                </div>
+                <div v-if="block.columns.length" class="rcard__scroll">
+                  <table class="rcard__table">
+                    <thead>
+                      <tr>
+                        <th v-for="(column, columnIndex) in block.columns" :key="columnIndex">{{ column }}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      <tr v-for="(cells, cellIndex) in block.rows" :key="cellIndex">
+                        <td v-for="(cell, cellIndex2) in cells" :key="cellIndex2">{{ cell }}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </template>
           </div>
           <div v-if="turn.status === 'interrupted'" class="cut">已中断 / 出错</div>
           <div v-if="turn.content" class="acts">
@@ -742,6 +908,20 @@ onUnmounted(() => {
         </div>
 
         <div class="bar__right">
+          <!-- 自动连续跑：默认关。开着一路跑到「上一节点真的实装」为止，
+               转人工 / 失败 / 下一节点是占位都会自动停住。 -->
+          <button
+            class="autorun"
+            :class="{ 'autorun--on': autoRun }"
+            type="button"
+            role="switch"
+            :aria-checked="autoRun ? 'true' : 'false'"
+            :title="autoRun ? '自动连续跑：已开启，点一下关闭' : '自动连续跑：关闭中，点一下开启'"
+            @click="toggleAutoRun"
+          >
+            <span class="autorun__dot" />
+            {{ autoRun ? '自动连续跑' : '手动逐步' }}
+          </button>
           <div class="mpick">
             <button
               class="mpick__trigger"
@@ -981,6 +1161,204 @@ onUnmounted(() => {
   color: var(--h-fg-muted);
 }
 
+/* ------------------------------------------------------------------ *
+ * 思考过程折叠：入口在耗时那一行下面，展开后才看内容。
+ * 它不是答复，所以**视觉上要明显弱于正文**；展开区用等宽小字 + 左竖线区分。
+ * ------------------------------------------------------------------ */
+.reason {
+  margin-top: 2px;
+}
+
+.reason__head {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  font-size: var(--font-size-sm);
+  color: var(--h-fg-muted);
+}
+
+.reason__head:hover {
+  color: var(--h-fg);
+}
+
+.reason__caret {
+  flex: none;
+  transition: transform var(--motion-dur) var(--motion-ease);
+}
+
+.reason__caret--open {
+  transform: rotate(90deg);
+}
+
+.reason__body {
+  margin: 6px 0 0;
+  padding: 6px 0 6px 10px;
+  border-left: 2px solid var(--h-line);
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+  font-size: var(--font-size-sm);
+  line-height: 1.6;
+  color: var(--h-fg-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow: auto;
+}
+
+/* ------------------------------------------------------------------ *
+ * 节点执行的系统行：紧凑一行，只报过程（进入 / 驳回 / 重试 / 回退 / 迁移）
+ * ------------------------------------------------------------------ */
+.rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0 2px;
+}
+
+.row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: var(--font-size-sm);
+}
+
+.row__kind {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px solid var(--h-line);
+  border-radius: 4px;
+  font-size: var(--font-size-xs);
+  color: var(--h-fg-muted);
+  white-space: nowrap;
+}
+
+.row__text {
+  color: var(--h-fg-muted);
+  word-break: break-word;
+}
+
+.row--ok .row__kind {
+  border-color: var(--h-ok, #2e8b57);
+  color: var(--h-ok, #2e8b57);
+}
+
+.row--warn .row__kind {
+  border-color: var(--h-warn, #b7791f);
+  color: var(--h-warn, #b7791f);
+}
+
+.row--err .row__kind {
+  border-color: var(--h-err, #c53030);
+  color: var(--h-err, #c53030);
+}
+
+.row--info .row__kind {
+  border-color: var(--h-accent);
+  color: var(--h-accent);
+}
+
+/* ------------------------------------------------------------------ *
+ * 结构化块：引导词的可点出口 + 查询结果卡片
+ * ------------------------------------------------------------------ */
+.blocks {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.choice {
+  padding: 6px 12px;
+  border: 1px solid var(--h-line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--h-fg);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  transition: border-color var(--motion-dur) var(--motion-ease), background var(--motion-dur) var(--motion-ease);
+}
+
+.choice:hover:not(:disabled) {
+  border-color: var(--h-accent);
+}
+
+.choice:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.choice:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.choice--primary {
+  border-color: var(--h-accent);
+  color: var(--h-accent);
+}
+
+.rcard {
+  border: 1px solid var(--h-line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.rcard__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--h-line);
+}
+
+.rcard__name {
+  color: var(--h-fg);
+  font-size: var(--font-size-sm);
+}
+
+.rcard__count {
+  flex: none;
+  color: var(--h-fg-muted);
+  font-size: var(--font-size-xs);
+}
+
+.rcard__scroll {
+  max-height: 260px;
+  overflow: auto;
+}
+
+.rcard__table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-size-sm);
+}
+
+.rcard__table th,
+.rcard__table td {
+  padding: 5px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--h-line);
+  white-space: nowrap;
+}
+
+.rcard__table th {
+  color: var(--h-fg-muted);
+  font-weight: 400;
+}
+
+.rcard__table td {
+  color: var(--h-fg);
+}
+
 .acts {
   display: flex;
   gap: 6px;
@@ -1141,6 +1519,45 @@ onUnmounted(() => {
 
 .composer--hero {
   margin-bottom: 40px;
+}
+
+/* 自动连续跑开关：与模型选择器并排，状态一眼可见（圆点=开） */
+.autorun {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border: 1px solid var(--h-line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--h-fg-muted);
+  font-size: var(--font-size-sm);
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    border-color var(--motion-dur) var(--motion-ease),
+    color var(--motion-dur) var(--motion-ease);
+}
+
+.autorun:hover {
+  border-color: var(--h-accent);
+}
+
+.autorun__dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--h-line-strong);
+}
+
+.autorun--on {
+  border-color: var(--h-accent);
+  color: var(--h-accent);
+}
+
+.autorun--on .autorun__dot {
+  background: var(--h-accent);
 }
 
 .composer:focus-within {
