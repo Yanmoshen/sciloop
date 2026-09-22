@@ -10,90 +10,41 @@ metadata:
 stage: experiment
 source: K-Dense-AI/scientific-agent-skills/skills/uncertainty-and-units
 steps:
-- id: audit_units
-  title: audit units
+- id: audit
+  title: 审计源码里的单位写法
   script: scripts/audit_units.py
   args:
-  - '{{in}}'
   - --input
-  - --fail-on
+  - '{{project_dir}}/server/services/skills/registry.py'
   - --format
+  - markdown
   - --output
+  - '{{out}}/units-audit.md'
   - --force
+  - --fail-on
+  - none
   outputs:
-  - '{{out}}/output'
+  - units-audit.md
   required: false
-- id: check_plausibility
-  title: check plausibility
+- id: plausibility
+  title: 量级合理性检查
   script: scripts/check_plausibility.py
   args:
-  - '{{in}}'
   - --quantity
-  - --group
-  - --scale
+  - diameter=15 um
   - --band
-  - --list
-  - --fail-on
-  outputs:
-  - '{{out}}/output'
-  required: false
-- id: convert_units
-  title: convert units
-  script: scripts/convert_units.py
-  args:
-  - '{{in}}'
-  - --value
-  - --unit
-  - --to
-  - --uncertainty
-  - --context
-  - --context-parameter
-  outputs:
-  - '{{out}}/output'
-  required: false
-- id: format_result
-  title: format result
-  script: scripts/format_result.py
-  args:
-  - '{{in}}'
-  - --value
-  - --uncertainty
-  - --unit
-  - --significant-digits
-  - --rounding
-  - --coverage-factor
-  outputs:
-  - '{{out}}/output'
-  required: false
-- id: propagate_uncertainty
-  title: propagate uncertainty
-  script: scripts/propagate_uncertainty.py
-  args:
-  - '{{in}}'
-  - --expression
-  - --variable
-  - --correlation
-  - --spec
-  - --measurand
-  - --unit
-  outputs:
-  - '{{out}}/output'
-  required: false
-- id: uncertainty_budget
-  title: uncertainty budget
-  script: scripts/uncertainty_budget.py
-  args:
-  - '{{in}}'
-  - --spec
-  - --template
-  - --coverage
+  - eukaryotic_cell_diameter=diameter
   - --format
+  - markdown
   - --output
+  - '{{out}}/plausibility.md'
   - --force
+  - --fail-on
+  - none
   outputs:
-  - '{{out}}/output'
-  required: false
-steps_note: auto（由脚本的 argparse 推导，演示用的技能会手工校准）
+  - plausibility.md
+  required: true
+steps_note: 手工校准（2026-09-23）：自动推导的 args 是猜的，真跑会报参数错
 ---
 
 

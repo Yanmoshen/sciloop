@@ -66,6 +66,29 @@ def python_bin() -> str:
     return (os.environ.get(PYTHON_ENV) or "python").strip() or "python"
 
 
+#: 产物目录的**卷映射**：容器 `<container>` ←→ 宿主 `<host_root>/<host_suffix>`
+#: （compose：`./.data/artifacts:/app/server/.cache/artifacts`）
+HOST_ARTIFACT_SUFFIX = Path(".data") / "artifacts"
+
+
+def host_mirror(container_path: Path | str, *, host_root: str | None) -> Path | None:
+    """把**容器里的产物路径**换成**宿主上的同一路径**。
+
+    ⚠️ 不加这一步，脚本在宿主上跑时会拿到 `/app/server/...` 这种路径 → "工作目录不存在"（实测踩过）。
+    拿不到宿主根就返回 None，由调用方决定怎么办（**不猜**）。
+    """
+
+    if not host_root:
+        return None
+    path = Path(container_path)
+    container_root = default_artifact_root()
+    try:
+        relative = path.resolve().relative_to(container_root.resolve())
+    except ValueError:
+        return None
+    return Path(host_root) / HOST_ARTIFACT_SUFFIX / relative
+
+
 def _safe(value: str) -> str:
     """把技能名/主题收成安全的目录名（中文保留，其余危险字符换掉）。"""
 
@@ -243,12 +266,15 @@ async def run_skill(
         return result
 
     project = project_dir or str(info.get("default_cwd") or host_root or "")
+    # ⚠️ 给脚本的参数必须是**宿主路径**（脚本在宿主上跑）；读产物仍用容器路径（卷映射，同一份文件）
+    host_work = host_mirror(work_dir, host_root=host_root) or work_dir
+    host_out = host_mirror(base, host_root=host_root) or base
     plan = plan_commands(
         pack,
         topic=topic,
         host_dir=host_dir,
-        work_dir=work_dir,
-        out_dir=base,
+        work_dir=host_work,
+        out_dir=host_out,
         project_dir=project,
         task_id=task_id,
     )
@@ -257,7 +283,7 @@ async def run_skill(
     def run_one(argv: list[str], step_timeout: int) -> Any:
         if executor is not None:
             return executor(argv=argv, cwd=str(work_dir), timeout_s=step_timeout)
-        return host_runner.call_exec(argv=argv, cwd=str(work_dir), timeout_s=step_timeout)
+        return host_runner.call_exec(argv=argv, cwd=str(host_work), timeout_s=step_timeout)
 
     before = {path.name for path in work_dir.rglob("*") if path.is_file()}
     ok_all = True
@@ -281,7 +307,7 @@ async def run_skill(
                 title=step.title,
                 script=step.script,
                 argv=item["argv"],
-                cwd=str(work_dir),
+                cwd=str(host_work),
                 ok=step_ok,
                 exit_code=int(exit_code) if isinstance(exit_code, int) else None,
                 stdout=stdout,
