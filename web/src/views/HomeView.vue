@@ -23,10 +23,12 @@ import { humanError, writeDenied } from '@/utils/messages'
 import { useRoute, useRouter } from 'vue-router'
 
 import { fetchAccessMode, isApprovalCard, setAccessMode, streamApprovalDecision, streamChatHome } from '@/api/chat'
+import { searchReportOf } from '@/api/chat'
 import type {
   ApprovalCard,
   ApprovalDecision,
   ChatBlock,
+  SearchReport as SearchReportData,
   StreamDone,
   StreamHandlers,
   TurnRow,
@@ -34,6 +36,7 @@ import type {
 import { ApiError } from '@/api/client'
 import { getConversation } from '@/api/conversations'
 import MarkdownText from '@/components/MarkdownText.vue'
+import SearchReport from '@/components/SearchReport.vue'
 import ConfirmDialog from '@/components/home/ConfirmDialog.vue'
 import ResearchFlowDrawer from '@/components/home/ResearchFlowDrawer.vue'
 import ProjectCreateDialog from '@/components/ProjectCreateDialog.vue'
@@ -542,6 +545,17 @@ function approvalCommand(preview: string): string {
  * 「已经批完/拒完」的过程行 —— 不在正文里显示（研究者 2026-09-22：
  * 批准之后不需要再输出一句"已批准"）。判定只认这几种固定话术，不影响真正的执行结果行。
  */
+
+/**
+ * 这一行有没有联网检索结果要展示。
+ *
+ * 两种形态都认：**对话侧**是工具行上挂了 `search`；**节点侧**是整行 `kind="search"`。
+ * 面板放在消息流里、这一轮的下方 —— 研究者 2026-09-22 定的版面。
+ */
+function searchReportFor(row: TurnRow): SearchReportData | null {
+  return isApprovalCard(row) ? null : searchReportOf(row)
+}
+
 function isSettledApprovalRow(row: TurnRow): boolean {
   if (isApprovalCard(row)) return false
   const text = (row.text ?? '').trim()
@@ -1072,8 +1086,13 @@ onUnmounted(() => {
             <template v-for="(row, rowIndex) in turn.rows" :key="rowIndex">
               <!-- 批准卡**不在正文里显示**：它贴在输入框上方（见 .approval-bar）；
                    批准/拒绝的过程也不在正文留痕（研究者 2026-09-22 定的）。 -->
+              <!-- 联网检索：折叠面板取代原来那句文字摘要（来源 · 搜索词 · 结果标题与链接） -->
+              <SearchReport
+                v-if="!isApprovalCard(row) && searchReportFor(row)"
+                :report="searchReportFor(row)!"
+              />
               <div
-                v-if="!isApprovalCard(row) && !isSettledApprovalRow(row)"
+                v-else-if="!isApprovalCard(row) && !isSettledApprovalRow(row)"
                 class="row"
                 :class="`row--${row.tone ?? 'idle'}`"
               >
@@ -1367,16 +1386,16 @@ onUnmounted(() => {
 
 <style scoped>
 .chat {
-  /* 宽度用 min(880, 100% - 60) 而不是 width:100% + max-width：
-     后者配上 margin-left 会让整列超出容器 30px（压到抽屉底下）。 */
-  width: min(880px, calc(100% - 60px));
+  /* 2026-09-22 改：这一层改为铺满内容区，列宽交给各子元素自己维持（见下面的 .chat > 规则）。
+     为什么：原来由 .chat 限宽 880 居中，滚动容器 .thread 只有 816 宽 ——
+     两侧留白落在**外壳 main.content**（不可滚）上，滚轮在那里要么没反应、要么只能靠 JS 代理
+     （量/惯性/平滑度都和原生不一致，实测"卡且每次滚的量差很多"）。
+     现在 .thread 覆盖整幅内容区，留白里的滚轮走**原生**滚动，与正文内完全一致。 */
+  width: 100%;
   display: flex;
   flex-direction: column;
   min-height: 100%;
-  padding: 64px 32px 0;
-  /* 空间够时居中；右侧抽屉越宽容器越窄 → 正文自然往左靠，但**始终保留 30px 左边距** */
-  align-self: flex-start;
-  margin-left: max(30px, calc((100% - 880px) / 2));
+  padding: 64px 0 0;
 }
 
 /* 有对话时：hero 收起，thread 吃掉剩余高度，输入栏留在文档流最后一行
@@ -1392,6 +1411,15 @@ onUnmounted(() => {
    默认可收缩会把它们压到比内容矮，配合折叠裁剪就表现为「输入框盖住开场文案」（2026-09-20 实测踩过）。 */
 .chat > .fold {
   flex: none;
+}
+
+/* 有自己外框的三块（标题区 / 审批条 / 输入栏）维持原来的 816 内容列与最小 62px 内缩；
+   滚动容器 `.thread` **不在这里** —— 它要铺满整幅（见 .thread 的 padding-inline）。 */
+.chat > .fold,
+.chat > .approval-bar,
+.chat > .composer {
+  width: min(816px, calc(100% - 124px));
+  margin-left: max(62px, calc((100% - 816px) / 2));
 }
 
 /* 只做「入场」：进入首页时逐级自下而上淡入（@keyframes rise-in 在 styles/motion.css，
@@ -1444,7 +1472,9 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: 22px;
-  padding: 18px 0 6px;
+  /* 左右内缩 = 原来的 816 内容列（宽屏居中、窄屏保底 62px），但**滚动容器本身铺满整幅** ——
+     两侧留白因此也属于它，滚轮/触控板走原生滚动，量、惯性、平滑度与正文内完全一致。 */
+  padding: 18px max(62px, calc((100% - 816px) / 2)) 6px;
 }
 
 .turn {
@@ -1534,8 +1564,11 @@ onUnmounted(() => {
   color: var(--h-fg-muted);
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 320px;
-  overflow: auto;
+  /* 思考内容**不再自带滚动条**（2026-09-22 研究者反馈）：原来这里是 max-height:320px + overflow:auto，
+     滚轮落在思考块上就被它吃掉，非要把思考划到最底才能继续往下看对话。
+     改成展开即全文铺开（overflow 用 .fold > * 的 hidden，收起时该裁掉的部分照样裁掉），
+     滚动统一交给外层对话容器 —— 鼠标在内容区任何位置（含左右两侧）都能直接滚上下文。 */
+  overflow: hidden;
 }
 
 /* ------------------------------------------------------------------ *

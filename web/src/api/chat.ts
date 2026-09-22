@@ -164,13 +164,87 @@ export type ChatBlock = ChoiceBlock | ResultBlock
 /** 过程行的语气（决定颜色，不决定语义） */
 export type SystemTone = 'idle' | 'info' | 'ok' | 'warn' | 'err'
 
+/** 联网检索的一条结果（面板只展示标题与链接，摘要留在模型那边） */
+export interface SearchHitRef {
+  title: string
+  url: string
+  source?: string
+}
+
+/**
+ * 一组检索（一个能力 + 一组关键词）。
+ *
+ * 面板的分组标题就用它拼：`arXiv · 搜「subword tokenization fairness」`
+ * —— 来源写具体、后面跟这一组**实际用的**搜索词（研究者 2026-09-22 定的口径）。
+ */
+export interface SearchGroup {
+  /** `academic` = 查学术，`web` = 搜网页 */
+  capability?: 'academic' | 'web' | string
+  query: string
+  count?: number
+  sources_used?: string[]
+  sources_failed?: Array<{ source?: string; reason?: string; detail?: string }>
+  reason?: string | null
+  results?: SearchHitRef[]
+}
+
+/** 一次检索的汇总（挂在过程行上；节点侧是整行 `kind: "search"`） */
+export interface SearchReport {
+  groups: SearchGroup[]
+  /** 收起时显示的那一行，例如 `联网搜索 · 21 条` */
+  title: string
+}
+
 /** 节点执行的紧凑系统行 */
 export interface SystemRow {
-  kind: 'system' | 'tool'
+  /**
+   * `search` = 联网检索的结构化结果行（节点侧）。
+   * 它随会话落盘，界面据此画折叠面板 —— 与批准卡同一套思路：**行即卡片**，刷新后还在。
+   */
+  kind: 'system' | 'tool' | 'search'
   /** 分类标签（节点过程行有；工具行由后端给的 text 自带工具名） */
   label?: string
   text: string
   tone?: SystemTone
+  /** 节点侧：整行就是一次检索的汇总 */
+  groups?: SearchGroup[]
+  /** 对话侧：搜索结果挂在工具行上 */
+  search?: {
+    capability?: string
+    label?: string
+    query?: string
+    count?: number
+    sources_used?: string[]
+    sources_failed?: Array<{ source?: string; reason?: string; detail?: string }>
+    reason?: string | null
+    results?: SearchHitRef[]
+  }
+}
+
+/** 这一行有没有联网检索结果要展示（两种形态都算） */
+export function searchReportOf(row: SystemRow): SearchReport | null {
+  if (row.kind === 'search' && row.groups?.length) {
+    return { groups: row.groups, title: row.text || '联网检索' }
+  }
+  const search = row.search
+  if (search && (search.query || search.results?.length)) {
+    const count = typeof search.count === 'number' ? search.count : (search.results?.length ?? 0)
+    return {
+      groups: [
+        {
+          capability: search.capability,
+          query: search.query ?? '',
+          count,
+          sources_used: search.sources_used,
+          sources_failed: search.sources_failed,
+          reason: search.reason,
+          results: search.results,
+        },
+      ],
+      title: `联网搜索 · ${count} 条`,
+    }
+  }
+  return null
 }
 
 /**
