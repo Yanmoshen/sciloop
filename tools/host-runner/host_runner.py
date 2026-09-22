@@ -84,10 +84,10 @@ def load_or_create_state(port: int) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 def run_command(
     *,
-    argv: list[str] | None,
-    command: str | None,
-    cwd: str | None,
-    timeout_s: int,
+    argv: list[str] | None = None,
+    command: str | None = None,
+    cwd: str | None = None,
+    timeout_s: int = DEFAULT_TIMEOUT_S,
     env_extra: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """执行一条命令，返回真实退出码与输出（**不美化、不伪造**）。"""
@@ -108,6 +108,15 @@ def run_command(
     if env_extra:
         env.update({str(k): str(v) for k, v in env_extra.items()})
 
+    # ⚠️ Windows 上必须显式给子进程一个**自己的（隐藏）控制台**。
+    # 实测坑：本执行器常被"没有交互式控制台"的进程拉起（计划任务 / 被别的程序 spawn），
+    # 这时再 spawn 控制台程序（git、python、whoami、连 `cmd /c ver`）会直接
+    # 以 0xC0000142（DLL 初始化失败）退出 —— 退出码看着像崩溃，实际是控制台继承不到。
+    # CREATE_NO_WINDOW = 新建一个不可见控制台，正好治这个。
+    extra: dict[str, Any] = {}
+    if os.name == "nt":
+        extra["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
     started = time.perf_counter()
     try:
         proc = subprocess.run(  # noqa: S603 - 这是执行器的本职
@@ -115,8 +124,10 @@ def run_command(
             cwd=workdir,
             env=env,
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             timeout=timeout_s,
             check=False,
+            **extra,
         )
         timed_out = False
     except subprocess.TimeoutExpired as exc:
@@ -332,11 +343,55 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200 if result.get("ok") else 400, result)
 
 
+def _selftest() -> int:
+    """自检：本机能不能正常跑命令 / 读写文件。用户排障与部署验收都用它。"""
+
+    print("SciLoop 宿主执行器 · 自检")
+    print(f"  平台：{sys.platform}  Python：{sys.version.split()[0]}")
+    print(f"  家目录：{Path.home()}")
+    print()
+
+    checks = [
+        ("跑一条最简单的命令", lambda: run_command(argv=[sys.executable, "-c", "print('ok')"], cwd=str(Path.home()), timeout_s=20)),
+        ("看当前用户是谁", lambda: run_command(command="whoami", cwd=str(Path.home()), timeout_s=20)),
+        ("看 git 能不能用", lambda: run_command(argv=["git", "--version"], cwd=str(Path.home()), timeout_s=20)),
+        ("列一下家目录", lambda: fs_action(action="list", path=str(Path.home()), to=None, content=None, encoding=None, recursive=False)),
+    ]
+    failures = 0
+    for label, call in checks:
+        try:
+            result = call()
+        except Exception as exc:  # noqa: BLE001 - 自检要把任何异常都摊开给人看
+            print(f"  ✗ {label}：抛异常 {type(exc).__name__}: {exc}")
+            failures += 1
+            continue
+        if result.get("ok"):
+            extra = (result.get("stdout") or "").strip().splitlines()
+            first = extra[0] if extra else ("目录项 %d 个" % len(result.get("children") or []))
+            print(f"  ✓ {label}：{first[:80]}")
+        else:
+            code = result.get("exit_code")
+            print(f"  ✗ {label}：{result.get('error') or ('退出码 ' + str(code))}")
+            if code == 3221225794:
+                print("      （退出码 0xC0000142 = 子进程拿不到控制台。"
+                      "把执行器从**普通终端**里启动一次通常就好了；"
+                      "被计划任务/服务拉起时请确保允许交互式进程。）")
+            failures += 1
+
+    print()
+    print("结论：" + ("全部正常，可以把它当执行器用" if failures == 0 else f"有 {failures} 项失败，见上面的原因"))
+    return 0 if failures == 0 else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="SciLoop 宿主执行器：让 SciLoop 能在你这台电脑上跑命令、读写文件")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"监听端口（默认 {DEFAULT_PORT}）")
     parser.add_argument("--print-token", action="store_true", help="只打印密钥后退出（不启动服务）")
+    parser.add_argument("--selftest", action="store_true", help="自检本机能不能跑命令、读文件后退出")
     args = parser.parse_args(argv)
+
+    if args.selftest:
+        return _selftest()
 
     state = load_or_create_state(args.port)
     token = str(state["token"])
@@ -347,6 +402,10 @@ def main(argv: list[str] | None = None) -> int:
 
     Handler.token = token
     Handler.started_at = time.time()
+
+    # 启动时先探一次"能不能起子进程"：不行就当场说清，别等用户点了半天才发现
+    probe = run_command(argv=[sys.executable, "-c", "print('ok')"], cwd=str(Path.home()), timeout_s=20)
+
     # 绑定 127.0.0.1：局域网/外网都连不上，只有本机能调
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     server.daemon_threads = True
@@ -357,6 +416,14 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  密钥文件：{STATE_FILE}")
     print(f"  把这行密钥复制到 SciLoop 的设置页：{token}")
     print("  停止：按 Ctrl+C")
+    if not probe.get("ok"):
+        print("")
+        print("⚠️ 注意：现在这台机器上起不了子进程，SciLoop 暂时没法帮你跑命令。")
+        print(f"   原因：{probe.get('error') or ('退出码 ' + str(probe.get('exit_code')))}")
+        if probe.get("exit_code") == 3221225794:
+            print("   （退出码 0xC0000142 = 子进程拿不到控制台。请把本程序改从"
+                  "普通终端窗口启动；被服务/计划任务拉起时需允许交互式进程。）")
+        print("   输入 `python tools/host-runner/host_runner.py --selftest` 可随时自查。")
     print("")
     try:
         server.serve_forever()
