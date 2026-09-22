@@ -43,7 +43,7 @@ const activeTab = ref('board')
 
 const canWrite = computed(() => session.isOwner || store.ownerWritesAllowed)
 const writeBlockReason = computed(() =>
-  canWrite.value ? null : 'public_demo 面禁止写操作（需 Owner 令牌；后端会独立校验并返回 403 owner_token_required）',
+  canWrite.value ? null : '只读浏览模式下不能改动：切换成研究者身份后可用。',
 )
 /**
  * 权限拒绝态：只读面下写入口已**前置禁用**；若本次请求确实收到 403，
@@ -53,7 +53,7 @@ const writeBlockReason = computed(() =>
 const permissionDenied = computed(() => !canWrite.value || store.errorStatus === 403)
 const permissionTitle = computed(() =>
   store.errorStatus === 403
-    ? '权限受限：该写操作已被服务端拒绝（403 owner_token_required）'
+    ? '权限受限：这个操作需要研究者身份，已切换到只读浏览模式'
     : '只读演示面：运行控制与人工介入入口已前置禁用（非请求被拒）',
 )
 const permissionNote = computed(() => {

@@ -72,7 +72,7 @@
               class="input input--mono"
               type="password"
               autocomplete="off"
-              placeholder="在此输入 OWNER_TOKEN 后才能修改配置（仅存本机 sessionStorage）"
+              placeholder="粘贴研究者密钥后即可修改配置（只保存在这台电脑上）"
               @keyup.enter="applyOwnerToken"
             />
           </div>
@@ -659,6 +659,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 
 import { ApiError } from '@/api/client'
+import { humanError } from '@/utils/messages'
 import { useDemoSession } from '@/api/demo'
 import {
   LLM_STAGES,
@@ -716,7 +717,7 @@ const demoSession = useDemoSession()
 const canWrite = computed(() => store.hasOwnerToken)
 
 const sessionPill = computed(() =>
-  demoSession.isOwner ? 'owner_mode · 写操作可用' : 'public_demo · 匿名只读',
+  demoSession.isOwner ? '研究者身份 · 可写' : '只读浏览 · 匿名',
 )
 
 /** 应用名固定为产品名（与左栏品牌一致）；版本取 `/health` 的真实响应，不在前端手写 */
@@ -724,7 +725,7 @@ const APP_NAME = 'SciLoop'
 const appVersion = computed(() => session.health?.app.version ?? '—')
 
 function describe(error: unknown): string {
-  if (error instanceof ApiError) return `${error.code}：${error.message}`
+  if (error instanceof ApiError) return humanError(error)
   return error instanceof Error ? error.message : String(error)
 }
 

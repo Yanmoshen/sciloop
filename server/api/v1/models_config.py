@@ -232,7 +232,7 @@ def _auth_error() -> Any:
         status_code=403,
         detail={
             "code": "owner_token_required",
-            "message": "该操作仅限 Owner 面（需要有效的 X-Owner-Token）",
+            "message": "这个操作需要研究者身份：当前是只读浏览模式。到「设置」里切换后重试。",
             "detail": None,
         },
     )

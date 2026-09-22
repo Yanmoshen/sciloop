@@ -74,7 +74,7 @@ function ensurePolling(): void {
 function ownerHint(error: unknown): string {
   const status = (error as { status?: number })?.status
   if (status === 403) {
-    return 'public_demo 只读面无法创建翻译任务（服务端 403）：请在「设置」页填入 OWNER_TOKEN 后重试。'
+    return '只读浏览模式下没法创建翻译任务：到「设置」里切换成研究者身份后重试。'
   }
   return error instanceof Error ? error.message : String(error)
 }

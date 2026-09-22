@@ -20,6 +20,7 @@
 import { computed, ref, watch } from 'vue'
 
 import { ApiError, createModelConfig } from '@/api/models'
+import { humanError } from '@/utils/messages'
 import PsSelect from '@/components/settings/PsSelect.vue'
 import { useSettingsStore } from '@/stores/settings'
 
@@ -71,7 +72,7 @@ watch(
 )
 
 function failure(err: unknown): string {
-  if (err instanceof ApiError) return `${err.code}：${err.message}`
+  if (err instanceof ApiError) return humanError(err)
   return err instanceof Error ? err.message : String(err)
 }
 

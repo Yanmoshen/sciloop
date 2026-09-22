@@ -33,6 +33,7 @@ import {
   syncModels as syncModelsApi,
   updateModelConfig,
 } from '@/api/models'
+import { humanError } from '@/utils/messages'
 import PsSelect from '@/components/settings/PsSelect.vue'
 import { useSettingsStore } from '@/stores/settings'
 
@@ -182,7 +183,7 @@ function resetDrafts(): void {
 watch(current, () => resetDrafts(), { immediate: true })
 
 function failure(err: unknown): string {
-  if (err instanceof ApiError) return `${err.code}：${err.message}`
+  if (err instanceof ApiError) return humanError(err)
   return err instanceof Error ? err.message : String(err)
 }
 

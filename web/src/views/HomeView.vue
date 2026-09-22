@@ -19,7 +19,7 @@
  * 中断/出错时**保留已生成部分**并在尾部如实标注，不假装完成。
  */
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { writeDenied } from '@/utils/messages'
+import { humanError, writeDenied } from '@/utils/messages'
 import { useRoute, useRouter } from 'vue-router'
 
 import { fetchAccessMode, isApprovalCard, setAccessMode, streamApprovalDecision, streamChatHome } from '@/api/chat'
@@ -470,7 +470,7 @@ function streamHandlers(assistantIndex: number, approvalIndex = assistantIndex):
     onError: (streamError) => {
       const current = target()
       if (current) current.status = 'interrupted'
-      errorText.value = `${streamError.code}：${streamError.message}`
+      errorText.value = humanError(streamError)
       void conversations.load()
     },
   }
@@ -513,7 +513,7 @@ async function runStream(
     }
     const withCode = error as { code?: string; message?: string }
     errorText.value = withCode?.message
-      ? `${withCode.code ?? 'failed'}：${withCode.message}`
+      ? humanError(withCode)
       : error instanceof Error
         ? error.message
         : String(error)
@@ -600,7 +600,7 @@ async function decideApprovalCard(card: ApprovalCard, decision: ApprovalDecision
       }
     }
     errorText.value = withCode?.message
-      ? `${withCode.code ?? 'failed'}：${withCode.message}`
+      ? humanError(withCode)
       : error instanceof Error
         ? error.message
         : String(error)

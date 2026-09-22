@@ -19,12 +19,30 @@
 
 /** 只读面（浏览模式）统一说法：说清"发生了什么 + 你能做什么" */
 export function writeDenied(action: string): string {
-  return `当前为浏览模式，${action}需要先在「设置」里启用编辑（填入 Owner 令牌）。`
+  return `当前是只读浏览模式，${action}需要先到「设置」里切换成研究者身份。`
 }
 
 /** 只读面短标签（徽标 / 按钮 title 用） */
-export const READONLY_LABEL = '浏览模式'
-export const WRITABLE_LABEL = '可编辑'
+export const READONLY_LABEL = '只读浏览'
+export const WRITABLE_LABEL = '研究者身份'
+
+/** 需要研究者身份时的那句人话（**不出现任何内部标识**） */
+export const NEED_OWNER_HINT =
+  '当前是只读浏览模式，这个操作需要研究者身份：到「设置」里切换后重试。'
+
+/**
+ * 把一次失败翻译成人话。
+ *
+ * ⚠️ 为什么不再拼 `code：message`：那会把 `owner_token_required` / `public_demo`
+ * 这类内部标识直接摆到研究者眼前（实测被模拟测试抓到过）。
+ * 这里按**错误码**给一句人话；其余情况用后端给的说明，但绝不附内部码。
+ */
+export function humanError(error: { code?: string; message?: string } | null | undefined): string {
+  const code = error?.code ?? ''
+  if (code === 'owner_token_required' || code === 'public_demo_readonly') return NEED_OWNER_HINT
+  const message = (error?.message ?? '').trim()
+  return message || '这次操作没有成功，请稍后再试。'
+}
 
 /** 实时连接状态的人话（SSE → 实时进度） */
 export function liveStatus(state: string): string {

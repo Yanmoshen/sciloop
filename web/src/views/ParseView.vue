@@ -420,7 +420,7 @@ async function rebuild(): Promise<void> {
   } catch (error) {
     if (error instanceof ApiError && error.isForbidden) {
       rebuildError.value =
-        '重新解析需要 Owner 令牌（X-Owner-Token）：当前为 public_demo 只读面，写操作被拒绝（403 owner_token_required）'
+        '重新解析需要研究者身份：当前是只读浏览模式，写操作会被服务端拒绝。'
     } else if (error instanceof ApiError) {
       rebuildError.value = `重新解析失败（${error.code}）：${error.message}`
     } else {
@@ -444,7 +444,7 @@ async function retryAll(): Promise<void> {
 async function retryCard(): Promise<void> {
   if (cardMissing.value) {
     notice.value = rebuildDenied.value
-      ? '该论文尚无解析卡片；建卡属 Owner 写操作，当前为 public_demo 只读面（403 owner_token_required）'
+      ? '这篇论文还没有解析卡片；建卡需要研究者身份，当前是只读浏览模式。'
       : '该论文尚无解析卡片：可点击右上角「解析并重建卡片」生成 version=1'
     return
   }
@@ -497,7 +497,7 @@ onMounted(() => {
           :content="
             session.isOwner
               ? 'force=true：生成 version+1 的新卡片，旧版本保留'
-              : 'public_demo 只读面不允许写操作：需 Owner 令牌'
+              : '只读浏览模式下不能写入：请先切换成研究者身份'
           "
           placement="bottom"
           :enterable="true"

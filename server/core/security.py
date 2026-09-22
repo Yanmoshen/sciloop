@@ -28,7 +28,7 @@ logger = logging.getLogger("sciloop.security")
 OWNER_HEADER = "X-Owner-Token"
 
 
-def _deny(message: str = "该操作仅限 Owner 面（需要有效的 X-Owner-Token）") -> HTTPException:
+def _deny(message: str = "这个操作需要研究者身份：当前是只读浏览模式。到「设置」里切换后重试。") -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_403_FORBIDDEN,
         detail={"code": "owner_token_required", "message": message, "detail": None},

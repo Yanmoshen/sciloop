@@ -91,7 +91,7 @@ async def owner_verify(_: OwnerDep) -> dict[str, Any]:
         "ok": True,
         "is_owner": True,
         "access_mode": state["access_mode"],
-        "message": "X-Owner-Token 有效：写操作可用（审计由服务端日志留痕）",
+        "message": "研究者身份已启用：现在可以修改配置了（改动会留痕）。",
     }
 
 

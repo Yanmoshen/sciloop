@@ -565,7 +565,7 @@ async function retryFetch(): Promise<void> {
   if (!result.ok) {
     ElMessage.warning(
       result.status === 403
-        ? 'public_demo 只读面无法触发抓取（服务端 403）：请在「设置」页填入 OWNER_TOKEN 后重试。'
+        ? '现在是只读浏览模式，没法在服务端触发抓取：到「设置」里切换成研究者身份后就能用。'
         : (result.message ?? '触发抓取失败'),
     )
   }
@@ -1388,7 +1388,7 @@ onUnmounted(() => {
             <button class="menu__item" type="button" role="menuitem" @click="openSettings">设置</button>
             <div class="menu__sep" />
             <div class="menu__meta">
-              {{ session.isOwner ? 'owner_mode（可写）' : 'public_demo（只读）' }}
+              {{ session.isOwner ? '研究者身份（可写）' : '只读浏览' }}
             </div>
           </div>
         </div>
