@@ -53,6 +53,14 @@ MAX_OUTPUT_CHARS = 200_000
 STATE_DIR = Path.home() / ".sciloop"
 STATE_FILE = STATE_DIR / "host-runner.json"
 
+#: 本脚本所在的 SciLoop 代码树根（`<repo>/tools/host-runner/host_runner.py` → `<repo>`）。
+#: 它会随 `/health` 一起报给后端 —— 后端跑在容器里、只知道容器视角的路径，
+#: 必须由执行器告诉它"宿主上这个目录是哪儿"，否则"删代码=硬拒"这条边界会失效。
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+#: 研究工作项目的默认根目录（新建项目时在这里建目录；用户选本地文件夹时不受它限制）
+PROJECT_ROOT = REPO_ROOT / "research-workspaces"
+
 
 # --------------------------------------------------------------------------- #
 # 状态：密钥与端口（写在用户主目录，不放在仓库里）
@@ -251,6 +259,17 @@ def fs_action(*, action: str, path: str, to: str | None, content: str | None,
     return {"ok": False, "error": f"不支持的动作：{action}"}
 
 
+def _say(text: str = "") -> None:
+    """启动横幅专用输出：**行缓冲**。
+
+    为什么单独包一层：Python 的 stdout 在"输出被重定向/非终端"时是**块缓冲**，
+    启动横幅会一直不显示 —— 用户以为程序没跑起来（我自己就被骗过一次：
+    后台启动的执行器其实活着，但一行输出都看不到）。这里强制 flush。
+    """
+
+    print(text, flush=True)
+
+
 def _clip(text: str) -> str:
     if len(text) <= MAX_OUTPUT_CHARS:
         return text
@@ -268,6 +287,7 @@ class Handler(BaseHTTPRequestHandler):
     # 默认的日志会把每条请求打到 stderr；保留一行简版，方便用户看"后端有没有连上来"
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
         sys.stderr.write("[host-runner] %s - %s\n" % (self.address_string(), fmt % args))
+        sys.stderr.flush()
 
     # -- 工具 ------------------------------------------------------------- #
     def _send(self, code: int, payload: dict[str, Any]) -> None:
@@ -296,7 +316,8 @@ class Handler(BaseHTTPRequestHandler):
     # -- 路由 ------------------------------------------------------------- #
     def do_GET(self) -> None:  # noqa: N802 - http.server 的约定
         if self.path.rstrip("/") == "/health":
-            # health 故意不需要密钥：后端用它判断"执行器在不在"，好给用户一句人话提示
+            # health 故意不需要密钥：后端用它判断"执行器在不在"，好给用户一句人话提示，
+            # 顺便把**宿主视角的路径**告诉后端（它自己看不到宿主文件系统）。
             self._send(
                 200,
                 {
@@ -307,6 +328,9 @@ class Handler(BaseHTTPRequestHandler):
                     "python": sys.version.split()[0],
                     "uptime_s": int(time.time() - self.started_at),
                     "home": str(Path.home()),
+                    "host_root": str(REPO_ROOT),
+                    "project_roots": [str(PROJECT_ROOT)],
+                    "default_cwd": str(PROJECT_ROOT),
                 },
             )
             return
@@ -341,6 +365,19 @@ class Handler(BaseHTTPRequestHandler):
                 recursive=bool(body.get("recursive")),
             )
         self._send(200 if result.get("ok") else 400, result)
+
+
+class Server(ThreadingHTTPServer):
+    """不许两个实例抢同一个端口。
+
+    ⚠️ 实测坑：`HTTPServer` 默认 `allow_reuse_address = True`，在 Windows 上于是
+    **第二个实例也能绑定成功**（不报错），请求随机落到其中一个上 ——
+    用户会看到"我刚改的配置没生效"这种极难查的现象（我自己就踩了：4 个旧实例同时占着端口，
+    新实例的 /health 永远被旧实例抢答）。这里显式关掉，撞端口就明确失败。
+    """
+
+    allow_reuse_address = False
+    daemon_threads = True
 
 
 def _selftest() -> int:
@@ -393,6 +430,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.selftest:
         return _selftest()
 
+    # 研究工作项目的根目录先建好：模型"没有特别指定目录"时就在这儿干活
+    try:
+        PROJECT_ROOT.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:  # pragma: no cover - 权限异常时只说一声，不让启动失败
+        print(f"（提示：没能创建 {PROJECT_ROOT}：{exc}）")
+
     state = load_or_create_state(args.port)
     token = str(state["token"])
 
@@ -407,24 +450,34 @@ def main(argv: list[str] | None = None) -> int:
     probe = run_command(argv=[sys.executable, "-c", "print('ok')"], cwd=str(Path.home()), timeout_s=20)
 
     # 绑定 127.0.0.1：局域网/外网都连不上，只有本机能调
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    server.daemon_threads = True
-
-    print("")
-    print("SciLoop 宿主执行器已启动（保持这个窗口开着）")
-    print(f"  监听地址：http://127.0.0.1:{args.port}（只有本机能访问）")
-    print(f"  密钥文件：{STATE_FILE}")
-    print(f"  把这行密钥复制到 SciLoop 的设置页：{token}")
-    print("  停止：按 Ctrl+C")
-    if not probe.get("ok"):
+    try:
+        server = Server(("127.0.0.1", args.port), Handler)
+    except OSError as exc:
         print("")
-        print("⚠️ 注意：现在这台机器上起不了子进程，SciLoop 暂时没法帮你跑命令。")
-        print(f"   原因：{probe.get('error') or ('退出码 ' + str(probe.get('exit_code')))}")
+        print(f"启动失败：端口 {args.port} 已经被占用了（{exc}）。")
+        print("通常说明已经有一个执行器在跑 —— 先关掉它，或者换一个端口：")
+        print(f"    python tools/host-runner/host_runner.py --port {args.port + 1}")
+        print("")
+        return 2
+
+    # 启动时先探一次"能不能起子进程"：不行就当场说清，别等用户点了半天才发现。
+    # 超时给 5 秒就够（正常是毫秒级）；探测卡住不该拖着用户看不到启动横幅。
+    probe = run_command(argv=[sys.executable, "-c", "print('ok')"], cwd=str(Path.home()), timeout_s=5)
+    _say("")
+    _say("SciLoop 宿主执行器已启动（保持这个窗口开着）")
+    _say(f"  监听地址：http://127.0.0.1:{args.port}（只有本机能访问）")
+    _say(f"  密钥文件：{STATE_FILE}")
+    _say(f"  把这行密钥复制到 SciLoop 的设置页：{token}")
+    _say("  停止：按 Ctrl+C")
+    if not probe.get("ok"):
+        _say("")
+        _say("⚠️ 注意：现在这台机器上起不了子进程，SciLoop 暂时没法帮你跑命令。")
+        _say(f"   原因：{probe.get('error') or ('退出码 ' + str(probe.get('exit_code')))}")
         if probe.get("exit_code") == 3221225794:
-            print("   （退出码 0xC0000142 = 子进程拿不到控制台。请把本程序改从"
-                  "普通终端窗口启动；被服务/计划任务拉起时需允许交互式进程。）")
-        print("   输入 `python tools/host-runner/host_runner.py --selftest` 可随时自查。")
-    print("")
+            _say("   （退出码 0xC0000142 = 子进程拿不到控制台。请把本程序改从"
+                 "普通终端窗口启动；被服务/计划任务拉起时需允许交互式进程。）")
+        _say("   输入 `python tools/host-runner/host_runner.py --selftest` 可随时自查。")
+    _say("")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

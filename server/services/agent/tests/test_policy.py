@@ -58,6 +58,50 @@ def test_host_root_is_also_recognised(monkeypatch: pytest.MonkeyPatch, tmp_path:
 
 
 # --------------------------------------------------------------------------- #
+# 执行器报上来的宿主路径（跨机器可移植的关键）
+# --------------------------------------------------------------------------- #
+def test_learned_host_root_wins_over_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """执行器自报的路径优先级最高 —— 换机器/换盘符都不用改配置。"""
+
+    policy.clear_host_roots()
+    fake_repo = tmp_path / "some-other-drive" / "sciloop"
+    (fake_repo / "web").mkdir(parents=True)
+    monkeypatch.setenv(policy.HOST_ROOT_ENV, "Z:/wrong-place")
+
+    policy.set_host_roots(host_root=fake_repo, project_roots_learned=[fake_repo / "research-workspaces"])
+
+    assert policy.classify_layer(fake_repo / "web" / "app.ts") == policy.LAYER_SCILOOP
+    assert policy.classify_layer(fake_repo / "research-workspaces" / "p1" / "a.csv") == policy.LAYER_PROJECT
+    assert policy.learned_host_root() == str(fake_repo)
+    policy.clear_host_roots()
+
+
+def test_windows_path_forms_are_normalised(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """反斜杠 vs 正斜杠、大小写不同，都必须判成同一个位置。
+
+    实测必要性：执行器在 Windows 上自报 `D:\\\\aicoding竞赛`，而模型给的参数可能是
+    `D:/aicoding竞赛/...` 或是把盘符写成小写 —— 直接比字符串会全部漏判。
+    """
+
+    policy.clear_host_roots()
+    monkeypatch.setenv(policy.HOST_ROOT_ENV, "D:/MyRepo")
+    monkeypatch.setenv(policy.PROJECT_ROOTS_ENV, "D:/MyRepo/research-workspaces")
+
+    for candidate in (
+        "D:\\MyRepo\\web\\src\\main.ts",
+        "d:/myrepo/web/src/main.ts",
+        "D:/MyRepo/./web/src/main.ts",
+    ):
+        assert policy.classify_layer(candidate) == policy.LAYER_SCILOOP, candidate
+
+    # `..` 也要折叠：从项目里往上跳回代码树，仍然是代码树
+    assert (
+        policy.classify_layer("D:/MyRepo/research-workspaces/p1/../p1/a.csv") == policy.LAYER_PROJECT
+    )
+    assert policy.classify_layer("D:/MyRepo/research-workspaces/../web/x.ts") == policy.LAYER_SCILOOP
+
+
+# --------------------------------------------------------------------------- #
 # 分层
 # --------------------------------------------------------------------------- #
 def test_layers(project_dir: Path) -> None:
@@ -65,6 +109,23 @@ def test_layers(project_dir: Path) -> None:
     assert policy.classify_layer(root / "server" / "main.py") == policy.LAYER_SCILOOP
     assert policy.classify_layer(project_dir / "p1" / "data.csv") == policy.LAYER_PROJECT
     assert policy.classify_layer(Path("/tmp/somewhere-else.txt")) == policy.LAYER_OTHER
+
+
+def test_project_dir_nested_in_code_tree_is_still_project(monkeypatch: pytest.MonkeyPatch) -> None:
+    """⚠️ 默认项目根**嵌在代码树里**（`<repo>/research-workspaces`）。
+
+    这是顺序问题不是小事：先判代码树的话，删自己项目里的数据会被当成"删代码"→ 硬拒，
+    研究者在自己的项目里反而什么都清理不了。所以项目层必须先判。
+    """
+
+    monkeypatch.delenv(policy.PROJECT_ROOTS_ENV, raising=False)
+    policy.clear_host_roots()
+    nested = policy.sciloop_root() / policy.DEFAULT_PROJECT_DIRNAME / "p1" / "tmp.bin"
+    assert policy.classify_layer(nested) == policy.LAYER_PROJECT, (
+        "嵌在代码树里的项目目录，必须先被认成项目层"
+    )
+    verdict = policy.judge_fs(action="delete", path=nested)
+    assert verdict.needs_approval and not verdict.forbidden
 
 
 def test_relative_path_uses_workdir(project_dir: Path) -> None:

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -44,11 +45,15 @@ __all__ = [
     "LAYER_SCILOOP",
     "Verdict",
     "classify_layer",
+    "clear_host_roots",
     "judge_command",
     "judge_fs",
     "judge_sql",
+    "learned_host_root",
     "project_roots",
     "sciloop_root",
+    "sciloop_roots",
+    "set_host_roots",
 ]
 
 DECISION_ALLOW = "allow"
@@ -83,6 +88,10 @@ HOST_ROOT_ENV = "SCILOOP_HOST_ROOT"
 #: 高危清单里的"覆盖"落在**研究工作项目**里（那里的文件是研究数据，覆盖不可逆）。
 SCILOOP_OVERWRITE_NEEDS_APPROVAL = False
 
+#: 执行器在 `/health` 里报上来的宿主路径（运行期学习，优先级最高）。
+#: 它是"跨机器可移植"的关键：盘符/家目录都由执行器自报，不在配置里写死。
+_LEARNED: dict[str, tuple[Path, ...]] = {}
+
 
 # --------------------------------------------------------------------------- #
 # 边界：哪些路径属于哪一层
@@ -94,54 +103,109 @@ def sciloop_root() -> Path:
 
 
 def sciloop_roots() -> tuple[Path, ...]:
-    """代码树的根，容器视角 + 宿主视角（宿主视角由环境变量给，可能为空）。"""
+    """代码树的根：**执行器告知的宿主路径** > 环境变量 > 容器/进程视角。"""
 
-    roots = [sciloop_root()]
+    roots: list[Path] = list(_LEARNED.get("sciloop", ()))
     raw = os.environ.get(HOST_ROOT_ENV, "").strip()
     if raw:
-        roots.append(_resolve(raw))
+        roots.append(Path(raw))
+    roots.append(sciloop_root())
     return tuple(roots)
 
 
 def project_roots() -> tuple[Path, ...]:
-    """研究工作项目的根目录们（环境变量优先，默认项目根下 `research-workspaces`）。"""
+    """研究工作项目的根目录们：**执行器告知的宿主路径** > 环境变量 > 默认目录。"""
 
+    learned = list(_LEARNED.get("project", ()))
+    if learned:
+        return tuple(learned)
     raw = os.environ.get(PROJECT_ROOTS_ENV, "").strip()
     if raw:
-        roots = [Path(item.strip()).expanduser() for item in raw.split(",") if item.strip()]
-    else:
-        roots = [sciloop_root() / DEFAULT_PROJECT_DIRNAME]
-    return tuple(roots)
+        return tuple(Path(item.strip()).expanduser() for item in raw.split(",") if item.strip())
+    return (sciloop_root() / DEFAULT_PROJECT_DIRNAME,)
 
 
-def _resolve(path: str | Path, *, base: str | Path | None = None) -> Path:
-    """把可能相对的路径解成绝对路径（相对路径按 base，默认当前目录）。"""
+def set_host_roots(
+    *,
+    host_root: str | Path | None = None,
+    project_roots_learned: Sequence[str | Path] = (),
+) -> None:
+    """记录执行器报上来的宿主路径（`/health` 里带回）。
 
-    candidate = Path(str(path)).expanduser()
-    if not candidate.is_absolute():
-        candidate = Path(base) / candidate if base else Path.cwd() / candidate
-    try:
-        return candidate.resolve()
-    except OSError:  # pragma: no cover - 极少数平台会因权限抛错
-        return candidate
+    为什么由执行器来报：后端跑在容器里，它**看不到宿主的路径长什么样**；
+    而"删 SciLoop 自己的代码 = 硬拒"这条边界必须用宿主真实路径才判得出来。
+    让执行器自报（它知道自己在哪）比在编排文件里写死一个盘符更稳 ——
+    换机器、换盘符都不用改配置。
+    """
+
+    if host_root:
+        _LEARNED["sciloop"] = (Path(str(host_root)),)
+    if project_roots_learned:
+        _LEARNED["project"] = tuple(Path(str(item)) for item in project_roots_learned if str(item).strip())
 
 
-def _inside(child: Path, parent: Path) -> bool:
-    try:
-        return child == parent or child.is_relative_to(parent)
-    except (OSError, ValueError):  # pragma: no cover
+def clear_host_roots() -> None:
+    """忘掉学到的宿主路径（执行器换机器/测试隔离用）。"""
+
+    _LEARNED.clear()
+
+
+def learned_host_root() -> str | None:
+    roots = _LEARNED.get("sciloop") or ()
+    return str(roots[0]) if roots else None
+
+
+def _norm(path: str | Path, *, base: str | Path | None = None) -> str:
+    """把路径归一成可跨平台比较的字符串键。
+
+    为什么不用 `Path.resolve()`：
+    - 判断跑在**容器**（Linux）里，而路径是**宿主**路径（`D:/aicoding竞赛/...`）——
+      `resolve()` 在 Linux 下会把它当成相对路径拼到 cwd 上，两边拼法一不一致就判错；
+    - Windows 路径大小写不敏感、`/` 与 `\\` 混用，直接比字符串会漏。
+
+    归一规则：反斜杠转正斜杠 → 相对路径按 base 补全 → 折叠 `.` 与 `..` →
+    去掉末尾斜杠 → **统一小写**。判"在不在里面"只认这个键的前缀关系。
+    """
+
+    text = str(path).strip().strip('"').strip("'").replace("\\", "/")
+    absolute = bool(re.match(r"^([A-Za-z]:|/)", text))
+    if base is not None and not absolute:
+        text = f"{str(base).strip().replace(chr(92), '/')}/{text}"
+    root = "/" if text.startswith("/") else ""
+    parts: list[str] = []
+    for piece in text.split("/"):
+        if piece in ("", "."):
+            continue
+        if piece == ".." and parts and parts[-1] != "..":
+            parts.pop()
+            continue
+        parts.append(piece)
+    return (root + "/".join(parts)).rstrip("/").casefold()
+
+
+def _inside(child: str, parent: str) -> bool:
+    """child 是否就是 parent、或在 parent 里面（两者都已归一）。"""
+
+    if not parent:
         return False
+    return child == parent or child.startswith(f"{parent}/")
 
 
 def classify_layer(path: str | Path, *, base: str | Path | None = None) -> str:
-    """一个路径属于哪一层（先判代码树，再判项目，最后归"其他地方"）。"""
+    """一个路径属于哪一层。
 
-    target = _resolve(path, base=base)
-    if any(_inside(target, root) for root in sciloop_roots()):
-        return LAYER_SCILOOP
+    ⚠️ **必须先判"研究工作项目"，再判代码树**（顺序是有原因的，不是随手写的）：
+    默认的项目根 `<代码树>/research-workspaces` 就**嵌在代码树里面**。
+    先判代码树的话，删自己项目里的数据会被当成"删代码"→ **硬拒**（本意是"弹卡待批准"），
+    研究者在自己的项目里反而什么都清理不了 —— 边界判反了比不判还糟。
+    """
+
+    target = _norm(path, base=base)
     for root in project_roots():
-        if _inside(target, _resolve(root)):
+        if _inside(target, _norm(root)):
             return LAYER_PROJECT
+    if any(_inside(target, _norm(root)) for root in sciloop_roots()):
+        return LAYER_SCILOOP
     return LAYER_OTHER
 
 

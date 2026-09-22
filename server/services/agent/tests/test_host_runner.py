@@ -131,3 +131,54 @@ def test_runner_does_not_read_token_from_repo(monkeypatch: pytest.MonkeyPatch) -
     assert host_runner.runner_token() == ""
     monkeypatch.setenv(host_runner.TOKEN_ENV, " abc ")
     assert host_runner.runner_token() == "abc"
+
+
+# --------------------------------------------------------------------------- #
+# 宿主路径的学习（跨机器可移植的关键）
+# --------------------------------------------------------------------------- #
+def test_ensure_host_roots_teaches_the_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """执行器自报的路径要真的落到裁决层，且默认工作目录跟着来。"""
+
+    host_runner.forget_host_roots()
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(
+            200,
+            json={
+                "ok": True,
+                "host_root": "D:/somewhere-else/sciloop",
+                "project_roots": ["D:/somewhere-else/sciloop/research-workspaces"],
+                "default_cwd": "D:/somewhere-else/sciloop/research-workspaces",
+            },
+        )
+
+    client = _client(handler)
+    try:
+        info = asyncio.run(host_runner.ensure_host_roots(client=client))
+        assert info["host_root"] == "D:/somewhere-else/sciloop"
+        # 裁决层立刻认识这个宿主路径
+        assert (
+            host_runner.policy.classify_layer("D:/somewhere-else/sciloop/web/a.ts")
+            == host_runner.policy.LAYER_SCILOOP
+        )
+        assert asyncio.run(host_runner.default_cwd(client=client)) == info["default_cwd"]
+
+        # 第二次走缓存，不再问执行器（省一次往返）
+        asyncio.run(host_runner.ensure_host_roots(client=client))
+        assert calls["n"] == 1
+    finally:
+        host_runner.forget_host_roots()
+
+
+def test_ensure_host_roots_is_silent_when_runner_is_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    host_runner.forget_host_roots()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    client = _client(handler)
+    assert asyncio.run(host_runner.ensure_host_roots(client=client)) == {}
+    assert asyncio.run(host_runner.is_connected(client=client)) is False
+    assert asyncio.run(host_runner.default_cwd(client=client)) is None

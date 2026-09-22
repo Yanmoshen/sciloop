@@ -180,6 +180,16 @@ async def tool_schemas() -> list[dict[str, Any]]:
 
     schemas: list[dict[str, Any]] = _json.loads(_json.dumps(_HOST_TOOL_SCHEMAS))
 
+    # 把"你在这台电脑上的默认工作目录"写进工具描述：模型据此决定要不要显式指定目录，
+    # 也免得它去猜容器里的路径（容器路径在宿主上根本不存在）。
+    default_dir = await host_runner.default_cwd()
+    if default_dir:
+        for item in schemas:
+            function = item["function"]
+            function["description"] = (
+                f"{function['description']} 你在这台电脑上的默认工作目录是 {default_dir}。"
+            )
+
     from mcp_server.client import list_tools
 
     wanted = set(AUTONOMOUS_TOOLS) | set(APPROVABLE_TOOLS)
@@ -221,12 +231,15 @@ async def judge(call: dict[str, Any]) -> policy.Verdict:
     args = arguments_of(call)
 
     if name == "run_on_computer":
+        # 先确保裁决层知道宿主路径（删代码=硬拒要靠它）；拿不到也不拦着走流程
+        await host_runner.ensure_host_roots()
         argv = args.get("argv") if isinstance(args.get("argv"), list) else None
         command = args.get("command") if isinstance(args.get("command"), str) else None
         cwd = args.get("cwd") if isinstance(args.get("cwd"), str) else None
         return policy.judge_command(argv=argv, command=command, cwd=cwd)
 
     if name == "files_on_computer":
+        await host_runner.ensure_host_roots()
         action = str(args.get("action") or "")
         path = str(args.get("path") or "")
         recursive = bool(args.get("recursive"))
@@ -388,10 +401,13 @@ async def run_tool_call(
             )
         if name == "run_on_computer":
             argv = arguments.get("argv") if isinstance(arguments.get("argv"), list) else None
+            raw_cwd = arguments.get("cwd") if isinstance(arguments.get("cwd"), str) else None
+            # 模型没说在哪儿跑 → 用研究者电脑上的研究项目目录（不是容器里的沙箱）
+            cwd = raw_cwd or await host_runner.default_cwd()
             result = await host_runner.call_exec(
                 argv=argv,
                 command=arguments.get("command") if isinstance(arguments.get("command"), str) else None,
-                cwd=arguments.get("cwd") if isinstance(arguments.get("cwd"), str) else None,
+                cwd=cwd,
                 timeout_s=int(arguments.get("timeout_s") or 120),
             )
         else:

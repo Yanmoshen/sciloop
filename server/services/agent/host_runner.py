@@ -23,18 +23,24 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import httpx
+
+from services.agent import policy
 
 __all__ = [
     "DEFAULT_URL",
     "START_HINT",
     "call_exec",
     "call_fs",
+    "default_cwd",
+    "ensure_host_roots",
     "health",
-    "runner_url",
+    "is_connected",
     "runner_token",
+    "runner_url",
 ]
 
 #: 容器里访问宿主的默认地址（Linux 下由 compose 的 extra_hosts 提供同名映射）
@@ -42,6 +48,10 @@ DEFAULT_URL = "http://host.docker.internal:8765"
 URL_ENV = "SCILOOP_HOST_RUNNER_URL"
 TOKEN_ENV = "SCILOOP_HOST_RUNNER_TOKEN"
 DEFAULT_TIMEOUT_S = 30.0
+
+#: 宿主路径的学习缓存（`/health` 里带回；60 秒内不重复问）
+ROOT_TTL_S = 60.0
+_ROOTS: dict[str, Any] = {"at": 0.0, "info": None}
 
 #: 面向研究者的启动指引（**人话，不许出现内部术语**）
 START_HINT = (
@@ -113,6 +123,57 @@ async def _post(
     finally:
         if owns:
             await client.aclose()
+
+
+async def ensure_host_roots(*, client: httpx.AsyncClient | None = None) -> dict[str, Any]:
+    """确保裁决层知道**宿主视角的路径**（执行器自报；60 秒缓存）。
+
+    为什么必须做：裁决跑在容器里（代码树是 `/app`），而 agent 递过来的是宿主路径
+    （`D:/aicoding竞赛/web/...`）。没有宿主根，"删代码=硬拒"会退化成"弹卡"。
+    让执行器自报（它知道自己装在哪）比在编排文件里写死盘符更稳：换机器不用改配置。
+    拿不到就返回空字典 —— 这不是错误状态，只是"还没连上"。
+    """
+
+    now = time.monotonic()
+    cached = _ROOTS.get("info")
+    if cached is not None and now - float(_ROOTS.get("at") or 0.0) < ROOT_TTL_S:
+        return cached
+
+    result = await health(client=client)
+    info = result.get("info") if result.get("reachable") else None
+    if isinstance(info, dict):
+        policy.set_host_roots(
+            host_root=info.get("host_root"),
+            project_roots_learned=info.get("project_roots") or (),
+        )
+        learned: dict[str, Any] = info
+    else:
+        learned = {}
+    _ROOTS["at"] = now
+    _ROOTS["info"] = learned
+    return learned
+
+
+async def is_connected(*, client: httpx.AsyncClient | None = None) -> bool:
+    """执行器连得上吗（给设置页与对话用；不抛异常）。"""
+
+    return bool((await ensure_host_roots(client=client)).get("ok"))
+
+
+async def default_cwd(*, client: httpx.AsyncClient | None = None) -> str | None:
+    """模型没指定目录时，默认在哪儿干活（执行器报来的研究项目根目录）。"""
+
+    info = await ensure_host_roots(client=client)
+    value = info.get("default_cwd") or info.get("host_root")
+    return str(value) if value else None
+
+
+def forget_host_roots() -> None:
+    """忘掉缓存（执行器换机器、或测试隔离时用）。"""
+
+    _ROOTS["at"] = 0.0
+    _ROOTS["info"] = None
+    policy.clear_host_roots()
 
 
 async def call_exec(
