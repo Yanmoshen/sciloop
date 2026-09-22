@@ -26,7 +26,6 @@ import { fetchAccessMode, isApprovalCard, setAccessMode, streamApprovalDecision,
 import type {
   ApprovalCard,
   ApprovalDecision,
-  ApprovalStatus,
   ChatBlock,
   StreamDone,
   StreamHandlers,
@@ -356,30 +355,6 @@ function pickedModel(): PickedModel | null {
   return { configId, modelId }
 }
 
-/** 卡片终态文案：后端只回状态码，给人看的话统一在前端说 */
-const APPROVAL_STATUS_TEXT: Record<ApprovalStatus, string> = {
-  pending: '等待研究者批准',
-  approved: '已批准并执行',
-  denied: '研究者已拒绝',
-  expired: '已过期（超时未裁决）',
-}
-
-/** 卡片左上角那个徽标：**跟着状态走**，别让已批准的卡还挂着「需批准」 */
-const APPROVAL_TAG_TEXT: Record<ApprovalStatus, string> = {
-  pending: '需批准',
-  approved: '已批准',
-  denied: '已拒绝',
-  expired: '已过期',
-}
-
-/** 裁决时刻只给出「时:分」，完整时间戳留给 tooltip（界面上不摆机器格式） */
-function clockText(value?: string | null): string {
-  if (!value) return ''
-  const at = new Date(value)
-  if (Number.isNaN(at.getTime())) return ''
-  return at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-}
-
 /** 同一 request_id 只留一张卡：后端在裁决后会把**同一张卡**以新状态再发一次。 */
 function upsertApprovalRow(rows: TurnRow[], card: ApprovalCard): TurnRow[] {  const index = rows.findIndex((row) => isApprovalCard(row) && row.request_id === card.request_id)
   if (index < 0) return [...rows, card]
@@ -529,6 +504,54 @@ async function runStream(
  * **批准入口只对 Owner 开放**，与后端 Owner 校验对齐：前端这层是提前拦住，
  * 真正的边界在后端 —— 这里放行不等于后端会放行。
  */
+/**
+ * 待研究者裁决的那张卡 —— **贴在输入框上方**显示（研究者 2026-09-22：
+ * 批准不该出现在内容输出区）。批准/拒绝后它就不再是 pending，这条自然消失。
+ */
+const pendingApprovalBar = computed<{ turnIndex: number; card: ApprovalCard } | null>(() => {
+  for (let index = turns.value.length - 1; index >= 0; index -= 1) {
+    const card = (turns.value[index].rows ?? []).find(
+      (row) => isApprovalCard(row) && row.status === 'pending',
+    )
+    if (card && isApprovalCard(card)) return { turnIndex: index, card }
+  }
+  return null
+})
+
+/**
+ * 第一行只显示"要执行的东西"本身。
+ *
+ * 旧记录里存的是 `{"command": "pwd && ls"}` 这种 JSON —— 括号和键名是给机器看的，
+ * 研究者只要看到 `pwd && ls`。新记录由服务端直接给命令，这里只是兜底解包。
+ */
+function approvalCommand(preview: string): string {
+  const text = (preview ?? '').trim()
+  if (!text.startsWith('{')) return text
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>
+    const value = parsed.command ?? parsed.argv
+    if (typeof value === 'string') return value
+    if (Array.isArray(value)) return value.map((item) => String(item)).join(' ')
+  } catch {
+    // 不是 JSON 就原样显示（宁可看到原文，也不要因为解析失败而变成空白）
+  }
+  return text
+}
+
+/**
+ * 「已经批完/拒完」的过程行 —— 不在正文里显示（研究者 2026-09-22：
+ * 批准之后不需要再输出一句"已批准"）。判定只认这几种固定话术，不影响真正的执行结果行。
+ */
+function isSettledApprovalRow(row: TurnRow): boolean {
+  if (isApprovalCard(row)) return false
+  const text = (row.text ?? '').trim()
+  return (
+    text.startsWith('研究者已批准') ||
+    text.startsWith('研究者已拒绝') ||
+    text.startsWith('已允许在本对话内直接执行')
+  )
+}
+
 async function decideApprovalCard(card: ApprovalCard, decision: ApprovalDecision): Promise<void> {
   if (phase.value === 'thinking') return
   if (!session.isOwner) {
@@ -1047,47 +1070,13 @@ onUnmounted(() => {
           <!-- 过程行：节点执行 / 工具调用 / **批准卡**（先于结论出现） -->
           <div v-if="turn.rows?.length" class="rows">
             <template v-for="(row, rowIndex) in turn.rows" :key="rowIndex">
-              <div v-if="isApprovalCard(row)" class="approval" :class="`approval--${row.status}`">
-                <div class="approval__head">
-                  <span class="approval__kind">{{ APPROVAL_TAG_TEXT[row.status] }}</span>
-                  <span class="approval__label">{{ row.label }}</span>
-                </div>
-                <code class="approval__cmd">{{ row.preview }}</code>
-                <div v-if="row.status === 'pending'" class="approval__actions">
-                  <button
-                    class="approval__btn approval__btn--primary"
-                    type="button"
-                    :disabled="phase === 'thinking' || !session.isOwner"
-                    @click="decideApprovalCard(row, 'approve')"
-                  >
-                    批准执行
-                  </button>
-                  <button
-                    class="approval__btn"
-                    type="button"
-                    :title="'在本对话里以后这类操作也直接执行（连高危也不再问），换个对话要重新决定'"
-                    :disabled="phase === 'thinking' || !session.isOwner"
-                    @click="decideApprovalCard(row, 'approve_conversation')"
-                  >
-                    此对话中默认允许执行
-                  </button>
-                  <button
-                    class="approval__btn"
-                    type="button"
-                    :disabled="phase === 'thinking' || !session.isOwner"
-                    @click="decideApprovalCard(row, 'deny')"
-                  >
-                    拒绝
-                  </button>
-                </div>
-                <div v-else class="approval__done">
-                  {{ APPROVAL_STATUS_TEXT[row.status] }}
-                  <span v-if="row.decided_at" class="approval__stamp" :title="row.decided_at">
-                    {{ clockText(row.decided_at) }}
-                  </span>
-                </div>
-              </div>
-              <div v-else class="row" :class="`row--${row.tone ?? 'idle'}`">
+              <!-- 批准卡**不在正文里显示**：它贴在输入框上方（见 .approval-bar）；
+                   批准/拒绝的过程也不在正文留痕（研究者 2026-09-22 定的）。 -->
+              <div
+                v-if="!isApprovalCard(row) && !isSettledApprovalRow(row)"
+                class="row"
+                :class="`row--${row.tone ?? 'idle'}`"
+              >
                 <span class="row__kind">{{ row.label }}</span>
                 <span class="row__text">{{ row.text }}</span>
               </div>
@@ -1175,6 +1164,36 @@ onUnmounted(() => {
 
     <!-- 研究流程已改为右侧控制台抽屉（见文件末尾 <ResearchFlowDrawer>），
          这里不再占用内容列。 -->
+
+    <!-- 待批准条：贴着输入框上方（研究者 2026-09-22：不放在内容输出区）。
+         四行 = 要执行的命令 + 三个选择；批准或拒绝后它自己就没了。 -->
+    <div v-if="pendingApprovalBar" class="approval-bar" role="group" aria-label="待批准">
+      <code class="approval-bar__cmd">{{ approvalCommand(pendingApprovalBar.card.preview) }}</code>
+      <button
+        class="approval-bar__action"
+        type="button"
+        :disabled="phase === 'thinking' || !session.isOwner"
+        @click="decideApprovalCard(pendingApprovalBar.card, 'approve')"
+      >
+        批准
+      </button>
+      <button
+        class="approval-bar__action"
+        type="button"
+        :disabled="phase === 'thinking' || !session.isOwner"
+        @click="decideApprovalCard(pendingApprovalBar.card, 'approve_conversation')"
+      >
+        此对话默认批准
+      </button>
+      <button
+        class="approval-bar__action"
+        type="button"
+        :disabled="phase === 'thinking' || !session.isOwner"
+        @click="decideApprovalCard(pendingApprovalBar.card, 'deny')"
+      >
+        拒绝
+      </button>
+    </div>
 
     <div class="composer rise-in rise-step-3" :class="{ 'composer--hero': !active }">
       <textarea
@@ -1575,135 +1594,86 @@ onUnmounted(() => {
  * 批准卡：模型提出了一次写盘/执行请求，等研究者裁决
  * 它是**这一轮的主角**，所以不缩在小字里——要执行什么必须一眼看清。
  * ------------------------------------------------------------------ */
-.approval {
+/* ------------------------------------------------------------------ *
+ * 待批准条（贴在输入框上方）
+ *
+ * 研究者 2026-09-22 定的口径：
+ * · **只用黑白灰**，按钮不上色（原来主色/危险色齐上，像告警横幅）；
+ * · 四行：第一行"要执行什么"（直接给命令本身），后三行是三个选择；
+ * · 批完就消失，正文里也不留"已批准"这类话。
+ * ------------------------------------------------------------------ */
+.approval-bar {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  margin: 2px 0;
+  gap: 2px;
+  margin-bottom: 8px;
   padding: 10px 12px;
   border: 1px solid var(--h-line);
-  border-left: 3px solid var(--h-warn);
-  border-radius: 6px;
+  border-radius: var(--radius-md);
   background: var(--h-surface);
+  animation: approval-in 180ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-.approval--approved {
-  border-left-color: var(--h-ok);
-}
-
-.approval--denied,
-.approval--expired {
-  border-left-color: var(--h-line);
-}
-
-.approval__head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.approval__kind {
-  flex: none;
-  padding: 1px 6px;
-  border: 1px solid var(--h-warn);
-  border-radius: 4px;
-  font-size: var(--font-size-xs);
-  color: var(--h-warn);
-}
-
-.approval--approved .approval__kind {
-  border-color: var(--h-ok);
-  color: var(--h-ok);
-}
-
-.approval--denied .approval__kind,
-.approval--expired .approval__kind {
-  border-color: var(--h-line);
-  color: var(--h-fg-muted);
-}
-
-.approval__label {
-  font-size: var(--font-size-sm);
-  font-weight: 600;
-  color: var(--h-fg);
-}
-
-/* 要跑的就是这一行：等宽字体，原样呈现，不做任何转义/美化 */
-.approval__cmd {
+.approval-bar__cmd {
   display: block;
-  padding: 6px 8px;
-  border: 1px solid var(--h-line);
-  border-radius: 4px;
-  background: var(--h-surface-raised);
-  font-family: var(--font-family-mono);
-  font-size: var(--font-size-sm);
+  margin-bottom: 6px;
   color: var(--h-fg);
-  word-break: break-all;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: var(--font-size-sm);
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
 }
 
-.approval__actions {
-  display: flex;
-  gap: 8px;
-}
-
-.approval__btn {
-  padding: 4px 12px;
-  border: 1px solid var(--h-line);
-  border-radius: 4px;
-  background: var(--h-surface-raised);
-  font-size: var(--font-size-sm);
+.approval-bar__action {
+  display: block;
+  width: 100%;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
   color: var(--h-fg);
+  font-family: inherit;
+  font-size: var(--font-size-sm);
+  text-align: left;
   cursor: pointer;
-  transition:
-    border-color 0.15s ease,
-    color 0.15s ease,
-    background-color 0.15s ease;
+  transition: background-color 160ms cubic-bezier(0.4, 0, 0.2, 1), transform 160ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 
-.approval__btn:hover:not(:disabled) {
-  border-color: var(--h-line-strong);
-}
-
-.approval__btn:active:not(:disabled) {
+.approval-bar__action:hover:not(:disabled) {
   background: var(--h-hover);
 }
 
-.approval__btn:focus-visible {
-  outline: 2px solid var(--h-primary);
+.approval-bar__action:active:not(:disabled) {
+  transform: scale(0.995);
+}
+
+.approval-bar__action:focus-visible {
+  outline: 2px solid currentColor;
   outline-offset: 2px;
 }
 
-.approval__btn:disabled {
-  opacity: 0.5;
+.approval-bar__action:disabled {
+  opacity: 0.45;
   cursor: not-allowed;
 }
 
-.approval__btn--primary {
-  border-color: var(--h-primary);
-  background: var(--h-primary);
-  color: var(--h-primary-fg);
+@keyframes approval-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
-.approval__btn--primary:hover:not(:disabled) {
-  border-color: var(--h-primary);
-  filter: brightness(1.08);
-}
-
-.approval__btn--primary:active:not(:disabled) {
-  filter: brightness(0.94);
-}
-
-.approval__done {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  font-size: var(--font-size-sm);
-  color: var(--h-fg-muted);
-}
-
-.approval__stamp {
-  font-size: var(--font-size-xs);
-  color: var(--h-fg-muted);
+@media (prefers-reduced-motion: reduce) {
+  .approval-bar {
+    animation: none;
+  }
 }
 
 /* ------------------------------------------------------------------ *

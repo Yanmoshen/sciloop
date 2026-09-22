@@ -118,13 +118,26 @@ def issue_token(request_id: str) -> str:
 
 
 def _preview(tool: str, args: dict[str, Any]) -> str:
-    """给人看的一行预览：**研究者要看的就是这一行**，所以它必须说清"到底要跑什么"。"""
+    """给人看的一行预览：**研究者要看的就是这一行**，所以它必须说清"到底要跑什么"。
+
+    ⚠️ 只给"要跑的东西本身"，**不要 JSON 外壳**（研究者 2026-09-22）：
+    原先宿主工具走 `json.dumps(args)`，卡片上就显示成
+    `{"command": "pwd && echo ..."}` —— 括号和 `"command"` 是给机器看的，
+    人只需要看到 `pwd && echo ...`。
+    """
 
     if tool == "run_command":
         argv = args.get("argv")
         # argv 逐项传入、不经过 shell，所以这里也**不做任何转义/拼接猜测**：
         # 原样用空格连接即可 —— 加引号反而会让研究者以为会走 shell。
         text = " ".join(str(item) for item in argv) if isinstance(argv, list) else str(argv or "")
+    elif tool == "run_on_computer":
+        text = str(args.get("command") or "")
+    elif tool == "files_on_computer":
+        action = str(args.get("action") or "")
+        path = str(args.get("path") or "")
+        to = str(args.get("to") or "")
+        text = f"{action} {path}".strip() + (f" → {to}" if to else "")
     else:
         text = json.dumps(args, ensure_ascii=False)
     text = text.strip() or "(无参数)"
