@@ -385,21 +385,68 @@ def _human_error(detail: str) -> str:
     return text.replace("{tool_denied}", "").replace("{tool_failed}", "").strip()
 
 
-def tool_row(call: dict[str, Any], phase: str, detail: str = "") -> dict[str, Any]:
-    """工具调用在对话里的呈现（走现有 SSE `row` 事件，前端已能渲染）。"""
+def search_row_payload(
+    tool: str, arguments: dict[str, Any], result: dict[str, Any]
+) -> dict[str, Any] | None:
+    """把一次搜索的结果收成"面板能画"的形状；不是搜索工具就返回 None。
+
+    ⚠️ 只留**面板要用的字段**：搜索词、来源、条数、标题、链接。
+    摘要（snippet）留给模型用，不往会话文件里灌 —— 过程行是会落盘的。
+    """
+
+    if tool not in ("search_web", "search_academic"):
+        return None
+    capability = web_search.CAPABILITY_ACADEMIC if tool == "search_academic" else web_search.CAPABILITY_WEB
+    label = TOOL_LABELS.get(tool, tool)
+    rows = [
+        {
+            "title": str(item.get("title") or ""),
+            "url": str(item.get("url") or ""),
+            "source": str(item.get("source") or ""),
+        }
+        for item in (result.get("results") or [])
+    ]
+    return {
+        "capability": capability,
+        "label": label,
+        "query": str(arguments.get("query") or result.get("query") or ""),
+        "count": int(result.get("count") or 0),
+        "sources_used": list(result.get("sources_used") or []),
+        "sources_failed": list(result.get("sources_failed") or []),
+        "reason": result.get("reason"),
+        "results": rows,
+    }
+
+
+def tool_row(
+    call: dict[str, Any],
+    phase: str,
+    detail: str = "",
+    *,
+    search: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """工具调用在对话里的呈现（走现有 SSE `row` 事件，前端已能渲染）。
+
+    ``search`` 非空时挂在这一行上：界面据此画"来源 · 搜索词 · 结果"的折叠面板
+    （与批准卡同一套思路：**行即卡片**，刷新后还在）。
+    """
 
     fn = call.get("function") or {}
     name = str(fn.get("name") or "")
     label = TOOL_LABELS.get(name, name or "工具")
     if phase == "start":
-        return {"kind": "tool", "tone": "info", "text": f"调用「{label}」{detail}".strip()}
-    if phase == "ok":
-        return {"kind": "tool", "tone": "ok", "text": f"「{label}」完成：{detail}"}
-    if phase == "waiting":
+        row = {"kind": "tool", "tone": "info", "text": f"调用「{label}」{detail}".strip()}
+    elif phase == "ok":
+        row = {"kind": "tool", "tone": "ok", "text": f"「{label}」完成：{detail}"}
+    elif phase == "waiting":
         # tone=warn 而不是 err：**这不是失败，是停下来等人** —— 把两者混起来，
         # 研究者会以为工具已经出错了，而实际上它一次都没跑。
-        return {"kind": "tool", "tone": "warn", "text": f"「{label}」等待研究者批准{detail}"}
-    return {"kind": "tool", "tone": "warn", "text": f"「{label}」未完成：{_human_error(detail)}"}
+        row = {"kind": "tool", "tone": "warn", "text": f"「{label}」等待研究者批准{detail}"}
+    else:
+        row = {"kind": "tool", "tone": "warn", "text": f"「{label}」未完成：{_human_error(detail)}"}
+    if search:
+        row["search"] = search
+    return row
 
 
 #: 批准请求在行里的状态 → 卡片语气（前端只按这个上色，不自己猜）

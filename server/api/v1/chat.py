@@ -43,6 +43,7 @@ from llm.registry import get_registry
 from llm.types import slugify_provider
 from services import conversations
 from services.agent import approvals as agent_approvals
+from services.output_style import OUTPUT_STYLE
 from services.research import dialog, messages
 
 logger = logging.getLogger("sciloop.chat")
@@ -60,12 +61,11 @@ TITLE_PROMPT = "为下面这段研究需求拟一个标题。\n\n研究需求：
 
 REPLY_SYSTEM = (
     "你是 SciLoop 的科研助手，帮助研究者把模糊的研究需求整理成可执行的研究方案。\n"
-    "回答要求：结构清晰、直指要点。\n"
     "信息不足时**最多集中提出 3 个问题**，且每个问题都要给出一个可用的默认值；"
     "如果研究者说「随便」「你帮我定」，就按默认值继续推进，并在回答里标明你用的是什么假设。\n"
     "**不要输出你的思考过程、推理草稿或自我对话**（例如「我们需要回答用户……」「让我想想……」），"
     "只输出给研究者看的最终答复。\n"
-    "不要编造文献、数据或结论；没有实际查过本地数据就不要声称查过。"
+    "不要编造文献、数据或结论；没有实际查过本地数据就不要声称查过。\n\n" + OUTPUT_STYLE
 )
 
 #: 通用回答的输出上限。默认 1536 会被思考型模型的长思考吃光，正文只挤出半句就断
@@ -149,6 +149,9 @@ async def _agent_loop(
 
     for round_index in range(agent_tools.MAX_TOOL_ROUNDS + 1):
         round_result: Any = None
+        #: 这一轮的思考过程从 `state["reasoning"]` 的哪个下标开始 —— 用于把**本轮**的
+        #: reasoning_content 跟着 assistant.tool_calls 一起回喂（见下面 append 处）。
+        reasoning_from = len(state["reasoning"])
         async for update in adapter.chat_stream(
             messages_now,
             model_ref=ref,
@@ -182,10 +185,25 @@ async def _agent_loop(
         if not calls or round_index >= agent_tools.MAX_TOOL_ROUNDS:
             break
 
-        # 模型要求调工具：先把这一轮如实记进消息（含它已说的话），再逐个处理
-        messages_now.append(
-            agent_tools.assistant_tool_message(getattr(round_result, "content", "") or "", calls)
+        # 模型要求调工具：先把这一轮如实记进消息（含它已说的话），再逐个处理。
+        #
+        # ⚠️ **带 tool_calls 的 assistant 消息必须把本轮 reasoning_content 一起回传**：
+        # 思考型供应商（实测 deepseek 系列）缺了它直接 400 ——
+        # `The reasoning_content in the thinking mode must be passed back to the API`。
+        # 2026-09-22 修：这里原先只拼 content/tool_calls，于是「批准后续答里模型再提一条命令」
+        # 的**第二轮必然 400** —— 表现是批准卡点完之后整轮中断（`interrupted=true` 落盘），
+        # 批准链在第一次工具回合后就断掉。批准路径手拼的那条消息早先已补上该字段，
+        # 但循环自己 append 的这一条漏了 —— 补丁只补了一半。
+        round_reasoning = "".join(state["reasoning"][reasoning_from:]).strip()
+        if not round_reasoning:
+            # 有的供应商只在收尾帧给思考过程（delta 为空）→ 从原始结果兜底取
+            round_reasoning = str((getattr(round_result, "raw", None) or {}).get("reasoning") or "").strip()
+        assistant_call = agent_tools.assistant_tool_message(
+            getattr(round_result, "content", "") or "", calls
         )
+        if round_reasoning:
+            assistant_call["reasoning_content"] = round_reasoning
+        messages_now.append(assistant_call)
         stopped_for_approval = False
         for call in calls:
             tool_name = str((call.get("function") or {}).get("name") or "")
@@ -248,7 +266,17 @@ async def _agent_loop(
             payload_out, summary = await agent_tools.run_tool_call(
                 call, approval_token=grant_token
             )
-            end_row = agent_tools.tool_row(call, "ok" if payload_out.get("ok") else "err", summary)
+            end_row = agent_tools.tool_row(
+                call,
+                "ok" if payload_out.get("ok") else "err",
+                summary,
+                # 搜索结果挂在这一行上，界面才能画折叠面板（行随会话落盘）
+                search=agent_tools.search_row_payload(
+                    str((call.get("function") or {}).get("name") or ""),
+                    _tool_arguments(call),
+                    (payload_out.get("result") or {}) if isinstance(payload_out.get("result"), dict) else {},
+                ),
+            )
             rows.append(end_row)
             yield _sse("row", {"row": end_row})
             messages_now.append(
@@ -1129,3 +1157,18 @@ async def read_access_mode(conversation_id: str) -> dict[str, Any]:
 
 
 __all__ = ["router"]
+
+
+def _tool_arguments(call: dict[str, Any]) -> dict[str, Any]:
+    """取工具调用里的参数（解析失败就当空，不影响主流程）。"""
+
+    raw = (call.get("function") or {}).get("arguments")
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}

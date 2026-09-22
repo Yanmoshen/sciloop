@@ -254,3 +254,54 @@ def test_academic_crossref_excludes_non_articles() -> None:
 
     asyncio.run(web_search.search_academic("tokenizer", sources=("crossref",), client=_client(handler)))
     assert "journal-article" in seen.get("filter", "")
+
+
+# --------------------------------------------------------------------------- #
+# 过程行：搜索结果挂上去给界面画面板
+# --------------------------------------------------------------------------- #
+def test_search_row_payload_keeps_only_what_the_panel_needs() -> None:
+    """面板只要搜索词/来源/条数/标题/链接；**摘要不往里灌**（过程行会落盘）。"""
+
+    from services.agent import mcp_tools
+
+    payload = mcp_tools.search_row_payload(
+        "search_academic",
+        {"query": "tokenizer fairness"},
+        {
+            "ok": True,
+            "count": 1,
+            "sources_used": ["arXiv"],
+            "results": [
+                {
+                    "title": "A Survey",
+                    "url": "https://a",
+                    "snippet": "很长的摘要" * 50,
+                    "source": "arXiv",
+                }
+            ],
+        },
+    )
+    assert payload is not None
+    assert payload["capability"] == "academic"
+    assert payload["label"] == "查学术"
+    assert payload["query"] == "tokenizer fairness"
+    assert payload["sources_used"] == ["arXiv"]
+    assert list(payload["results"][0]) == ["title", "url", "source"], "只留面板要用的三个字段"
+    assert "snippet" not in str(payload)
+
+
+def test_search_row_payload_is_none_for_other_tools() -> None:
+    from services.agent import mcp_tools
+
+    assert mcp_tools.search_row_payload("query_library", {}, {}) is None
+
+
+def test_tool_row_carries_search_payload() -> None:
+    from services.agent import mcp_tools
+
+    call = {"function": {"name": "search_web", "arguments": "{}"}}
+    row = mcp_tools.tool_row(call, "ok", "搜到 3 条结果", search={"count": 3})
+    assert row["text"] == "「搜网页」完成：搜到 3 条结果"
+    assert row["search"] == {"count": 3}
+    # 没有搜索结果时不该凭空多出字段
+    assert "search" not in mcp_tools.tool_row(call, "ok", "搜到 0 条结果")
