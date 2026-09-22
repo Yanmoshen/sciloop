@@ -21,8 +21,11 @@ from services.skills.registry import (
     packs_dir,
     scan,
 )
+from services.skills.runner import RunResult, StepResult, run_skill
 
 __all__ = [
+    'RunResult',
+    'StepResult',
     "PACKS_DIR",
     "STAGE_LABELS",
     "CatalogEntry",
@@ -31,5 +34,6 @@ __all__ = [
     "catalog",
     "load",
     "packs_dir",
+    "run_skill",
     "scan",
 ]
