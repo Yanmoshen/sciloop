@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -36,7 +37,7 @@ from services.research.rules import MIN_EVIDENCE_COUNT, rule_catalog
 
 logger = logging.getLogger("sciloop.research.prompts")
 
-__all__ = ["NODE_GUIDES", "SYSTEM_PROMPT", "build_messages"]
+__all__ = ["NODE_GUIDES", "SELF_CHECK_SYSTEM", "SYSTEM_PROMPT", "build_messages", "build_self_check_messages"]
 
 #: 节点 → 长文档文件名（人类可读版在 prompts/）
 _NODE_DOC_FILES: dict[str, str] = {
@@ -82,16 +83,41 @@ NODE_GUIDES: dict[str, str] = {
 
 SYSTEM_PROMPT = (
     "你是 SciLoop 科研流程中的一个研究节点执行者。"
-    "当前节点完全由程序控制：你只负责产出本节点要求的结构化成果，"
-    "由程序校验后决定是否进入下一节点。\n\n"
+    "**这一站做没做完由你自己判断**：程序只把「本轮验收情况」如实告诉你（它看到的缺项、"
+    "材料有多少条），不替你决定。\n\n"
+    "你要在产出里用 state 声明你的判断：\n"
+    "- state=done：这一站该做的都做完了；\n"
+    "- state=continue：还有你能自己做的事没做完（换个检索式再找、补齐证据、把结论写全），"
+    "同时用 pending 逐条列出还缺什么；\n"
+    "- state=need_human：卡住的正是只有研究者能给的东西（他自己的数据 / 他的取舍 / 他的判断），"
+    "同时用 state_reason 说清要他决定什么。\n\n"
+    "怎么判（重要）：\n"
+    "1. **材料不足也可以 done**：如果论文库里确实没有材料，而你能做的都做了"
+    "（换英文关键词再检索、说明缺口、给可用的替代路线），就把 state 写 done，"
+    "并把「缺什么、为什么缺、下一步建议」如实写进 gaps / coverage_note / limits。\n"
+    "2. **绝不为了凑数而编造**：宁可如实写「0 条证据」，也不要造 paper_id、造结果。\n"
+    "3. 该继续就 continue，别硬交；需要人就 need_human，别自己猜研究者的意图。\n\n"
     "硬性要求：\n"
     "1. 只输出一个 JSON 对象，不要输出任何解释文字、不要用代码围栏包裹。\n"
     "2. 只使用下文材料清单里真实存在的论文编号；**不得编造 paper_id**。\n"
     "3. 没查到的信息如实标注（例如 verification 填 inferred 或 limits 里说明），"
     "不要把不确定写成确定。\n"
-    "4. 不得为了通过校验而虚构证据、结果或执行记录；"
-    "**声明 completed 或 exit_code=0 必须与实际相符**。\n"
+    "4. 不得为了好看而虚构证据、结果或执行记录；"
+    "**state 声明必须与实际相符**（说 done 就要真的做完了）。\n"
     "5. 负结果、混合结果和无法判定的结果都是有效产出，不需要包装成成功。"
+)
+
+#: 同模型自检（先出结论，再让同一个模型回头自查一遍）用的系统提示。
+SELF_CHECK_SYSTEM = (
+    "你是刚才产出这份成果的同一个模型。现在请**回头检查自己刚交的东西**，不要重写、不要客套。\n\n"
+    "检查三件事：\n"
+    "1. 契约要求的字段是不是真的都填了、填的是不是真事实（有没有编造论文编号或结果）；\n"
+    "2. 程序给出的「本轮验收情况」里那些缺项，是不是真的无法在本节点内解决"
+    "（如果你其实还能自己再做一步，就不算无法解决）；\n"
+    "3. 有没有明显漏掉的东西（该说明的缺口没说、该给的建议没给）。\n\n"
+    "给出你的判断：state=done（确实完成）/ continue（还有你该做的没做）/ "
+    "need_human（缺只有研究者能提供的东西）。\n"
+    "只输出一个 JSON 对象，含 state、summary（一句话）、issues（逐条列出问题，没有就空数组）。"
 )
 
 
@@ -249,7 +275,7 @@ def build_messages(
         f"\n## 检索命中（仅限以下论文编号可被引用）\n{_format_hits(hits or [])}",
         f"\n## 当前额度\n{_format_budget(budget or {})}",
         f"\n## 输出契约（必须严格符合）\n```json\n{_format_contract(node)}\n```",
-        f"\n## 会被校验的规则（不满足将被驳回重跑）\n{_format_rules(node)}",
+        f"\n## 程序会如实报出的验收情况（**不是判决**，是事实；做没做完由你判断）\n{_format_rules(node)}",
         f"\n## 方法说明\n{NODE_GUIDES.get(node, '（无）')}",
     ]
 
@@ -267,5 +293,38 @@ def build_messages(
     parts.append("\n请只输出符合上述契约的 JSON 对象。")
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": "\n".join(parts)},
+    ]
+
+
+def build_self_check_messages(
+    *,
+    node: str,
+    payload: dict[str, Any],
+    research_question: str = "",
+    advisories: list[str] | None = None,
+    library: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    """同模型自检：把刚交的产出和程序看到的事实原样交回给**同一个模型**，让它回头自查。
+
+    为什么值得多花这一次调用：模型在"刚写完"的状态下容易收工了事；
+    让它换一个"审查者"视角看同一份东西，能抓到漏填、编造、漏说明的缺口 ——
+    而**判定权仍在模型手里**（自检说 done 才算完，说 continue 就接着做）。
+    """
+
+    label = graph.NODE_LABELS.get(node, node)
+    facts = advisories or []
+    parts = [
+        f"# 你刚交出的成果（节点：{label}）",
+        f"\n## 研究问题\n{research_question or '（未确定）'}",
+        f"\n## 论文库实际可访问材料\n{_format_library(library or {})}",
+        "\n## 你交出的 JSON",
+        "```json\n" + _truncate(json.dumps(payload, ensure_ascii=False, indent=2), 12000) + "\n```",
+        "\n## 程序本轮如实报出的验收情况（事实，不是判决）",
+        ("\n".join(facts) if facts else "（没有报出缺项）"),
+        "\n请回头检查上面这份成果，并给出你的判断（state / summary / issues）。",
+    ]
+    return [
+        {"role": "system", "content": SELF_CHECK_SYSTEM},
         {"role": "user", "content": "\n".join(parts)},
     ]

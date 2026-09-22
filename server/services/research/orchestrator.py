@@ -961,6 +961,8 @@ async def _run_node_events(
     #   ③ 读模型自己的决定：done / continue / need_human。
     attempt = 0
     contract_misses = 0
+    self_checks = 0
+    self_check_note: dict[str, Any] | None = None
     advisories: list[str] = []
     while True:
         yield "attempt", {
@@ -1213,6 +1215,12 @@ async def _run_node_events(
                     llm_calls=llm_calls,
                     total_cost=total_cost,
                     budget_snapshot=budget,
+                    extra={
+                        "advisory": True,
+                        "decided_by": "program",
+                        "state": "contract_miss",
+                        "self_check": self_check_note,
+                    },
                 )
                 yield "waiting_human", {
                     "node": target,
@@ -1260,6 +1268,12 @@ async def _run_node_events(
                 llm_calls=llm_calls,
                 total_cost=total_cost,
                 budget_snapshot=budget,
+                extra={
+                    "advisory": True,
+                    "decided_by": "model",
+                    "state": "need_human",
+                    "self_check": self_check_note,
+                },
             )
             yield "waiting_human", {
                 "node": target,
@@ -1289,8 +1303,90 @@ async def _run_node_events(
             attempt += 1
             continue
 
-        # ---- 模型说完成 → 收工（程序不再用硬规则拦它）--------------------- #
+        # ---- 模型说完成 → **再让同一个模型回头自查一遍**（研究者点名要的）-- #
         payload = normalized if isinstance(normalized, dict) else (candidate or {})
+        if self_checks < SELF_CHECK_LIMIT:
+            self_checks += 1
+            check = await _run_self_check(
+                node=target,
+                model_ref=model_ref,
+                payload=payload,
+                research_question=research_question,
+                advisories=advisories,
+                library=library,
+                project_id=project_id,
+            )
+            llm_calls += 1
+            if check:
+                total_cost += float(check.get("cost_usd") or 0)
+                self_check_note = {
+                    "state": str(check.get("state") or "done"),
+                    "summary": str(check.get("summary") or "")[:400],
+                    "issues": [str(item)[:300] for item in (check.get("issues") or [])][:10],
+                }
+                verdict = self_check_note["state"].lower()
+                summary_line = self_check_note["summary"] or "（没给结论）"
+                yield "notice", {
+                    "node": target,
+                    "code": "self_check",
+                    "message": f"自检（同一个模型回头看了一遍）：{summary_line}",
+                }
+                if verdict == "continue":
+                    issues = self_check_note["issues"] or ["自检认为还有该做的事没做完"]
+                    repair = (
+                        "你刚才判定完成，但**回头自查时发现还没做完**。请把下面这些补齐后再交：\n"
+                        + "\n".join(f"· {item}" for item in issues)
+                    )
+                    attempt += 1
+                    continue
+                if verdict == "need_human":
+                    reason = (
+                        "自检认为需要研究者介入："
+                        + (summary_line if summary_line != "（没给结论）" else "缺只有研究者能提供的信息")
+                    )
+                    await _hand_off_to_human(
+                        session_factory,
+                        conversation_id=conversation_id,
+                        project_id=project_id,
+                        node=target,
+                        entry_index=entry_index,
+                        retry_count=attempt,
+                        reason=reason,
+                        validation=last_validation,
+                        raw_output=last_raw,
+                        llm_calls=llm_calls,
+                        total_cost=total_cost,
+                        budget_snapshot=budget,
+                        extra={
+                            "advisory": True,
+                            "decided_by": "model",
+                            "state": "need_human",
+                            "self_check": self_check_note,
+                        },
+                    )
+                    yield "waiting_human", {
+                        "node": target,
+                        "node_label": graph.NODE_LABELS.get(target, target),
+                        "retry_count": attempt,
+                        "items": [h.to_dict() for h in (last_validation.hits if last_validation else [])],
+                        "message": reason,
+                    }
+                    yield "done", {
+                        "node": target,
+                        "status": "waiting_human",
+                        "display_status": graph.display_status("waiting_human"),
+                        "cost_usd": round(total_cost, 6),
+                        "llm_call_count": llm_calls,
+                    }
+                    return
+            else:
+                yield "notice", {
+                    "node": target,
+                    "code": "self_check_skipped",
+                    "message": "自检这一步没跑成（调用失败或返回看不懂），已跳过，不影响本轮结论。",
+                }
+
+        # 收工（程序不再用硬规则拦它）
         async with session_factory() as session:
             await store.upsert_node_run(
                 session,
@@ -1311,6 +1407,7 @@ async def _run_node_events(
                     "advisory": True,
                     "decided_by": "model",
                     "state": "done",
+                    "self_check": self_check_note,
                 },
                 llm_call_count=llm_calls,
                 cost_usd=round(total_cost, 6),
@@ -1368,8 +1465,8 @@ async def _run_node_events(
                 from_node=target,
                 to_node=next_target,
                 kind="advance",
-                trigger="program",
-                reason=f"「{graph.NODE_LABELS.get(target, target)}」通过校验，进入下一节点",
+                trigger="model",
+                reason=f"「{graph.NODE_LABELS.get(target, target)}」由模型判定完成，进入下一节点",
                 budget_snapshot=budget,
             )
             yield "migrated", {
@@ -1448,9 +1545,16 @@ async def _hand_off_to_human(
     llm_calls: int,
     total_cost: float,
     budget_snapshot: dict[str, Any] | None,
+    extra: dict[str, Any] | None = None,
 ) -> None:
-    """转到人工：落节点行 + 留痕。**触发者写 model**（是模型判断要人介入，不是程序拦的）。"""
+    """转到人工：落节点行 + 留痕。**触发者写 model**（是模型判断要人介入，不是程序拦的）。
 
+    `extra` 并进 `validation`：用来记「谁做的决定」（`decided_by`）、模型自述的 `state`、
+    以及自检结论 —— 这几项是审计链上最该留住的证据，缺了就没法回答"这个节点为什么停在这"。
+    """
+
+    stored: dict[str, Any] = dict(validation.to_dict()) if validation is not None else {}
+    stored.update(extra or {})
     async with session_factory() as session:
         await store.upsert_node_run(
             session,
@@ -1461,7 +1565,7 @@ async def _hand_off_to_human(
             status="waiting_human",
             retry_count=retry_count,
             raw_output=raw_output[:20000],
-            validation=(validation.to_dict() if validation is not None else None),
+            validation=stored or None,
             llm_call_count=llm_calls,
             cost_usd=round(total_cost, 6),
             finished_at=_utcnow(),
@@ -1477,3 +1581,62 @@ async def _hand_off_to_human(
             reason=reason,
             budget_snapshot=budget_snapshot,
         )
+
+
+#: 同模型自检的输出契约（小、直白：state / summary / issues）。
+SELF_CHECK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "state": {"type": "string", "enum": ["done", "continue", "need_human"]},
+        "summary": {"type": "string"},
+        "issues": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["state", "summary"],
+    "additionalProperties": False,
+}
+
+#: 一次进入最多自检几轮。**这不是研究质量上限**（研究做几轮由模型说了算），
+#: 而是防"自检→继续→自检→继续"的乒乓：自检本身不产出新内容，来回踢没有意义。
+SELF_CHECK_LIMIT = 3
+
+
+async def _run_self_check(
+    *,
+    node: str,
+    model_ref: str,
+    payload: dict[str, Any],
+    research_question: str,
+    advisories: list[str],
+    library: dict[str, Any] | None,
+    project_id: int | None,
+) -> dict[str, Any]:
+    """让**同一个模型**回头自查刚交的产出。拿不到结论就返回空字典（不阻断流程）。"""
+
+    messages = prompts.build_self_check_messages(
+        node=node,
+        payload=payload,
+        research_question=research_question,
+        advisories=advisories,
+        library=library,
+    )
+    try:
+        result = await chat(
+            messages,
+            model_ref,
+            None,
+            NODE_MAX_TOKENS,
+            SELF_CHECK_SCHEMA,
+            project_id=project_id,
+            stage=graph.stage_alias(node),
+            purpose=f"{graph.purpose_for(node)}#自检"[:64],
+            allow_fallback=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - 自检失败不该拖垮节点
+        logger.warning("自检调用失败 node=%s：%s", node, exc)
+        return {}
+
+    data = result.parsed if isinstance(result.parsed, dict) else _parse_lenient(result.content or "")
+    if not isinstance(data, dict):
+        return {}
+    data["cost_usd"] = float(result.cost_usd or 0)
+    return data

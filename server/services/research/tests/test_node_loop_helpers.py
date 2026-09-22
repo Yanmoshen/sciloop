@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from services.research import orchestrator
+from services.research import orchestrator, prompts
 from services.research.rules import RuleHit, ValidationResult
 
 
@@ -101,3 +101,65 @@ def test_decision_fields_are_part_of_the_contract() -> None:
         fields = set(model.model_fields)
         assert {"state", "pending", "state_reason"} <= fields, node
         assert model.model_fields["state"].default == "done"
+
+
+# --------------------------------------------------------------------------- #
+# 提示词口径（2026-09-22：判不判定由模型说了算，所以口径必须写清楚）
+# --------------------------------------------------------------------------- #
+def test_system_prompt_no_longer_claims_program_controls_everything() -> None:
+    """旧的系统提示写着"当前节点完全由程序控制…由程序校验后决定"—— 已经不成立。"""
+
+    assert "完全由程序控制" not in prompts.SYSTEM_PROMPT
+    assert "state" in prompts.SYSTEM_PROMPT
+    for word in ("done", "continue", "need_human"):
+        assert word in prompts.SYSTEM_PROMPT, word
+
+
+def test_system_prompt_allows_done_with_thin_material_but_forbids_fabrication() -> None:
+    """材料不足也可以如实说完成；但绝不许编造 —— 这两句必须同时在。"""
+
+    assert "材料不足也可以 done" in prompts.SYSTEM_PROMPT
+    assert "绝不为了凑数而编造" in prompts.SYSTEM_PROMPT
+
+
+def test_rules_are_described_as_facts_not_a_verdict() -> None:
+    """提示词里那一段不能再写"不满足将被驳回重跑"。"""
+
+    messages = prompts.build_messages(node="literature_review", user_text="x")
+    user_text = messages[-1]["content"]
+    assert "不满足将被驳回重跑" not in user_text
+    assert "不是判决" in user_text
+
+
+def test_self_check_messages_carry_payload_and_facts() -> None:
+    payload = {"research_question": "某问题", "evidence": []}
+    messages = prompts.build_self_check_messages(
+        node="literature_review",
+        payload=payload,
+        research_question="某问题",
+        advisories=["· 证据只有 0 条，至少需要 3 条"],
+    )
+    assert messages[0]["content"] == prompts.SELF_CHECK_SYSTEM
+    body = messages[1]["content"]
+    assert "某问题" in body
+    assert "证据只有 0 条" in body
+    assert "research_question" in body, "自检要看到自己交的原件，不能只给摘要"
+
+
+def test_self_check_schema_is_strict_and_small() -> None:
+    schema = orchestrator.SELF_CHECK_SCHEMA
+    assert schema["properties"]["state"]["enum"] == ["done", "continue", "need_human"]
+    assert schema["additionalProperties"] is False
+    assert orchestrator.SELF_CHECK_LIMIT <= 5, "自检是防乒乓，不该变成又一道循环"
+
+
+def test_self_check_is_wired_into_the_done_branch() -> None:
+    """结构断言：模型说 done 之后必须真去自检，且自检结论能改变流程。"""
+
+    import inspect
+
+    source = inspect.getsource(orchestrator)
+    assert "_run_self_check(" in source
+    assert 'code": "self_check"' in source
+    assert "自检认为需要研究者介入" in source
+    assert "回头自查时发现还没做完" in source
