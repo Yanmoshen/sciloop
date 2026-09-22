@@ -966,6 +966,8 @@ async def _run_node_events(
     advisories: list[str] = []
     #: 模型要求搜的结果累积在这里，下一轮作为事实塞进提示词
     search_notes: list[dict[str, Any]] = []
+    #: 模型要求跑的命令与真实输出（同样是"事实"，下一轮塞回去）
+    command_notes: list[dict[str, Any]] = []
     while True:
         yield "attempt", {
             "node": target,
@@ -987,6 +989,7 @@ async def _run_node_events(
             budget={**budget, "retry_count": attempt},
             repair=repair,
             search_results=search_notes,
+            command_results=command_notes,
         )
 
         result: Any = None
@@ -1272,6 +1275,37 @@ async def _run_node_events(
                     else f"按你的要求搜了 {len(queries)} 组关键词，但没搜到结果。"
                 ),
             }
+
+        # ---- 替模型跑实验命令（要授权；高危不静默跑）---------------------- #
+        asked = candidate.get("commands_to_run") if isinstance(candidate, dict) else None
+        commands = (
+            [str(item).strip() for item in asked if str(item).strip()]
+            if isinstance(asked, list)
+            else []
+        )[:MAX_NODE_COMMANDS]
+        if commands:
+            records, granted = await _run_node_commands(conversation_id, commands)
+            command_notes.extend(records)
+            if not granted:
+                yield "notice", {
+                    "node": target,
+                    "code": "commands_need_grant",
+                    "message": (
+                        "这一站要求跑 "
+                        + f"{len(commands)} 条命令，但本对话还没开「完全访问模式」，我一条都没跑。"
+                        "你在输入栏打开它（或自己把下面的命令跑一遍再把结果告诉我），我就继续。"
+                    ),
+                }
+            else:
+                ok_count = sum(1 for item in records if item.get("ok"))
+                yield "notice", {
+                    "node": target,
+                    "code": "commands_ran",
+                    "message": (
+                        f"按你的要求跑了 {len(records)} 条命令，成功 {ok_count} 条"
+                        "（真实输出已放进下一轮）。"
+                    ),
+                }
 
         # ---- ③ 决策权在模型手里：done / continue / need_human ------------- #
         state = str((candidate or {}).get("state") or "").strip().lower() or "done"
@@ -1693,3 +1727,61 @@ async def _run_searches(queries: list[str]) -> list[dict[str, Any]]:
             }
         )
     return blocks
+
+
+#: 一轮里最多替模型跑几条命令（防一次点 20 条把机器占满）
+MAX_NODE_COMMANDS = 3
+#: 单条命令最长跑多久
+NODE_COMMAND_TIMEOUT_S = 300
+
+
+async def _run_node_commands(
+    conversation_id: str, commands: list[str]
+) -> tuple[list[dict[str, Any]], bool]:
+    """在研究者电脑上跑模型点名的命令，返回 `(记录, 是否获授权)`。
+
+    ⚠️ **必须在获授权的对话里才跑**：跑命令属于"动手"，默认要人点头；
+    节点里没有批准卡的位置，所以这里用**本对话的授权**当闸门 ——
+    没开「完全访问模式」就一条都不跑，并把命令原样列给研究者（他可以自己跑或开开关）。
+
+    高危命令（删数据 / 改系统 / 下载即执行）**即使开了授权也不静默跑**：
+    那些要在对话里单独确认。硬拒的（删 SciLoop 自己的代码）直接拒。
+    """
+
+    from services.agent import approvals, host_runner, policy
+
+    record = approvals.load(conversation_id) or {}
+    granted = approvals.allows(approvals.grants(record), high_risk=False)
+    if not granted:
+        return [], False
+
+    results: list[dict[str, Any]] = []
+    for command in commands[:MAX_NODE_COMMANDS]:
+        verdict = policy.judge_command(command=command)
+        if verdict.forbidden:
+            results.append(
+                {"command": command, "ok": False, "refused": True, "error": verdict.message}
+            )
+            continue
+        if verdict.needs_approval:
+            results.append(
+                {
+                    "command": command,
+                    "ok": False,
+                    "needs_approval": True,
+                    "error": "这条属于高危操作，需要在对话里单独确认后才会执行",
+                }
+            )
+            continue
+        outcome = await host_runner.call_exec(command=command, timeout_s=NODE_COMMAND_TIMEOUT_S)
+        results.append(
+            {
+                "command": command,
+                "ok": bool(outcome.get("ok")),
+                "exit_code": outcome.get("exit_code"),
+                "stdout_tail": str(outcome.get("stdout") or "")[-2000:],
+                "stderr_tail": str(outcome.get("stderr") or "")[-800:],
+                "error": outcome.get("error"),
+            }
+        )
+    return results, True

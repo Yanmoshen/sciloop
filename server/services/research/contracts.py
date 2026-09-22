@@ -26,7 +26,9 @@ from pydantic import Field
 from schemas.base import SciLoopModel
 
 __all__ = [
+    "EXPERIMENT_EXECUTION_SCHEMA",
     "EXPERIMENT_PREP_SCHEMA",
+    "RESULTS_ANALYSIS_SCHEMA",
     "IDEA_FEASIBILITY_SCHEMA",
     "LITERATURE_REVIEW_SCHEMA",
     "NODE_OUTPUT_MODELS",
@@ -36,6 +38,10 @@ __all__ = [
     "DatasetPlan",
     "EvidenceDraft",
     "ExperimentPrepOutput",
+    "ResultsAnalysisOutput",
+    "FindingDraft",
+    "ExperimentRunRecord",
+    "ExperimentExecutionOutput",
     "FalsificationDraft",
     "FeasibilityDraft",
     "GapDraft",
@@ -519,10 +525,137 @@ EXPERIMENT_PREP_SCHEMA: dict[str, Any] = {
     },
 }
 
+# --------------------------------------------------------------------------- #
+# ④ 执行实验（2026-09-22 补：这一站要真的跑，不是写计划）
+# --------------------------------------------------------------------------- #
+class ExperimentRunRecord(SciLoopModel):
+    """一次实验运行的**真实**记录。
+
+    「真跑」的含义就落在这里：跑没跑、退出码是多少、末尾输出是什么，一律如实填。
+    没跑就写 status=skipped 并说明原因 —— **不许把"计划要跑"写成"跑成功了"**。
+    """
+
+    command: str = Field(description="实际执行的命令（原样）")
+    status: Literal["success", "failed", "timeout", "skipped"]
+    exit_code: int | None = Field(default=None, description="真实退出码；没拿到就留空")
+    stdout_tail: str = Field(default="", description="标准输出末尾若干行（如实截取，不要改写）")
+    stderr_tail: str = Field(default="", description="标准错误末尾若干行（如实截取）")
+    duration_s: float | None = None
+    note: str = Field(default="", description="补充说明（例如为什么跳过、为什么算失败）")
+
+
+class ExperimentExecutionOutput(NodeDecisionFields):
+    """④ 执行实验的产出。"""
+
+    runs: list[ExperimentRunRecord] = Field(
+        default_factory=list, description="已经跑过并拿到结果的运行"
+    )
+    commands_to_run: list[str] = Field(
+        default_factory=list,
+        description=(
+            "请程序替你跑的命令（逐条）。**只有在研究者已经打开「完全访问模式」的对话里才会真跑**；"
+            "没打开时程序会把这件事如实告诉他，并把你的命令列出来让他自己决定。"
+        ),
+    )
+    results_summary: str = Field(default="", description="这一站跑出来的结论摘要（只写跑出来的东西）")
+    failures_and_fixes: list[str] = Field(default_factory=list, description="失败与处置（逐条）")
+    artifacts: list[str] = Field(default_factory=list, description="产出的文件/路径（如训练日志、权重）")
+    limits: list[str] = Field(default_factory=list, description="没做到的部分与原因")
+
+
+# --------------------------------------------------------------------------- #
+# ⑤ 结果分析
+# --------------------------------------------------------------------------- #
+class FindingDraft(SciLoopModel):
+    """一条分析结论（要能追到它是从哪来的）。"""
+
+    finding_text: str
+    supports_hypothesis: Literal["support", "refute", "inconclusive"] = "inconclusive"
+    based_on: list[str] = Field(
+        default_factory=list, description="依据：运行记录/证据的标识（逐条），便于回查"
+    )
+    confidence: Literal["high", "medium", "low"] = "medium"
+    caveat: str = Field(default="", description="这条结论的适用条件或不确定性")
+
+
+class ResultsAnalysisOutput(NodeDecisionFields):
+    """⑤ 结果分析的产出。"""
+
+    findings: list[FindingDraft] = Field(default_factory=list)
+    conclusion: str = Field(default="", description="整体结论（**允许是负结果或无法判定**）")
+    deviations: list[str] = Field(
+        default_factory=list, description="与预期不符的地方（逐条）——如实写比好看重要"
+    )
+    limitations: list[str] = Field(default_factory=list)
+    next_steps: list[str] = Field(default_factory=list, description="下一步建议（逐条）")
+
+
+EXPERIMENT_EXECUTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["runs", "results_summary"],
+    "properties": {
+        "runs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["command", "status"],
+                "properties": {
+                    "command": {"type": "string"},
+                    "status": {"enum": ["success", "failed", "timeout", "skipped"]},
+                    "exit_code": {"type": ["integer", "null"]},
+                    "stdout_tail": {"type": "string"},
+                    "stderr_tail": {"type": "string"},
+                    "duration_s": {"type": ["number", "null"]},
+                    "note": {"type": "string"},
+                },
+            },
+        },
+        "commands_to_run": {"type": "array", "items": {"type": "string"}},
+        "results_summary": {"type": "string"},
+        "failures_and_fixes": {"type": "array", "items": {"type": "string"}},
+        "artifacts": {"type": "array", "items": {"type": "string"}},
+        "limits": {"type": "array", "items": {"type": "string"}},
+        "revert_request": _REVERT_REQUEST,
+    },
+}
+
+RESULTS_ANALYSIS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["findings", "conclusion"],
+    "properties": {
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["finding_text"],
+                "properties": {
+                    "finding_text": {"type": "string"},
+                    "supports_hypothesis": {"enum": ["support", "refute", "inconclusive"]},
+                    "based_on": {"type": "array", "items": {"type": "string"}},
+                    "confidence": {"enum": ["high", "medium", "low"]},
+                    "caveat": {"type": "string"},
+                },
+            },
+        },
+        "conclusion": {"type": "string"},
+        "deviations": {"type": "array", "items": {"type": "string"}},
+        "limitations": {"type": "array", "items": {"type": "string"}},
+        "next_steps": {"type": "array", "items": {"type": "string"}},
+        "revert_request": _REVERT_REQUEST,
+    },
+}
+
+
 NODE_OUTPUT_MODELS: dict[str, type[SciLoopModel]] = {
     "literature_review": LiteratureReviewOutput,
     "idea_and_feasibility": IdeaAndFeasibilityOutput,
     "experiment_and_data_preparation": ExperimentPrepOutput,
+    "experiment_execution_and_retries": ExperimentExecutionOutput,
+    "results_analysis": ResultsAnalysisOutput,
 }
 
 #: 「模型自己的决定」那组字段（做没做完 / 还缺什么 / 要不要上网搜）。
@@ -563,4 +696,6 @@ NODE_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "literature_review": _with_decision_fields(LITERATURE_REVIEW_SCHEMA),
     "idea_and_feasibility": _with_decision_fields(IDEA_FEASIBILITY_SCHEMA),
     "experiment_and_data_preparation": _with_decision_fields(EXPERIMENT_PREP_SCHEMA),
+    "experiment_execution_and_retries": _with_decision_fields(EXPERIMENT_EXECUTION_SCHEMA),
+    "results_analysis": _with_decision_fields(RESULTS_ANALYSIS_SCHEMA),
 }

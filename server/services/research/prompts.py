@@ -79,6 +79,24 @@ NODE_GUIDES: dict[str, str] = {
         "必须有一次真实跑通的小规模预检记录（preflight.exit_code 必须为 0）；\n"
         "**只有计划、脚本或语法检查通过，不等于准备完成**。"
     ),
+    "experiment_execution_and_retries": (
+        "这一站要**真的跑**，不是复述计划：\n"
+        "能跑的命令写进 commands_to_run，程序会替你跑（**只有开了「完全访问模式」的对话才真跑**，"
+        "没开时它会如实告诉研究者，并把命令摆给他）。\n"
+        "跑完的每一次都要在 runs 里如实记：命令原文、status、退出码、输出末尾几行。\n"
+        "**没跑就写 skipped 并说明为什么** —— 把「计划要跑」写成「跑成功了」是本节点最严重的错误。\n"
+        "失败要写进 failures_and_fixes（失败原因 + 你怎么处置的），一次没成就改参数再来，"
+        "改了什么也要写下来；始终跑不通就如实说跑不通，别编结果。\n"
+        "跑出来的产物路径写 artifacts，没做到的写 limits。"
+    ),
+    "results_analysis": (
+        "只根据**真的跑出来的东西**下结论：每条 finding 都要在 based_on 里写清依据"
+        "（哪次运行 / 哪条证据），让人能回查。\n"
+        "支持、反对、无法判定都是有效结论——**负结果和无法判定必须如实写**，不要为了好看往支持上靠。\n"
+        "与预期不符的地方写进 deviations（这往往是最有信息量的部分）。\n"
+        "结论的适用条件与不确定性写进 caveat / limitations；下一步建议写 next_steps。\n"
+        "样本量、重复次数不足以支撑结论时，confidence 写 low 并说明。"
+    ),
 }
 
 SYSTEM_PROMPT = (
@@ -273,6 +291,7 @@ def build_messages(
     budget: dict[str, Any] | None = None,
     repair: str | None = None,
     search_results: list[dict[str, Any]] | None = None,
+    command_results: list[dict[str, Any]] | None = None,
     include_long_guide: bool = True,
 ) -> list[dict[str, str]]:
     """渲染某一节点的执行提示词。"""
@@ -297,6 +316,11 @@ def build_messages(
 
     if search_results:
         parts.append(f"\n## 联网搜索结果（你上一轮要求搜的）\n{_format_search(search_results)}")
+
+    if command_results:
+        parts.append(
+            f"\n## 你上一轮要求跑的命令与真实输出\n{_format_commands(command_results)}"
+        )
 
     if include_long_guide:
         guide = _load_long_guide(node)
@@ -334,6 +358,36 @@ def _format_search(blocks: list[dict[str, Any]]) -> str:
             lines.append(f"{index}. {title}\n   {url}\n   {snippet}")
         lines.append("")
     lines.append("（以上是网页摘要，不是论文全文；若要素材请打开原始链接核对，或说明缺什么。）")
+    return "\n".join(lines)
+
+
+def _format_commands(records: list[dict[str, Any]]) -> str:
+    """模型点名的命令跑成什么样，原样摆出来。
+
+    ⚠️ 只说事实：命令、退出码、输出末尾几行、拒跑的原因。
+    **不要替它解释输出是什么意思、也不要替它判断这算成功还是失败**。
+    """
+
+    lines: list[str] = []
+    for item in records:
+        command = str(item.get("command") or "")
+        if item.get("refused"):
+            lines.append(f"- `{command}` → **没有执行**：{item.get('error')}")
+            continue
+        if item.get("needs_approval"):
+            lines.append(f"- `{command}` → **没有执行**：{item.get('error')}")
+            continue
+        code = item.get("exit_code")
+        lines.append(f"- `{command}` → 退出码 {code}" if code is not None else f"- `{command}` → 没跑起来")
+        if item.get("error"):
+            lines.append(f"    错误：{item['error']}")
+        stdout_tail = str(item.get("stdout_tail") or "").strip()
+        if stdout_tail:
+            lines.append("    输出末尾：\n" + "\n".join("      " + row for row in stdout_tail.splitlines()[-12:]))
+        stderr_tail = str(item.get("stderr_tail") or "").strip()
+        if stderr_tail:
+            lines.append("    错误输出末尾：\n" + "\n".join("      " + row for row in stderr_tail.splitlines()[-8:]))
+    lines.append("（以上是命令的真实输出，截取末尾若干行；请如实写进 runs，不要改写。）")
     return "\n".join(lines)
 
 

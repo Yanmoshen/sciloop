@@ -29,9 +29,11 @@ from typing import Any
 
 from services.research.contracts import (
     NODE_OUTPUT_MODELS,
+    ExperimentExecutionOutput,
     ExperimentPrepOutput,
     IdeaAndFeasibilityOutput,
     LiteratureReviewOutput,
+    ResultsAnalysisOutput,
 )
 
 __all__ = [
@@ -435,10 +437,72 @@ def _check_experiment_prep(
     return hits
 
 
+def _check_execution(
+    out: ExperimentExecutionOutput, facts: LibraryFacts | None
+) -> list[RuleHit]:
+    """④ 执行实验：只核对"到底跑没跑、记录得实不实"，不评判实验设计好坏。"""
+
+    hits: list[RuleHit] = []
+    if not out.runs:
+        if not out.commands_to_run:
+            hits.append(
+                RuleHit(
+                    "R16",
+                    "L2",
+                    "既没有任何运行记录、也没给出要跑的命令：这一站应当真的跑过，或明确说要跑什么",
+                    "runs",
+                )
+            )
+    else:
+        for index, run in enumerate(out.runs, start=1):
+            if run.status == "skipped" and not run.note.strip():
+                hits.append(
+                    RuleHit("R15", "L2", f"第 {index} 条运行标了 skipped，但没写为什么跳过", "runs")
+                )
+            if run.status in ("success", "failed") and run.exit_code is None:
+                hits.append(
+                    RuleHit(
+                        "R15",
+                        "L2",
+                        f"第 {index} 条运行没有退出码，无法核对是否真的执行过",
+                        "runs",
+                    )
+                )
+        if not any(run.status in ("success", "failed") for run in out.runs) and not out.limits:
+            hits.append(
+                RuleHit("R16", "L2", "所有运行都不是真实执行结果，且 limits 里没说明原因", "limits")
+            )
+    if not out.results_summary.strip():
+        hits.append(RuleHit("R15", "L2", "没有写结果摘要（results_summary）", "results_summary"))
+    return hits
+
+
+def _check_analysis(out: ResultsAnalysisOutput, facts: LibraryFacts | None) -> list[RuleHit]:
+    """⑤ 结果分析：只核对"结论能不能回查、有没有如实写不确定"，不评判结论对不对。"""
+
+    hits: list[RuleHit] = []
+    if not out.findings:
+        hits.append(RuleHit("R18", "L2", "没有任何分析结论（findings 为空）", "findings"))
+    for index, finding in enumerate(out.findings, start=1):
+        if not finding.based_on:
+            hits.append(
+                RuleHit("R18", "L2", f"第 {index} 条结论没写依据（based_on），无法回查", "findings")
+            )
+    if not out.conclusion.strip():
+        hits.append(RuleHit("R19", "L2", "没有写整体结论（conclusion）", "conclusion"))
+    if not (out.limitations or any(finding.caveat.strip() for finding in out.findings)):
+        hits.append(
+            RuleHit("R20", "L2", "没有写任何局限或不确定性（limitations / caveat）", "limitations")
+        )
+    return hits
+
+
 _CHECKERS: dict[str, Callable[[Any, LibraryFacts | None], list[RuleHit]]] = {
     "literature_review": _check_literature,
     "idea_and_feasibility": _check_idea,
     "experiment_and_data_preparation": _check_experiment_prep,
+    "experiment_execution_and_retries": _check_execution,
+    "results_analysis": _check_analysis,
 }
 
 
@@ -472,6 +536,15 @@ def rule_catalog(node: str) -> list[dict[str, str]]:
             ("R12", "质量", "必须同时给出成功判据与失败判据"),
             ("R13", "质量", "小规模预检必须真实跑通（退出码 0）"),
             ("R14", "质量", "必须给出预算"),
+        ],
+        "experiment_execution_and_retries": [
+            ("R15", "质量", "每次运行都要写清命令与状态；没跑就标 skipped 并说明原因"),
+            ("R16", "质量", "至少要有一次真实执行记录，或明确说明为什么一条都没跑"),
+        ],
+        "results_analysis": [
+            ("R18", "质量", "每条结论都要写依据（based_on），便于回查"),
+            ("R19", "质量", "必须写整体结论；负结果与无法判定都算有效结论"),
+            ("R20", "质量", "必须写明局限或不确定性"),
         ],
     }
     return [

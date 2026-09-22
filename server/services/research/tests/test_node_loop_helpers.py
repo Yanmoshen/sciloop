@@ -198,6 +198,147 @@ def test_search_is_model_decided_and_bounded() -> None:
     assert 1 <= orchestrator.MAX_SEARCH_QUERIES <= 8
 
 
+# --------------------------------------------------------------------------- #
+# ④⑤ 执行实验 / 结果分析（2026-09-22 补的两种站）
+# --------------------------------------------------------------------------- #
+def test_two_more_nodes_are_implemented() -> None:
+    """后四站里先补两站：执行实验、结果分析。已实现清单是单一事实来源。"""
+
+    from db.models.research import IMPLEMENTED_NODES
+
+    assert "experiment_execution_and_retries" in IMPLEMENTED_NODES
+    assert "results_analysis" in IMPLEMENTED_NODES
+    for node in ("experiment_execution_and_retries", "results_analysis"):
+        assert node in orchestrator.NODE_OUTPUT_MODELS
+        assert node in orchestrator.NODE_OUTPUT_SCHEMAS
+        properties = orchestrator.NODE_OUTPUT_SCHEMAS[node]["properties"]
+        assert "state" in properties and "search_queries" in properties, "决策字段要自动并进去"
+
+
+def test_execution_node_contract_carries_the_real_run_record() -> None:
+    """「真跑」的证据形状：命令 / 状态 / 退出码 / 输出末尾都要在契约里。"""
+
+    schema = orchestrator.NODE_OUTPUT_SCHEMAS["experiment_execution_and_retries"]
+    run_item = schema["properties"]["runs"]["items"]["properties"]
+    assert {"command", "status", "exit_code", "stdout_tail", "stderr_tail"} <= set(run_item)
+    assert run_item["status"]["enum"] == ["success", "failed", "timeout", "skipped"]
+    assert "commands_to_run" in schema["properties"]
+
+
+def test_guides_tell_the_model_to_be_honest_about_not_running() -> None:
+    """提示词必须把"没跑就写 skipped"和"负结果如实写"讲清楚。"""
+
+    execution = prompts.NODE_GUIDES["experiment_execution_and_retries"]
+    assert "skipped" in execution
+    assert "真的跑" in execution
+    analysis = prompts.NODE_GUIDES["results_analysis"]
+    assert "负结果" in analysis and "无法判定" in analysis
+
+
+@pytest.mark.parametrize(
+    "command,expect_key",
+    [
+        ("rm -rf /tmp/whatever", "needs_approval"),  # 高危：不静默跑
+        ("sudo reboot", "needs_approval"),
+    ],
+)
+def test_node_commands_never_run_high_risk(
+    monkeypatch: pytest.MonkeyPatch, command: str, expect_key: str
+) -> None:
+    """高危命令即使在获授权的对话里也不静默跑 —— 要在对话里单独确认。"""
+
+    from services.agent import approvals, host_runner
+
+    called: list[str] = []
+
+    async def fake_exec(**_kwargs):
+        called.append("ran")
+        return {"ok": True, "exit_code": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(host_runner, "call_exec", fake_exec)
+    monkeypatch.setattr(
+        approvals, "load", lambda _cid: {"id": "c1", "grants": {"full_access": True}}
+    )
+    records, granted = asyncio.run(orchestrator._run_node_commands("c1", [command]))
+    assert granted is True
+    assert records and records[0].get(expect_key) is True
+    assert called == [], "高危命令不该真的执行"
+
+
+def test_node_commands_do_not_run_without_grant(monkeypatch: pytest.MonkeyPatch) -> None:
+    """没开「完全访问模式」→ 一条都不跑（这是节点里唯一的闸门）。"""
+
+    from services.agent import approvals, host_runner
+
+    called: list[str] = []
+
+    async def fake_exec(**_kwargs):
+        called.append("ran")
+        return {"ok": True, "exit_code": 0, "stdout": "", "stderr": ""}
+
+    monkeypatch.setattr(host_runner, "call_exec", fake_exec)
+    monkeypatch.setattr(approvals, "load", lambda _cid: {"id": "c1", "grants": {}})
+    records, granted = asyncio.run(orchestrator._run_node_commands("c1", ["python --version"]))
+    assert granted is False and records == []
+    assert called == []
+
+
+def test_node_commands_refuse_deleting_own_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    """硬拒（删 SciLoop 自己的代码）连跑都不跑，且如实说明。"""
+
+    from services.agent import approvals, host_runner, policy
+
+    called: list[str] = []
+
+    async def fake_exec(**_kwargs):
+        called.append("ran")
+        return {"ok": True}
+
+    monkeypatch.setattr(host_runner, "call_exec", fake_exec)
+    monkeypatch.setattr(approvals, "load", lambda _cid: {"id": "c1", "grants": {"allow_exec": True}})
+    target = f"rm -rf {policy.sciloop_root()}/web"
+    records, granted = asyncio.run(orchestrator._run_node_commands("c1", [target]))
+    assert granted is True
+    assert records[0]["refused"] is True
+    assert called == []
+
+
+def test_node_commands_actually_run_when_granted(monkeypatch: pytest.MonkeyPatch) -> None:
+    from services.agent import approvals, host_runner
+
+    seen: list[dict] = []
+
+    async def fake_exec(**kwargs):
+        seen.append(kwargs)
+        return {"ok": True, "exit_code": 0, "stdout": "hello\n", "stderr": ""}
+
+    monkeypatch.setattr(host_runner, "call_exec", fake_exec)
+    monkeypatch.setattr(
+        approvals, "load", lambda _cid: {"id": "c1", "grants": {"full_access": True}}
+    )
+    records, granted = asyncio.run(
+        orchestrator._run_node_commands("c1", ["python --version", "echo hi"])
+    )
+    assert granted is True and len(records) == 2
+    assert seen and "python --version" in seen[0]["command"]
+    assert records[0]["stdout_tail"] == "hello\n"
+
+
+def test_command_results_are_rendered_as_facts() -> None:
+    messages = prompts.build_messages(
+        node="experiment_execution_and_retries",
+        user_text="x",
+        command_results=[
+            {"command": "python --version", "ok": True, "exit_code": 0, "stdout_tail": "Python 3.13"},
+            {"command": "sudo reboot", "ok": False, "needs_approval": True, "error": "高危"},
+        ],
+    )
+    body = messages[-1]["content"]
+    assert "你上一轮要求跑的命令与真实输出" in body
+    assert "python --version" in body and "退出码 0" in body
+    assert "**没有执行**" in body
+
+
 def test_decision_fields_are_part_of_the_contract() -> None:
     """模型的决定跟着产出一起回来：state / pending / state_reason 必须在契约里。"""
 

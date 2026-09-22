@@ -57,6 +57,10 @@ IMPLEMENTED_NODES: tuple[str, ...] = (
     "literature_review",
     "idea_and_feasibility",
     "experiment_and_data_preparation",
+    # 2026-09-22 补：执行实验要真的跑（模型给命令、程序在获授权的对话里替它跑），
+    # 结果分析只认跑出来的东西。剩下两站（论文写作 / 论文评审）紧随其后补。
+    "experiment_execution_and_retries",
+    "results_analysis",
 )
 
 #: 节点状态（程序内部六态；文档五态在展示层映射，见 services/research/graph.py）
