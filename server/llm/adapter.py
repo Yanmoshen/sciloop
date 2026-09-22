@@ -245,6 +245,14 @@ async def _live_call(
     started_total = time.perf_counter()
 
     for attempt in range(1, max_attempts + 1):
+        # 每轮都重取一次档位：上一轮若被上游拒绝，``note_strategy_rejected`` 已把该档
+        # 记进**进程内**记忆（``providers._REJECTED_STRATEGIES``），这里必须重新查询。
+        # 只在循环外算一次的话，第 2 轮会拿旧档位再发一次已经被拒的 ``json_schema``
+        # ——实测白烧一次往返（上游 400、0 token），日志里表现为同一 purpose 下
+        # 两次 ``schema_strategy_rejected``夹着一次真实调用。
+        if json_schema is not None:
+            strategy = json_strategy(capability, provider_key=model.provider)
+
         resolved_temperature = (
             temperature if temperature is not None else (model.temperature or DEFAULT_TEMPERATURE)
         )

@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import json
 import logging
@@ -41,7 +42,8 @@ from db.models.aggregation import Evidence, Idea
 from db.models.feasibility import Feasibility, Taskbook
 from db.models.research import IMPLEMENTED_NODES, ResearchNodeRun
 from llm.adapter import chat
-from llm.errors import LLMAuthError
+from llm.errors import LLMAuthError, LLMBadRequestError
+from llm.providers import looks_like_schema_rejection
 from llm.schema import load_json_payload
 from services.research import graph, prompts, store
 from services.research import preflight as preflight_mod
@@ -96,7 +98,70 @@ NODE_MAX_TOKENS = 8000
 #: 而 env 的 Key 可能是空的 —— 一次本来能成的调用就这样变成硬失败。
 #: 因此首次带 schema 试一次，失败就把该模型记下来、本轮改用纯文本模式重试，
 #: **不占用节点的修复重试额度**。能从上游拿到结构化输出时仍然优先用它。
+#: ⚠️ 只记「**确实是上游拒绝 schema 档**」这一种失败（见 ``_is_schema_rejection``）：
+#: 早先无差别地把任何异常都记进来，于是网络抖动 / 认证失败 / 解析失败都会让该模型
+#: 在进程余下的生命周期里**永久失去**结构化输出档位。
 _SCHEMA_UNSUPPORTED: set[str] = set()
+
+
+def _is_schema_rejection(exc: BaseException) -> bool:
+    """这次失败是不是「上游不接受 ``response_format`` 档位」。"""
+
+    if not isinstance(exc, LLMBadRequestError):
+        return False
+    detail = getattr(exc, "detail", None)
+    body = f"{exc} {detail if isinstance(detail, str) else ''}"
+    return looks_like_schema_rejection(getattr(exc, "status_code", None) or 400, body)
+
+
+#: 「没被收尾的 running」多久算已中断（**读侧**判定用）。
+#: 量级参考：单次尝试实测上限约 40s（8000 token 上限），最多 3 次尝试加每层降档重发，
+#: 正常最坏也在 3 分钟内。15 分钟足够宽，不会把真在跑的节点误报成中断。
+STALE_RUN_SECONDS = 15 * 60
+
+
+def _interrupted_if_stale(
+    row: dict[str, Any], *, now: datetime.datetime
+) -> dict[str, Any]:
+    """读取时把「超时仍未收尾的 ``running``」报成已中断。
+
+    为什么要读侧也兜一道：节点行一旦卡在 ``running``（客户端断连、进程被替换），
+    控制台的流光会**一直转**、像还在跑（实测有卡了 15 小时的行）。
+    这里**不改库**，只在读取时按 ``updated_at`` 超时判定，并把原因写成一条校验缺项，
+    让界面显示红点「已中断」而不是永远进行中；重试入口照旧可用。
+    """
+
+    if str(row.get("status")) != "running":
+        return row
+    seen = row.get("updated_at") or row.get("started_at")
+    if not isinstance(seen, datetime.datetime):
+        return row
+    if seen.tzinfo is None:  # 兼容历史行里的 naive 时间戳
+        seen = seen.replace(tzinfo=datetime.UTC)
+    idle = (now - seen).total_seconds()
+    if idle < STALE_RUN_SECONDS:
+        return row
+
+    stale = dict(row)
+    stale["status"] = "failed"
+    stale["interrupted"] = True
+    stale["validation"] = {
+        "ok": False,
+        "level": "L1",
+        "rules": ["interrupted"],
+        "items": [
+            {
+                "rule": "interrupted",
+                "level": "L1",
+                "path": None,
+                "message": (
+                    f"执行已中断约 {int(idle // 60)} 分钟（连接断开或进程退出），"
+                    "这一轮没有产出结论——可以直接重试。"
+                ),
+            }
+        ],
+    }
+    return stale
 
 
 @dataclass
@@ -319,8 +384,10 @@ async def chain_state(
 
     runs = await store.list_node_runs(session, conversation_id=conversation_id)
     by_node: dict[str, dict[str, Any]] = {}
+    now = _utcnow()
     for row in runs:
-        by_node[str(row["node"])] = row  # 后者覆盖前者 = 取最新进入
+        # 超时仍未收尾的 running → 如实报成「已中断」（不改库，只改读取口径）
+        by_node[str(row["node"])] = _interrupted_if_stale(row, now=now)  # 后者覆盖前者 = 取最新进入
 
     nodes: list[dict[str, Any]] = []
     for node in _DEFAULT_ORDER:
@@ -642,7 +709,119 @@ async def run_node(
     拿不到就按 ``ask`` 处理——不替用户造项目，也不因此拦住他。
 
     失败一律如实上报：任何异常都转成 ``error`` 事件，**不返回伪造的成功**。
+
+    这一层只做一件事：**保证那行 ``running`` 一定被收尾**。
+    真正的执行在 ``_run_node_events``；这里包一层，是因为上游多是 SSE——
+    客户端切页 / 关抽屉 / 浏览器回收连接都会**取消**本生成器，而取消走的是
+    ``BaseException``（``CancelledError``），原先没人管，于是库里留下一行
+    永远 ``running`` 的僵尸（实测最长卡了 15 小时，控制台流光一直转）。
     """
+
+    entered: dict[str, Any] = {}
+    settled = False
+    source = _run_node_events(
+        session_factory,
+        conversation_id=conversation_id,
+        node=node,
+        text=text,
+        project_id=project_id,
+    )
+    try:
+        async for event, data in source:
+            if event == "node":
+                entered = {
+                    "node": data.get("node"),
+                    "entry_index": data.get("entry_index"),
+                }
+            elif event in ("done", "error"):
+                # ``done`` = 正常收尾；``error`` 之前各失败分支都已落过终态
+                settled = True
+            yield event, data
+    except BaseException:
+        if entered and not settled:
+            await _settle_interrupted(
+                session_factory,
+                conversation_id=conversation_id,
+                project_id=project_id,
+                node=str(entered.get("node") or ""),
+                entry_index=int(entered.get("entry_index") or 1),
+            )
+        raise
+
+
+async def _settle_interrupted(
+    session_factory: Any,
+    *,
+    conversation_id: str,
+    project_id: int | None,
+    node: str,
+    entry_index: int,
+) -> None:
+    """把被中断的那行 ``running`` 落成 ``failed`` 并留痕（尽力而为）。
+
+    用 ``asyncio.shield``：调用方此刻多半已经处于**取消**状态，不 shield 的话
+    收尾的第一次 ``await`` 会立刻再抛 ``CancelledError``，这行就还是收不了尾。
+    收尾本身失败也**绝不掩盖**原始异常（只记日志）。
+    """
+
+    async def _write() -> None:
+        async with session_factory() as session:
+            latest = await _latest_run(session, conversation_id=conversation_id, node=node)
+            if str((latest or {}).get("status")) != "running":
+                return  # 已被正常路径收尾，别覆盖真实结论
+            label = graph.NODE_LABELS.get(node, node)
+            await store.upsert_node_run(
+                session,
+                conversation_id=conversation_id,
+                project_id=project_id,
+                node=node,
+                entry_index=entry_index,
+                status="failed",
+                validation={
+                    "ok": False,
+                    "level": "L1",
+                    "rules": ["interrupted"],
+                    "items": [
+                        {
+                            "rule": "interrupted",
+                            "level": "L1",
+                            "path": None,
+                            "message": (
+                                "执行被中断（连接断开或进程退出），本次没有产出结论——可以直接重试。"
+                            ),
+                        }
+                    ],
+                },
+                finished_at=_utcnow(),
+            )
+            await store.record_transition(
+                session,
+                conversation_id=conversation_id,
+                project_id=project_id,
+                from_node=node,
+                to_node=node,
+                kind="stop",
+                trigger="program",
+                reason=f"「{label}」执行被中断（客户端断开或进程退出），已如实标记为失败",
+            )
+
+    try:
+        await asyncio.shield(_write())
+    except BaseException:  # noqa: BLE001 - 收尾是尽力而为，绝不掩盖原始异常
+        logger.warning(
+            "中断收尾失败 conversation=%s node=%s", conversation_id, node, exc_info=True
+        )
+
+
+async def _run_node_events(
+    session_factory: Any,
+    *,
+    conversation_id: str,
+    node: str | None = None,
+    text: str = "",
+    project_id: int | None = None,
+) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+    """节点执行主体（事件语义见 ``run_node`` 的文档字符串）。"""
 
     async with session_factory() as session:
         project = await _load_project(session, project_id) if project_id else None
@@ -917,8 +1096,10 @@ async def run_node(
                 break
             except Exception as exc:  # noqa: BLE001 - 失败如实上报，不做假成功
                 llm_failed = exc
-                if want_schema:
-                    # 记下该模型不支持 schema 档，改用纯文本模式再试一次（同一轮，不扣额度）
+                if want_schema and _is_schema_rejection(exc):
+                    # **确实是上游拒绝 schema 档**才记：改用纯文本模式再试一次
+                    # （同一轮，不扣额度）。别把网络抖动 / 认证失败 / 解析失败也记进来，
+                    # 那会让该模型在进程余下的生命周期里永久失去结构化输出档位。
                     _SCHEMA_UNSUPPORTED.add(model_ref)
                     yield "notice", {
                         "node": target,
