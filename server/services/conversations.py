@@ -357,6 +357,9 @@ def purge_flat_test_files(keep_ids: set[str] | None = None) -> list[str]:
 
 
 __all__ = [
+    "TITLE_MONOLOGUE_MARKERS",
+    "TITLE_SYSTEM",
+    "pick_title_line",
     "MAX_TURNS_FOR_CONTEXT",
     "UNGROUPED_KEY",
     "append_turns",
@@ -379,3 +382,62 @@ __all__ = [
     "summary",
     "write",
 ]
+
+
+# --------------------------------------------------------------------------- #
+# 会话标题：只输出标题本身，不许把"思考过程"混进来
+# --------------------------------------------------------------------------- #
+#: 标题调用的系统提示。**这句不能省** —— 标题调用原来只有 user 提示，
+#: 于是擅长"自言自语"的模型把推理写进正文，第一行就被当标题存下来了（2026-09-22 实测 17 例）。
+TITLE_SYSTEM = (
+    "你是科研项目的命名助手。只输出一个标题，不要输出任何思考过程、推理、自我对话、"
+    "解释或前后缀——例如「我们需要回答用户……」「用户要求……」「让我看看……」这类句子一律不许出现。"
+    "标题用中文，不超过 20 个字，不带引号、不带句号，只输出标题本身。"
+)
+
+#: 一眼能看出是"模型在自言自语"的痕迹：命中就不要拿它当标题
+TITLE_MONOLOGUE_MARKERS: tuple[str, ...] = (
+    "我们需要回答用户",
+    "用户要求",
+    "用户说",
+    "用户希望",
+    "让我",
+    "我需要",
+    "首先",
+    "拟一个标题",
+    "命名助手",
+    "只输出标题",
+    "输出标题",
+    "标题：",
+    "标题:",
+    "题目：",
+    "以下是",
+)
+
+#: 标题里不该出现的标点（标题是一行短语，不是句子）
+_TITLE_BAD_PUNCT = ("。", "？", "！", "?", "!", "；", ";")
+
+
+def pick_title_line(content: str, *, max_chars: int = 20) -> str:
+    """从模型回复里挑出**标题那一行**；挑不出来就返回空串。
+
+    三层兜底：
+    1. 跳过含独白痕迹的行；
+    2. 在剩下的里面优先挑"像标题"的（不超过 max_chars、且没有句末标点）；
+    3. 实在没有像样的 → 返回空串，**由调用方降级**（用研究者输入的前若干字），
+       而不是硬把一段独白塞进侧栏。
+    """
+
+    rows = [row.strip().strip("《》\"'“”") for row in (content or "").splitlines()]
+    rows = [row for row in rows if row]
+    if not rows:
+        return ""
+
+    clean = [row for row in rows if not any(marker in row for marker in TITLE_MONOLOGUE_MARKERS)]
+    for row in clean:
+        if len(row) <= max_chars and not any(punct in row for punct in _TITLE_BAD_PUNCT):
+            return row
+    if clean:
+        # 次选：最短的一行再截断（比整段独白强得多）
+        return min(clean, key=len)[:max_chars]
+    return ""

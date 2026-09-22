@@ -55,11 +55,8 @@ REASONING_MAX_CHARS = 6000
 #: 64 太小：思考型模型会把预算全花在 reasoning 上，content 为空 → 标题静默降级。
 TITLE_MAX_TOKENS = 400
 
-TITLE_PROMPT = (
-    "你是科研项目的命名助手。为下面这段研究需求拟一个标题。\n"
-    "要求：中文；不超过 20 个字；只输出标题本身，不要引号、不要句号、不要解释。\n\n"
-    "研究需求：\n{text}"
-)
+#: 标题调用的 user 提示（约束在 `conversations.TITLE_SYSTEM` 里，两边都留着更稳）
+TITLE_PROMPT = "为下面这段研究需求拟一个标题。\n\n研究需求：\n{text}"
 
 REPLY_SYSTEM = (
     "你是 SciLoop 的科研助手，帮助研究者把模糊的研究需求整理成可执行的研究方案。\n"
@@ -304,7 +301,12 @@ async def _generate_title(text: str, ref: str) -> tuple[str, str, str | None]:
     title_note: str | None = None
     try:
         title_result = await adapter.chat(
-            TITLE_PROMPT.format(text=text),
+            [
+                # ⚠️ 必须有 system 约束：只有 user 提示时，爱"自言自语"的模型
+                # 会把推理写进正文，第一行就被当标题存下来（2026-09-22 实测 17 例）
+                {"role": "system", "content": conversations.TITLE_SYSTEM},
+                {"role": "user", "content": TITLE_PROMPT.format(text=text)},
+            ],
             model_ref=ref,
             max_tokens=TITLE_MAX_TOKENS,
             temperature=0.2,
@@ -312,10 +314,15 @@ async def _generate_title(text: str, ref: str) -> tuple[str, str, str | None]:
             allow_fallback=False,
             strict_logging=False,
         )
-        candidate = (title_result.content or "").strip().strip("《》\"'“”").splitlines()[0].strip()
+        candidate = conversations.pick_title_line(
+            title_result.content or "", max_chars=TITLE_MAX_CHARS
+        )
         if candidate:
             title = candidate[:TITLE_MAX_CHARS]
             title_source = "model"
+        elif (title_result.content or "").strip():
+            # 有正文但不含标题（整段是思考过程）：如实说明，用需求前 20 字兜底
+            title_note = "模型返回的是思考过程而不是标题，已沿用需求前 20 字"
         else:
             title_note = "模型未给出标题（返回空正文），已沿用需求前 20 字"
     except Exception as exc:  # noqa: BLE001 - 标题是锦上添花，任何失败都降级
