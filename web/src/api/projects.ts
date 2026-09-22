@@ -18,6 +18,13 @@ export interface CreateProjectInput {
   note: string
   fields: string[]
   mode?: 'manual' | 'auto'
+  /**
+   * 这个项目在研究者电脑上的工作目录（可选）。
+   *
+   * 不填 = 自动在研究项目根下建一个 `<项目号>-<名字>`；填了就按填的建。
+   * 目录是**真的在你电脑上建出来的**（服务端走宿主执行器）。
+   */
+  workspace_dir?: string
 }
 
 /** `GET /projects/{id}` 的响应（含迭代历史；缺值一律 null，不编造） */
@@ -101,6 +108,7 @@ export async function createProject(input: CreateProjectInput): Promise<CreatedP
     body: {
       name: input.name.trim(),
       mode: input.mode ?? 'manual',
+      workspace_dir: input.workspace_dir?.trim() || undefined,
       settings: {
         note: input.note.trim(),
         fields: input.fields,

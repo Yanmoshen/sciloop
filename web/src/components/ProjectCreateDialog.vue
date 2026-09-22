@@ -41,6 +41,7 @@ const CUSTOM_FIELD_KEY = 'sciloop.custom_research_fields'
 
 const name = ref('')
 const note = ref('')
+const workspaceDir = ref('')
 const selected = ref<string[]>(['cs.CL'])
 const notice = ref('')
 const busy = ref(false)
@@ -91,6 +92,7 @@ watch(
     if (!open) return
     notice.value = ''
     busy.value = false
+    workspaceDir.value = ''
     editing.value = false
     newFieldName.value = ''
     const seed = (props.prefill ?? '').trim()
@@ -151,6 +153,7 @@ async function submit(): Promise<void> {
       name: name.value,
       note: note.value,
       fields: selected.value,
+      workspace_dir: workspaceDir.value,
     })
     emit('created', project)
     close()
@@ -177,6 +180,15 @@ async function submit(): Promise<void> {
       <label class="field">
         <span class="field__label">项目名</span>
         <input v-model="name" type="text" placeholder="例如：长上下文问答评测方案" />
+      </label>
+
+      <label class="field">
+        <span class="field__label">工作目录</span>
+        <input
+          v-model="workspaceDir"
+          type="text"
+          placeholder="留空即可：会在项目的 research-workspaces 下自动建一个"
+        />
       </label>
 
       <label class="field">

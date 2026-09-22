@@ -79,7 +79,11 @@ def _iso(value: Any) -> str | None:
 
 
 def _project_dict(project: Project, *, include_settings: bool = True) -> dict[str, Any]:
-    """项目基础字段（``is_demo`` / ``taskbook_id`` 如实返回，缺值置 null 不编造）。"""
+    """项目基础字段（``is_demo`` / ``taskbook_id`` 如实返回，缺值置 null 不编造）。
+
+    ``workspace_dir`` = 这个项目在研究者电脑上的工作目录（没定过就是 null）；
+    ``workspace_note`` = 建目录时如实留下的说明（例如"执行器没连上，目录没建成"）。
+    """
     payload: dict[str, Any] = {
         "id": int(project.id),
         "name": project.name,
@@ -95,6 +99,10 @@ def _project_dict(project: Project, *, include_settings: bool = True) -> dict[st
     }
     if include_settings:
         payload["settings"] = project.settings
+    # 工作目录单独提出来给界面用（存在 settings 里，不加迁移）
+    stored_settings = project.settings if isinstance(project.settings, dict) else {}
+    payload["workspace_dir"] = stored_settings.get("workspace_dir")
+    payload["workspace_note"] = stored_settings.get("workspace_note")
     return payload
 
 
@@ -216,7 +224,9 @@ async def create_project(
     """创建项目（``status=DRAFT``，``current_iteration=0``）。
 
     允许字段：``name``（必填）、``mode``（``manual``/``auto``，默认 ``manual``）、
-    ``idea_id`` / ``taskbook_id``（可选外键）、``settings``（JSONB）、``is_demo``。
+    ``idea_id`` / ``taskbook_id``（可选外键）、``settings``（JSONB）、``is_demo``、
+    ``workspace_dir``（可选：这个项目在研究者电脑上的工作目录；不填就落在研究项目根下
+    ``<根>/<项目号>-<名字>``）。目录会真的在你电脑上建出来（走宿主执行器）。
     """
     name = str(payload.get("name") or "").strip()
     if not name:
@@ -293,6 +303,21 @@ async def create_project(
         )
         session.add(project)
         await session.flush()
+
+        # 工作目录：研究者选了就按他的，没选就落在研究项目根下。
+        # 目录建在**他的电脑上**（容器看不到宿主路径），所以走宿主执行器；
+        # 执行器没连上也不拦着建项目，但要如实说明目录没建成。
+        chosen = str(payload.get("workspace_dir") or "").strip()
+        workspace_dir, workspace_note = await _ensure_workspace(
+            project_id=int(project.id), name=name, chosen=chosen
+        )
+        merged_settings = dict(project.settings) if isinstance(project.settings, dict) else {}
+        merged_settings["workspace_dir"] = workspace_dir
+        if workspace_note:
+            merged_settings["workspace_note"] = workspace_note
+        project.settings = merged_settings
+        await session.flush()
+
         result = _project_dict(project)
         result["stage_order"] = list(STAGE_ORDER)
         result["note"] = (
@@ -399,3 +424,48 @@ __all__ = [
     "rename_project",
     "router",
 ]
+
+
+#: 没选文件夹时，项目工作目录相对"研究项目根"的形态：<项目号>-<名字片段>
+WORKSPACE_SLUG_MAX = 40
+
+
+def _slug(name: str) -> str:
+    """把项目名压成一个安全的目录名片段（中文名压不出东西就退回 project）。"""
+
+    kept = [ch for ch in name.strip().lower() if ch.isascii() and (ch.isalnum() or ch in "-_")]
+    slug = "".join(kept).strip("-_")
+    return slug[:WORKSPACE_SLUG_MAX] or "project"
+
+
+async def _ensure_workspace(*, project_id: int, name: str, chosen: str) -> tuple[str | None, str | None]:
+    """确定并创建项目的工作目录，返回 `(目录, 如实说明或 None)`。
+
+    - 研究者给了路径 → 用它（**任意路径都支持**：执行器跑在他人电脑上）；
+    - 没给 → 落在研究项目根下 `<根>/<项目号>-<名字片段>`；
+    - 建目录走宿主执行器；连不上就返回说明，**不让建项目失败**。
+    """
+
+    from services.agent import host_runner
+
+    if chosen:
+        target = chosen
+    else:
+        root = await host_runner.default_cwd()
+        if not root:
+            return None, "还没连上你电脑上的执行器，工作目录没建成；连上后可以再设置一次。"
+        # 容器里跑的是 Python 3.11：**f-string 里不能出现反斜杠转义**
+        # （3.12 才放开），所以先把分隔符处理干净再拼。
+        base = str(root).rstrip("/").rstrip("\\")
+        target = f"{base}/{project_id}-{_slug(name)}"
+
+    # 统一成正斜杠再存：Windows 上两种都认，但混着显示（D:\a\b/96-demo）会让人以为路径不对。
+    target = target.replace("\\", "/")
+
+    created = await host_runner.call_fs(action="mkdir", path=target)
+    if created.get("ok"):
+        return target, None
+    reason = str(created.get("error") or "目录没能创建")
+    if created.get("unreachable"):
+        return target, f"目录还没建成：{reason}（连上执行器后可以再试）"
+    return target, f"目录还没建成：{reason}"
