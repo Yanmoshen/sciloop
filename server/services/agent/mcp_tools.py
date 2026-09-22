@@ -39,7 +39,9 @@ MAX_TOOL_ROUNDS = 3
 #: 摆给模型**自主**调用的工具白名单（**只读**）。写/执行类不在这里，见 APPROVABLE_TOOLS。
 #: 摆给模型**自主**调用的工具白名单（**只读**）。写/执行类不在这里，见 APPROVABLE_TOOLS。
 #: `search_web` 走项目自建的 SearXNG（见 `services/agent/web_search.py`），也是只读。
-AUTONOMOUS_TOOLS = ("query_library", "search_web", "fetch_url")
+#: 只读的联网检索**两个并列能力**（模型自己选）：
+#: `search_academic` 查学术（官方接口，稳）、`search_web` 搜网页（覆盖广，可能被限流）。
+AUTONOMOUS_TOOLS = ("query_library", "search_academic", "search_web", "fetch_url")
 
 #: 摆给模型但**必须研究者批准**才执行的工具（写盘/执行类）。
 APPROVABLE_TOOLS = ("run_command",)
@@ -52,29 +54,63 @@ HOST_TOOLS = ("run_on_computer", "files_on_computer")
 #: 工具名 → 对话里那句话（给用户看的，不是给模型看的）
 TOOL_LABELS = {
     "query_library": "查询论文库",
-    "search_web": "联网搜索",
+    "search_academic": "查学术",
+    "search_web": "搜网页",
     "fetch_url": "抓取网页",
     "run_command": "执行命令",
     "run_on_computer": "在你的电脑上执行命令",
     "files_on_computer": "在你电脑上读写或整理文件",
 }
 
-#: 「联网搜索」的工具声明（本地声明，不经过 MCP server）。
-#: 它走项目自建的 SearXNG：免费开源、不需要商业 API Key。
-_SEARCH_TOOL_SCHEMA: dict[str, Any] = {
+#: 「搜网页」的工具声明（本地声明，不经过 MCP server）。
+#: 走项目自建的 SearXNG：免费开源、不需要商业 API Key。
+_SEARCH_WEB_TOOL_SCHEMA: dict[str, Any] = {
     "type": "function",
     "function": {
         "name": "search_web",
         "description": (
-            "到互联网上搜索资料，返回网页标题、链接与摘要（不是论文全文，引用前自己核对原始链接）。"
-            "当论文库里找不到相关材料、或需要最新进展时用它。搜到什么由你判断怎么用；"
-            "要不要把某条结果存进论文库，也由你决定。"
+            "到互联网上搜资料（网页/博客/问答/文档都可能有），返回标题、链接与摘要。"
+            "覆盖面广，但**可能被上游搜索引擎限流或要验证码**（那种情况我会如实告诉你）。"
+            "找论文、找开源实现，优先用 search_academic（它走官方接口，更稳）。"
+            "引用前自己打开原始链接核对；结果要不要存进论文库由你决定。"
         ),
         "parameters": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "搜索词（用研究对象最可能被怎么写，英文通常更好搜）"},
+                "query": {
+                    "type": "string",
+                    "description": "搜索词（用研究对象最可能被怎么写；英文通常更好搜）",
+                },
                 "limit": {"type": "integer", "description": "最多要几条结果，默认 8"},
+            },
+            "required": ["query"],
+        },
+    },
+}
+
+#: 「查学术」的工具声明：直连官方接口（arXiv / Crossref / GitHub），不抓页面。
+_SEARCH_ACADEMIC_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "search_academic",
+        "description": (
+            "查学术资料：论文题录（arXiv 预印本、Crossref 正式期刊）与开源代码（GitHub）。"
+            "走官方接口，**稳、不受反爬影响**，是找相关工作/找实现的主力。"
+            "返回标题、链接与摘要；引用前打开链接核对。结果要不要存进论文库由你决定。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "检索词（英文通常更准）"},
+                "limit": {
+                    "type": "integer",
+                    "description": "每个来源最多要几条，默认 5",
+                },
+                "sources": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["arxiv", "crossref", "github"]},
+                    "description": "只查这几个来源（不填就三个都查）",
+                },
             },
             "required": ["query"],
         },
@@ -204,7 +240,8 @@ async def tool_schemas() -> list[dict[str, Any]]:
     import json as _json
 
     schemas: list[dict[str, Any]] = _json.loads(_json.dumps(_HOST_TOOL_SCHEMAS))
-    schemas.append(_json.loads(_json.dumps(_SEARCH_TOOL_SCHEMA)))
+    schemas.append(_json.loads(_json.dumps(_SEARCH_WEB_TOOL_SCHEMA)))
+    schemas.append(_json.loads(_json.dumps(_SEARCH_ACADEMIC_TOOL_SCHEMA)))
 
     # 把"你在这台电脑上的默认工作目录"写进工具描述：模型据此决定要不要显式指定目录，
     # 也免得它去猜容器里的路径（容器路径在宿主上根本不存在）。
@@ -318,6 +355,36 @@ def _public_schema(raw: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
+#: 错误详情里的「内部话 → 人话」映射。
+#: 过程行是**给研究者看的**，不该出现工具名、MCP 的 `Error executing tool …` 包装前缀、
+#: 以及整份可执行白名单（2026-09-22 实测：界面上原样出现
+#: `Error executing tool run_command: {tool_denied}「pwd」不在可执行白名单内；允许：[…]`）。
+#: 注意：**只改这一行**；回给模型的错误原文照旧（模型需要具体信息才能自己改正）。
+_HUMAN_ERRORS: tuple[tuple[str, str], ...] = (
+    ("不在可执行白名单内", "这条命令不在允许范围内（只允许读取与分析类命令）"),
+    ("tool_denied", "这条命令不在允许范围内（只允许读取与分析类命令）"),
+    ("workdir_outside", "不允许在这个目录下执行"),
+    ("path_outside", "不允许访问工作区以外的路径"),
+    ("forbidden_name", "不允许读写这个文件"),
+)
+
+
+def _human_error(detail: str) -> str:
+    """把内部报错折叠成一句人话（识别不出就原样返回，绝不吞信息）。"""
+
+    text = detail.strip()
+    # 去掉 MCP SDK 的包装前缀：`Error executing tool run_command: …`
+    if text.startswith("Error executing tool "):
+        _, _, tail = text.partition(": ")
+        if tail:
+            text = tail.strip()
+    for needle, human in _HUMAN_ERRORS:
+        if needle in text:
+            return human
+    # 其余情况只去掉 `{code}` 花括号编码，保留具体原因
+    return text.replace("{tool_denied}", "").replace("{tool_failed}", "").strip()
+
+
 def tool_row(call: dict[str, Any], phase: str, detail: str = "") -> dict[str, Any]:
     """工具调用在对话里的呈现（走现有 SSE `row` 事件，前端已能渲染）。"""
 
@@ -332,7 +399,7 @@ def tool_row(call: dict[str, Any], phase: str, detail: str = "") -> dict[str, An
         # tone=warn 而不是 err：**这不是失败，是停下来等人** —— 把两者混起来，
         # 研究者会以为工具已经出错了，而实际上它一次都没跑。
         return {"kind": "tool", "tone": "warn", "text": f"「{label}」等待研究者批准{detail}"}
-    return {"kind": "tool", "tone": "warn", "text": f"「{label}」未完成：{detail}"}
+    return {"kind": "tool", "tone": "warn", "text": f"「{label}」未完成：{_human_error(detail)}"}
 
 
 #: 批准请求在行里的状态 → 卡片语气（前端只按这个上色，不自己猜）
@@ -416,8 +483,22 @@ async def run_tool_call(
     arguments = _arguments(call)
 
     # 「联网搜索」：只读，走自建 SearXNG；连不上就如实回一句人话（不假装搜过）
+    if name == "search_academic":
+        sources = arguments.get("sources")
+        picked = (
+            tuple(str(item) for item in sources if str(item) in web_search.SUPPORTED_SOURCES)
+            if isinstance(sources, list)
+            else web_search.SUPPORTED_SOURCES
+        )
+        result = await web_search.search_academic(
+            str(arguments.get("query") or ""),
+            limit=int(arguments.get("limit") or 5),
+            sources=picked or web_search.SUPPORTED_SOURCES,
+        )
+        return {"ok": bool(result.get("ok")), "tool": name, "result": result}, _summarize(name, result)
+
     if name == "search_web":
-        result = await web_search.search(
+        result = await web_search.search_web(
             str(arguments.get("query") or ""),
             limit=int(arguments.get("limit") or 8),
         )
@@ -507,13 +588,17 @@ def _summarize(name: str, data: dict[str, Any]) -> str:
         return f"退出码 {code}" + ("（成功）" if code == 0 else "（命令返回非零，不是工具失败）")
 
     # 宿主工具：摘要会显示在对话里的过程行上（研究者看得到），所以只说人话与事实
-    if name == "search_web":
-        if data.get("unavailable"):
-            return "没连上搜索服务"
+    if name in ("search_web", "search_academic"):
         count = data.get("count")
+        label = web_search.REASON_LABELS.get(str(data.get("reason") or ""), "")
+        if not data.get("ok") and label:
+            # 失败的三种原因各有各的修法，过程行里直接说清是哪一种
+            return f"{label}"
         if not isinstance(count, int):
             return "搜索完成"
-        return f"搜到 {count} 条结果" if count else "没搜到相关结果"
+        used = data.get("sources_used") or []
+        suffix = f"（{'、'.join(str(item) for item in used[:3])}）" if used else ""
+        return f"搜到 {count} 条结果{suffix}" if count else "没搜到相关结果"
 
     if name == "run_on_computer":
         if data.get("unreachable"):

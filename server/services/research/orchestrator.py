@@ -47,6 +47,7 @@ from llm.adapter import chat
 from llm.errors import LLMAuthError, LLMBadRequestError
 from llm.providers import looks_like_schema_rejection
 from llm.schema import load_json_payload
+from services.agent import web_search
 from services.research import graph, prompts, store
 from services.research import preflight as preflight_mod
 from services.research.contracts import (
@@ -1275,30 +1276,60 @@ async def _run_node_events(
             continue
         contract_misses = 0
 
-        # ---- 替模型搜：它给了搜索词就搜（**搜什么、要不要搜都由它定**）------ #
+        # ---- 替模型搜：**两个能力**，它给了词就搜（搜什么、要不要搜都由它定）---- #
         # ⚠️ 位置放在状态判断**之前**：即使它同一轮说 done / need_human，
-        # 只要它把搜索词写出来了，那就是它要求的事实采集 ——
+        # 只要它把检索词写出来了，那就是它要求的事实采集 ——
         # 研究者也正好能看见"为了这个结论我搜过什么、搜到了什么"。
-        wanted = candidate.get("search_queries") if isinstance(candidate, dict) else None
-        queries = (
-            [str(item).strip() for item in wanted if str(item).strip()]
-            if isinstance(wanted, list)
-            else []
-        )[:MAX_SEARCH_QUERIES]
-        if queries:
-            found = await _run_searches(queries)
+        academic_wanted = _query_list(candidate, "academic_queries")
+        web_wanted = _query_list(candidate, "web_queries")
+        if academic_wanted or web_wanted:
+            found: list[dict[str, Any]] = []
+            if academic_wanted:
+                found.extend(await _run_academic_queries(academic_wanted))
+            if web_wanted:
+                found.extend(await _run_web_queries(web_wanted))
             search_notes.extend(found)
+
             total = sum(len(block.get("results") or []) for block in found)
-            yield "notice", {
-                "node": target,
-                "code": "web_search",
-                "message": (
-                    f"按你的要求上网搜了 {len(queries)} 组关键词、共 {total} 条结果"
-                    "（是网页摘要，引用前请核对链接）。"
-                    if total
-                    else f"按你的要求搜了 {len(queries)} 组关键词，但没搜到结果。"
-                ),
+            # **结构化结果行**：随会话落盘，界面据此画折叠面板（行即卡片，刷新后还在）
+            yield "row", {
+                "row": {
+                    "kind": "search",
+                    "tone": "idle",
+                    "label": "联网检索",
+                    "text": f"联网搜索 · {total} 条",
+                    "query_count": len(academic_wanted) + len(web_wanted),
+                    "total": total,
+                    "groups": found,
+                }
             }
+            # 有来源失败时把"哪一层坏了"单独说清白（三种原因修法不同）
+            failed = [
+                item
+                for block in found
+                for item in (block.get("sources_failed") or [])
+            ]
+            reasons = {str(item.get("reason") or "") for item in failed}
+            if not total and reasons:
+                hint = web_search.HINTS.get(sorted(reasons)[0], "")
+                yield "notice", {
+                    "node": target,
+                    "code": "search_blocked",
+                    "message": ("这次联网检索没有拿到结果：" + hint).strip(),
+                }
+            elif failed:
+                yield "notice", {
+                    "node": target,
+                    "code": "search_partial",
+                    "message": (
+                        "部分来源没响应（"
+                        # 同一个来源可能被查了好几次（每组关键词一次），去重后再说
+                        + "、".join(
+                            dict.fromkeys(str(item.get("source") or "") for item in failed)
+                        )[:120]
+                        + "），其它来源的结果已放进下一轮。"
+                    ),
+                }
 
         # ---- 替模型跑实验命令（要授权；高危不静默跑）---------------------- #
         asked = candidate.get("commands_to_run") if isinstance(candidate, dict) else None
@@ -1766,23 +1797,73 @@ MAX_SEARCH_QUERIES = 4
 SEARCH_RESULTS_PER_QUERY = 5
 
 
-async def _run_searches(queries: list[str]) -> list[dict[str, Any]]:
-    """替模型执行它给出的搜索词。**搜不到也照样如实返回**（不吞、不编）。"""
+def _query_list(candidate: Any, key: str) -> list[str]:
+    """从产出里取一组检索词（去空、截断到上限）。"""
+
+    wanted = candidate.get(key) if isinstance(candidate, dict) else None
+    if not isinstance(wanted, list):
+        return []
+    return [str(item).strip() for item in wanted if str(item).strip()][:MAX_SEARCH_QUERIES]
+
+
+def _block(capability: str, query: str, result: dict[str, Any]) -> dict[str, Any]:
+    """把一次检索的结果收成"面板能用"的形状（来源 / 搜索词 / 条数 / 结果）。"""
+
+    return {
+        "capability": capability,
+        "query": query,
+        "ok": bool(result.get("ok")),
+        "count": int(result.get("count") or 0),
+        "sources_used": list(result.get("sources_used") or []),
+        "sources_failed": list(result.get("sources_failed") or []),
+        "reason": result.get("reason"),
+        "error": result.get("error") if not result.get("ok") else None,
+        # 面板只展示标题与链接；摘要留给模型（提示词里给全）
+        "results": [
+            {
+                "title": str(row.get("title") or ""),
+                "url": str(row.get("url") or ""),
+                "source": str(row.get("source") or ""),
+            }
+            for row in (result.get("results") or [])
+        ],
+    }
+
+
+async def _run_academic_queries(queries: list[str]) -> list[dict[str, Any]]:
+    """查学术（arXiv / Crossref / GitHub 官方接口）。**查不到也照实返回**。"""
 
     from services.agent import web_search
 
-    blocks: list[dict[str, Any]] = []
-    for query in queries:
-        result = await web_search.search(query, limit=SEARCH_RESULTS_PER_QUERY)
-        blocks.append(
-            {
-                "query": query,
-                "ok": bool(result.get("ok")),
-                "results": result.get("results") or [],
-                "error": result.get("error") if not result.get("ok") else None,
-            }
+    return [
+        _block(
+            web_search.CAPABILITY_ACADEMIC,
+            query,
+            await web_search.search_academic(query, limit=SEARCH_RESULTS_PER_QUERY),
         )
-    return blocks
+        for query in queries
+    ]
+
+
+async def _run_web_queries(queries: list[str]) -> list[dict[str, Any]]:
+    """搜网页（自建 SearXNG）。**搜不到也照实返回**。"""
+
+    from services.agent import web_search
+
+    return [
+        _block(
+            web_search.CAPABILITY_WEB,
+            query,
+            await web_search.search_web(query, limit=SEARCH_RESULTS_PER_QUERY),
+        )
+        for query in queries
+    ]
+
+
+async def _run_searches(queries: list[str]) -> list[dict[str, Any]]:
+    """兼容旧名：等价于"搜网页"。"""
+
+    return await _run_web_queries(queries)
 
 
 #: 一轮里最多替模型跑几条命令（防一次点 20 条把机器占满）

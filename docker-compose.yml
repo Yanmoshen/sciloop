@@ -97,9 +97,10 @@ services:
   # JSON 输出默认是关的，靠挂载的 `config/searxng/settings.yml` 打开（顺带关掉限流器，
   # 否则后端的 JSON 请求会被当成机器人 429 掉）。
   #
-  # ⚠️ 故意**不加 healthcheck**：搜索是"有更好、没有也能用"的能力，
-  # 让它因为健康检查失败把整套 `docker compose` 的状态带黄，得不偿失；
-  # 后端连不上时会如实告诉研究者"搜索没连上"，不会假装搜过了。
+  # ⚠️ 健康检查的语义（2026-09-22 补，别搞错）：**只表示"这个服务自己活着"**，
+  # 不表示"现在能搜到东西" —— 上游限流/验证码是常态，那种情况不该把容器标黄，
+  # 否则编排状态天天黄、没人再看它。**能不能搜到**由工具如实回报（服务没起 / 没外网 / 被挡，分开说），
+  # 界面另有常驻状态标识（`GET /api/v1/research/search-status`）。
   searxng:
     image: searxng/searxng:latest
     container_name: sciloop-searxng
@@ -108,11 +109,25 @@ services:
       SEARXNG_BASE_URL: http://localhost:${SEARXNG_PORT:-8888}/
       # 容器内一律用 UTC，与其它服务一致（日志对得上时间）
       TZ: UTC
+      # 【可选】只能通过代理上网时填它（例：http://host.docker.internal:7897）。
+      # **默认空 = 直连** —— 研究者要的默认行为：实测直连就能搜到学术与 IT 内容。
+      HTTP_PROXY: ${SCILOOP_SEARXNG_PROXY:-}
+      HTTPS_PROXY: ${SCILOOP_SEARXNG_PROXY:-}
+      NO_PROXY: localhost,127.0.0.1,searxng,backend,db
     volumes:
       - ./config/searxng:/etc/searxng:rw
     ports:
       # 只在需要时自己开浏览器看：http://localhost:8888
       - "${SEARXNG_PORT:-8888}:8080"
+    extra_hosts:
+      # 走代理时容器要能解析宿主机（Docker Desktop 自带，Linux 上靠这行）
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
   frontend:
     build:

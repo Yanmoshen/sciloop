@@ -135,10 +135,12 @@ SYSTEM_PROMPT = (
     "并把「缺什么、为什么缺、下一步建议」如实写进 gaps / coverage_note / limits。\n"
     "2. **绝不为了凑数而编造**：宁可如实写「0 条证据」，也不要造 paper_id、造结果。\n"
     "3. 该继续就 continue，别硬交；需要人就 need_human，别自己猜研究者的意图。\n"
-    "4. **要上网查资料就直接说**：在 search_queries 里给出搜索词（逐条）。"
-    "程序会替你搜，并把结果放进下一轮提示词的「联网搜索结果」里 —— "
-    "搜不搜由你决定，搜到什么也由你判断怎么用。**不要因为'手上没有联网工具'就说做不了**，"
-    "你有这个能力，只要把搜索词写出来。\n\n"
+    "4. **要联网查资料就直接说**，有两个能力由你选：\n"
+    "   · `academic_queries` —— 查学术（论文题录与开源实现，走官方接口，**稳**，找相关工作优先用它）；\n"
+    "   · `web_queries` —— 搜网页（博客/文档/问答，覆盖广，但可能被上游限流）。\n"
+    "   两者都填也可以。程序替你查，结果放进下一轮提示词的「联网检索结果」里 —— "
+    "查不查、查哪个、查什么词，都由你决定。"
+    "**不要因为'手上没有联网工具'就说做不了**，只要把检索词写出来。\n\n"
     "硬性要求：\n"
     "1. 只输出一个 JSON 对象，不要输出任何解释文字、不要用代码围栏包裹。\n"
     "2. 只使用下文材料清单里真实存在的论文编号；**不得编造 paper_id**。\n"
@@ -335,7 +337,7 @@ def build_messages(
         parts.append(f"\n## 上一轮未通过的原因（只需修正这些）\n{repair}")
 
     if search_results:
-        parts.append(f"\n## 联网搜索结果（你上一轮要求搜的）\n{_format_search(search_results)}")
+        parts.append(f"\n## 联网检索结果（你上一轮要求查的）\n{_format_search(search_results)}")
 
     if command_results:
         parts.append(
@@ -357,27 +359,42 @@ def build_messages(
     ]
 
 
-def _format_search(blocks: list[dict[str, Any]]) -> str:
-    """把联网搜索结果排成人能读、模型也好用的清单。
+#: 能力 → 给人看/给模型看的名字
+_CAPABILITY_LABELS = {"academic": "查学术", "web": "搜网页"}
 
-    ⚠️ 只说事实：标题 / 链接 / 摘要原文。**不要替模型总结、不要替它判断相关性** ——
-    那正是"程序替模型做判断"的老毛病。
+
+def _format_search(blocks: list[dict[str, Any]]) -> str:
+    """把联网检索结果排成人能读、模型也好用的清单。
+
+    ⚠️ 只说事实：**哪个能力、哪个来源、搜索词、标题 / 链接 / 摘要原文**。
+    不要替模型总结、不要替它判断相关性 —— 那正是"程序替模型做判断"的老毛病。
     """
 
     lines: list[str] = []
     for block in blocks:
+        capability = _CAPABILITY_LABELS.get(str(block.get("capability") or ""), "联网检索")
         query = str(block.get("query") or "")
         results = block.get("results") or []
-        lines.append(f'### 搜索词：{query}（{len(results)} 条）')
+        sources = "、".join(str(item) for item in (block.get("sources_used") or []))
+        head = f"### {capability}｜搜索词：{query}（{len(results)} 条"
+        head += f"；来源：{sources}）" if sources else "）"
+        lines.append(head)
         if not results:
-            lines.append("（没有搜到结果）")
+            failed = "、".join(
+                f"{item.get('source')}" for item in (block.get("sources_failed") or [])
+            )
+            lines.append(f"（没有拿到结果{f'；未响应的来源：{failed}' if failed else ''}）")
         for index, item in enumerate(results, start=1):
             title = str(item.get("title") or "").strip() or "（无标题）"
             url = str(item.get("url") or "").strip()
             snippet = str(item.get("snippet") or "").strip()
-            lines.append(f"{index}. {title}\n   {url}\n   {snippet}")
+            source = str(item.get("source") or "").strip()
+            tag = f"［{source}］" if source else ""
+            lines.append(f"{index}. {tag}{title}\n   {url}\n   {snippet}")
         lines.append("")
-    lines.append("（以上是网页摘要，不是论文全文；若要素材请打开原始链接核对，或说明缺什么。）")
+    lines.append(
+        "（以上是题录或网页摘要，不是论文全文；要素材就打开原始链接核对，或说明还缺什么。）"
+    )
     return "\n".join(lines)
 
 

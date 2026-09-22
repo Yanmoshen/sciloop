@@ -45,6 +45,7 @@ __all__ = [
     "REASON_NO_EGRESS",
     "REASON_SERVICE_DOWN",
     "SEARXNG_URL_ENV",
+    "REASON_LABELS",
     "SOURCE_LABELS",
     "SUPPORTED_SOURCES",
     "base_url",
@@ -114,6 +115,15 @@ def _headers(extra: dict[str, str] | None = None) -> dict[str, str]:
     if extra:
         base.update(extra)
     return base
+
+
+#: 失败原因 → 过程行里的一句话（三种修法不同，别混成一句搜索失败）
+REASON_LABELS: dict[str, str] = {
+    REASON_SERVICE_DOWN: "搜索服务没启动",
+    REASON_NO_EGRESS: "搜索服务连不上外网",
+    REASON_BLOCKED: "被上游限流或反爬挡了",
+    REASON_BAD_RESPONSE: "搜索服务返回异常",
+}
 
 
 #: 引擎名 → 给人看的来源名（面板里要显示"来源 · 搜索词"）

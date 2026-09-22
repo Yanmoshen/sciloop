@@ -101,12 +101,14 @@ def test_node_loop_has_no_retry_cap() -> None:
 # --------------------------------------------------------------------------- #
 # 节点里也能联网搜索（搜什么、搜不搜都由模型定）
 # --------------------------------------------------------------------------- #
-def test_search_queries_is_part_of_the_contract() -> None:
-    """模型要上网找资料，就在产出里给搜索词 —— 契约里必须有这个字段。"""
+def test_two_search_fields_are_part_of_the_contract() -> None:
+    """联网检索是**两个并列能力**：查学术 / 搜网页 —— 契约里各有一个字段。"""
 
     model = orchestrator.NODE_OUTPUT_MODELS["literature_review"]
-    assert "search_queries" in model.model_fields
-    assert model.model_fields["search_queries"].default_factory() == []
+    for field in ("academic_queries", "web_queries"):
+        assert field in model.model_fields, field
+        assert model.model_fields[field].default_factory() == []
+    assert "search_queries" not in model.model_fields, "旧的单字段已退役，别两头都留"
 
 
 def test_hand_written_schema_carries_the_decision_fields() -> None:
@@ -121,7 +123,7 @@ def test_hand_written_schema_carries_the_decision_fields() -> None:
 
     for node in ("literature_review", "idea_and_feasibility", "experiment_and_data_preparation"):
         properties = (contracts.NODE_OUTPUT_SCHEMAS.get(node) or {}).get("properties") or {}
-        for name in ("state", "pending", "state_reason", "search_queries"):
+        for name in ("state", "pending", "state_reason", "academic_queries", "web_queries"):
             assert name in properties, f"{node} 的契约里缺 {name}"
         # 决策字段不该被塞进 required（它们都有默认值）
         required = (contracts.NODE_OUTPUT_SCHEMAS[node] or {}).get("required") or []
@@ -146,9 +148,8 @@ def test_rendered_prompt_actually_shows_the_decision_fields() -> None:
     """真正的检查点：**渲染出来的提示词**里要能看到这些字段名与搜索能力。"""
 
     body = prompts.build_messages(node="literature_review", user_text="x")[-1]["content"]
-    for name in ("state", "pending", "search_queries"):
+    for name in ("state", "pending", "academic_queries", "web_queries"):
         assert name in body, f"提示词里看不到 {name}"
-    assert "联网搜索结果" in body or "search_queries" in body
 
 
 def test_prompt_renders_search_results_as_facts() -> None:
@@ -157,36 +158,64 @@ def test_prompt_renders_search_results_as_facts() -> None:
         user_text="x",
         search_results=[
             {
+                "capability": "academic",
                 "query": "gnn recommendation",
                 "ok": True,
-                "results": [{"title": "A Survey", "url": "https://a", "snippet": "摘要甲"}],
+                "sources_used": ["arXiv"],
+                "results": [
+                    {"title": "A Survey", "url": "https://a", "snippet": "摘要甲", "source": "arXiv"}
+                ],
             },
-            {"query": "没搜到的词", "ok": True, "results": []},
+            {"capability": "web", "query": "没搜到的词", "ok": True, "results": []},
         ],
     )
     body = messages[-1]["content"]
-    assert "联网搜索结果" in body
+    assert "联网检索结果" in body
+    assert "查学术" in body and "搜网页" in body, "要说清是哪个能力查的"
     assert "A Survey" in body and "https://a" in body and "摘要甲" in body
-    assert "没有搜到结果" in body
-    # 必须讲清"这是网页摘要、不是全文"，免得它当论文引用
+    assert "来源：arXiv" in body, "结果要标出来源"
+    assert "没有拿到结果" in body
+    # 必须讲清"这不是论文全文"，免得它当论文引用
     assert "不是论文全文" in body
 
 
-def test_run_searches_returns_blocks_even_when_it_fails(monkeypatch: pytest.MonkeyPatch) -> None:
-    """搜不到也要如实返回（带 error），不能吞掉。"""
+def test_both_capabilities_return_blocks_even_when_they_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """两个能力各跑一遍：成功与失败都要如实返回（失败带 reason），不能吞掉。"""
 
     from services.agent import web_search
 
-    async def fake_search(query: str, *, limit: int = 5, client: object = None):
+    async def fake_web(query: str, *, limit: int = 5, client: object = None):
         if "坏" in query:
-            return {"ok": False, "error": "连不上搜索服务"}
-        return {"ok": True, "results": [{"title": "T", "url": "https://t", "snippet": "s"}]}
+            return {"ok": False, "reason": web_search.REASON_SERVICE_DOWN, "error": "连不上"}
+        return {
+            "ok": True,
+            "count": 1,
+            "sources_used": ["必应"],
+            "results": [{"title": "T", "url": "https://t", "snippet": "s", "source": "必应"}],
+        }
 
-    monkeypatch.setattr(web_search, "search", fake_search)
-    blocks = asyncio.run(orchestrator._run_searches(["好", "坏"]))
-    assert [block["ok"] for block in blocks] == [True, False]
-    assert blocks[1]["error"] == "连不上搜索服务"
-    assert len(blocks[0]["results"]) == 1
+    async def fake_academic(query: str, *, limit: int = 5, sources: object = None, client: object = None):
+        return {
+            "ok": True,
+            "count": 1,
+            "sources_used": ["arXiv"],
+            "results": [{"title": "A", "url": "https://a", "snippet": "s", "source": "arXiv"}],
+        }
+
+    monkeypatch.setattr(web_search, "search_web", fake_web)
+    monkeypatch.setattr(web_search, "search_academic", fake_academic)
+
+    web_blocks = asyncio.run(orchestrator._run_web_queries(["好", "坏"]))
+    assert [block["ok"] for block in web_blocks] == [True, False]
+    assert web_blocks[1]["reason"] == web_search.REASON_SERVICE_DOWN
+    assert web_blocks[0]["capability"] == "web"
+    assert web_blocks[0]["results"][0]["url"] == "https://t"
+
+    academic_blocks = asyncio.run(orchestrator._run_academic_queries(["好"]))
+    assert academic_blocks[0]["capability"] == "academic"
+    assert academic_blocks[0]["sources_used"] == ["arXiv"]
 
 
 def test_search_is_model_decided_and_bounded() -> None:
@@ -213,7 +242,7 @@ def test_two_more_nodes_are_implemented() -> None:
         assert node in orchestrator.NODE_OUTPUT_MODELS
         assert node in orchestrator.NODE_OUTPUT_SCHEMAS
         properties = orchestrator.NODE_OUTPUT_SCHEMAS[node]["properties"]
-        assert "state" in properties and "search_queries" in properties, "决策字段要自动并进去"
+        assert "state" in properties and "academic_queries" in properties, "决策字段要自动并进去"
 
 
 def test_execution_node_contract_carries_the_real_run_record() -> None:
@@ -476,3 +505,30 @@ def test_self_check_is_wired_into_the_done_branch() -> None:
     assert 'code": "self_check"' in source
     assert "自检认为需要研究者介入" in source
     assert "回头自查时发现还没做完" in source
+
+
+def test_search_row_is_emitted_for_the_panel() -> None:
+    """结构断言：节点里查到东西后要发一条 `kind="search"` 的结构化行。
+
+    界面那个折叠面板就靠这一行（行随会话落盘，刷新后还在 —— 与批准卡同一套思路）。
+    """
+
+    import inspect
+
+    source = inspect.getsource(orchestrator)
+    assert '"kind": "search"' in source
+    assert '"groups": found' in source
+    assert "_run_academic_queries(" in source and "_run_web_queries(" in source
+
+
+def test_queries_are_read_from_the_two_fields() -> None:
+    """两个字段各自读，互不串味；空值与超长都要收敛。"""
+
+    candidate = {
+        "academic_queries": ["a1", " ", "a2"],
+        "web_queries": ["w1"] * 10,
+    }
+    assert orchestrator._query_list(candidate, "academic_queries") == ["a1", "a2"]
+    assert len(orchestrator._query_list(candidate, "web_queries")) == orchestrator.MAX_SEARCH_QUERIES
+    assert orchestrator._query_list({}, "academic_queries") == []
+    assert orchestrator._query_list({"academic_queries": "不是数组"}, "academic_queries") == []

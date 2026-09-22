@@ -391,3 +391,16 @@ async def put_access(
         "execution_access": str(settings.get("execution_access")),
         "note": "已保存到项目设置；对话里可随时切回 ask",
     }
+
+
+@router.get("/research/search-status", summary="联网检索服务状态（公开只读）")
+async def search_status() -> dict[str, Any]:
+    """搜索服务当前状态，给界面那个常驻标识用。
+
+    **只看服务本身**（活着 / 没起来）：上游限流是常态，不该由这个接口表达，
+    那种情况由每次检索的回报负责说清（服务没起 / 没外网 / 被挡，三种分开）。
+    """
+
+    from services.agent import web_search
+
+    return await web_search.search_status()

@@ -129,12 +129,21 @@ class NodeDecisionFields(SciLoopModel):
     state_reason: str = Field(
         default="", description="state=need_human 时：为什么需要研究者介入"
     )
-    search_queries: list[str] = Field(
+    academic_queries: list[str] = Field(
         default_factory=list,
         description=(
-            "需要上网搜索时，在这里给出搜索词（逐条）。程序替你搜，并把结果放进下一轮的"
-            "「联网搜索结果」—— 搜不搜由你决定，搜到什么也由你判断怎么用。"
-            "注意：搜索结果是网页摘要、不是论文全文，引用前必须核对原始链接。"
+            "要查学术资料（论文题录 / 开源实现）时，在这里给出检索词（逐条）。"
+            "程序会去 arXiv、Crossref、GitHub 的官方接口查，把结果放进下一轮的「联网检索结果」。"
+            "**找相关工作、找实现优先用这个**（官方接口稳，不受反爬影响）。"
+        ),
+    )
+    web_queries: list[str] = Field(
+        default_factory=list,
+        description=(
+            "要搜网页（博客 / 文档 / 问答等）时，在这里给出搜索词（逐条）。"
+            "程序会走自建搜索服务，把结果放进下一轮的「联网检索结果」。"
+            "注意：搜到的多是网页摘要、不是论文全文，引用前必须核对原始链接；"
+            "这一步可能被上游限流，被挡了会如实告诉你。"
         ),
     )
 
@@ -789,7 +798,13 @@ NODE_OUTPUT_MODELS: dict[str, type[SciLoopModel]] = {
 
 #: 「模型自己的决定」那组字段（做没做完 / 还缺什么 / 要不要上网搜）。
 #: **从 Pydantic 模型现取**，不再手写第二份 —— 见下面 `_with_decision_fields` 的说明。
-_DECISION_FIELD_NAMES = ("state", "pending", "state_reason", "search_queries")
+_DECISION_FIELD_NAMES = (
+    "state",
+    "pending",
+    "state_reason",
+    "academic_queries",
+    "web_queries",
+)
 
 
 def _decision_fields_schema() -> dict[str, Any]:
