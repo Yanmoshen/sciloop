@@ -28,5 +28,28 @@ search:
   autocomplete: ""
   default_lang: "auto"
 
+# ⚠️ 默认只搜 `general` 分类，而 arxiv / github 这些引擎在 `science` / `it` 分类里 ——
+# 于是"搜了 0 条"里有一半其实是**分类没选**，不是网络问题（2026-09-22 实测：
+# science → arxiv 10 条、it → github/stackoverflow 等 98 条，全程直连、没走代理）。
+# 客户端的搜索请求会显式带上 `general,science,it`；这里再打开两个默认关着但直连可用的引擎。
+#
+# ⚠️ 覆盖默认引擎时**必须写全定义**（`engine:` 等），只写 `name` + `disabled: false` 会被丢掉
+# —— 实测过一次：只写两行 → 两个引擎仍然是"未启用"。
+engines:
+  # 通用网页搜索：Bing 默认是 disabled: true，是这版里唯一默认关着、但直连可用的网页引擎
+  # （brave 会 429、DuckDuckGo 返验证码、google cse 需要 key）。
+  # 默认定义里的 `base_url: https://cn.bing.com`（中国区建议）在这台机器上**不通**，
+  # 所以保持默认的 www.bing.com（实测 200）。
+  - name: bing
+    engine: bing
+    shortcut: bi
+    disabled: false
+  # 学术检索：Crossref 全学科（arXiv / GitHub 默认已启用，在 science / it 分类里）
+  - name: crossref
+    engine: crossref
+    shortcut: cr
+    timeout: 30
+    disabled: false
+
 ui:
   static_use_hash: true
