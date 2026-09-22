@@ -61,6 +61,10 @@ IMPLEMENTED_NODES: tuple[str, ...] = (
     # 结果分析只认跑出来的东西。剩下两站（论文写作 / 论文评审）紧随其后补。
     "experiment_execution_and_retries",
     "results_analysis",
+    # 2026-09-22 补：写作产出可导出的真草稿（落 paper_drafts/draft_claims），
+    # 评审逐条判主张有没有支撑。至此七站全部实现。
+    "paper_writing",
+    "paper_review",
 )
 
 #: 节点状态（程序内部六态；文档五态在展示层映射，见 services/research/graph.py）

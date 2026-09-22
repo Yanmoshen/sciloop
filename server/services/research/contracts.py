@@ -32,6 +32,8 @@ __all__ = [
     "IDEA_FEASIBILITY_SCHEMA",
     "LITERATURE_REVIEW_SCHEMA",
     "NODE_OUTPUT_MODELS",
+    "PAPER_REVIEW_SCHEMA",
+    "PAPER_WRITING_SCHEMA",
     "NODE_OUTPUT_SCHEMAS",
     "BaselinePlan",
     "ClosestWork",
@@ -52,6 +54,10 @@ __all__ = [
     "MetricPlan",
     "NoveltyDelta",
     "PreflightRecord",
+    "PaperWritingOutput",
+    "PaperReviewOutput",
+    "DraftClaimDraft",
+    "ClaimVerdict",
     "ProtocolDraft",
     "QueryRecord",
     "ResourceDraft",
@@ -650,12 +656,135 @@ RESULTS_ANALYSIS_SCHEMA: dict[str, Any] = {
 }
 
 
+# --------------------------------------------------------------------------- #
+# ⑥ 论文写作（产出一份**真草稿**，可导出成文档）
+# --------------------------------------------------------------------------- #
+class DraftClaimDraft(SciLoopModel):
+    """草稿里的一条**事实性主张**（后面由评审站逐条判它有没有支撑）。"""
+
+    claim_text: str
+    section_heading: str | None = None
+    is_factual: bool = Field(
+        default=True, description="是不是「可被证据支持或反驳」的事实性主张（观点性表述填 false）"
+    )
+    cited_paper_ids: list[int] = Field(
+        default_factory=list, description="这条主张引用的论文编号（必须真的在论文库里）"
+    )
+    note: str = ""
+
+
+class PaperWritingOutput(NodeDecisionFields):
+    """⑥ 论文写作的产出：一份可以导出的 Markdown 草稿 + 它的主张清单。"""
+
+    title: str = Field(description="论文标题")
+    content_md: str = Field(
+        description=(
+            "草稿正文（Markdown）。引用论文时用 [#论文编号] 的形式，"
+            "**只能引用论文库里真实存在的编号**；没把握的写法进 limitations，不要编造。"
+        )
+    )
+    claims: list[DraftClaimDraft] = Field(
+        default_factory=list,
+        description="草稿里的事实性主张（逐条），评审站会按它逐条核对有没有支撑",
+    )
+    sections: list[str] = Field(default_factory=list, description="小节标题（便于阅读与定位）")
+    limitations: list[str] = Field(default_factory=list)
+    open_items: list[str] = Field(
+        default_factory=list, description="还没写、还没验证的部分（如实列出，不要留空话）"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# ⑦ 论文评审（逐条判"有没有支撑"，不替研究者下"能不能投"的结论）
+# --------------------------------------------------------------------------- #
+class ClaimVerdict(SciLoopModel):
+    """对一条主张的判定（三态）。"""
+
+    claim_text: str
+    support_status: Literal["supported", "contradicted", "insufficient"] = "insufficient"
+    status_reason: str = Field(default="", description="为什么这么判（要能追到具体来源）")
+    evidence_count: int = 0
+
+
+class PaperReviewOutput(NodeDecisionFields):
+    """⑦ 论文评审的产出。"""
+
+    verdicts: list[ClaimVerdict] = Field(
+        default_factory=list, description="逐条主张的判定；证据不足就如实写 insufficient"
+    )
+    overall: str = Field(default="", description="整体评估（哪里站得住、哪里站不住）")
+    required_revisions: list[str] = Field(
+        default_factory=list, description="必须改的地方（逐条）；没有就留空，不要凑"
+    )
+    strengths: list[str] = Field(default_factory=list)
+    limits: list[str] = Field(default_factory=list, description="本次评审没覆盖到的范围")
+
+
+PAPER_WRITING_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["title", "content_md"],
+    "properties": {
+        "title": {"type": "string"},
+        "content_md": {"type": "string"},
+        "claims": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["claim_text"],
+                "properties": {
+                    "claim_text": {"type": "string"},
+                    "section_heading": {"type": ["string", "null"]},
+                    "is_factual": {"type": "boolean"},
+                    "cited_paper_ids": {"type": "array", "items": {"type": "integer"}},
+                    "note": {"type": "string"},
+                },
+            },
+        },
+        "sections": {"type": "array", "items": {"type": "string"}},
+        "limitations": {"type": "array", "items": {"type": "string"}},
+        "open_items": {"type": "array", "items": {"type": "string"}},
+        "revert_request": _REVERT_REQUEST,
+    },
+}
+
+PAPER_REVIEW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["verdicts", "overall"],
+    "properties": {
+        "verdicts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["claim_text", "support_status"],
+                "properties": {
+                    "claim_text": {"type": "string"},
+                    "support_status": {"enum": ["supported", "contradicted", "insufficient"]},
+                    "status_reason": {"type": "string"},
+                    "evidence_count": {"type": "integer"},
+                },
+            },
+        },
+        "overall": {"type": "string"},
+        "required_revisions": {"type": "array", "items": {"type": "string"}},
+        "strengths": {"type": "array", "items": {"type": "string"}},
+        "limits": {"type": "array", "items": {"type": "string"}},
+        "revert_request": _REVERT_REQUEST,
+    },
+}
+
+
 NODE_OUTPUT_MODELS: dict[str, type[SciLoopModel]] = {
     "literature_review": LiteratureReviewOutput,
     "idea_and_feasibility": IdeaAndFeasibilityOutput,
     "experiment_and_data_preparation": ExperimentPrepOutput,
     "experiment_execution_and_retries": ExperimentExecutionOutput,
     "results_analysis": ResultsAnalysisOutput,
+    "paper_writing": PaperWritingOutput,
+    "paper_review": PaperReviewOutput,
 }
 
 #: 「模型自己的决定」那组字段（做没做完 / 还缺什么 / 要不要上网搜）。
@@ -698,4 +827,6 @@ NODE_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
     "experiment_and_data_preparation": _with_decision_fields(EXPERIMENT_PREP_SCHEMA),
     "experiment_execution_and_retries": _with_decision_fields(EXPERIMENT_EXECUTION_SCHEMA),
     "results_analysis": _with_decision_fields(RESULTS_ANALYSIS_SCHEMA),
+    "paper_writing": _with_decision_fields(PAPER_WRITING_SCHEMA),
+    "paper_review": _with_decision_fields(PAPER_REVIEW_SCHEMA),
 }

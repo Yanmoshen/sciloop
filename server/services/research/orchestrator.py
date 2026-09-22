@@ -33,6 +33,7 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import select
@@ -41,6 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from db.models.aggregation import Evidence, Idea
 from db.models.feasibility import Feasibility, Taskbook
 from db.models.research import IMPLEMENTED_NODES, ResearchNodeRun
+from db.models.review import DraftClaim, PaperDraft
 from llm.adapter import chat
 from llm.errors import LLMAuthError, LLMBadRequestError
 from llm.providers import looks_like_schema_rejection
@@ -53,6 +55,8 @@ from services.research.contracts import (
     ExperimentPrepOutput,
     IdeaAndFeasibilityOutput,
     LiteratureReviewOutput,
+    PaperReviewOutput,
+    PaperWritingOutput,
 )
 from services.research.rules import (
     LibraryFacts,
@@ -93,6 +97,20 @@ _DEFAULT_ORDER: tuple[str, ...] = graph.NODE_ORDER
 #: 为什么需要显式给：默认 1536 会把契约 JSON 截断在中间（实测 finish_reason=length），
 #: 截断的 JSON 一定解析失败，于是节点会在「模型其实答得挺好」的情况下被反复驳回。
 NODE_MAX_TOKENS = 8000
+
+#: 单独放大某些节点的输出上限。
+#: ⚠️ "论文写作"要产出一整篇草稿（长 Markdown 塞进 JSON 字符串），
+#: 8000 tokens 很容易**被截断** —— 而截断的 JSON 一定不合法，表现为
+#: 「产出不是可解析的 JSON 对象」，宽松解析也救不回来（实测踩到过一次）。
+NODE_MAX_TOKENS_BY_NODE: dict[str, int] = {
+    "paper_writing": 12000,
+}
+
+
+def max_tokens_for(node: str) -> int:
+    """该节点的输出上限。"""
+
+    return NODE_MAX_TOKENS_BY_NODE.get(node, NODE_MAX_TOKENS)
 
 #: 已探明「不支持 response_format=json_schema」的模型（进程内记忆）。
 #: 实测：某些供应商会直接拒绝 schema 档，适配层随即降级去试 env 兜底模型；
@@ -592,6 +610,12 @@ async def _persist_outputs(
                     question=question,
                 )
             )
+        elif node == "paper_writing":
+            out = PaperWritingOutput.model_validate(payload)
+            refs.update(await _persist_draft(session, project_id=project_id, out=out))
+        elif node == "paper_review":
+            out = PaperReviewOutput.model_validate(payload)
+            refs.update(await _persist_review(session, project_id=project_id, out=out))
         await session.commit()
     except Exception as exc:  # noqa: BLE001 - 落库失败不能伪装成节点成功
         await session.rollback()
@@ -1005,7 +1029,7 @@ async def _run_node_events(
                     messages,
                     model_ref,
                     None,
-                    NODE_MAX_TOKENS,
+                    max_tokens_for(target),
                     NODE_OUTPUT_SCHEMAS.get(target) if want_schema else None,
                     project_id=project_id,
                     stage=graph.stage_alias(target),
@@ -1317,6 +1341,23 @@ async def _run_node_events(
                 reason = "模型判断本节点需要研究者介入"
                 if pending:
                     reason += "：" + "；".join(str(item) for item in pending[:5])
+            # 转人工之前先把产出落库：模型常常是"写完草稿 + 有几件事要你定"才停的，
+            # 不落库的话那份草稿就丢了（研究者既看不到也导不出）。
+            # 节点状态仍是 waiting_human，不 pretended 成"已完成"。
+            persisted: dict[str, Any] = {}
+            if isinstance(normalized, dict) and normalized:
+                async with session_factory() as session:
+                    run_row = await _latest_run(
+                        session, conversation_id=conversation_id, node=target
+                    )
+                    persisted = await _persist_outputs(
+                        session,
+                        node=target,
+                        project_id=project_id,
+                        node_run_id=int((run_row or {}).get("id") or 0),
+                        payload=normalized,
+                        question=research_question,
+                    )
             await _hand_off_to_human(
                 session_factory,
                 conversation_id=conversation_id,
@@ -1335,6 +1376,7 @@ async def _run_node_events(
                     "decided_by": "model",
                     "state": "need_human",
                     "self_check": self_check_note,
+                    "persisted": persisted,
                 },
             )
             yield "waiting_human", {
@@ -1406,6 +1448,20 @@ async def _run_node_events(
                         "自检认为需要研究者介入："
                         + (summary_line if summary_line != "（没给结论）" else "缺只有研究者能提供的信息")
                     )
+                    # 同上：自检发现"只有人能给的信息"时，模型交的产出也要先落库
+                    if isinstance(normalized, dict) and normalized:
+                        async with session_factory() as session:
+                            run_row = await _latest_run(
+                                session, conversation_id=conversation_id, node=target
+                            )
+                            await _persist_outputs(
+                                session,
+                                node=target,
+                                project_id=project_id,
+                                node_run_id=int((run_row or {}).get("id") or 0),
+                                payload=normalized,
+                                question=research_question,
+                            )
                     await _hand_off_to_human(
                         session_factory,
                         conversation_id=conversation_id,
@@ -1686,7 +1742,7 @@ async def _run_self_check(
             messages,
             model_ref,
             None,
-            NODE_MAX_TOKENS,
+            max_tokens_for(node),
             SELF_CHECK_SCHEMA,
             project_id=project_id,
             stage=graph.stage_alias(node),
@@ -1785,3 +1841,118 @@ async def _run_node_commands(
             }
         )
     return results, True
+
+
+# --------------------------------------------------------------------------- #
+# ⑥⑦ 的落库：草稿进 paper_drafts，claim 三态进 draft_claims
+# --------------------------------------------------------------------------- #
+#: 「这次没关联项目」的如实说明。**不能假装存上了** —— 研究者会去找那份草稿。
+NO_PROJECT_REASON = "这次对话没有关联项目，草稿没有落成可导出的文件；关联一个项目后就会落库。"
+
+
+async def _persist_draft(
+    session: AsyncSession,
+    *,
+    project_id: int | None,
+    out: PaperWritingOutput,
+) -> dict[str, Any]:
+    """把写作产出落成**可导出的草稿**（`paper_drafts` + 逐条 `draft_claims`）。
+
+    ⚠️ `paper_drafts.project_id` 是 NOT NULL：**没有项目就落不了库**。
+    这时如实回报原因（研究者在界面上一眼能看到），而不是静默丢弃或假装成功。
+
+    **写作阶段不给结论**：所有 claim 先记成 `insufficient` + "尚未评审"，
+    等评审站给出判定后再回写 —— 这样"有支撑/证据不足"永远是评审的结论，不是写作的自评。
+    """
+
+    if project_id is None:
+        return {"draft_persisted": False, "reason": NO_PROJECT_REASON}
+
+    existing = await session.execute(
+        select(PaperDraft.id).where(PaperDraft.project_id == project_id)
+    )
+    iteration = len(list(existing.scalars().all())) + 1
+
+    draft = PaperDraft(
+        project_id=project_id,
+        pipeline_run_id=None,
+        iteration=iteration,
+        content_md=out.content_md,
+        # 还没评审 → 覆盖率如实记 0；由评审站回写
+        claim_coverage=Decimal("0.000"),
+    )
+    session.add(draft)
+    await session.flush()
+
+    for claim in out.claims:
+        session.add(
+            DraftClaim(
+                draft_id=draft.id,
+                section_heading=claim.section_heading,
+                claim_text=claim.claim_text,
+                is_factual=claim.is_factual,
+                support_status="insufficient",
+                status_reason="草稿刚落库，尚未评审",
+                evidence_count=len(claim.cited_paper_ids),
+            )
+        )
+    await session.flush()
+    return {
+        "draft_id": int(draft.id),
+        "draft_iteration": iteration,
+        "claim_count": len(out.claims),
+    }
+
+
+async def _persist_review(
+    session: AsyncSession,
+    *,
+    project_id: int | None,
+    out: PaperReviewOutput,
+) -> dict[str, Any]:
+    """把评审判定回写到**该项目最新那份草稿**的 claim 上，并重算覆盖率。
+
+    对不上号的判定（草稿里没有这条 claim）**不静默丢弃**：记进返回值里，
+    研究者能看到"评审说了但我没找到对应主张"。
+    """
+
+    if project_id is None:
+        return {"review_persisted": False, "reason": NO_PROJECT_REASON}
+
+    latest = await session.execute(
+        select(PaperDraft).where(PaperDraft.project_id == project_id).order_by(PaperDraft.id.desc()).limit(1)
+    )
+    draft = latest.scalars().first()
+    if draft is None:
+        return {"review_persisted": False, "reason": "该项目下还没有草稿，评审结果无处可写"}
+
+    rows = await session.execute(select(DraftClaim).where(DraftClaim.draft_id == draft.id))
+    claims = list(rows.scalars().all())
+    by_text = {" ".join(item.claim_text.split()): item for item in claims}
+
+    updated = 0
+    unmatched: list[str] = []
+    for verdict in out.verdicts:
+        key = " ".join(verdict.claim_text.split())
+        claim = by_text.get(key)
+        if claim is None:
+            unmatched.append(verdict.claim_text[:120])
+            continue
+        claim.support_status = verdict.support_status
+        claim.status_reason = verdict.status_reason or None
+        claim.evidence_count = int(verdict.evidence_count)
+        updated += 1
+
+    factual = [item for item in claims if item.is_factual]
+    supported = sum(1 for item in factual if item.support_status == "supported")
+    draft.claim_coverage = (
+        Decimal(str(round(supported / len(factual), 3))) if factual else Decimal("0.000")
+    )
+    await session.flush()
+    return {
+        "review_persisted": True,
+        "draft_id": int(draft.id),
+        "verdicts_applied": updated,
+        "unmatched_claims": unmatched,
+        "claim_coverage": float(draft.claim_coverage),
+    }

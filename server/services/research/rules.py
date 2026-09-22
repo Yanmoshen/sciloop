@@ -33,6 +33,8 @@ from services.research.contracts import (
     ExperimentPrepOutput,
     IdeaAndFeasibilityOutput,
     LiteratureReviewOutput,
+    PaperReviewOutput,
+    PaperWritingOutput,
     ResultsAnalysisOutput,
 )
 
@@ -497,12 +499,66 @@ def _check_analysis(out: ResultsAnalysisOutput, facts: LibraryFacts | None) -> l
     return hits
 
 
+def _check_writing(out: PaperWritingOutput, facts: LibraryFacts | None) -> list[RuleHit]:
+    """⑥ 论文写作：只核对"有没有真写、引用的编号真不真"。"""
+
+    hits: list[RuleHit] = []
+    body = (out.content_md or "").strip()
+    if len(body) < 200:
+        hits.append(
+            RuleHit("R21", "L2", f"草稿正文太短（{len(body)} 字），看不出是一份成稿", "content_md")
+        )
+    if not out.title.strip():
+        hits.append(RuleHit("R21", "L2", "没有标题", "title"))
+    factual = [claim for claim in out.claims if claim.is_factual]
+    if factual and not any(claim.cited_paper_ids for claim in factual):
+        hits.append(
+            RuleHit("R22", "L2", "事实性主张一条都没给出引用编号，无法核对来源", "claims")
+        )
+    if facts is not None and facts.paper_ids:
+        for claim in out.claims:
+            missing = [pid for pid in claim.cited_paper_ids if pid not in facts.paper_ids]
+            if missing:
+                hits.append(
+                    RuleHit(
+                        "R23",
+                        "L2",
+                        f"主张引用的论文编号 {missing} 不在论文库里（不得编造编号）",
+                        "claims",
+                    )
+                )
+                break
+    return hits
+
+
+def _check_review(out: PaperReviewOutput, facts: LibraryFacts | None) -> list[RuleHit]:
+    """⑦ 论文评审：只核对"有没有逐条判、判了有没有写理由"。"""
+
+    hits: list[RuleHit] = []
+    if not out.verdicts:
+        hits.append(RuleHit("R24", "L2", "一条主张都没判（verdicts 为空）", "verdicts"))
+    for index, verdict in enumerate(out.verdicts, start=1):
+        if not verdict.status_reason.strip():
+            hits.append(
+                RuleHit("R24", "L2", f"第 {index} 条判定没写理由（status_reason）", "verdicts")
+            )
+    if not out.overall.strip():
+        hits.append(RuleHit("R25", "L2", "没有写整体评估（overall）", "overall"))
+    if not out.limits:
+        hits.append(
+            RuleHit("R26", "L2", "没有写本次评审没覆盖到的范围（limits）", "limits")
+        )
+    return hits
+
+
 _CHECKERS: dict[str, Callable[[Any, LibraryFacts | None], list[RuleHit]]] = {
     "literature_review": _check_literature,
     "idea_and_feasibility": _check_idea,
     "experiment_and_data_preparation": _check_experiment_prep,
     "experiment_execution_and_retries": _check_execution,
     "results_analysis": _check_analysis,
+    "paper_writing": _check_writing,
+    "paper_review": _check_review,
 }
 
 
@@ -545,6 +601,16 @@ def rule_catalog(node: str) -> list[dict[str, str]]:
             ("R18", "质量", "每条结论都要写依据（based_on），便于回查"),
             ("R19", "质量", "必须写整体结论；负结果与无法判定都算有效结论"),
             ("R20", "质量", "必须写明局限或不确定性"),
+        ],
+        "paper_writing": [
+            ("R21", "质量", "草稿要成文（有标题、有正文），不是提纲或计划"),
+            ("R22", "质量", "事实性主张要给出引用编号，便于核对来源"),
+            ("R23", "格式", "引用的论文编号必须真实存在于论文库，不得编造"),
+        ],
+        "paper_review": [
+            ("R24", "质量", "逐条主张都要判定并写理由（证据不足就写 insufficient）"),
+            ("R25", "质量", "必须写整体评估"),
+            ("R26", "质量", "必须写明本次评审没覆盖到的范围"),
         ],
     }
     return [

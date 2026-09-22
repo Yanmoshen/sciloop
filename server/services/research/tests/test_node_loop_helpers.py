@@ -54,10 +54,11 @@ def test_contract_payload_rejects_empty_or_unparsable() -> None:
         assert why
 
 
-def test_placeholder_nodes_pass_through() -> None:
-    """占位节点没有契约 → 原样放行（它们本来就只做占位，不该被卡住）。"""
+def test_nodes_without_a_contract_pass_through() -> None:
+    """没有契约的节点名 → 原样放行（占位节点曾经走这条路；现在七站都有契约了，
+    但"没有契约就放行"这条规则仍要成立，否则以后加节点会莫名被卡）。"""
 
-    usable, normalized, why = orchestrator._contract_payload("paper_writing", {"anything": 1})
+    usable, normalized, why = orchestrator._contract_payload("not_a_real_node", {"anything": 1})
     assert usable and normalized == {"anything": 1} and why == ""
 
 
@@ -337,6 +338,72 @@ def test_command_results_are_rendered_as_facts() -> None:
     assert "你上一轮要求跑的命令与真实输出" in body
     assert "python --version" in body and "退出码 0" in body
     assert "**没有执行**" in body
+
+
+# --------------------------------------------------------------------------- #
+# ⑥⑦ 论文写作 / 论文评审（七站至此全部实现）
+# --------------------------------------------------------------------------- #
+def test_all_seven_nodes_are_implemented() -> None:
+    from db.models.research import IMPLEMENTED_NODES, RESEARCH_NODES
+
+    assert set(IMPLEMENTED_NODES) == set(RESEARCH_NODES), "七站应当都实现了"
+    for node in RESEARCH_NODES:
+        assert node in orchestrator.NODE_OUTPUT_MODELS, node
+        assert node in orchestrator.NODE_OUTPUT_SCHEMAS, node
+        assert prompts.rule_catalog(node), f"{node} 必须有规则清单"
+
+
+def test_writing_and_review_contracts_carry_what_we_persist() -> None:
+    writing = orchestrator.NODE_OUTPUT_SCHEMAS["paper_writing"]["properties"]
+    assert {"title", "content_md", "claims"} <= set(writing)
+    claim_fields = writing["claims"]["items"]["properties"]
+    assert {"claim_text", "is_factual", "cited_paper_ids"} <= set(claim_fields)
+
+    review = orchestrator.NODE_OUTPUT_SCHEMAS["paper_review"]["properties"]
+    assert {"verdicts", "overall"} <= set(review)
+    verdict_fields = review["verdicts"]["items"]["properties"]
+    assert verdict_fields["support_status"]["enum"] == [
+        "supported",
+        "contradicted",
+        "insufficient",
+    ]
+
+
+def test_writing_node_gets_more_output_room() -> None:
+    """草稿要长：输出上限被截断时 JSON 一定不合法（实测踩过一次）。"""
+
+    assert orchestrator.max_tokens_for("paper_writing") > orchestrator.NODE_MAX_TOKENS
+    assert orchestrator.max_tokens_for("literature_review") == orchestrator.NODE_MAX_TOKENS
+
+
+def test_writing_guide_warns_about_json_escaping() -> None:
+    guide = prompts.NODE_GUIDES["paper_writing"]
+    assert "裸换行" in guide
+    assert "转义" in guide
+
+
+def test_persist_helpers_say_so_when_there_is_no_project() -> None:
+    """没有项目就落不了库（paper_drafts.project_id 是 NOT NULL）——必须如实说，不许静默丢。"""
+
+    writing = {"title": "t", "content_md": "# x" * 100, "claims": []}
+    result = asyncio.run(orchestrator._persist_draft(None, project_id=None, out=writing))  # type: ignore[arg-type]
+    assert result["draft_persisted"] is False
+    assert "没有关联项目" in result["reason"]
+
+    review = {"verdicts": [], "overall": "x"}
+    result = asyncio.run(orchestrator._persist_review(None, project_id=None, out=review))  # type: ignore[arg-type]
+    assert result["review_persisted"] is False
+
+
+def test_review_writes_verdicts_back_to_claims() -> None:
+    """评审的判定要能回写到 claim（结构断言：三态字段与理由都在写回语句里）。"""
+
+    import inspect
+
+    source = inspect.getsource(orchestrator._persist_review)
+    assert "support_status" in source and "status_reason" in source
+    assert "unmatched_claims" in source, "对不上号的判定要如实回报，不能静默丢弃"
+    assert "claim_coverage" in source
 
 
 def test_decision_fields_are_part_of_the_contract() -> None:
