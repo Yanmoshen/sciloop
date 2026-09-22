@@ -1,0 +1,155 @@
+/**
+ * Copyright 2026 SciLoop contributors
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Element Plus 的黑白化覆盖层（2026-09-22 全站黑白化）。
+ *
+ * 为什么必须有这一层：Element Plus 自己带一套调色板，**蓝色藏在它内部**而组件的
+ * `color`/`background` 并不读我们的令牌 —— 输入框焦点框、下拉选中项、开关、复选框、
+ * 单选、日期面板、分页、加载环、滑块…… 只要不覆盖它，黑白页面上就会时不时冒出一个蓝框。
+ * 只改 `styles/tokens.css` 是**覆盖不到**这些的（这是本次改造最容易漏的一处）。
+ *
+ * 口径与 tokens.css 一致：
+ * - 浅色主题：primary ＝ 近黑 #0a0a0a（配白字）；
+ * - 深色主题（纯黑底）：primary ＝ 纯白 #ffffff（配黑字）；
+ * - 语义色保留红绿（与研究者定稿一致）；原来的橙色（warning）收进灰阶。
+ *
+ * ⚠️ 必须在 `element-plus/dist/index.css` 与 `theme-chalk/dark/css-vars.css` **之后**引入
+ * （见 main.ts 的引入顺序），否则优先级不够、覆盖会被官方变量表压掉。
+ */
+
+/* ---------- 浅色（默认） ---------- */
+:root {
+  --el-color-primary: #0a0a0a;
+  --el-color-primary-dark-2: #000000;
+  --el-color-primary-light-3: #404040;
+  --el-color-primary-light-5: #6b6b6b;
+  --el-color-primary-light-7: #b8b8b8;
+  --el-color-primary-light-8: #d6d6d6;
+  --el-color-primary-light-9: #ededed;
+
+  --el-color-success: #0a7a3d;
+  --el-color-success-light-9: #eef7f1;
+  --el-color-warning: #6b6b6b;
+  --el-color-warning-light-9: #f2f2f2;
+  --el-color-danger: #c40000;
+  --el-color-danger-light-9: #fdf1f1;
+  --el-color-error: #c40000;
+  --el-color-info: #6b6b6b;
+  --el-color-info-light-9: #f2f2f2;
+
+  --el-bg-color: #ffffff;
+  --el-bg-color-page: #ffffff;
+  --el-bg-color-overlay: #ffffff;
+  --el-text-color-primary: #0a0a0a;
+  --el-text-color-regular: #3d3d3d;
+  --el-text-color-secondary: #5a5a5a;
+  --el-text-color-placeholder: #9a9a9a;
+  --el-text-color-disabled: #b5b5b5;
+  --el-border-color: #e6e6e6;
+  --el-border-color-light: #ededed;
+  --el-border-color-lighter: #f2f2f2;
+  --el-border-color-extra-light: #f7f7f7;
+  --el-border-color-dark: #cfcfcf;
+  --el-border-color-darker: #b5b5b5;
+  --el-fill-color: #f2f2f2;
+  --el-fill-color-light: #f7f7f7;
+  --el-fill-color-lighter: #fafafa;
+  --el-fill-color-blank: #ffffff;
+  --el-mask-color: rgba(255, 255, 255, 0.85);
+  --el-box-shadow: 0 8px 24px rgba(0, 0, 0, 0.14);
+  --el-box-shadow-light: 0 1px 3px rgba(0, 0, 0, 0.07);
+  --el-box-shadow-lighter: 0 1px 3px rgba(0, 0, 0, 0.05);
+  --el-border-radius-base: 6px;
+}
+
+/* ---------- 深色（纯黑底） ---------- */
+:root[data-theme='dark'],
+html.dark {
+  --el-color-primary: #ffffff;
+  --el-color-primary-dark-2: #d4d4d4;
+  --el-color-primary-light-3: #cccccc;
+  --el-color-primary-light-5: #8f8f8f;
+  --el-color-primary-light-7: #3d3d3d;
+  --el-color-primary-light-8: #2a2a2a;
+  --el-color-primary-light-9: #1f1f1f;
+
+  --el-color-success: #4ad991;
+  --el-color-success-light-9: #14261d;
+  --el-color-warning: #c9c9c9;
+  --el-color-warning-light-9: #1a1a1a;
+  --el-color-danger: #ff5c5c;
+  --el-color-danger-light-9: #2a1414;
+  --el-color-error: #ff5c5c;
+  --el-color-info: #c9c9c9;
+  --el-color-info-light-9: #1a1a1a;
+
+  --el-bg-color: #141414;
+  --el-bg-color-page: #000000;
+  /* ⚠️ 关键：EP 的选中态 = 底色 --el-color-primary + 字色 --el-color-white。
+     深色主题 primary 已是纯白，不把 color-white 反过来就是**白底白字**
+     （2026-09-22 实测：论文库视图切换按钮整块变白板、字看不见）。 */
+  --el-color-white: #000000;
+  --el-color-black: #ffffff;
+  --el-bg-color-overlay: #1b1b1b;
+  --el-text-color-primary: #ececec;
+  --el-text-color-regular: #d4d4d4;
+  --el-text-color-secondary: #b4b4b4;
+  --el-text-color-placeholder: #8f8f8f;
+  --el-text-color-disabled: #6f6f6f;
+  --el-border-color: #242424;
+  --el-border-color-light: #1f1f1f;
+  --el-border-color-lighter: #1b1b1b;
+  --el-border-color-extra-light: #161616;
+  --el-border-color-dark: #3d3d3d;
+  --el-border-color-darker: #4d4d4d;
+  --el-fill-color: #1b1b1b;
+  --el-fill-color-light: #161616;
+  --el-fill-color-lighter: #121212;
+  --el-fill-color-blank: #141414;
+  --el-mask-color: rgba(0, 0, 0, 0.85);
+  --el-box-shadow: 0 12px 32px rgba(0, 0, 0, 0.75);
+  --el-box-shadow-light: 0 2px 10px rgba(0, 0, 0, 0.6);
+  --el-box-shadow-lighter: 0 2px 8px rgba(0, 0, 0, 0.5);
+}
+
+/**
+ * 焦点可见性：黑白化后 primary 是黑白两色，EP 默认那圈"淡色"焦点环几乎看不见，
+ * 键盘用户会失去落点。这里统一成 2px 实色环（与 styles/a11y.css 的口径一致）。
+ */
+.el-input__wrapper.is-focus,
+.el-select .el-input.is-focus .el-input__wrapper,
+.el-textarea__inner:focus {
+  box-shadow: 0 0 0 1px var(--el-color-primary) !important;
+}
+
+.el-checkbox__input.is-checked .el-checkbox__inner,
+.el-radio__input.is-checked .el-radio__inner,
+.el-switch.is-checked .el-switch__core {
+  border-color: var(--el-color-primary);
+  background-color: var(--el-color-primary);
+}
+
+.el-switch.is-checked .el-switch__core .el-switch__action {
+  background-color: var(--el-bg-color);
+}
+
+/* 选中项的可读性：黑白主题下必须图标反相，否则白底白勾看不见 */
+.el-checkbox__input.is-checked .el-checkbox__inner::after {
+  border-color: var(--el-text-color-inverse, var(--el-bg-color));
+}
+
+.el-select-dropdown__item.is-selected,
+.el-select-dropdown__item.is-hovering {
+  color: var(--el-text-color-primary);
+  font-weight: 600;
+}
+
+.el-pagination.is-background .el-pager li.is-active {
+  background-color: var(--el-color-primary);
+  color: var(--el-bg-color);
+}

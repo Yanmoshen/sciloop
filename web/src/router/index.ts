@@ -86,8 +86,8 @@ export const MODULE_GROUPS: ModuleGroup[] = [
   },
   {
     key: 'knowledge',
-    title: '知识资产',
-    items: [{ key: 'knowledge', label: '知识资产', path: '/knowledge', hint: 'P1 知识资产库' }],
+    title: '知识库',
+    items: [{ key: 'knowledge', label: '知识库', path: '/knowledge', hint: '文件 / 摘录 / 技能 / 记忆' }],
   },
   {
     key: 'settings',
@@ -115,6 +115,15 @@ export function moduleGroup(key: string | undefined): ModuleGroup {
  * `homeNav` 决定左栏哪一项高亮；未标注的页面（研究构思 / 工作台 / 设置）不高亮任何一项。
  */
 export const routes: RouteRecordRaw[] = [
+  // ---- 独立整页阅读器（不带壳层，整屏只放内容）----
+  // 知识库里「在新页面打开」落到这里（新标签页），因此它必须是**顶层路由**，
+  // 否则会被 HomeLayout 包住、左栏导航还在，"全屏"就名不副实。
+  {
+    path: '/knowledge/read/:entryId',
+    name: 'knowledge-read',
+    component: () => import('@/views/KnowledgeReaderPage.vue'),
+    meta: { title: '阅读' },
+  },
   {
     path: '/',
     component: HomeLayout,
@@ -159,11 +168,14 @@ export const routes: RouteRecordRaw[] = [
         meta: { title: '聚合对比', module: 'aggregate' },
       },
       // ---- 知识库 ----
+      // 2026-09-22：入口交给用户自己管的知识库（文件 / 论文与 Idea 摘录 / 技能 / 记忆）。
+      // 原「知识资产」四页签（论文卡片 / 证据 / 决策 / Passport）不在导航里出现了，
+      // 组件 `KnowledgeView.vue` 保留在仓库中未删，需要时再挂回一条路由即可。
       {
         path: 'knowledge',
         name: 'knowledge',
-        component: () => import('@/views/KnowledgeView.vue'),
-        meta: { title: '知识资产', module: 'knowledge', homeNav: 'knowledge' },
+        component: () => import('@/views/KnowledgeBaseView.vue'),
+        meta: { title: '知识库', module: 'knowledge', homeNav: 'knowledge' },
       },
       // ---- 四个核心模块（EasyPaper 风格，本轮前端对接）----
       // 论文导入已并入「文献总览」的弹窗（2026-09-20）：旧路径保留为重定向，

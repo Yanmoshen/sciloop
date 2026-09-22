@@ -14,6 +14,9 @@ import zhCn from 'element-plus/es/locale/lang/zh-cn'
 import 'element-plus/dist/index.css'
 // Element Plus 暗色变量表（挂在 html.dark 下）——缺它时深色模式下所有 el-* 组件仍是浅色
 import 'element-plus/theme-chalk/dark/css-vars.css'
+// Element Plus 黑白化覆盖层（2026-09-22 全站黑白化）：必须排在上面两份官方样式之后，
+// 否则蓝色会从输入框焦点框 / 下拉选中 / 开关 / 日期面板里冒出来
+import '@/styles/element-mono.css'
 
 import App from '@/App.vue'
 import router from '@/router'
