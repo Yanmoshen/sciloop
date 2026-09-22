@@ -291,6 +291,13 @@ def test_empty_sql_is_harmless() -> None:
 def test_verdict_dict_has_no_internal_fields() -> None:
     payload = policy.judge_command(command="sudo reboot").to_dict()
     assert payload["decision"] == policy.DECISION_APPROVE
-    assert set(payload) == {"decision", "layer", "message", "categories", "detail"}
+    assert set(payload) == {
+        "decision",
+        "layer",
+        "message",
+        "categories",
+        "detail",
+        "harmless",
+    }
     # 面向研究者的话术里不许出现内部术语
     assert "arg" not in payload["message"].lower()

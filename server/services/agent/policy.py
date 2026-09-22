@@ -214,13 +214,20 @@ def classify_layer(path: str | Path, *, base: str | Path | None = None) -> str:
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class Verdict:
-    """一次裁决的结论（面向研究者的话术也在这里，**不许出现内部术语**）。"""
+    """一次裁决的结论（面向研究者的话术也在这里，**不许出现内部术语**）。
+
+    ``harmless`` 单独标出来，是为了把两件事分清：
+    「看东西」（列目录 / 读文件 / 查论文库）**任何时候都放行** —— 它不改变任何状态；
+    「动手」（跑命令 / 写文件 / 删东西）要不要问人，**取决于研究者的开关**：
+    完全访问模式开着就直接做，关着就弹批准卡（高危无论如何都要点头）。
+    """
 
     decision: str
     layer: str
     message: str
     categories: tuple[str, ...] = field(default_factory=tuple)
     detail: str = ""
+    harmless: bool = False
 
     @property
     def allowed(self) -> bool:
@@ -243,11 +250,12 @@ class Verdict:
             "message": self.message,
             "categories": list(self.categories),
             "detail": self.detail,
+            "harmless": self.harmless,
         }
 
 
-def _allow(layer: str, message: str) -> Verdict:
-    return Verdict(DECISION_ALLOW, layer, message)
+def _allow(layer: str, message: str, *, harmless: bool = False) -> Verdict:
+    return Verdict(DECISION_ALLOW, layer, message, harmless=harmless)
 
 
 def _approve(layer: str, message: str, *categories: str) -> Verdict:
@@ -403,7 +411,7 @@ def judge_fs(
     layer = classify_layer(path)
 
     if act in ("list", "read", "stat"):
-        return _allow(layer, "读取文件或目录，可以直接做")
+        return _allow(layer, "读取文件或目录，可以直接做", harmless=True)
 
     if act in ("write", "mkdir", "move", "copy"):
         if layer == LAYER_SCILOOP:
@@ -450,7 +458,7 @@ def judge_sql(sql: str) -> Verdict:
 
     text = (sql or "").strip()
     if not text:
-        return _allow(LAYER_DATABASE, "空语句，无需处理")
+        return _allow(LAYER_DATABASE, "空语句，无需处理", harmless=True)
     hits = [c for c in _scan(text) if c == CATEGORY_DATABASE]
     if hits:
         return _approve(
@@ -458,4 +466,9 @@ def judge_sql(sql: str) -> Verdict:
             "这句会删掉或改动数据库结构，属于不可逆操作，请你确认。",
             *hits,
         )
-    return _allow(LAYER_DATABASE, "读写数据，可以直接做（改结构、删数据才需要你确认）")
+    read_only = bool(re.match(r"^(select|with|explain|show|table)\b", text, re.I))
+    return _allow(
+        LAYER_DATABASE,
+        "读写数据，可以直接做（改结构、删数据才需要你确认）",
+        harmless=read_only,
+    )

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from typing import Any
 
 from services.agent import approvals
 
@@ -67,23 +68,30 @@ def test_digest_binds_the_tool_and_every_argument() -> None:
 # --------------------------------------------------------------------------- #
 # 有效期：过期是**读出来的**
 # --------------------------------------------------------------------------- #
-def test_expired_is_computed_on_read() -> None:
+def test_pending_never_expires_on_its_own() -> None:
+    """待批就是待批，**不再按时间自动作废**（研究者 2026-09-22 明确说"没必要"）。
+
+    注意这条是"行为契约"：以后若有人以"安全"为名把 15 分钟过期逻辑加回来，
+    这个测试会红 —— 因为那会让研究者刚看到卡片、转头回来点批准时已经作废。
+    """
+
     request = _request()
     assert approvals.effective_status(request) == "pending"
-    later = datetime.fromisoformat(request["expires_at"]) + timedelta(seconds=1)
-    assert approvals.effective_status(request, now=later) == "expired"
-    # 已裁决的状态不会被"过期"覆盖掉 —— 批过就是批过
+    much_later = datetime.fromisoformat(request["expires_at"]) + timedelta(days=30)
+    assert approvals.effective_status(request, now=much_later) == "pending"
+
+    # 已裁决的状态照旧，不会被改写成别的
     request["status"] = "approved"
-    assert approvals.effective_status(request, now=later) == "approved"
+    assert approvals.effective_status(request, now=much_later) == "approved"
 
 
-def test_zero_ttl_expires_immediately() -> None:
+def test_zero_ttl_still_pending() -> None:
     request = _request(ttl_seconds=0)
-    assert approvals.effective_status(request) == "expired"
+    assert approvals.effective_status(request) == "pending"
 
 
 def test_find_pending_refuses_closed_requests() -> None:
-    """**一次性**的关键就在这条：已批准/已拒绝/已过期都不能再批一次。"""
+    """一次性没有取消：**已批准/已拒绝**都不能再批一次（但待批不会自己过期）。"""
 
     request = _request()
     record = _record(request)
@@ -93,9 +101,64 @@ def test_find_pending_refuses_closed_requests() -> None:
         request["status"] = status
         assert approvals.find_pending(record, request["id"]) is None
 
-    request["status"] = "pending"
-    record2 = _record(_request(ttl_seconds=0))
-    assert approvals.find_pending(record2, record2["turns"][0]["approvals"][0]["id"]) is None
+
+def test_conversation_grants_default_off_and_are_settable() -> None:
+    """按对话的授权：默认全关；可以分别打开（两个是不同的事）。"""
+
+    record: dict[str, Any] = {"id": "c1", "turns": []}
+    assert approvals.grants(record) == {"full_access": False, "allow_exec": False}
+
+    approvals.set_grants(record, full_access=True)
+    assert approvals.grants(record)["full_access"] is True
+    assert approvals.grants(record)["allow_exec"] is False, "开完全访问模式不等于放行高危"
+
+    approvals.set_grants(record, allow_exec=True)
+    assert approvals.grants(record) == {"full_access": True, "allow_exec": True}
+
+    # 关掉"高危也放行"时，不该顺手把完全访问模式也关掉
+    approvals.set_grants(record, allow_exec=False)
+    assert approvals.grants(record)["full_access"] is True
+
+
+def test_grants_summary_says_it_in_human_words() -> None:
+    record: dict[str, Any] = {"id": "c1", "turns": []}
+    assert "先问" in approvals.grants_summary(record)["note"]
+    approvals.set_grants(record, full_access=True)
+    assert "高危" in approvals.grants_summary(record)["note"]
+    approvals.set_grants(record, allow_exec=True)
+    assert "高危操作也直接执行" in approvals.grants_summary(record)["note"]
+
+
+def test_allows_matrix() -> None:
+    """授权 → 能不能直接执行。
+
+    这段判定决定了"会不会不打招呼就动研究者的机器"，所以把矩阵穷举钉住：
+
+    | 本对话默认允许 | 完全访问模式 | 高危 | 结果 |
+    |---|---|---|---|
+    | 关 | 关 | 任意 | 先问 |
+    | 关 | **开** | 否 | 直接做 |
+    | 关 | **开** | **是** | **仍然先问** |
+    | **开** | 任意 | 任意 | 直接做 |
+    """
+
+    off = {"full_access": False, "allow_exec": False}
+    full = {"full_access": True, "allow_exec": False}
+    exec_ = {"full_access": False, "allow_exec": True}
+    both = {"full_access": True, "allow_exec": True}
+
+    assert approvals.allows(off, high_risk=False) is False
+    assert approvals.allows(off, high_risk=True) is False
+    assert approvals.allows(full, high_risk=False) is True
+    assert approvals.allows(full, high_risk=True) is False, "完全访问模式不该放行高危"
+    assert approvals.allows(exec_, high_risk=True) is True
+    assert approvals.allows(both, high_risk=True) is True
+
+
+def test_three_decisions_are_the_contract() -> None:
+    """卡上就三个选择（研究者原话），多一个少一个都要在这里红。"""
+
+    assert approvals.VALID_DECISIONS == ("approve", "approve_conversation", "deny")
 
 
 def test_find_and_find_pending_report_where_the_request_lives() -> None:

@@ -261,7 +261,9 @@ async def judge(call: dict[str, Any]) -> policy.Verdict:
             ("执行命令",),
         )
     if name in AUTONOMOUS_TOOLS:
-        return policy.Verdict(policy.DECISION_ALLOW, "read", "只读查询，可以直接做")
+        return policy.Verdict(
+            policy.DECISION_ALLOW, "read", "只读查询，可以直接做", harmless=True
+        )
     return policy.Verdict(
         policy.DECISION_FORBID, "unknown", f"我不认识这个工具（{name}），不执行。"
     )

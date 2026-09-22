@@ -8,23 +8,35 @@
 但**令牌从哪来**是产品问题——没有签发入口，门 3 就只能靠"不摆工具给模型"来规避，
 能力等于没接上。本模块就是那个入口的存储层。
 
-三条口径（已确认，别再改）
---------------------------
+三条口径（2026-09-22 按研究者要求改过，别再改回去）
+--------------------------------------------------
 1. **批准随会话记录落盘**，不加表、不动迁移（`EXPECTED_TABLES` 保持 37）。
    批准是"这一轮对话里发生的事"，与 turns 同源，天然自洽。
-2. **一次性、带有效期、绑死具体调用**：令牌绑 `request_id`，`request_id` 绑
-   conversation + 工具 + 那次具体参数（`args_digest`）。批准的是**这一次调用**，
-   不是"以后这类调用都放行"——后者等于把批准变成了一次性开关。
+2. **批准分三种**（研究者的原话：「做成三个选择，批准此次执行，此对话中默认允许执行，拒绝执行」）：
+   - `approve` —— 只批这一次调用；
+   - `approve_conversation` —— 在本对话里以后这类（**包括高危**）都直接放行（写进会话的授权块）；
+   - `deny` —— 拒绝。
+   ⚠️ **不再有 15 分钟自动失效**（研究者明确说"没必要"）：一条待批请求会一直等着，
+   直到研究者自己处理它。批准仍绑死具体调用（`request_id` + `args_digest`），
+   所以"批准了 A"不会被拿去执行 B。
 3. **不存明文令牌**：会话文件只留指纹（`token_fingerprint`）。明文只在"执行的那一瞬间"
    存在于内存里并被送进 MCP 子进程的启动环境。会话文件是可以被人工打开查看的（这是它的
    设计目的），把可用凭据写进去就等于把它交出去了。
+
+按对话的授权块（`record["grants"]`）
+-----------------------------------
+``{"full_access": bool, "allow_exec": bool}``
+- `full_access` = 输入栏那个「完全访问模式」开关：**低危动作免批准**（高危仍要点头）；
+- `allow_exec` = 批准卡里选「此对话中默认允许执行」：**连高危也免批准**。
+两个都是**按对话**的 —— 换个对话就要重新决定，避免"某一次心软变成了永久开关"。
 
 请求的样子
 ----------
 ``{"id", "tool", "args_digest", "preview", "cwd", "status", "created_at", "expires_at",
    "decided_at", "decided_by", "note", "token_fingerprint", "consumed_at"}``
 
-状态机：``pending → approved | denied | expired``；``approved`` 执行后加 ``consumed_at``。
+状态机：``pending → approved | denied``；``approved`` 执行后加 ``consumed_at``。
+（`expires_at` 字段保留但**不再自动作废**，只为兼容旧记录与前端展示。）
 **没有"审批通过但没跑"以外的中间态**——不给"已批准但还在排队"这种模糊状态留位置。
 """
 
@@ -49,6 +61,16 @@ REQUEST_TTL_SECONDS = 900
 TOKEN_PREFIX = "apv"
 
 VALID_STATUSES = ("pending", "approved", "denied", "expired")
+
+#: 三种裁决（研究者的原话：批准此次执行 / 此对话中默认允许执行 / 拒绝执行）
+DECISION_APPROVE = "approve"
+DECISION_APPROVE_CONVERSATION = "approve_conversation"
+DECISION_DENY = "deny"
+VALID_DECISIONS = (DECISION_APPROVE, DECISION_APPROVE_CONVERSATION, DECISION_DENY)
+
+#: 按对话的授权键
+GRANT_FULL_ACCESS = "full_access"
+GRANT_ALLOW_EXEC = "allow_exec"
 
 #: 预览的最大长度（对话里那一行放不下更长的）
 PREVIEW_MAX_CHARS = 200
@@ -142,15 +164,78 @@ def new_request(
 
 
 def effective_status(request: dict[str, Any], *, now: datetime | None = None) -> str:
-    """把"到点没批"如实算成 `expired` —— 过期是**读出来的**事实，不依赖谁去巡检。"""
+    """一条批准请求现在是什么状态。
 
-    status = str(request.get("status") or "pending")
-    if status != "pending":
-        return status
-    expires = _parse(request.get("expires_at"))
-    if expires is not None and (now or _now()) >= expires:
-        return "expired"
-    return "pending"
+    ⚠️ **不再按时间自动作废**（研究者 2026-09-22：「一次性和 15 分钟自动失效没必要」）。
+    待批就是待批，直到研究者自己处理；`expires_at` 仅作展示用，不参与判定。
+    因此这里只会返回 `pending` / `approved` / `denied`（旧记录里的 `expired` 原样返回）。
+    """
+
+    return str(request.get("status") or "pending")
+
+
+# --------------------------------------------------------------------------- #
+# 按对话的授权（完全访问模式 / 本对话默认允许）
+# --------------------------------------------------------------------------- #
+def grants(record: dict[str, Any]) -> dict[str, bool]:
+    """读这个对话当前的授权块（缺省全是 False）。"""
+
+    raw = record.get("grants")
+    raw = raw if isinstance(raw, dict) else {}
+    return {
+        GRANT_FULL_ACCESS: bool(raw.get(GRANT_FULL_ACCESS)),
+        GRANT_ALLOW_EXEC: bool(raw.get(GRANT_ALLOW_EXEC)),
+    }
+
+
+def set_grants(
+    record: dict[str, Any],
+    *,
+    full_access: bool | None = None,
+    allow_exec: bool | None = None,
+) -> dict[str, bool]:
+    """改这个对话的授权块（**只改内存**，落盘由调用方 `save`）。
+
+    `None` = 不动这一项。关掉 `allow_exec` 时**不连带关掉** `full_access` ——
+    它们是两件事（一个是"免点头动手"，一个是"连高危也放行"），各有各的开关。
+    """
+
+    current = grants(record)
+    if full_access is not None:
+        current[GRANT_FULL_ACCESS] = bool(full_access)
+    if allow_exec is not None:
+        current[GRANT_ALLOW_EXEC] = bool(allow_exec)
+    record["grants"] = dict(current)
+    return current
+
+
+def grants_summary(record: dict[str, Any]) -> dict[str, Any]:
+    """给界面看的授权摘要（人话 + 两个布尔值）。"""
+
+    current = grants(record)
+    if current[GRANT_ALLOW_EXEC]:
+        note = "本对话内：连高危操作也直接执行"
+    elif current[GRANT_FULL_ACCESS]:
+        note = "本对话内：普通操作直接执行，高危操作仍会先问你"
+    else:
+        note = "本对话内：动手前都会先问你"
+    return {**current, "note": note}
+
+
+def allows(grant: dict[str, bool], *, high_risk: bool) -> bool:
+    """这份授权是否允许**直接执行**（不发批准卡）。
+
+    规则（研究者 2026-09-22 定的）：
+    - 「此对话中默认允许执行」= 最宽的一档，**连高危也直接做**；
+    - 「完全访问模式」= 普通动手操作直接做，**高危仍然先问**；
+    - 都没开 → 一概先问。
+
+    单拎成函数是为了能被穷举测试 —— 这段判定决定了"到底会不会不打招呼就动研究者的机器"。
+    """
+
+    if grant.get(GRANT_ALLOW_EXEC):
+        return True
+    return bool(grant.get(GRANT_FULL_ACCESS)) and not high_risk
 
 
 def find(record: dict[str, Any], request_id: str) -> tuple[int, dict[str, Any]] | None:
@@ -239,20 +324,30 @@ def save(record: dict[str, Any]) -> None:
 
 
 __all__ = [
+    "DECISION_APPROVE",
+    "DECISION_APPROVE_CONVERSATION",
+    "DECISION_DENY",
+    "GRANT_ALLOW_EXEC",
+    "GRANT_FULL_ACCESS",
     "PREVIEW_MAX_CHARS",
     "REQUEST_TTL_SECONDS",
     "TOKEN_PREFIX",
+    "VALID_DECISIONS",
     "VALID_STATUSES",
+    "allows",
     "args_digest",
     "attach",
     "decide",
     "effective_status",
     "find",
     "find_pending",
+    "grants",
+    "grants_summary",
     "issue_token",
     "load",
     "mark_consumed",
     "new_request",
     "save",
+    "set_grants",
     "token_fingerprint",
 ]

@@ -124,6 +124,7 @@ def _sse(event: str, payload: dict[str, Any]) -> str:
 async def _agent_loop(
     messages_now: list[dict[str, Any]],
     *,
+    conversation_id: str,
     ref: str,
     tool_defs: list[dict[str, Any]],
     rows: list[dict[str, Any]],
@@ -133,11 +134,14 @@ async def _agent_loop(
 ) -> AsyncIterator[str]:
     """agent 循环：模型 → 工具 → 结果回喂 → 再模型（轮数有上限，防死循环）。
 
-    两类工具待遇不同，**这条边界只在这里落实一次**：
+    每一次工具调用都走同一道裁决（`agent_tools.judge` → `policy`），再叠上**本对话的授权**：
 
-    - 只读工具（`AUTONOMOUS_TOOLS`）：直接执行，过程与结果都回报。
-    - 写盘/执行类（`APPROVABLE_TOOLS`）：**只建批准请求，一次都不执行** —— 发一张卡、
-      结束本轮、等研究者裁决。模型可以提出，但没有资格替自己批准。
+    - 硬拒（删代码这类）：直接回绝，不进批准队列（没得商量）；
+    - 无害（列目录 / 读文件 / 查论文库）：直接做 —— 它不改变任何状态；
+    - 动手（跑命令 / 写文件 / 删东西）：
+      · 本对话选了「默认允许执行」（高危也放行）→ 直接做；
+      · 开了「完全访问模式」且不是高危 → 直接做；
+      · 否则 → **发一张批准卡，一次都不执行**。模型可以提出，但没有资格替自己批准。
 
     主对话与批准后续答共用本函数。**状态通过 `state` 写回**（`text` / `reasoning` /
     `result` / `pending`），而不是靠生成器返回值 —— 调用方在两处需要同一份口径，
@@ -206,31 +210,47 @@ async def _agent_loop(
                     }
                 )
                 continue
-            if verdict.needs_approval:
-                # 写盘/执行类：**只建请求，不执行**。连一次 MCP 调用都不发出去。
-                arguments = agent_tools.arguments_of(call)
-                cwd = arguments.get("cwd")
-                request = agent_approvals.new_request(
-                    tool=tool_name,
-                    args=arguments,
-                    cwd=cwd if isinstance(cwd, str) else None,
-                    call_id=str(call.get("id") or "") or None,
+            if verdict.needs_approval or not verdict.harmless:
+                # 本对话当前的授权（**每轮重读**：研究者中途拨开关要立刻生效）
+                grants_now = agent_approvals.grants(
+                    agent_approvals.load(conversation_id) or {}
                 )
-                approvals_out.append(request)
-                # **行即卡片**：卡片本身就是那一条过程行。同一份内容既发 row（用来落盘，
-                # 刷新后凭它重建）也发 approval（前端据此渲染按钮）——
-                # 只发 SSE 不落盘的话，刷新后卡片刻凭空消失，而库里留着一句"等待批准"。
-                card = agent_tools.approval_row(request)
-                rows.append(card)
-                yield _sse("row", {"row": card})
-                yield _sse("approval", card)
-                state["pending"] = request
-                stopped_for_approval = True
-                break
-            start_row = agent_tools.tool_row(call, "start")
+                high_risk = verdict.needs_approval
+                allowed_by_grant = agent_approvals.allows(grants_now, high_risk=high_risk)
+                if not allowed_by_grant:
+                    # 动手类：**只建请求，不执行**。连一次执行都不发出去。
+                    arguments = agent_tools.arguments_of(call)
+                    cwd = arguments.get("cwd")
+                    request = agent_approvals.new_request(
+                        tool=tool_name,
+                        args=arguments,
+                        cwd=cwd if isinstance(cwd, str) else None,
+                        call_id=str(call.get("id") or "") or None,
+                    )
+                    approvals_out.append(request)
+                    # **行即卡片**：卡片本身就是那一条过程行。同一份内容既发 row（用来落盘，
+                    # 刷新后凭它重建）也发 approval（前端据此渲染按钮）——
+                    # 只发 SSE 不落盘的话，刷新后卡片刻凭空消失，而库里留着一句"等待批准"。
+                    card = agent_tools.approval_row(request)
+                    rows.append(card)
+                    yield _sse("row", {"row": card})
+                    yield _sse("approval", card)
+                    state["pending"] = request
+                    stopped_for_approval = True
+                    break
+                # 已获授权：这一行如实写明"是按你在本对话里的授权直接执行的"，
+                # 让研究者事后对得上账（而不是看到一次没人批准的执行）。
+                start_detail = "按你在这个对话里的授权直接执行（无需再确认）"
+                grant_token = agent_approvals.issue_token(f"grant-{conversation_id[:8]}")
+            else:
+                start_detail = ""
+                grant_token = None
+            start_row = agent_tools.tool_row(call, "start", start_detail)
             rows.append(start_row)
             yield _sse("row", {"row": start_row})
-            payload_out, summary = await agent_tools.run_tool_call(call)
+            payload_out, summary = await agent_tools.run_tool_call(
+                call, approval_token=grant_token
+            )
             end_row = agent_tools.tool_row(call, "ok" if payload_out.get("ok") else "err", summary)
             rows.append(end_row)
             yield _sse("row", {"row": end_row})
@@ -564,6 +584,7 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
             }
             async for frame in _agent_loop(
                 messages_now,
+                conversation_id=conversation_id,
                 ref=ref,
                 tool_defs=tool_defs,
                 rows=tool_rows,
@@ -720,7 +741,7 @@ class ApprovalDecisionRequest(BaseModel):
     conversation_id: str = Field(min_length=1, max_length=64)
     #: 待裁决请求的 id（来自 `approval` 事件 / 过程行里的 `request_id`）
     request_id: str = Field(min_length=1, max_length=64)
-    decision: Literal["approve", "deny"]
+    decision: Literal["approve", "approve_conversation", "deny"]
     #: 可选备注，随裁决一起留痕（例如"只跑这次，下次同样的再说"）
     note: str | None = Field(default=None, max_length=500)
     #: 续答用哪个模型；不传 = 沿用会话记录里的 `model_ref`（通常够用）
@@ -832,6 +853,19 @@ async def _approval_stream(
                 note=payload.note,
                 token=token,
             )
+            # 选「此对话中默认允许执行」：把授权写进**这个对话**（下一个对话要重新决定）。
+            # 这是比「完全访问模式」更宽的一档：连高危操作也不再弹卡。
+            if payload.decision == agent_approvals.DECISION_APPROVE_CONVERSATION:
+                summary = agent_approvals.set_grants(record, allow_exec=True)
+                agent_approvals.save(record)
+                grant_row = {
+                    "kind": "tool",
+                    "tone": "ok",
+                    "text": f"已允许在本对话内直接执行（{agent_approvals.grants_summary(record)['note']}）",
+                }
+                rows.append(grant_row)
+                yield _sse("row", {"row": grant_row})
+                logger.info("会话 %s 获得执行授权：%s", conversation_id, summary)
             card = agent_tools.approval_row(request)
             yield _sse("approval", card)
             decision_row = {"kind": "tool", "tone": "ok", "text": f"研究者已批准「{label}」"}
@@ -899,6 +933,7 @@ async def _approval_stream(
             }
             async for frame in _agent_loop(
                 messages_now,
+                conversation_id=conversation_id,
                 ref=ref,
                 tool_defs=tool_defs,
                 rows=rows,
@@ -994,7 +1029,7 @@ async def _approval_stream(
 
 @router.post(
     "/chat/approvals/decide",
-    summary="研究者裁决一次写盘/执行请求（approve 则执行并续答；deny 则如实记录）",
+    summary="研究者裁决一次写盘/执行请求（批准此次 / 此对话默认允许 / 拒绝）",
     dependencies=[Depends(require_owner)],
 )
 async def decide_approval(payload: ApprovalDecisionRequest) -> StreamingResponse:
@@ -1036,6 +1071,54 @@ async def decide_approval(payload: ApprovalDecisionRequest) -> StreamingResponse
         raise _error(409, "no_model", "会话没有记录可用模型，请重新发送一次对话再裁决")
 
     return _streaming(_approval_stream(record, turn_index, request, payload, ref))
+
+
+class AccessModeRequest(BaseModel):
+    """完全访问模式开关（**按对话**）。
+
+    为什么按对话而不是全局：研究者说的是「都是盖当前对话」——
+    换一个对话就该重新决定，避免"某一次图省事"变成永久开关。
+    """
+
+    conversation_id: str = Field(min_length=1, max_length=64)
+    full_access: bool
+
+
+@router.post(
+    "/chat/access-mode",
+    summary="切换本对话的完全访问模式（开=普通动手操作不再逐一确认，高危仍会问）",
+    dependencies=[Depends(require_owner)],
+)
+async def set_access_mode(payload: AccessModeRequest) -> dict[str, Any]:
+    """开 / 关当前对话的「完全访问模式」。
+
+    它管的是"动手类操作"（跑命令、写文件、删文件）要不要逐一确认：
+    开着 → 普通操作直接做；关着 → 都先问一句。**高危操作无论开关如何都会先问**
+    （除非研究者在那张卡上选了"此对话中默认允许执行"，那是更宽的一档）。
+    只看东西的操作（列目录、读文件、查论文库）任何时候都不打扰研究者。
+    """
+
+    record = agent_approvals.load(payload.conversation_id)
+    if record is None:
+        raise _error(404, "conversation_not_found", "会话不存在（可能已被删除）")
+    agent_approvals.set_grants(record, full_access=payload.full_access)
+    agent_approvals.save(record)
+    summary = agent_approvals.grants_summary(record)
+    logger.info("会话 %s 完全访问模式=%s", payload.conversation_id, payload.full_access)
+    return {"ok": True, "conversation_id": payload.conversation_id, **summary}
+
+
+@router.get(
+    "/chat/access-mode/{conversation_id}",
+    summary="读本对话当前的授权状态（公开只读）",
+)
+async def read_access_mode(conversation_id: str) -> dict[str, Any]:
+    """给界面显示用：现在是"动手前都先问"还是"直接做"。"""
+
+    record = agent_approvals.load(conversation_id)
+    if record is None:
+        raise _error(404, "conversation_not_found", "会话不存在（可能已被删除）")
+    return {"conversation_id": conversation_id, **agent_approvals.grants_summary(record)}
 
 
 __all__ = ["router"]
