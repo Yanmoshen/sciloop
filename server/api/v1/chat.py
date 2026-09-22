@@ -68,6 +68,40 @@ REPLY_SYSTEM = (
     "不要编造文献、数据或结论；没有实际查过本地数据就不要声称查过。\n\n" + OUTPUT_STYLE
 )
 
+
+def skills_system_block() -> str:
+    """技能清单（两级披露的**第一级**）：只给名字 + 一句话 + 环节。
+
+    ⚠️ 正文**不能**放进来 —— 40 多个技能的全文会把提示词撑爆，而且大多数跟当前这一步无关。
+    模型需要哪个，就 `load_skill` 哪个（那才是第二级）。
+    只列**启用**的技能（研究者关掉的不该被模型选中）。
+    """
+
+    from services.skills import service
+
+    try:
+        items = service.prompt_catalog()
+    except Exception:  # noqa: BLE001 - 技能库读不出来不该把对话带崩
+        return ""
+    if not items:
+        return ""
+    by_stage: dict[str, list[dict[str, str]]] = {}
+    for item in items:
+        by_stage.setdefault(item["stage"], []).append(item)
+    lines = [
+        "",
+        "",
+        "## 你可以调用的「技能」",
+        "下面每个技能都是一套已经写好的做法（有的还带脚本）。**先看名字与一句话，判断要不要用**；",
+        "要用哪个就用 `load_skill` 把它的完整说明加载进来，再照它做 —— 不要凭名字猜内容。",
+        "其中带脚本的技能可以用 `run_skill` 按它声明的流程在研究者电脑上跑（会先请研究者确认）。",
+    ]
+    for stage, stage_items in by_stage.items():
+        lines.append(f"### {stage}")
+        for item in stage_items:
+            lines.append(f"- {item['name']}：{item['description']}")
+    return "\n".join(lines)
+
 #: 通用回答的输出上限。默认 1536 会被思考型模型的长思考吃光，正文只挤出半句就断
 #: （实测有一轮只落了 26 个字符）。放宽到 4096 让正文有地方落。
 REPLY_MAX_TOKENS = 4096
@@ -415,7 +449,7 @@ async def home_chat(payload: HomeChatRequest) -> HomeChatResponse:
     try:
         reply_result = await adapter.chat(
             [
-                {"role": "system", "content": REPLY_SYSTEM},
+                {"role": "system", "content": REPLY_SYSTEM + skills_system_block()},
                 *history,
                 {"role": "user", "content": text},
             ],
@@ -601,7 +635,7 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
             from services.agent import mcp_tools as agent_tools
 
             messages_now: list[dict[str, Any]] = [
-                {"role": "system", "content": REPLY_SYSTEM},
+                {"role": "system", "content": REPLY_SYSTEM + skills_system_block()},
                 *history,
                 {"role": "user", "content": text},
             ]
@@ -942,7 +976,7 @@ async def _approval_stream(
             if reasoning_before:
                 assistant_call_msg["reasoning_content"] = reasoning_before
             messages_now: list[dict[str, Any]] = [
-                {"role": "system", "content": REPLY_SYSTEM},
+                {"role": "system", "content": REPLY_SYSTEM + skills_system_block()},
                 *conversations.context_messages(record),
                 assistant_call_msg,
                 {

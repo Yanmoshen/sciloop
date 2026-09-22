@@ -90,6 +90,11 @@ export const MODULE_GROUPS: ModuleGroup[] = [
     items: [{ key: 'knowledge', label: '知识库', path: '/knowledge', hint: '文件 / 摘录 / 技能 / 记忆' }],
   },
   {
+    key: 'skills',
+    title: '技能',
+    items: [{ key: 'skills', label: '技能库', path: '/skills', hint: '装了什么 / 开关 / 挂载 / 自己写' }],
+  },
+  {
     key: 'settings',
     title: '设置',
     items: [
@@ -176,6 +181,13 @@ export const routes: RouteRecordRaw[] = [
         name: 'knowledge',
         component: () => import('@/views/KnowledgeBaseView.vue'),
         meta: { title: '知识库', module: 'knowledge', homeNav: 'knowledge' },
+      },
+      // 技能库（2026-09-23）：独立入口，与知识库平级
+      {
+        path: 'skills',
+        name: 'skills',
+        component: () => import('@/views/SkillsView.vue'),
+        meta: { title: '技能库', module: 'skills', homeNav: 'skills' },
       },
       // ---- 四个核心模块（EasyPaper 风格，本轮前端对接）----
       // 论文导入已并入「文献总览」的弹窗（2026-09-20）：旧路径保留为重定向，

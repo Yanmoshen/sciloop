@@ -103,3 +103,24 @@ async def run_skill(payload: RunBody = Body(...)) -> dict[str, Any]:
 @router.get("/skills/runs", summary="某个任务下的技能执行记录（公开只读）")
 async def list_runs(task_id: str) -> dict[str, Any]:
     return {"task_id": task_id, "runs": service.runs(task_id)}
+
+
+@router.get("/skills/{name}", summary="某个技能的完整说明（公开只读）")
+async def get_skill(name: str) -> dict[str, Any]:
+    """编辑技能时要拿到**当前内容**：不然"编辑"会把原内容覆盖成空壳。
+
+    ⚠️ 本路由必须排在 `/skills/runs` 之后（字面路径先于同前缀参数路由）。
+    """
+
+    from services.skills import registry, service
+
+    pack = next((item for item in service.all_packs() if item.name == name), None)
+    if pack is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "skill_not_found", "message": f"没有这个技能：{name}", "detail": None},
+        )
+    content = ""
+    if pack.path is not None and (pack.path / "SKILL.md").is_file():
+        content = (pack.path / "SKILL.md").read_text(encoding="utf-8", errors="replace")
+    return registry.load(pack) | {"ok": True, "content": content}

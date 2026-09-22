@@ -339,6 +339,10 @@ def build_messages(
     if search_results:
         parts.append(f"\n## 联网检索结果（你上一轮要求查的）\n{_format_search(search_results)}")
 
+    skills_block = _skills_block()
+    if skills_block:
+        parts.append(skills_block)
+
     if command_results:
         parts.append(
             f"\n## 你上一轮要求跑的命令与真实输出\n{_format_commands(command_results)}"
@@ -361,6 +365,34 @@ def build_messages(
 
 #: 能力 → 给人看/给模型看的名字
 _CAPABILITY_LABELS = {"academic": "查学术", "web": "搜网页"}
+
+
+#: 技能清单（两级披露第一级）：只给名字 + 一句话，正文要模型自己 load_skill
+_SKILLS_HEADER = (
+    "\n## 你可以调用的技能（先看名字判断要不要用，要用哪个再 load_skill 看全文）\n"
+)
+
+
+def _skills_block() -> str:
+    """技能清单（只给名字 + 一句话 + 环节）；读不出来就返回空串，绝不影响出题。"""
+
+    from services.skills import service
+
+    try:
+        items = service.prompt_catalog()
+    except Exception:  # noqa: BLE001
+        return ""
+    if not items:
+        return ""
+    by_stage: dict[str, list[dict[str, str]]] = {}
+    for item in items:
+        by_stage.setdefault(item["stage"], []).append(item)
+    lines = [_SKILLS_HEADER.rstrip()]
+    for stage, stage_items in by_stage.items():
+        lines.append(f"### {stage}")
+        for item in stage_items:
+            lines.append(f"- {item['name']}：{item['description']}")
+    return "\n".join(lines)
 
 
 def _format_search(blocks: list[dict[str, Any]]) -> str:
