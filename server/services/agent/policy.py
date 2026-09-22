@@ -275,6 +275,13 @@ _DELETE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bremove-item\b|\bri\b\s+-|clear-content", re.I),
     re.compile(r"\b(rmtree|unlink|remove|rmdir|removedirs)\s*\(", re.I),  # python 里的删除调用
     re.compile(r"\b(format|mkfs(\.\w+)?|diskpart|fdisk|dd|wipefs)\b", re.I),
+    # 「看着不像删除、其实会毁掉工作」的那几个（实测补上）：
+    # ⚠️ 末尾不要加 `\b`：`git checkout -- .` 里 `--` 后面是空格/点，`\b` 会匹配不上，
+    # 于是这条最该拦的命令会漏过去（写完测试才发现）。
+    re.compile(r"\bgit\s+(clean\b|reset\s+--hard|checkout\s+--|branch\s+-D\b|stash\s+drop\b)", re.I),
+    re.compile(r"(^|[;&|]\s*)find\b[^\n]*-delete\b", re.I),
+    re.compile(r"(^|[;&|]\s*)sed\b[^\n]*\s-i(\s|$)", re.I),  # sed -i = 原地改写
+    re.compile(r"(^|[;&|]\s*)truncate\b", re.I),
 )
 
 #: ② 改系统与权限
@@ -350,6 +357,74 @@ def _scan(text: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
+# 只读命令：看东西不打扰研究者（研究者 2026-09-22：「只读命令也直接跑」）
+# --------------------------------------------------------------------------- #
+#: 只看不改的命令（第一个词命中即算只读）。
+#: 原则：**宁可少认几个，也不要把会改东西的命令放进来** ——
+#: 放进来会"不打招呼就动手"，漏掉只是"多问一句"，两种错的代价不对称。
+_READONLY_TOKENS: frozenset[str] = frozenset(
+    {
+        # 文件与目录：看
+        "ls", "dir", "pwd", "cat", "type", "head", "tail", "wc", "stat", "file", "tree",
+        "realpath", "basename", "dirname", "du", "df",
+        # 查找与比较：看
+        "grep", "rg", "findstr", "select-string", "diff", "sort", "uniq", "cut", "tr",
+        # 环境与身份：看
+        "echo", "hostname", "whoami", "id", "date", "env", "printenv", "uname", "which",
+        "where", "whereis", "command", "sleep", "true",
+        # 只读的包/运行时查询
+        "node", "java", "go", "cargo", "ruff", "flake8", "mypy", "black",
+    }
+)
+
+#: `git` 只看不改的子命令（其余一律按"动手"处理 —— `git clean/reset --hard/push` 都不在这里）
+_READONLY_GIT_SUBCOMMANDS: frozenset[str] = frozenset(
+    {
+        "status", "diff", "log", "show", "branch", "remote", "config", "tag", "describe",
+        "blame", "rev-parse", "ls-files", "ls-remote", "shortlog", "whatchanged", "cat-file",
+        "grep", "version", "fetch-status",
+    }
+)
+
+#: 这些"工具"只有看子命令算只读，其余看子命令之外的都按"动手"处理
+_READONLY_SUBCOMMAND_TOOLS: dict[str, frozenset[str]] = {
+    "git": _READONLY_GIT_SUBCOMMANDS,
+    "pip": frozenset({"list", "show", "freeze", "check", "--version"}),
+    "npm": frozenset({"ls", "list", "view", "outdated", "--version"}),
+    "docker": frozenset({"ps", "images", "inspect", "version", "logs"}),
+    "poetry": frozenset({"show", "env", "--version"}),
+}
+
+
+def _first_token(text: str) -> str:
+    return (re.split(r"[\s]+", text.strip())[0] if text.strip() else "").lower()
+
+
+def _is_readonly_command(text: str) -> bool:
+    """这条命令是不是"只是看看"。
+
+    判据刻意做成白名单（而不是"没有危险关键字就算安全"）：
+    黑名单漏一个就会出事，白名单漏一个只是多问一句。
+    """
+
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if bool(re.search(r"[;&|><]", stripped)):
+        # 带管道/重定向/串联的，一律不当作"只读" —— `cat x | tee y` 也会写盘。
+        # 例外：常见的"看"组合不值得为它破例，多问一句没有代价。
+        return False
+
+    token = _first_token(stripped)
+    if token in _READONLY_SUBCOMMAND_TOOLS:
+        parts = stripped.split()
+        if len(parts) < 2:
+            return False
+        return parts[1].lower() in _READONLY_SUBCOMMAND_TOOLS[token]
+    return token in _READONLY_TOKENS
+
+
+# --------------------------------------------------------------------------- #
 # 裁决入口：命令 / 文件 / SQL
 # --------------------------------------------------------------------------- #
 def judge_command(
@@ -365,6 +440,10 @@ def judge_command(
     hits = _scan(text)
 
     if not hits:
+        # 只看不改的命令**任何时候都放行**（研究者：「只读命令也直接跑」）——
+        # 它既不改变状态，也不值得为它打断研究者的思路。
+        if _is_readonly_command(text):
+            return _allow(workdir_layer, "只读命令，可以直接跑", harmless=True)
         return _allow(workdir_layer, "普通命令，可以直接跑")
 
     # 删除类命令如果指名道姓落在 SciLoop 代码树里 → 直接拒绝（不是"等你批准"）

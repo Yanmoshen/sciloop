@@ -16,7 +16,7 @@
  * 自己读 `response.body` 的 ReadableStream，边收边交给回调。
  */
 
-import { apiUrl, getOwnerToken, parseError } from '@/api/client'
+import { apiUrl, get, getOwnerToken, parseError, post } from '@/api/client'
 
 export interface HomeChatInput {
   text: string
@@ -173,11 +173,53 @@ export interface SystemRow {
   tone?: SystemTone
 }
 
-/** 研究者裁决的结果 */
-export type ApprovalDecision = 'approve' | 'deny'
+/**
+ * 研究者裁决的结果。
+ *
+ * 三个选择（2026-09-22 定）：
+ * - `approve` 只批这一次；
+ * - `approve_conversation` 在本对话里以后这类**连高危也直接执行**（比完全访问模式更宽的一档）；
+ * - `deny` 拒绝。
+ */
+export type ApprovalDecision = 'approve' | 'approve_conversation' | 'deny'
 
-/** 批准请求的状态：只有 `pending` 是可点的 */
+/** 批准请求的状态：只有 `pending` 是可点的（**不再按时间自动过期**） */
 export type ApprovalStatus = 'pending' | 'approved' | 'denied' | 'expired'
+
+/**
+ * 「完全访问模式」的状态（**按对话**，后端是唯一事实来源）。
+ *
+ * 口径只维护一份：`note` 由后端给，前端直接显示，别在界面上另写一句同义的话。
+ */
+export interface AccessModeState {
+  conversation_id: string
+  /** 开 = 普通动手操作直接执行（高危仍会先问） */
+  full_access: boolean
+  /** 开 = 连高危也直接执行（由批准卡上「此对话中默认允许执行」设置） */
+  allow_exec: boolean
+  /** 后端给的人话说明 */
+  note: string
+}
+
+/** 读当前对话的授权状态（公开只读：匿名也能看，只是不能改）。 */
+export function fetchAccessMode(conversationId: string): Promise<AccessModeState> {
+  return get<AccessModeState>(`/chat/access-mode/${encodeURIComponent(conversationId)}`)
+}
+
+/**
+ * 开 / 关当前对话的「完全访问模式」。
+ *
+ * **写接口只对 Owner 开放**：匿名调用后端回 403，这里会抛 `ApiError`，
+ * 由视图层如实说明（而不是在前端装作切成功了）。
+ */
+export function setAccessMode(
+  conversationId: string,
+  fullAccess: boolean,
+): Promise<AccessModeState> {
+  return post<AccessModeState>('/chat/access-mode', {
+    body: { conversation_id: conversationId, full_access: fullAccess },
+  })
+}
 
 /**
  * 批准卡：模型提出了一次写盘/执行请求，**在研究者点「批准」之前它一次都不会跑**。

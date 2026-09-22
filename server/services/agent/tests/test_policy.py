@@ -158,6 +158,66 @@ def test_plain_commands_are_allowed(command: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 只读命令：直接跑，不打扰研究者（用户 2026-09-22：「只读命令也直接跑」）
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "command",
+    [
+        "ls -la",
+        "pwd",
+        "cat README.md",
+        "head -20 server/main.py",
+        "grep -rn token server/api",
+        "git status",
+        "git log --oneline -5",
+        "git diff HEAD~1",
+        "git rev-parse --short HEAD",
+        "wc -l file.txt",
+        "which python",
+        "whoami",
+        "date",
+        "du -sh .data",
+        "ruff check .",
+        "node --version",
+        "pip list",
+        "docker ps",
+    ],
+)
+def test_readonly_commands_run_without_bothering_anyone(command: str) -> None:
+    verdict = policy.judge_command(command=command)
+    assert verdict.allowed and verdict.harmless, f"{command} 应当只读放行"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat a.txt | tee b.txt",  # 管道 → 不当只读
+        "echo hi > out.txt",  # 重定向 → 不当只读
+        "git clean -fdx",  # 看着是 git，其实在删东西
+        "git reset --hard HEAD~3",
+        "git checkout -- .",
+        "find . -name '*.pyc' -delete",
+        "sed -i 's/a/b/' file.txt",
+        "ruff format .",  # 会改写文件 → 不当只读
+        "pip install pandas",
+    ],
+)
+def test_things_that_look_readonly_but_are_not(command: str) -> None:
+    """白名单的反面：这些不能被当成只读放行（该问就问）。"""
+
+    assert not policy.judge_command(command=command).harmless, f"{command} 不能算只读"
+
+
+def test_destructive_git_is_high_risk() -> None:
+    """`git clean` / `reset --hard` 这类会毁掉工作的命令必须归到「删除或覆盖」。"""
+
+    for command in ("git clean -fdx", "git reset --hard origin/main", "git checkout -- ."):
+        verdict = policy.judge_command(command=command)
+        assert verdict.needs_approval, command
+        assert policy.CATEGORY_DELETE in verdict.categories
+
+
+# --------------------------------------------------------------------------- #
 # 四类高危 → 要人点头
 # --------------------------------------------------------------------------- #
 def test_delete_command_needs_approval(project_dir: Path) -> None:

@@ -22,7 +22,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { writeDenied } from '@/utils/messages'
 import { useRoute, useRouter } from 'vue-router'
 
-import { isApprovalCard, streamApprovalDecision, streamChatHome } from '@/api/chat'
+import { fetchAccessMode, isApprovalCard, setAccessMode, streamApprovalDecision, streamChatHome } from '@/api/chat'
 import type {
   ApprovalCard,
   ApprovalDecision,
@@ -32,6 +32,7 @@ import type {
   StreamHandlers,
   TurnRow,
 } from '@/api/chat'
+import { ApiError } from '@/api/client'
 import { getConversation } from '@/api/conversations'
 import MarkdownText from '@/components/MarkdownText.vue'
 import ConfirmDialog from '@/components/home/ConfirmDialog.vue'
@@ -283,6 +284,8 @@ async function loadConversation(id: string): Promise<void> {
     conversationTitle.value = detail.title ?? ''
     projectId.value = detail.project_id ?? null
     archived.value = detail.archived
+    // 授权是**按对话**的：打开这个对话就把它自己的开关状态读回来
+    void loadAccessMode(detail.id)
     turns.value = (detail.turns ?? []).map((turn) => {
       // 磁盘里存的结构化块 / 过程行 / 思考过程要一并还原，
       // 否则刷新后引导词的选项、节点的过程行、思考折叠都会消失。
@@ -403,6 +406,8 @@ function streamHandlers(assistantIndex: number, approvalIndex = assistantIndex):
       projectId.value = meta.project_id
       conversationTitle.value = meta.title ?? ''
       if (meta.turn_count === 0) syncStore()
+      // 新会话刚拿到 id：如果用户在开聊之前就拨了开关，这里把它补写到这个会话上
+      if (pendingFullAccess !== null) void loadAccessMode(meta.conversation_id)
     },
     onDelta: (delta) => {
       const current = target()
@@ -527,7 +532,13 @@ async function runStream(
 async function decideApprovalCard(card: ApprovalCard, decision: ApprovalDecision): Promise<void> {
   if (phase.value === 'thinking') return
   if (!session.isOwner) {
-    errorText.value = writeDenied(decision === 'approve' ? '批准执行' : '拒绝执行')
+    const action =
+      decision === 'deny'
+        ? '拒绝执行'
+        : decision === 'approve_conversation'
+          ? '允许本对话内直接执行'
+          : '批准执行'
+    errorText.value = writeDenied(action)
     return
   }
   const id = conversationId.value
@@ -535,9 +546,10 @@ async function decideApprovalCard(card: ApprovalCard, decision: ApprovalDecision
     errorText.value = '会话还没建立，无法裁决'
     return
   }
-  // 拒绝路径不调模型，所以不需要模型可用；批准要续答，必须先有模型
-  const model = decision === 'approve' ? pickedModel() : null
-  if (decision === 'approve' && !model) return
+  // 拒绝路径不调模型，所以不需要模型可用；批准（含"本对话默认允许"）要续答，必须先有模型
+  const needsModel = decision === 'approve' || decision === 'approve_conversation'
+  const model = needsModel ? pickedModel() : null
+  if (needsModel && !model) return
 
   errorText.value = ''
   phase.value = 'thinking'
@@ -646,14 +658,67 @@ function pickOption(text: string): void {
 }
 
 /* ------------------------------------------------------------------ *
- * 自动连续跑（输入栏开关，默认关）
+ * 完全访问模式（输入栏开关，默认关）
+ *
+ * 一个开关管两件事：① 节点跑完自动接力下一站；② **普通动手操作不再逐一确认**
+ * （跑命令 / 写文件 / 删文件）。高危操作无论开关如何都会先弹批准卡。
+ * 授权**按对话**存在后端（`/chat/access-mode`），浏览器本地只是"还没有会话时"的暂存。
  * ------------------------------------------------------------------ */
-const AUTO_RUN_KEY = 'sciloop.autoRun'
-const autoRun = ref(localStorage.getItem(AUTO_RUN_KEY) === '1')
+const FULL_ACCESS_KEY = 'sciloop.fullAccess'
+const fullAccess = ref(localStorage.getItem(FULL_ACCESS_KEY) === '1')
+/** 后端给的授权状态说明（口径只维护一份，界面直接显示它） */
+const accessNote = ref('')
+/** 本地暂存过、但还没落到任何会话上的开关值（新建会话后补写） */
+let pendingFullAccess: boolean | null = null
 
-function toggleAutoRun(): void {
-  autoRun.value = !autoRun.value
-  localStorage.setItem(AUTO_RUN_KEY, autoRun.value ? '1' : '0')
+function toggleFullAccess(): void {
+  fullAccess.value = !fullAccess.value
+  localStorage.setItem(FULL_ACCESS_KEY, fullAccess.value ? '1' : '0')
+  void syncFullAccess()
+}
+
+/**
+ * 把开关同步到后端（授权按对话存）。
+ *
+ * 还没有会话时先记在 `pendingFullAccess` 里 —— 用户是在"开始对话之前"拨的开关，
+ * 等第一轮对话拿到会话 id 再补写，不能因此丢了他的选择。
+ */
+async function syncFullAccess(): Promise<void> {
+  const id = conversationId.value
+  if (!id) {
+    pendingFullAccess = fullAccess.value
+    return
+  }
+  if (!session.isOwner) {
+    accessNote.value = '切到研究者身份后才能改这个开关'
+    return
+  }
+  try {
+    const state = await setAccessMode(id, fullAccess.value)
+    accessNote.value = state.note
+    pendingFullAccess = null
+  } catch (error) {
+    // 如实说：本地拨了但后端没记上，别让界面显示成"已开"
+    accessNote.value =
+      error instanceof ApiError ? `开关没改成：${error.message}` : '开关没改成（网络异常）'
+  }
+}
+
+/** 打开某个对话时，读回它自己的授权状态（换对话就要重新决定）。 */
+async function loadAccessMode(id: string): Promise<void> {
+  try {
+    const state = await fetchAccessMode(id)
+    if (pendingFullAccess !== null && state.full_access !== pendingFullAccess) {
+      // 用户在"还没有会话"时拨过开关 → 把它补写到这个会话上
+      await syncFullAccess()
+      return
+    }
+    fullAccess.value = state.full_access
+    localStorage.setItem(FULL_ACCESS_KEY, state.full_access ? '1' : '0')
+    accessNote.value = state.note
+  } catch {
+    accessNote.value = ''
+  }
 }
 
 /**
@@ -663,7 +728,7 @@ function toggleAutoRun(): void {
  * 尤其是占位节点——让它们依次「通过」等于伪造「实验做完了、论文写好了」。
  */
 function maybeAutoContinue(done: StreamDone): void {
-  if (!autoRun.value) return
+  if (!fullAccess.value) return
   if (done.routing !== 'node') return
   if (done.node_status !== 'done') return
   if (!done.next_node || done.next_node === 'end') return
@@ -1000,6 +1065,15 @@ onUnmounted(() => {
                   <button
                     class="approval__btn"
                     type="button"
+                    :title="'在本对话里以后这类操作也直接执行（连高危也不再问），换个对话要重新决定'"
+                    :disabled="phase === 'thinking' || !session.isOwner"
+                    @click="decideApprovalCard(row, 'approve_conversation')"
+                  >
+                    此对话中默认允许执行
+                  </button>
+                  <button
+                    class="approval__btn"
+                    type="button"
                     :disabled="phase === 'thinking' || !session.isOwner"
                     @click="decideApprovalCard(row, 'deny')"
                   >
@@ -1132,19 +1206,25 @@ onUnmounted(() => {
         </div>
 
         <div class="bar__right">
-          <!-- 自动连续跑：默认关。开着一路跑到「上一节点真的实装」为止，
+          <!-- 完全访问模式：默认关。开着时①节点跑完自动接力下一站
+               ②普通动手操作（跑命令/写文件）不再逐一确认；**高危操作仍会先弹批准卡**。
                转人工 / 失败 / 下一节点是占位都会自动停住。 -->
           <button
             class="autorun"
-            :class="{ 'autorun--on': autoRun }"
+            :class="{ 'autorun--on': fullAccess }"
             type="button"
             role="switch"
-            :aria-checked="autoRun ? 'true' : 'false'"
-            :title="autoRun ? '自动连续跑：已开启，点一下关闭' : '自动连续跑：关闭中，点一下开启'"
-            @click="toggleAutoRun"
+            :aria-checked="fullAccess ? 'true' : 'false'"
+            :title="
+              accessNote ||
+              (fullAccess
+                ? '完全访问模式：已开启。普通操作直接执行，高危操作仍会先问你'
+                : '完全访问模式：关闭中。动手前都会先问你，点一下开启')
+            "
+            @click="toggleFullAccess"
           >
             <span class="autorun__dot" />
-            {{ autoRun ? '自动连续跑' : '手动逐步' }}
+            {{ fullAccess ? '完全访问模式' : '逐步确认' }}
           </button>
           <div class="mpick">
             <button
