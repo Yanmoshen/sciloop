@@ -11,7 +11,7 @@
 - `query_library`：**只读业务工具**——真去查 SciLoop 的论文库与对话链（走 `services.research.lookup`），
   自动放行。它证明"SciLoop 自己的能力已经能通过 MCP 被 agent 调用"。
 - `run_command`：**高风险执行工具**——`argv` 逐项传入（不经过 shell）、命中程序白名单、
-  且必须带**研究者批准令牌**。它是合规 8.3「研究者接管/批准」的落点。
+  **argv 里的路径须落在授权工作区内**、且必须带**研究者批准令牌**。它是合规 8.3「研究者接管/批准」的落点。
 
 工具实现**不自己判权限**，一律先过 `Guard` 的四道门；这样边界只有一处，不会各写各的。
 """
@@ -140,6 +140,7 @@ def register(server: MCPServer, guard: Guard) -> None:
         name="run_command",
         description=(
             "在授权工作区内执行一个白名单程序（argv 逐项传入，不经过 shell）。"
+            "argv 里的路径也必须落在工作区内，越界会被拒绝。"
             "需要研究者批准令牌；非零退出码会原样回报，不算工具失败。"
         ),
     )
@@ -172,6 +173,11 @@ def register(server: MCPServer, guard: Guard) -> None:
             workdir = guard.resolve("run_command", cwd or ".", for_write=False)
             if not workdir.is_dir():
                 raise GuardError("tool_failed", f"工作目录不存在：{workdir}")
+
+            # 门 2 的补口：cwd 合法**不代表 argv 里的路径合法**。
+            # 实测补判前 `argv=["cat","/etc/passwd"]` 能读到授权根之外 —— 白名单管的是
+            # "跑哪个程序"，管不了"程序去读哪个文件"，所以必须在这里再拦一道。
+            guard.assert_argv_paths("run_command", argv, relative_to=workdir)
 
             budget = max(0.5, min(float(timeout_s), 300.0))
             try:

@@ -17,6 +17,8 @@ stdio 传输下，调用方就是我们自己拉起的后端进程——如果�
 1. **能力**：工具声明的 `kinds` 必须都在授权里出现（read/write/exec/net）。
 2. **路径**：先 `resolve()` 再比对授权根 —— 挡掉 `..` 穿越与软链逃逸；
    字符串前缀比较会被 `workspace/../../etc/passwd` 直接绕过。
+   **`run_command` 的 `cwd` 与 `argv` 里的路径都要过这一关**：原先只判 `cwd`，
+   于是 `argv=["cat","/etc/passwd"]` 能读到授权根之外，见 `assert_argv_paths`。
 3. **审批**：写盘/执行类工具必须带**研究者批准令牌**，令牌由授权里列出；没给就是
    `approval_required`，给了但不对就是 `approval_invalid`。这是合规 8.3「研究者接管/批准」的落点。
 4. **审计**：每次调用（含被拒）落一条；**只记参数键名与长度，不记原文**（参数可能是论文正文或凭据）。
@@ -28,7 +30,7 @@ stdio 传输下，调用方就是我们自己拉起的后端进程——如果�
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -58,6 +60,30 @@ def _coerce(value: str | os.PathLike[str] | None) -> Path | None:
         return Path(value).expanduser().resolve()
     except OSError:  # pragma: no cover
         return None
+
+
+def _argv_path_candidates(value: str) -> tuple[str, ...]:
+    """从一个 argv 项里取出**可能承载路径**的片段。
+
+    `--file=/etc/passwd` 必须把等号后面那段单独取出来判：该项整体不以 `/` 开头，
+    若整项按"相对路径"解析，就会被判成工作区内从而放行 —— 而 grep 真的会去读那个绝对路径。
+    """
+
+    text = value.strip()
+    if text.startswith("-") and "=" in text:
+        return (text.split("=", 1)[1],)
+    return (text,)
+
+
+def _looks_like_path(value: str) -> bool:
+    """片段是否"看起来像路径"。**宁宽勿窄**：漏判一项，就等于边界失效一项。"""
+
+    text = value.strip()
+    if not text:
+        return False
+    if text in (".", "..") or text.startswith("~"):
+        return True
+    return "/" in text or "\\" in text
 
 
 def grant_from_env(env: dict[str, str] | None = None) -> Grant:
@@ -161,6 +187,49 @@ class Guard:
                 raise GuardError("tool_denied", f"「{part}」属于凭据/版本库元数据，禁止由工具写入")
         if path.suffix.lower() in FORBIDDEN_SUFFIXES:
             raise GuardError("tool_denied", f"「{path.suffix}」密钥类文件禁止由工具写入")
+
+    def assert_argv_paths(self, tool: str, argv: Sequence[str], *, relative_to: Path) -> None:
+        """门 2 的补口：**argv 里的路径也必须落在授权读根之内**。
+
+        原先只校验 `cwd`，于是白名单管住了"跑哪个程序"，却管不住"程序去读哪个文件"：
+        实测 `argv=["cat","/etc/passwd"]` 直接返回 exit 0，能读到授权根之外
+        （`.learnbuddy/tmp/probe_argv_path_gate.sh`）。"唯一可读根"这句话要成立，这里必须补判。
+
+        只判**看起来像路径**的片段，是为了不误伤正常参数（`-la`、`--pretty=%h/%s` 都放行）；
+        片段按 `relative_to` 解析，落在授权根内即放行。`--flag=/abs/path` 这种藏在等号后的
+        绝对路径会被单独取出判定。
+
+        ⚠️ **残留缺口（如实声明，别当成已解决）**：本门只约束**路径操作数**，
+        管不住**把路径写进代码里的解释器** —— `["python","-c","open('/etc/passwd').read()"]`
+        依然能读到授权根之外。要真正封死，只能二选一：把 `python`/`python3`/`awk`/`sed`/`find`
+        这类"给什么参数都能碰任意文件"的程序从 `ALLOWED_BINARIES` 里拿掉，
+        或在容器里给子进程加 OS 级沙箱（独立用户 + 只读挂载）。
+        """
+
+        if len(argv) < 2:
+            return
+        roots = tuple(root for root in self.grant.read_roots() if root is not None)
+        if not roots:
+            raise GuardError(
+                "tool_denied", f"工具「{tool}」当前授权没有任何可读根，不能执行带路径参数的命令"
+            )
+        for raw in argv[1:]:
+            if not isinstance(raw, str):
+                continue
+            for piece in _argv_path_candidates(raw):
+                if not _looks_like_path(piece):
+                    continue
+                candidate = Path(piece).expanduser()
+                if not candidate.is_absolute():
+                    candidate = relative_to / candidate
+                resolved = candidate.resolve()
+                if any(resolved == root or root in resolved.parents for root in roots):
+                    continue
+                raise GuardError(
+                    "tool_denied",
+                    f"argv 里的路径越出授权范围：{resolved} 不在 {[str(r) for r in roots]} 之内",
+                    path=str(resolved),
+                )
 
     def assert_within_limit(self, tool: str, size: int) -> None:
         if size > self.grant.write_limit_bytes:

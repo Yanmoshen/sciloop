@@ -66,6 +66,64 @@ def test_absolute_path_outside_workspace_is_denied(tmp_path: Path) -> None:
     assert exc.value.code == "tool_denied"
 
 
+def test_argv_path_outside_workspace_is_denied(tmp_path: Path) -> None:
+    """**argv 里的路径也要过门 2**。
+
+    回归用例：补判之前 `argv=["cat","/etc/passwd"]` 返回 exit 0，
+    白名单管住了"跑哪个程序"却管不住"去读哪个文件"。
+    """
+
+    guard = Guard(grant=Grant(workspace=tmp_path))
+    for argv in (
+        ["cat", "/etc/passwd"],          # 绝对路径
+        ["head", "/etc/hostname"],       # 绝对路径
+        ["grep", "root", "../../etc/passwd"],  # `..` 穿越
+        ["find", ".."],                  # 裸 `..`：能列出整个 server 树
+        ["cat", "~/.ssh/id_rsa"],        # 家目录
+        ["grep", "x", "--file=/etc/passwd"],  # 藏在 flag 里
+    ):
+        with pytest.raises(GuardError) as exc:
+            guard.assert_argv_paths("run_command", argv, relative_to=tmp_path)
+        assert exc.value.code == "tool_denied", argv
+        assert exc.value.detail["path"], argv
+
+
+def test_argv_non_path_arguments_are_not_falsely_rejected(tmp_path: Path) -> None:
+    """只判"像路径"的项，正常参数不能被误伤（否则会出现莫名其妙的拒绝）。"""
+
+    guard = Guard(grant=Grant(workspace=tmp_path))
+    for argv in (
+        ["ls", "-la"],
+        ["python", "-c", "print(1)"],
+        ["grep", "-rn", "needle"],
+        ["git", "log", "--pretty=%h/%s"],   # 含 `/` 但不是绝对路径 → 按相对路径解析，落在工作区内
+        ["ruff", "check", "."],
+        ["cat", "note.txt"],                 # 工作区内的相对路径
+    ):
+        guard.assert_argv_paths("run_command", argv, relative_to=tmp_path)  # 不抛即通过
+
+
+@pytest.mark.xfail(
+    reason="已知残留缺口：路径门只管路径操作数，管不住把路径写进代码的解释器；"
+    "要封死需从白名单拿掉 python/awk/sed/find，或加 OS 级沙箱",
+    strict=False,
+)
+def test_argv_path_gate_cannot_stop_interpreters(tmp_path: Path) -> None:
+    """**如实记录残缺**：`python -c "...open('/etc/passwd')..."` 仍能读到授权根之外。
+
+    这条用例故意写成会失败的断言：它一旦变绿，说明缺口真的被补上了，
+    届时应当把 `xfail` 去掉、改成正常断言。
+    """
+
+    guard = Guard(grant=Grant(workspace=tmp_path))
+    with pytest.raises(GuardError):
+        guard.assert_argv_paths(
+            "run_command",
+            ["python", "-c", "print(open('/etc/passwd').read())"],
+            relative_to=tmp_path,
+        )
+
+
 def test_credentials_are_never_writable(tmp_path: Path) -> None:
     guard = Guard(grant=Grant(workspace=tmp_path))
     for name in (".env", ".git/config", "cert.pem", "id_rsa"):
@@ -247,6 +305,56 @@ def test_end_to_end_binary_allowlist(tmp_path: Path) -> None:
     )
     assert result.ok is False
     assert result.error_code == "tool_denied"
+
+
+def test_end_to_end_argv_path_escape_is_denied(tmp_path: Path) -> None:
+    """端到端确认**新门真的接在 run_command 上**，而不是只存在于 Guard 里。
+
+    这是补判前那条漏洞的回归用例：当时 `cat /etc/passwd` 返回 exit 0 并带回文件内容。
+    """
+
+    params = server_params(
+        python=sys.executable,
+        repo_server_dir=REPO_SERVER_DIR,
+        workspace=tmp_path,
+        allow_exec=True,
+        approval_tokens=("researcher-ok",),
+    )
+    result = _run(
+        call_tool(
+            "run_command",
+            {"argv": ["cat", "/etc/passwd"], "approval_token": "researcher-ok"},
+            params,
+        )
+    )
+    assert result.ok is False
+    assert result.error_code == "tool_denied"
+    # 关键：**文件内容一个字都没回传**（这才是漏洞的真正危害）
+    assert "root:" not in (result.text or "")
+    assert "stdout" not in (result.data or {})
+
+
+def test_end_to_end_relative_path_inside_workspace_still_runs(tmp_path: Path) -> None:
+    """补判不能把正常用法一起禁掉：工作区内的相对路径必须照常可执行。"""
+
+    (tmp_path / "note.txt").write_text("inside-workspace", encoding="utf-8")
+    params = server_params(
+        python=sys.executable,
+        repo_server_dir=REPO_SERVER_DIR,
+        workspace=tmp_path,
+        allow_exec=True,
+        approval_tokens=("researcher-ok",),
+    )
+    result = _run(
+        call_tool(
+            "run_command",
+            {"argv": ["cat", "note.txt"], "approval_token": "researcher-ok"},
+            params,
+        )
+    )
+    assert result.ok is True, result.raw_error
+    assert result.data["exit_code"] == 0
+    assert "inside-workspace" in result.data["stdout"]
 
 
 def test_end_to_end_schema_violation_is_rejected_before_our_guard(tmp_path: Path) -> None:
