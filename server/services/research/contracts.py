@@ -117,6 +117,14 @@ class NodeDecisionFields(SciLoopModel):
     state_reason: str = Field(
         default="", description="state=need_human 时：为什么需要研究者介入"
     )
+    search_queries: list[str] = Field(
+        default_factory=list,
+        description=(
+            "需要上网搜索时，在这里给出搜索词（逐条）。程序替你搜，并把结果放进下一轮的"
+            "「联网搜索结果」—— 搜不搜由你决定，搜到什么也由你判断怎么用。"
+            "注意：搜索结果是网页摘要、不是论文全文，引用前必须核对原始链接。"
+        ),
+    )
 
 
 class LiteratureReviewOutput(NodeDecisionFields):
@@ -517,8 +525,42 @@ NODE_OUTPUT_MODELS: dict[str, type[SciLoopModel]] = {
     "experiment_and_data_preparation": ExperimentPrepOutput,
 }
 
+#: 「模型自己的决定」那组字段（做没做完 / 还缺什么 / 要不要上网搜）。
+#: **从 Pydantic 模型现取**，不再手写第二份 —— 见下面 `_with_decision_fields` 的说明。
+_DECISION_FIELD_NAMES = ("state", "pending", "state_reason", "search_queries")
+
+
+def _decision_fields_schema() -> dict[str, Any]:
+    """把决策字段的 JSON Schema 从模型里取出来（单一来源 = 模型定义）。"""
+
+    raw = NodeDecisionFields.model_json_schema()
+    properties = raw.get("properties") or {}
+    return {name: properties[name] for name in _DECISION_FIELD_NAMES if name in properties}
+
+
+def _with_decision_fields(schema: dict[str, Any]) -> dict[str, Any]:
+    """把决策字段并进手写 schema。
+
+    ⚠️ 这一条是**用真事故换来的**（2026-09-22）：
+    契约 schema 是手写的（为了 `additionalProperties: false` 这类显式约束），
+    于是给 Pydantic 模型加了 `state` / `pending` / `search_queries` 之后，
+    **渲染进提示词的 schema 并没有跟上** —— 结果：
+    · 模型在产出里几乎从不使用 `pending`（它压根没见过这个字段）；
+    · 让它"上网找资料"时，自检回了一句「在无联网工具…无法完成」（它不知道自己能要求搜索）。
+    `state` 之所以还能用，是因为系统提示词里另外讲了一遍。
+    所以这组字段改为**从模型现取**，一处定义、两处生效。
+    """
+
+    import copy
+
+    merged = copy.deepcopy(schema)
+    merged.setdefault("properties", {}).update(copy.deepcopy(_decision_fields_schema()))
+    # `required` 保持原样：决策字段都有默认值，不该逼模型每个都填。
+    return merged
+
+
 NODE_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
-    "literature_review": LITERATURE_REVIEW_SCHEMA,
-    "idea_and_feasibility": IDEA_FEASIBILITY_SCHEMA,
-    "experiment_and_data_preparation": EXPERIMENT_PREP_SCHEMA,
+    "literature_review": _with_decision_fields(LITERATURE_REVIEW_SCHEMA),
+    "idea_and_feasibility": _with_decision_fields(IDEA_FEASIBILITY_SCHEMA),
+    "experiment_and_data_preparation": _with_decision_fields(EXPERIMENT_PREP_SCHEMA),
 }

@@ -96,7 +96,11 @@ SYSTEM_PROMPT = (
     "（换英文关键词再检索、说明缺口、给可用的替代路线），就把 state 写 done，"
     "并把「缺什么、为什么缺、下一步建议」如实写进 gaps / coverage_note / limits。\n"
     "2. **绝不为了凑数而编造**：宁可如实写「0 条证据」，也不要造 paper_id、造结果。\n"
-    "3. 该继续就 continue，别硬交；需要人就 need_human，别自己猜研究者的意图。\n\n"
+    "3. 该继续就 continue，别硬交；需要人就 need_human，别自己猜研究者的意图。\n"
+    "4. **要上网查资料就直接说**：在 search_queries 里给出搜索词（逐条）。"
+    "程序会替你搜，并把结果放进下一轮提示词的「联网搜索结果」里 —— "
+    "搜不搜由你决定，搜到什么也由你判断怎么用。**不要因为'手上没有联网工具'就说做不了**，"
+    "你有这个能力，只要把搜索词写出来。\n\n"
     "硬性要求：\n"
     "1. 只输出一个 JSON 对象，不要输出任何解释文字、不要用代码围栏包裹。\n"
     "2. 只使用下文材料清单里真实存在的论文编号；**不得编造 paper_id**。\n"
@@ -237,9 +241,17 @@ def _format_upstream(upstream: dict[str, Any]) -> str:
 
 
 def _format_budget(budget: dict[str, Any]) -> str:
+    """给模型看的"进展与花费"。
+
+    ⚠️ **不要再写"修复重试上限"**（2026-09-22）：节点重试已经不设上限、由模型决定何时停，
+    再摆一个"上限 2"给它，它会据此判断"我只能再试一次" —— 实测它真的在结论里写了
+    「本次修复重试已用 1/2」，等于程序用一个不存在的规则左右了它的决定。
+    回退次数上限仍然保留（那是结构性预算，由 `graph.check_revert_gate` 真的在拦）。
+    """
+
     lines = [
-        f"- 本节点本次进入内的修复重试：已用 {budget.get('retry_count', 0)} / "
-        f"上限 {budget.get('max_retry', graph.MAX_RETRY_PER_ENTRY)}",
+        f"- 本节点本次进入内：已进行 {budget.get('retry_count', 0)} 轮修复"
+        "（**没有次数上限**：做没做完由你判断，需要停就说 need_human）",
         f"- 本节点被回退次数：{budget.get('revisit_count', 0)} / "
         f"上限 {budget.get('max_revisit', graph.MAX_REVISIT_PER_NODE)}",
         f"- 整条链回退次数：{budget.get('total_reverts', 0)} / "
@@ -260,6 +272,7 @@ def build_messages(
     hits: list[dict[str, Any]] | None = None,
     budget: dict[str, Any] | None = None,
     repair: str | None = None,
+    search_results: list[dict[str, Any]] | None = None,
     include_long_guide: bool = True,
 ) -> list[dict[str, str]]:
     """渲染某一节点的执行提示词。"""
@@ -282,6 +295,9 @@ def build_messages(
     if repair:
         parts.append(f"\n## 上一轮未通过的原因（只需修正这些）\n{repair}")
 
+    if search_results:
+        parts.append(f"\n## 联网搜索结果（你上一轮要求搜的）\n{_format_search(search_results)}")
+
     if include_long_guide:
         guide = _load_long_guide(node)
         if guide:
@@ -295,6 +311,30 @@ def build_messages(
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": "\n".join(parts)},
     ]
+
+
+def _format_search(blocks: list[dict[str, Any]]) -> str:
+    """把联网搜索结果排成人能读、模型也好用的清单。
+
+    ⚠️ 只说事实：标题 / 链接 / 摘要原文。**不要替模型总结、不要替它判断相关性** ——
+    那正是"程序替模型做判断"的老毛病。
+    """
+
+    lines: list[str] = []
+    for block in blocks:
+        query = str(block.get("query") or "")
+        results = block.get("results") or []
+        lines.append(f'### 搜索词：{query}（{len(results)} 条）')
+        if not results:
+            lines.append("（没有搜到结果）")
+        for index, item in enumerate(results, start=1):
+            title = str(item.get("title") or "").strip() or "（无标题）"
+            url = str(item.get("url") or "").strip()
+            snippet = str(item.get("snippet") or "").strip()
+            lines.append(f"{index}. {title}\n   {url}\n   {snippet}")
+        lines.append("")
+    lines.append("（以上是网页摘要，不是论文全文；若要素材请打开原始链接核对，或说明缺什么。）")
+    return "\n".join(lines)
 
 
 def build_self_check_messages(

@@ -50,6 +50,9 @@ services:
       FULLTEXT_TEXT_CACHE_DIR: /app/server/.cache/fulltext
       # APScheduler 三类批量任务默认关闭：演示期不自动抓取/解析，避免消耗外部额度与 LLM 额度
       SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-0}
+      # 【联网搜索】自建搜索服务的容器内地址（服务名即可，与 compose 同网）。
+      # 用自建而不是商业搜索 API：免费、开源、可离线部署（研究者 2026-09-22 选定）。
+      SCILOOP_SEARXNG_URL: ${SCILOOP_SEARXNG_URL:-http://searxng:8080}
     volumes:
       # 【WP01 跨包痛点修复】宿主 ./.data/fulltext-cache ←→ 容器全文缓存目录。
       # 目的：容器重建 / docker compose down && up 后，paper_spans 的 offset 校验仍能判定
@@ -86,6 +89,30 @@ services:
       timeout: 5s
       retries: 12
       start_period: 20s
+
+  # 【联网搜索】自建元搜索（SearXNG）：免费开源、不需要任何商业 API Key。
+  #
+  # 它的工作方式：**自己不爬网**，而是把查询转给上游搜索引擎（Google/Bing/DuckDuckGo…）
+  # 再把结果汇总回来 —— 所以这个容器**需要能出网**（没有 key，但不等于能离线用）。
+  # JSON 输出默认是关的，靠挂载的 `config/searxng/settings.yml` 打开（顺带关掉限流器，
+  # 否则后端的 JSON 请求会被当成机器人 429 掉）。
+  #
+  # ⚠️ 故意**不加 healthcheck**：搜索是"有更好、没有也能用"的能力，
+  # 让它因为健康检查失败把整套 `docker compose` 的状态带黄，得不偿失；
+  # 后端连不上时会如实告诉研究者"搜索没连上"，不会假装搜过了。
+  searxng:
+    image: searxng/searxng:latest
+    container_name: sciloop-searxng
+    restart: unless-stopped
+    environment:
+      SEARXNG_BASE_URL: http://localhost:${SEARXNG_PORT:-8888}/
+      # 容器内一律用 UTC，与其它服务一致（日志对得上时间）
+      TZ: UTC
+    volumes:
+      - ./config/searxng:/etc/searxng:rw
+    ports:
+      # 只在需要时自己开浏览器看：http://localhost:8888
+      - "${SEARXNG_PORT:-8888}:8080"
 
   frontend:
     build:

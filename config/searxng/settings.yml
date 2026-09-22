@@ -1,0 +1,32 @@
+# SciLoop 自带搜索（SearXNG）的最小配置
+#
+# 为什么要挂这份文件：SearXNG 默认**只输出 HTML**，JSON 接口是关的；
+# 而我们的搜索工具要的是 JSON。另外它的「限流器」默认会把 API 调用当机器人挡掉（429）。
+#
+# 上游引擎（Google / Bing / DuckDuckGo 等）由 SearXNG 自己汇总 —— 它不爬网，
+# 只是转发查询，所以**这个容器需要能出网**，但不需要任何商业 API Key。
+
+use_default_settings: true
+
+server:
+  # 换成一个随机字符串更稳妥（本机自用不改也能跑）：
+  #   openssl rand -hex 24
+  secret_key: "sciloop-local-searxng-change-me"
+  # 关掉限流器：开着会把我们后端的 JSON 请求当机器人 → 429 拒绝
+  limiter: false
+  # 关掉图片代理：我们只取文字结果，不需要它去代取图片
+  image_proxy: false
+  method: "GET"
+
+search:
+  # 关键：加上 json，后端的搜索工具才能拿到结构化结果
+  formats:
+    - html
+    - json
+  safe_search: 0
+  # 留空 = 不自动补全（少一次对外请求）
+  autocomplete: ""
+  default_lang: "auto"
+
+ui:
+  static_use_hash: true

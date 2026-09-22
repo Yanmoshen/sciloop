@@ -964,6 +964,8 @@ async def _run_node_events(
     self_checks = 0
     self_check_note: dict[str, Any] | None = None
     advisories: list[str] = []
+    #: 模型要求搜的结果累积在这里，下一轮作为事实塞进提示词
+    search_notes: list[dict[str, Any]] = []
     while True:
         yield "attempt", {
             "node": target,
@@ -984,6 +986,7 @@ async def _run_node_events(
             hits=hits or [],
             budget={**budget, "retry_count": attempt},
             repair=repair,
+            search_results=search_notes,
         )
 
         result: Any = None
@@ -1244,6 +1247,31 @@ async def _run_node_events(
             attempt += 1
             continue
         contract_misses = 0
+
+        # ---- 替模型搜：它给了搜索词就搜（**搜什么、要不要搜都由它定**）------ #
+        # ⚠️ 位置放在状态判断**之前**：即使它同一轮说 done / need_human，
+        # 只要它把搜索词写出来了，那就是它要求的事实采集 ——
+        # 研究者也正好能看见"为了这个结论我搜过什么、搜到了什么"。
+        wanted = candidate.get("search_queries") if isinstance(candidate, dict) else None
+        queries = (
+            [str(item).strip() for item in wanted if str(item).strip()]
+            if isinstance(wanted, list)
+            else []
+        )[:MAX_SEARCH_QUERIES]
+        if queries:
+            found = await _run_searches(queries)
+            search_notes.extend(found)
+            total = sum(len(block.get("results") or []) for block in found)
+            yield "notice", {
+                "node": target,
+                "code": "web_search",
+                "message": (
+                    f"按你的要求上网搜了 {len(queries)} 组关键词、共 {total} 条结果"
+                    "（是网页摘要，引用前请核对链接）。"
+                    if total
+                    else f"按你的要求搜了 {len(queries)} 组关键词，但没搜到结果。"
+                ),
+            }
 
         # ---- ③ 决策权在模型手里：done / continue / need_human ------------- #
         state = str((candidate or {}).get("state") or "").strip().lower() or "done"
@@ -1640,3 +1668,28 @@ async def _run_self_check(
         return {}
     data["cost_usd"] = float(result.cost_usd or 0)
     return data
+
+
+#: 一轮里最多替模型搜几组关键词（防一次要求 20 组把上游打爆）
+MAX_SEARCH_QUERIES = 4
+#: 每组关键词最多取几条（提示词塞不下更多，也没必要）
+SEARCH_RESULTS_PER_QUERY = 5
+
+
+async def _run_searches(queries: list[str]) -> list[dict[str, Any]]:
+    """替模型执行它给出的搜索词。**搜不到也照样如实返回**（不吞、不编）。"""
+
+    from services.agent import web_search
+
+    blocks: list[dict[str, Any]] = []
+    for query in queries:
+        result = await web_search.search(query, limit=SEARCH_RESULTS_PER_QUERY)
+        blocks.append(
+            {
+                "query": query,
+                "ok": bool(result.get("ok")),
+                "results": result.get("results") or [],
+                "error": result.get("error") if not result.get("ok") else None,
+            }
+        )
+    return blocks

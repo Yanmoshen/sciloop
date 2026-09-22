@@ -30,14 +30,16 @@ from pathlib import Path
 from typing import Any
 
 from mcp_server.client import call_tool, server_params
-from services.agent import host_runner, policy
+from services.agent import host_runner, policy, web_search
 
 #: 单轮对话里最多允许的「模型要求调工具」轮数。上限存在的意义是**防死循环**：
 #: 模型可能反复要求调同一个工具，没有上限就会一直烧 token。
 MAX_TOOL_ROUNDS = 3
 
 #: 摆给模型**自主**调用的工具白名单（**只读**）。写/执行类不在这里，见 APPROVABLE_TOOLS。
-AUTONOMOUS_TOOLS = ("query_library", "fetch_url")
+#: 摆给模型**自主**调用的工具白名单（**只读**）。写/执行类不在这里，见 APPROVABLE_TOOLS。
+#: `search_web` 走项目自建的 SearXNG（见 `services/agent/web_search.py`），也是只读。
+AUTONOMOUS_TOOLS = ("query_library", "search_web", "fetch_url")
 
 #: 摆给模型但**必须研究者批准**才执行的工具（写盘/执行类）。
 APPROVABLE_TOOLS = ("run_command",)
@@ -50,10 +52,33 @@ HOST_TOOLS = ("run_on_computer", "files_on_computer")
 #: 工具名 → 对话里那句话（给用户看的，不是给模型看的）
 TOOL_LABELS = {
     "query_library": "查询论文库",
+    "search_web": "联网搜索",
     "fetch_url": "抓取网页",
     "run_command": "执行命令",
     "run_on_computer": "在你的电脑上执行命令",
     "files_on_computer": "在你电脑上读写或整理文件",
+}
+
+#: 「联网搜索」的工具声明（本地声明，不经过 MCP server）。
+#: 它走项目自建的 SearXNG：免费开源、不需要商业 API Key。
+_SEARCH_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "search_web",
+        "description": (
+            "到互联网上搜索资料，返回网页标题、链接与摘要（不是论文全文，引用前自己核对原始链接）。"
+            "当论文库里找不到相关材料、或需要最新进展时用它。搜到什么由你判断怎么用；"
+            "要不要把某条结果存进论文库，也由你决定。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "搜索词（用研究对象最可能被怎么写，英文通常更好搜）"},
+                "limit": {"type": "integer", "description": "最多要几条结果，默认 8"},
+            },
+            "required": ["query"],
+        },
+    },
 }
 
 #: 宿主工具的工具声明（OpenAI 兼容）。参数尽量少而直白，让模型好填、让人好读。
@@ -179,6 +204,7 @@ async def tool_schemas() -> list[dict[str, Any]]:
     import json as _json
 
     schemas: list[dict[str, Any]] = _json.loads(_json.dumps(_HOST_TOOL_SCHEMAS))
+    schemas.append(_json.loads(_json.dumps(_SEARCH_TOOL_SCHEMA)))
 
     # 把"你在这台电脑上的默认工作目录"写进工具描述：模型据此决定要不要显式指定目录，
     # 也免得它去猜容器里的路径（容器路径在宿主上根本不存在）。
@@ -389,6 +415,14 @@ async def run_tool_call(
     name = str(fn.get("name") or "")
     arguments = _arguments(call)
 
+    # 「联网搜索」：只读，走自建 SearXNG；连不上就如实回一句人话（不假装搜过）
+    if name == "search_web":
+        result = await web_search.search(
+            str(arguments.get("query") or ""),
+            limit=int(arguments.get("limit") or 8),
+        )
+        return {"ok": bool(result.get("ok")), "tool": name, "result": result}, _summarize(name, result)
+
     # 「在研究者的电脑上干活」这一类：逐次裁决 + 走宿主执行器。
     # ⚠️ 这里**再判一次**（`_agent_loop` 已判过）：批准链路可以被别的入口复用，
     # 把边界放在执行点上，才不会因为"某个调用方忘了先判"而放水。
@@ -473,6 +507,14 @@ def _summarize(name: str, data: dict[str, Any]) -> str:
         return f"退出码 {code}" + ("（成功）" if code == 0 else "（命令返回非零，不是工具失败）")
 
     # 宿主工具：摘要会显示在对话里的过程行上（研究者看得到），所以只说人话与事实
+    if name == "search_web":
+        if data.get("unavailable"):
+            return "没连上搜索服务"
+        count = data.get("count")
+        if not isinstance(count, int):
+            return "搜索完成"
+        return f"搜到 {count} 条结果" if count else "没搜到相关结果"
+
     if name == "run_on_computer":
         if data.get("unreachable"):
             return "还没连上这台电脑的执行器"

@@ -17,6 +17,10 @@
 
 from __future__ import annotations
 
+import asyncio
+
+import pytest
+
 from services.research import orchestrator, prompts
 from services.research.rules import RuleHit, ValidationResult
 
@@ -91,6 +95,107 @@ def test_node_loop_has_no_retry_cap() -> None:
     source = inspect.getsource(orchestrator)
     assert "range(max_retry" not in source, "节点循环不许再有重试次数上限"
     assert "while True:" in source, "主循环应当是「跑到模型说停为止」"
+
+
+# --------------------------------------------------------------------------- #
+# 节点里也能联网搜索（搜什么、搜不搜都由模型定）
+# --------------------------------------------------------------------------- #
+def test_search_queries_is_part_of_the_contract() -> None:
+    """模型要上网找资料，就在产出里给搜索词 —— 契约里必须有这个字段。"""
+
+    model = orchestrator.NODE_OUTPUT_MODELS["literature_review"]
+    assert "search_queries" in model.model_fields
+    assert model.model_fields["search_queries"].default_factory() == []
+
+
+def test_hand_written_schema_carries_the_decision_fields() -> None:
+    """⚠️ 回归护栏：手写 schema 必须带上决策字段。
+
+    2026-09-22 真事故：契约 schema 是手写的，给 Pydantic 模型加字段**不会**自动同步，
+    于是渲染给模型的契约里没有 `pending` / `search_queries` —— 模型从不知道可以这么说，
+    自检甚至回"我没有联网工具"。这条测试就是防它再脱钩。
+    """
+
+    from services.research import contracts
+
+    for node in ("literature_review", "idea_and_feasibility", "experiment_and_data_preparation"):
+        properties = (contracts.NODE_OUTPUT_SCHEMAS.get(node) or {}).get("properties") or {}
+        for name in ("state", "pending", "state_reason", "search_queries"):
+            assert name in properties, f"{node} 的契约里缺 {name}"
+        # 决策字段不该被塞进 required（它们都有默认值）
+        required = (contracts.NODE_OUTPUT_SCHEMAS[node] or {}).get("required") or []
+        assert not {"state", "pending", "search_queries"} & set(required), node
+
+
+def test_prompt_does_not_show_a_retry_cap_to_the_model() -> None:
+    """提示词里不许再给模型看"重试上限" —— 它真的会据此少做尝试。
+
+    2026-09-22 实测：额度块里写着「修复重试：已用 1 / 上限 2」，
+    模型在结论里就写了「本节点本次修复重试已用 1/2」，用一条已经不存在的规则限制了自己。
+    """
+
+    body = prompts.build_messages(node="literature_review", user_text="x")[-1]["content"]
+    retry_lines = [line for line in body.splitlines() if "轮修复" in line]
+    assert retry_lines, "额度块里应当有修复轮次的说明"
+    assert "没有次数上限" in retry_lines[0]
+    assert "上限" not in retry_lines[0].split("（")[0], "修复那一行不许再摆一个上限"
+
+
+def test_rendered_prompt_actually_shows_the_decision_fields() -> None:
+    """真正的检查点：**渲染出来的提示词**里要能看到这些字段名与搜索能力。"""
+
+    body = prompts.build_messages(node="literature_review", user_text="x")[-1]["content"]
+    for name in ("state", "pending", "search_queries"):
+        assert name in body, f"提示词里看不到 {name}"
+    assert "联网搜索结果" in body or "search_queries" in body
+
+
+def test_prompt_renders_search_results_as_facts() -> None:
+    messages = prompts.build_messages(
+        node="literature_review",
+        user_text="x",
+        search_results=[
+            {
+                "query": "gnn recommendation",
+                "ok": True,
+                "results": [{"title": "A Survey", "url": "https://a", "snippet": "摘要甲"}],
+            },
+            {"query": "没搜到的词", "ok": True, "results": []},
+        ],
+    )
+    body = messages[-1]["content"]
+    assert "联网搜索结果" in body
+    assert "A Survey" in body and "https://a" in body and "摘要甲" in body
+    assert "没有搜到结果" in body
+    # 必须讲清"这是网页摘要、不是全文"，免得它当论文引用
+    assert "不是论文全文" in body
+
+
+def test_run_searches_returns_blocks_even_when_it_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    """搜不到也要如实返回（带 error），不能吞掉。"""
+
+    from services.agent import web_search
+
+    async def fake_search(query: str, *, limit: int = 5, client: object = None):
+        if "坏" in query:
+            return {"ok": False, "error": "连不上搜索服务"}
+        return {"ok": True, "results": [{"title": "T", "url": "https://t", "snippet": "s"}]}
+
+    monkeypatch.setattr(web_search, "search", fake_search)
+    blocks = asyncio.run(orchestrator._run_searches(["好", "坏"]))
+    assert [block["ok"] for block in blocks] == [True, False]
+    assert blocks[1]["error"] == "连不上搜索服务"
+    assert len(blocks[0]["results"]) == 1
+
+
+def test_search_is_model_decided_and_bounded() -> None:
+    """结构断言：搜索接在节点循环里，且一轮有上限（别把上游打爆）。"""
+
+    import inspect
+
+    source = inspect.getsource(orchestrator)
+    assert "_run_searches(" in source
+    assert 1 <= orchestrator.MAX_SEARCH_QUERIES <= 8
 
 
 def test_decision_fields_are_part_of_the_contract() -> None:
