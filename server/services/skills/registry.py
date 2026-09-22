@@ -90,12 +90,20 @@ class SkillPack:
     scripts: list[str] = field(default_factory=list)
     references: list[str] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
+    #: `scripts` = 带脚本、能真跑；`instructions` = 说明书型（模型读说明自己写代码/自己算）
+    mode: str = "instructions"
 
     @property
     def runnable(self) -> bool:
-        """能不能真跑：至少要有一个脚本，且声明的问题为空。"""
+        """能不能**真跑脚本**（说明书型本来就不需要跑，不算坏）。"""
 
-        return bool(self.steps or self.scripts) and not self.problems
+        return self.mode == "scripts" and not self.problems
+
+    @property
+    def usable(self) -> bool:
+        """这一份技能能不能用：说明书型也能用，只是不跑脚本。"""
+
+        return not self.problems
 
     @property
     def stage_label(self) -> str:
@@ -216,8 +224,9 @@ def parse_pack(skill_dir: Path) -> SkillPack:
     )
 
     steps = _parse_steps(head.get("steps"), skill_dir, problems)
-    if not steps and not scripts:
-        problems.append("既没有 steps 声明，也没有 scripts/ 目录 —— 这个技能跑不了")
+    # ⚠️ 上游有些技能**本来就没有脚本**（说明书型）。那不是坏技能，别报成问题
+    # （2026-09-23 实测：42 个里 12 个被误报，改完才算准）。
+    mode = "scripts" if (steps or scripts) else "instructions"
 
     version = str(meta.get("version") or head.get("version") or "")
     return SkillPack(
@@ -233,6 +242,7 @@ def parse_pack(skill_dir: Path) -> SkillPack:
         scripts=scripts,
         references=references,
         problems=problems,
+        mode=mode,
     )
 
 
@@ -305,6 +315,8 @@ def load(skill: SkillPack) -> dict[str, Any]:
             }
             for step in skill.steps
         ],
+        "mode": skill.mode,
         "runnable": skill.runnable,
+        "usable": skill.usable,
         "problems": skill.problems,
     }

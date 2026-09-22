@@ -142,3 +142,33 @@ def test_builtin_packs_dir_is_scannable() -> None:
 
     assert registry.packs_dir().name == "packs"
     registry.scan()  # 不抛异常即通过
+
+
+def test_instructions_only_skill_is_usable_not_broken(tmp_path: Path) -> None:
+    """说明书型技能（上游本来就没脚本）：能用、但不算"能跑"，更不是坏技能。
+
+    2026-09-23 实测踩到：42 个技能里 12 个是这类（networkx / polars / sympy …），
+    我一开始把它们报成"这个技能跑不了" —— 那是引擎误报。
+    """
+
+    skill_dir = tmp_path / "sympy"
+    skill_dir.mkdir()
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: sympy\ndescription: 符号计算\nstage: experiment\n---\n\n用 sympy 怎么推公式…\n",
+        encoding="utf-8",
+    )
+    pack = registry.scan(tmp_path, packs=tmp_path)[0]
+    assert pack.mode == "instructions"
+    assert pack.problems == [], "没有脚本不是问题"
+    assert pack.usable is True
+    assert pack.runnable is False, "它确实不需要跑脚本"
+
+    detail = registry.load(pack)
+    assert detail["mode"] == "instructions" and detail["usable"] is True
+    assert detail["runnable"] is False
+
+
+def test_scripts_skill_is_runnable(tmp_path: Path) -> None:
+    _write_skill(tmp_path, "with-script", GOOD.replace("__NAME__", "with-script"), script="print('ok')")
+    pack = registry.scan(tmp_path, packs=tmp_path)[0]
+    assert pack.mode == "scripts" and pack.runnable is True

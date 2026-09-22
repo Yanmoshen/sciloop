@@ -67,7 +67,14 @@ filterwarnings = ["ignore::DeprecationWarning"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-extend-exclude = ["migrations/versions"]
+extend-exclude = [
+    "migrations/versions",
+    # 内置技能包是**第三方内容**（上游仓库整目录拷进来，来源与许可见
+    # services/skills/packs/README.md）。它的脚本有自己的风格，不该拿本仓库的
+    # lint 规则去要求它 —— 强行改就等于篡改来源。
+    # 2026-09-23 实测：整目录拷进来后 `ruff check .` 从 0 条变成 1924 条。
+    "services/skills/packs",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM"]
