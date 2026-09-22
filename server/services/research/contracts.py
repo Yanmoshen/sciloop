@@ -42,6 +42,7 @@ __all__ = [
     "Hypothesis",
     "IdeaAndFeasibilityOutput",
     "LiteratureReviewOutput",
+    "NodeDecisionFields",
     "MetricPlan",
     "NoveltyDelta",
     "PreflightRecord",
@@ -96,7 +97,29 @@ class GapDraft(SciLoopModel):
     novelty_hint: str | None = None
 
 
-class LiteratureReviewOutput(SciLoopModel):
+class NodeDecisionFields(SciLoopModel):
+    """模型自己的"做完没有"的判断 —— 程序不再替它判（2026-09-22 研究者要求）。
+
+    为什么放在产出契约里：这样它跟着结构化输出一起回来，**可留痕、可回看**，
+    比"程序猜模型想不想停"可靠；也让界面能直接把模型的原话展示给研究者。
+    """
+
+    state: Literal["done", "continue", "need_human"] = Field(
+        default="done",
+        description=(
+            "你自己判断本节点现在算不算完成：done=完成；continue=还没做完、请继续做下一轮；"
+            "need_human=需要研究者介入（比如缺少只有人能给的信息）"
+        ),
+    )
+    pending: list[str] = Field(
+        default_factory=list, description="state=continue 时：还缺什么（逐条列）"
+    )
+    state_reason: str = Field(
+        default="", description="state=need_human 时：为什么需要研究者介入"
+    )
+
+
+class LiteratureReviewOutput(NodeDecisionFields):
     """文献调研节点产出。"""
 
     research_question: str
@@ -146,7 +169,7 @@ class FeasibilityDraft(SciLoopModel):
     total_score: float = 0.0
 
 
-class IdeaAndFeasibilityOutput(SciLoopModel):
+class IdeaAndFeasibilityOutput(NodeDecisionFields):
     """idea 与可行性节点产出。"""
 
     hypothesis: Hypothesis
@@ -227,7 +250,7 @@ class PreflightRecord(SciLoopModel):
     note: str = ""
 
 
-class ExperimentPrepOutput(SciLoopModel):
+class ExperimentPrepOutput(NodeDecisionFields):
     """实验与数据准备节点产出。"""
 
     protocol: ProtocolDraft = Field(default_factory=ProtocolDraft)

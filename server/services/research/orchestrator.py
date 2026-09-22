@@ -48,6 +48,7 @@ from llm.schema import load_json_payload
 from services.research import graph, prompts, store
 from services.research import preflight as preflight_mod
 from services.research.contracts import (
+    NODE_OUTPUT_MODELS,
     NODE_OUTPUT_SCHEMAS,
     ExperimentPrepOutput,
     IdeaAndFeasibilityOutput,
@@ -950,13 +951,22 @@ async def _run_node_events(
     last_raw = ""
     last_validation: ValidationResult | None = None
     repair: str | None = None
-    passed = False
+    # 循环的出口只有两个：模型说完成（break）或模型要人介入（return）。
+    # 不再有"重试用尽"这个由程序判定出来的出口。
 
-    for attempt in range(max_retry + 1):
+    # **不设次数上限**：由模型决定什么时候停（2026-09-22 研究者明确要求「让模型自己决定
+    # 什么时候停下、什么时候需要人工介入」）。程序这一层的职责只剩三件：
+    #   ① 把产出摆成能落库的形状（契约不过 = 产出不可用，必须再来一轮）；
+    #   ② 把"验收到了什么"如实整理成事实（只报事实，不判通过）；
+    #   ③ 读模型自己的决定：done / continue / need_human。
+    attempt = 0
+    contract_misses = 0
+    advisories: list[str] = []
+    while True:
         yield "attempt", {
             "node": target,
             "attempt": attempt + 1,
-            "max_attempts": max_retry + 1,
+            "max_attempts": None,
             "retry_count": attempt,
             "library_hits": len(hits or []),
             "paper_total": library.get("paper_total"),
@@ -1031,7 +1041,9 @@ async def _run_node_events(
             # 认证 / 配置类失败重试也没用（拿空 Key 再撞两次只会白花钱）→ 立即如实失败。
             # 其余失败（供应商拒绝结构化输出、上游抖动、超时）**算一次 L1 并消耗本节点的
             # 重试额度**再继续，而不是让一次调用抖动直接终结整个节点。
-            recoverable = not isinstance(llm_failed, LLMAuthError) and attempt < max_retry
+            # 认证/配置类失败重试没有意义（拿空 Key 再撞只会白花钱）；
+            # 其余失败（供应商抖动、超时）继续交给模型，**不再受次数上限约束**。
+            recoverable = not isinstance(llm_failed, LLMAuthError)
             if recoverable:
                 llm_calls += 0  # 已在上面计过
                 failure = ValidationResult(
@@ -1051,7 +1063,7 @@ async def _run_node_events(
                     "node": target,
                     "node_label": graph.NODE_LABELS.get(target, target),
                     "attempt": attempt + 1,
-                    "max_attempts": max_retry + 1,
+                    "max_attempts": None,
                     "ok": False,
                     "level": "L1",
                     "items": [h.to_dict() for h in failure.hits],
@@ -1138,8 +1150,9 @@ async def _run_node_events(
             )
         validation = validate_node_output(target, candidate, facts=facts)
 
-        # 回退申请：闸门 G1/G2 的判定结果并入校验缺项（不是静默放行 / 静默拒绝）
-        if validation.ok and candidate is not None:
+        # 回退申请：G1「必须带齐信息」是**结构性**要求（不然回退过去也做不下去），
+        # 因此仍然保留；研究质量类的判定一律不再拦截（见下面的 advisories）。
+        if candidate is not None:
             revert = candidate.get("revert_request")
             if isinstance(revert, dict) and revert.get("target"):
                 gate = graph.check_revert_gate(
@@ -1162,37 +1175,122 @@ async def _run_node_events(
 
         last_validation = validation
 
-        if validation.ok:
-            passed = True
-            payload = candidate or {}
-            async with session_factory() as session:
-                await store.upsert_node_run(
-                    session,
+        # ---- ① 提醒：把验收情况如实说出来（对话一行 + 节点详情一份）-------- #
+        advisories = _advisory_notes(validation)
+        if advisories:
+            yield "notice", {
+                "node": target,
+                "code": "validator_findings",
+                "message": "本轮验收情况（只报事实，是否算完成由你判断）：\n"
+                + "\n".join(advisories),
+            }
+
+        # ---- ② 产出能不能用，只看契约（能不能落库），不看研究质量 ---------- #
+        usable, normalized, why = _contract_payload(target, candidate)
+        if not usable:
+            contract_misses += 1
+            yield "notice", {
+                "node": target,
+                "code": "contract_miss",
+                "message": f"这一版产出还不能落库（{why}），已经把要补齐的地方回给你了。",
+            }
+            if contract_misses >= CONTRACT_MISS_LIMIT:
+                # 防挂死：连续多次给不出可落库的产出，如实停下等人 ——
+                # 这不是"研究质量判定"，而是"这台机器现在产不出可用的东西"。
+                reason = (
+                    f"连续 {CONTRACT_MISS_LIMIT} 次未能给出可落库的产出（{why}），已停下等你处理"
+                )
+                await _hand_off_to_human(
+                    session_factory,
                     conversation_id=conversation_id,
                     project_id=project_id,
                     node=target,
                     entry_index=entry_index,
-                    status="done",
                     retry_count=attempt,
-                    payload=payload,
-                    raw_output=last_raw[:20000],
-                    validation={"ok": True, "level": None, "rules": [], "items": []},
-                    llm_call_count=llm_calls,
-                    cost_usd=round(total_cost, 6),
-                    finished_at=_utcnow(),
+                    reason=reason,
+                    validation=last_validation,
+                    raw_output=last_raw,
+                    llm_calls=llm_calls,
+                    total_cost=total_cost,
+                    budget_snapshot=budget,
                 )
-            break
+                yield "waiting_human", {
+                    "node": target,
+                    "node_label": graph.NODE_LABELS.get(target, target),
+                    "retry_count": attempt,
+                    "items": [h.to_dict() for h in (last_validation.hits if last_validation else [])],
+                    "message": reason,
+                }
+                yield "done", {
+                    "node": target,
+                    "status": "waiting_human",
+                    "display_status": graph.display_status("waiting_human"),
+                    "cost_usd": round(total_cost, 6),
+                    "llm_call_count": llm_calls,
+                }
+                return
+            repair = (
+                f"上一版产出不能直接用：{why}。请按契约重新输出**完整**的 JSON 对象，"
+                "不要输出解释文字，也不要使用代码围栏。"
+            )
+            attempt += 1
+            continue
+        contract_misses = 0
 
-        yield "validation", {
-            "node": target,
-            "node_label": graph.NODE_LABELS.get(target, target),
-            "attempt": attempt + 1,
-            "max_attempts": max_retry + 1,
-            "ok": False,
-            "level": validation.level,
-            "items": [h.to_dict() for h in validation.hits],
-        }
+        # ---- ③ 决策权在模型手里：done / continue / need_human ------------- #
+        state = str((candidate or {}).get("state") or "").strip().lower() or "done"
 
+        if state == "need_human":
+            pending = candidate.get("pending") if isinstance(candidate.get("pending"), list) else []
+            reason = str((candidate or {}).get("state_reason") or "").strip()
+            if not reason:
+                reason = "模型判断本节点需要研究者介入"
+                if pending:
+                    reason += "：" + "；".join(str(item) for item in pending[:5])
+            await _hand_off_to_human(
+                session_factory,
+                conversation_id=conversation_id,
+                project_id=project_id,
+                node=target,
+                entry_index=entry_index,
+                retry_count=attempt,
+                reason=reason,
+                validation=last_validation,
+                raw_output=last_raw,
+                llm_calls=llm_calls,
+                total_cost=total_cost,
+                budget_snapshot=budget,
+            )
+            yield "waiting_human", {
+                "node": target,
+                "node_label": graph.NODE_LABELS.get(target, target),
+                "retry_count": attempt,
+                "items": advisories,
+                "message": reason,
+            }
+            yield "done", {
+                "node": target,
+                "status": "waiting_human",
+                "display_status": graph.display_status("waiting_human"),
+                "cost_usd": round(total_cost, 6),
+                "llm_call_count": llm_calls,
+            }
+            return
+
+        if state == "continue":
+            pending = candidate.get("pending") if isinstance(candidate.get("pending"), list) else []
+            lines = ["你自己判断本节点还没完成。"]
+            if pending:
+                lines.append("你说还缺的：" + "；".join(str(item) for item in pending[:8]))
+            if advisories:
+                lines.append("本轮验收情况（事实，供你判断）：\n" + "\n".join(advisories))
+            lines.append("请继续做完，并在下一次产出的 state 里写 done 或 need_human。")
+            repair = "\n".join(lines)
+            attempt += 1
+            continue
+
+        # ---- 模型说完成 → 收工（程序不再用硬规则拦它）--------------------- #
+        payload = normalized if isinstance(normalized, dict) else (candidate or {})
         async with session_factory() as session:
             await store.upsert_node_run(
                 session,
@@ -1200,65 +1298,26 @@ async def _run_node_events(
                 project_id=project_id,
                 node=target,
                 entry_index=entry_index,
-                status="running",
-                retry_count=attempt + 1,
+                status="done",
+                retry_count=attempt,
+                payload=payload,
                 raw_output=last_raw[:20000],
-                validation=validation.to_dict(),
-                llm_call_count=llm_calls,
-                cost_usd=round(total_cost, 6),
-            )
-            budget = await _budget_snapshot(
-                session, conversation_id=conversation_id, node=target, retry_count=attempt + 1
-            )
-        repair = validation.repair_instruction()
-
-    if not passed:
-        # 重试用尽：置 waiting_human，如实说明，不静默继续
-        items = [h.to_dict() for h in (last_validation.hits if last_validation else [])]
-        async with session_factory() as session:
-            await store.upsert_node_run(
-                session,
-                conversation_id=conversation_id,
-                project_id=project_id,
-                node=target,
-                entry_index=entry_index,
-                status="waiting_human",
-                retry_count=max_retry,
-                raw_output=last_raw[:20000],
-                validation=(last_validation.to_dict() if last_validation else None),
+                validation={
+                    "ok": validation.ok,
+                    "level": validation.level,
+                    "rules": [h.rule for h in validation.hits],
+                    "items": [h.to_dict() for h in validation.hits],
+                    # 标记清楚：这份校验结果是**提醒**，不是通过与否的判据
+                    "advisory": True,
+                    "decided_by": "model",
+                    "state": "done",
+                },
                 llm_call_count=llm_calls,
                 cost_usd=round(total_cost, 6),
                 finished_at=_utcnow(),
             )
-            await store.record_transition(
-                session,
-                conversation_id=conversation_id,
-                project_id=project_id,
-                from_node=target,
-                to_node=target,
-                kind="stop",
-                trigger="program",
-                reason=(
-                    f"「{graph.NODE_LABELS.get(target, target)}」修复重试达上限"
-                    f"（{max_retry} 次）仍未通过校验，需人工介入"
-                ),
-                budget_snapshot=budget,
-            )
-        yield "waiting_human", {
-            "node": target,
-            "node_label": graph.NODE_LABELS.get(target, target),
-            "retry_count": max_retry,
-            "items": items,
-            "message": "多次修复仍未通过校验，已转入人工介入",
-        }
-        yield "done", {
-            "node": target,
-            "status": "waiting_human",
-            "display_status": graph.display_status("waiting_human"),
-            "cost_usd": round(total_cost, 6),
-            "llm_call_count": llm_calls,
-        }
-        return
+        break
+
 
     # 通过：落业务实体 + 处理迁移
     async with session_factory() as session:
@@ -1331,3 +1390,90 @@ async def _run_node_events(
             "cost_usd": round(total_cost, 6),
             "llm_call_count": llm_calls,
         }
+
+
+# --------------------------------------------------------------------------- #
+# 节点循环的三个辅助（2026-09-22：程序从"判定者"退成"报事实的人"）
+# --------------------------------------------------------------------------- #
+#: 契约连续失败多少次就如实停下等人。**这不是研究质量的上限**，
+#: 而是"这台机器已经产不出可落库的东西了"的防挂死阈值 —— 没有它，
+#: 一个无论如何都产不出合法 JSON 的模型会让循环永远烧下去。
+CONTRACT_MISS_LIMIT = 6
+
+
+def _advisory_notes(validation: Any) -> list[str]:
+    """把校验器看到的东西整理成**给研究者看的事实清单**（不是判决书）。"""
+
+    if validation is None:
+        return []
+    notes: list[str] = []
+    for hit in getattr(validation, "hits", []) or []:
+        message = str(getattr(hit, "message", "") or "").strip()
+        if not message:
+            continue
+        notes.append(f"· {message}")
+    return notes
+
+
+def _contract_payload(target: str, candidate: dict[str, Any] | None) -> tuple[bool, dict[str, Any], str]:
+    """产出能否落库（只看契约结构，不看研究质量）。
+
+    返回 `(能不能用, 归一化后的产出, 不能用的原因)`。
+    **占位节点没有契约** → 原样放行（它们本来就只做占位）。
+    """
+
+    if not isinstance(candidate, dict) or not candidate:
+        return False, {}, "没有拿到可解析的 JSON 对象"
+    model = NODE_OUTPUT_MODELS.get(target)
+    if model is None:
+        return True, candidate, ""
+    try:
+        obj = model.model_validate(candidate)
+    except Exception as exc:  # noqa: BLE001 - 契约错误要如实回给模型，而不是吞掉
+        return False, {}, f"产出结构不符合契约：{str(exc)[:240]}"
+    return True, obj.model_dump(), ""
+
+
+async def _hand_off_to_human(
+    session_factory: Any,
+    *,
+    conversation_id: str,
+    project_id: int | None,
+    node: str,
+    entry_index: int,
+    retry_count: int,
+    reason: str,
+    validation: Any,
+    raw_output: str,
+    llm_calls: int,
+    total_cost: float,
+    budget_snapshot: dict[str, Any] | None,
+) -> None:
+    """转到人工：落节点行 + 留痕。**触发者写 model**（是模型判断要人介入，不是程序拦的）。"""
+
+    async with session_factory() as session:
+        await store.upsert_node_run(
+            session,
+            conversation_id=conversation_id,
+            project_id=project_id,
+            node=node,
+            entry_index=entry_index,
+            status="waiting_human",
+            retry_count=retry_count,
+            raw_output=raw_output[:20000],
+            validation=(validation.to_dict() if validation is not None else None),
+            llm_call_count=llm_calls,
+            cost_usd=round(total_cost, 6),
+            finished_at=_utcnow(),
+        )
+        await store.record_transition(
+            session,
+            conversation_id=conversation_id,
+            project_id=project_id,
+            from_node=node,
+            to_node=node,
+            kind="stop",
+            trigger="model",
+            reason=reason,
+            budget_snapshot=budget_snapshot,
+        )
