@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -41,15 +42,20 @@ __all__ = [
     "CatalogEntry",
     "SkillPack",
     "SkillStep",
+    "SAFE_SKILL_NAME",
     "catalog",
     "load",
     "packs_dir",
     "scan",
+    "split_frontmatter",
 ]
 
 #: 内置技能包位置（``server/services/skills/packs/``）——
 #: 放这里是为了**不新增挂载**：``server/services`` 本来就已经挂进后端容器，镜像也会带上它。
 PACKS_DIR = Path(__file__).resolve().parent / "packs"
+
+#: 技能名的安全形态（中文保留；路径分隔符等危险字符一律换掉）—— 新建技能时要校验
+SAFE_SKILL_NAME = re.compile(r"[^0-9A-Za-z._\-\u4e00-\u9fff]+")
 
 #: 环节 → 给人看的中文名（界面与提示词共用一份口径）
 STAGE_LABELS: dict[str, str] = {
@@ -90,6 +96,8 @@ class SkillPack:
     scripts: list[str] = field(default_factory=list)
     references: list[str] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
+    #: 上游声明的环境变量：[{"name": "OPENROUTER_API_KEY", "required": False}]
+    requires_env: list[dict[str, Any]] = field(default_factory=list)
     #: `scripts` = 带脚本、能真跑；`instructions` = 说明书型（模型读说明自己写代码/自己算）
     mode: str = "instructions"
 
@@ -127,7 +135,7 @@ def packs_dir() -> Path:
     return PACKS_DIR
 
 
-def _split_frontmatter(text: str) -> tuple[dict[str, Any], str, str | None]:
+def split_frontmatter(text: str) -> tuple[dict[str, Any], str, str | None]:
     """拆出 YAML frontmatter 与正文；没 frontmatter 就返回空头（不报错）。"""
 
     stripped = text.lstrip("\ufeff")
@@ -198,7 +206,7 @@ def parse_pack(skill_dir: Path) -> SkillPack:
             problems=[f"缺少 SKILL.md：{skill_md}"],
         )
 
-    head, body, head_problem = _split_frontmatter(skill_md.read_text(encoding="utf-8", errors="replace"))
+    head, body, head_problem = split_frontmatter(skill_md.read_text(encoding="utf-8", errors="replace"))
     if head_problem:
         problems.append(head_problem)
 
@@ -228,6 +236,13 @@ def parse_pack(skill_dir: Path) -> SkillPack:
     # （2026-09-23 实测：42 个里 12 个被误报，改完才算准）。
     mode = "scripts" if (steps or scripts) else "instructions"
 
+    requires: list[dict[str, Any]] = []
+    raw_env = head.get("requires_env")
+    if isinstance(raw_env, list):
+        for item in raw_env:
+            if isinstance(item, dict) and item.get("name"):
+                requires.append({"name": str(item["name"]), "required": bool(item.get("required", False))})
+
     version = str(meta.get("version") or head.get("version") or "")
     return SkillPack(
         name=name,
@@ -243,6 +258,7 @@ def parse_pack(skill_dir: Path) -> SkillPack:
         references=references,
         problems=problems,
         mode=mode,
+        requires_env=requires,
     )
 
 
@@ -316,6 +332,7 @@ def load(skill: SkillPack) -> dict[str, Any]:
             for step in skill.steps
         ],
         "mode": skill.mode,
+        "requires_env": skill.requires_env,
         "runnable": skill.runnable,
         "usable": skill.usable,
         "problems": skill.problems,

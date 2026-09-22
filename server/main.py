@@ -117,6 +117,9 @@ ROUTER_REGISTRY: tuple[tuple[str, str, bool], ...] = (
     # 12) 模型配置与成本（WP02，自带 /models 与 /costs 前缀）
     ("api.v1.models_config", "/api/v1", True),
     ("api.v1.costs", "/api/v1", True),
+    # 13) 技能库（2026-09-23）：独立入口，自带 /skills 前缀。
+    #     注意字面路由要排在参数路由之前（`/skills/mounts` 必须先于 `/skills/{name}`）。
+    ("api.v1.skills", "/api/v1", False),
 )
 
 

@@ -31,6 +31,7 @@ from typing import Any
 
 from mcp_server.client import call_tool, server_params
 from services.agent import host_runner, policy, web_search
+from services.skills import runner as runner_mod
 
 #: 单轮对话里最多允许的「模型要求调工具」轮数。上限存在的意义是**防死循环**：
 #: 模型可能反复要求调同一个工具，没有上限就会一直烧 token。
@@ -41,7 +42,7 @@ MAX_TOOL_ROUNDS = 3
 #: `search_web` 走项目自建的 SearXNG（见 `services/agent/web_search.py`），也是只读。
 #: 只读的联网检索**两个并列能力**（模型自己选）：
 #: `search_academic` 查学术（官方接口，稳）、`search_web` 搜网页（覆盖广，可能被限流）。
-AUTONOMOUS_TOOLS = ("query_library", "search_academic", "search_web", "fetch_url")
+AUTONOMOUS_TOOLS = ("query_library", "search_academic", "search_web", "fetch_url", "load_skill")
 
 #: 摆给模型但**必须研究者批准**才执行的工具（写盘/执行类）。
 APPROVABLE_TOOLS = ("run_command",)
@@ -57,6 +58,8 @@ TOOL_LABELS = {
     "search_academic": "查学术",
     "search_web": "搜网页",
     "fetch_url": "抓取网页",
+    "load_skill": "加载技能",
+    "run_skill": "跑技能",
     "run_command": "执行命令",
     "run_on_computer": "在你的电脑上执行命令",
     "files_on_computer": "在你电脑上读写或整理文件",
@@ -116,6 +119,48 @@ _SEARCH_ACADEMIC_TOOL_SCHEMA: dict[str, Any] = {
         },
     },
 }
+
+#: 技能相关的两个工具：`load_skill` 只读（自动放行）；`run_skill` 是执行类（要研究者点头）。
+_SKILL_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "load_skill",
+            "description": (
+                "把一个技能的完整说明加载进来（工作流程、要跑哪些脚本、注意事项）。"
+                "技能清单在系统提示里，只能看到名字与一句话；**觉得要用哪个，就先 load_skill 看全文**，"
+                "再按它的说明做事。只读操作，不会在研究者电脑上执行任何东西。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string", "description": "技能名（清单里的那个）"}},
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_skill",
+            "description": (
+                "按某个技能**声明的流程**在研究者电脑上跑它的脚本（一次跑完它声明的步骤）。"
+                "属于执行类动作：**会先请研究者确认**，卡上会列出将要执行的命令。"
+                "跑出来的产物会落到项目产物目录，供引用与审计。"
+                "注意：说明书型技能（没有脚本）不需要这个，直接按说明做就行。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "技能名"},
+                    "topic": {"type": "string", "description": "这一步要解决什么（会填进技能的 {{topic}} 占位符）"},
+                    "task_id": {"type": "string", "description": "任务编号：产物按它归档（不填就用当前会话）"},
+                    "project_dir": {"type": "string", "description": "在哪个项目目录下干活（不填用默认目录）"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+]
 
 #: 宿主工具的工具声明（OpenAI 兼容）。参数尽量少而直白，让模型好填、让人好读。
 _HOST_TOOL_SCHEMAS: list[dict[str, Any]] = [
@@ -242,6 +287,8 @@ async def tool_schemas() -> list[dict[str, Any]]:
     schemas: list[dict[str, Any]] = _json.loads(_json.dumps(_HOST_TOOL_SCHEMAS))
     schemas.append(_json.loads(_json.dumps(_SEARCH_WEB_TOOL_SCHEMA)))
     schemas.append(_json.loads(_json.dumps(_SEARCH_ACADEMIC_TOOL_SCHEMA)))
+    for schema in _SKILL_TOOL_SCHEMAS:
+        schemas.append(_json.loads(_json.dumps(schema)))
 
     # 把"你在这台电脑上的默认工作目录"写进工具描述：模型据此决定要不要显式指定目录，
     # 也免得它去猜容器里的路径（容器路径在宿主上根本不存在）。
@@ -292,6 +339,59 @@ async def judge(call: dict[str, Any]) -> policy.Verdict:
 
     name = str((call.get("function") or {}).get("name") or "")
     args = arguments_of(call)
+
+    if name == "run_skill":
+        # 跑技能 = 在研究者电脑上按技能声明的流程真跑脚本。
+        # 把**将要执行的命令**逐条送去裁决：有任一条被硬拒 → 整次拒绝；
+        # 有任一条不能直接放行 → 弹卡（卡上写明这些命令），批了才跑。
+        await host_runner.ensure_host_roots()
+        skill_name = str(args.get("name") or "").strip()
+        from services.skills import service
+
+        pack = next((item for item in service.all_packs() if item.name == skill_name), None)
+        if pack is None:
+            return policy.Verdict(
+                layer=policy.LAYER_OTHER,
+                allowed=False,
+                needs_approval=False,
+                harmless=True,
+                forbidden=True,
+                message=f"没有这个技能：{skill_name}",
+                categories=(),
+            )
+        info = await host_runner.ensure_host_roots()
+        host_dir = runner_mod.host_pack_dir(pack, host_root=str(info.get("host_root") or ""))
+        if host_dir is None:
+            return policy.Verdict(
+                layer=policy.LAYER_OTHER,
+                allowed=False,
+                needs_approval=False,
+                harmless=True,
+                forbidden=True,
+                message="执行器没连上，跑不了技能脚本（先让研究者电脑上的执行器连上）。",
+                categories=(),
+            )
+        plan = runner_mod.plan_commands(
+            pack,
+            topic=str(args.get("topic") or ""),
+            host_dir=host_dir,
+            work_dir=host_dir,  # 计划只为裁决路径，工作目录在执行时才定
+            out_dir=host_dir,
+            project_dir=str(args.get("project_dir") or ""),
+            task_id=str(args.get("task_id") or "manual-run"),
+        )
+        commands = [" ".join(item["argv"]) for item in plan]
+        verdicts = [policy.judge_command(argv=item["argv"], cwd=str(host_dir)) for item in plan]
+        for verdict in verdicts:
+            if verdict.forbidden:
+                return verdict
+        if any(not item.harmless for item in verdicts):
+            return policy._approve(
+                verdicts[0].layer,
+                "将按技能「{}」声明的流程跑 {} 个脚本：{}".format(skill_name, len(commands), " ｜ ".join(commands)[:600]),
+                "跑技能脚本",
+            )
+        return verdicts[0]
 
     if name == "run_on_computer":
         # 先确保裁决层知道宿主路径（删代码=硬拒要靠它）；拿不到也不拦着走流程
@@ -530,6 +630,28 @@ async def run_tool_call(
     arguments = _arguments(call)
 
     # 「联网搜索」：只读，走自建 SearXNG；连不上就如实回一句人话（不假装搜过）
+    if name == "load_skill":
+        from services.skills import registry, service
+
+        skill_name = str(arguments.get("name") or "").strip()
+        pack = next((item for item in service.all_packs() if item.name == skill_name), None)
+        if pack is None:
+            result: dict[str, Any] = {"ok": False, "error": f"没有这个技能：{skill_name}"}
+        else:
+            result = registry.load(pack) | {"ok": True}
+        return {"ok": bool(result.get("ok")), "tool": name, "result": result}, _summarize(name, result)
+
+    if name == "run_skill":
+        from services.skills import service
+
+        result = await service.run(
+            str(arguments.get("name") or "").strip(),
+            topic=str(arguments.get("topic") or ""),
+            task_id=str(arguments.get("task_id") or "manual-run"),
+            project_dir=str(arguments.get("project_dir") or ""),
+        )
+        return {"ok": bool(result.get("ok")), "tool": name, "result": result}, _summarize(name, result)
+
     if name == "search_academic":
         sources = arguments.get("sources")
         picked = (
@@ -635,6 +757,14 @@ def _summarize(name: str, data: dict[str, Any]) -> str:
         return f"退出码 {code}" + ("（成功）" if code == 0 else "（命令返回非零，不是工具失败）")
 
     # 宿主工具：摘要会显示在对话里的过程行上（研究者看得到），所以只说人话与事实
+    if name == "load_skill":
+        return "加载了技能说明" if data.get("ok") else str(data.get("error") or "技能说明没取到")
+
+    if name == "run_skill":
+        if data.get("ok"):
+            return f"按技能声明的流程跑了 {len(data.get('steps') or [])} 步，产出 {len(data.get('outputs') or [])} 个文件"
+        return str(data.get("message") or "这次没跑成")
+
     if name in ("search_web", "search_academic"):
         count = data.get("count")
         label = web_search.REASON_LABELS.get(str(data.get("reason") or ""), "")
