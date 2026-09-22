@@ -188,7 +188,25 @@ async def _agent_loop(
         stopped_for_approval = False
         for call in calls:
             tool_name = str((call.get("function") or {}).get("name") or "")
-            if agent_tools.requires_approval(tool_name):
+            # 逐次裁决（不是按工具名一刀切）：同一句删除命令，删研究数据是"待批准"，
+            # 删 SciLoop 自己的代码是"直接拒绝"，读文件则根本不用打扰研究者。
+            verdict = await agent_tools.judge(call)
+            if verdict.forbidden:
+                # **没有商量余地的事不进批准队列**：直接拒绝，把原因如实回给模型，
+                # 并落一行过程行 —— 研究者看得到"它想干什么、为什么被挡"。
+                refused = {"ok": False, "error": verdict.message, "refused": True}
+                row = agent_tools.tool_row(call, "err", verdict.message)
+                rows.append(row)
+                yield _sse("row", {"row": row})
+                messages_now.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": str(call.get("id") or ""),
+                        "content": agent_tools.tool_message_content(refused),
+                    }
+                )
+                continue
+            if verdict.needs_approval:
                 # 写盘/执行类：**只建请求，不执行**。连一次 MCP 调用都不发出去。
                 arguments = agent_tools.arguments_of(call)
                 cwd = arguments.get("cwd")

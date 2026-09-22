@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp_server.client import call_tool, server_params
+from services.agent import host_runner, policy
 
 #: 单轮对话里最多允许的「模型要求调工具」轮数。上限存在的意义是**防死循环**：
 #: 模型可能反复要求调同一个工具，没有上限就会一直烧 token。
@@ -41,12 +42,68 @@ AUTONOMOUS_TOOLS = ("query_library", "fetch_url")
 #: 摆给模型但**必须研究者批准**才执行的工具（写盘/执行类）。
 APPROVABLE_TOOLS = ("run_command",)
 
+#: 「在研究者自己的电脑上干活」的两个工具（走宿主执行器）。
+#: 它们**不是** MCP server 提供的，声明写在下面 `_HOST_TOOL_SCHEMAS` 里；
+#: 是否放行由 `judge()` 按三层边界与四类高危逐次裁决，**不是按名字一刀切**。
+HOST_TOOLS = ("run_on_computer", "files_on_computer")
+
 #: 工具名 → 对话里那句话（给用户看的，不是给模型看的）
 TOOL_LABELS = {
     "query_library": "查询论文库",
     "fetch_url": "抓取网页",
     "run_command": "执行命令",
+    "run_on_computer": "在你的电脑上执行命令",
+    "files_on_computer": "在你电脑上读写或整理文件",
 }
+
+#: 宿主工具的工具声明（OpenAI 兼容）。参数尽量少而直白，让模型好填、让人好读。
+_HOST_TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_on_computer",
+            "description": (
+                "在研究者自己的电脑上执行一条命令，返回真实输出与退出码。"
+                "cwd 用研究者电脑上的真实路径。删除类/改系统/破坏数据库/下载即执行属于高危，"
+                "执行前会先请研究者确认。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "要执行的命令行文本"},
+                    "cwd": {"type": "string", "description": "在哪个目录下执行（绝对路径）"},
+                    "timeout_s": {"type": "integer", "description": "最长允许跑多少秒，默认 120"},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "files_on_computer",
+            "description": (
+                "在研究者自己的电脑上读、列、新建、移动、删除文件或目录。"
+                "删除与覆盖已有文件属于高危，会先请研究者确认。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "read", "write", "mkdir", "move", "delete"],
+                        "description": "要做的动作",
+                    },
+                    "path": {"type": "string", "description": "目标路径（绝对路径）"},
+                    "to": {"type": "string", "description": "移动的目标路径（仅 move 用）"},
+                    "content": {"type": "string", "description": "要写入的内容（仅 write 用）"},
+                    "recursive": {"type": "boolean", "description": "删除目录时必须为 true"},
+                },
+                "required": ["action", "path"],
+            },
+        },
+    },
+]
 
 
 def agent_workspace() -> Path:
@@ -107,27 +164,32 @@ def requires_approval(name: str) -> bool:
 async def tool_schemas() -> list[dict[str, Any]]:
     """OpenAI 兼容的工具声明（只含当前允许摆给模型的那两类）。
 
-    工具清单以**运行中的 MCP server** 为准（不硬编码参数），这样工具改了声明这里自动跟上；
-    拿不到就返回空列表 —— 摆不出工具不该让整段对话失败。
+    两类来源：
+    - **MCP server 提供**的（`query_library` / `fetch_url` / `run_command`）——
+      清单以运行中的 server 为准，不硬编码参数；
+    - **本地声明**的宿主工具（`_HOST_TOOL_SCHEMAS`）—— 它们走宿主执行器，不经过 MCP。
+
+    ⚠️ MCP 侧拿不到**不再等于"没有工具"**：宿主工具仍要摆出去，否则执行器连不上时
+    模型会以为自己什么都不能做，而不是告诉研究者"先启动执行器"。
 
     **必须是 async**：调用点在对话的 async 生成器里，用 `asyncio.run()` 会直接抛
     `RuntimeError: asyncio.run() cannot be called from a running event loop`。
     """
 
+    import json as _json
+
+    schemas: list[dict[str, Any]] = _json.loads(_json.dumps(_HOST_TOOL_SCHEMAS))
+
     from mcp_server.client import list_tools
 
     wanted = set(AUTONOMOUS_TOOLS) | set(APPROVABLE_TOOLS)
     if not _allowed_hosts():
-        # 没配出网白名单 → 不摆 fetch_url（摆了也一定会被边界拒，不如不摆）
         wanted.discard("fetch_url")
     try:
         listed = await list_tools(mcp_params())
     except Exception:  # noqa: BLE001 - 工具侧不可用不该拖垮对话
-        return []
+        return schemas
 
-    import json as _json
-
-    schemas: list[dict[str, Any]] = []
     for item in listed:
         name = item.get("name")
         if name not in wanted:
@@ -145,6 +207,51 @@ async def tool_schemas() -> list[dict[str, Any]]:
             }
         )
     return schemas
+
+
+async def judge(call: dict[str, Any]) -> policy.Verdict:
+    """逐次裁决一次工具调用该「放行 / 要研究者点头 / 直接拒绝」。
+
+    与 `requires_approval(name)` 的区别：那个只看**工具名**（写盘类一律弹卡）；
+    这个看**这一次要干什么** —— 同一句 `rm`，删研究项目里的临时文件是"高危待批"，
+    删 SciLoop 自己的代码是"直接拒绝"；调 `files_on_computer` 读文件则根本不用打扰研究者。
+    """
+
+    name = str((call.get("function") or {}).get("name") or "")
+    args = arguments_of(call)
+
+    if name == "run_on_computer":
+        argv = args.get("argv") if isinstance(args.get("argv"), list) else None
+        command = args.get("command") if isinstance(args.get("command"), str) else None
+        cwd = args.get("cwd") if isinstance(args.get("cwd"), str) else None
+        return policy.judge_command(argv=argv, command=command, cwd=cwd)
+
+    if name == "files_on_computer":
+        action = str(args.get("action") or "")
+        path = str(args.get("path") or "")
+        recursive = bool(args.get("recursive"))
+        to = args.get("to") if isinstance(args.get("to"), str) else None
+        # 覆盖已有文件才算高危 → 先问一眼"它现在在不在"，问不到就按"在"处理（宁可多问一次）
+        exists: bool | None = None
+        if action in ("write", "move", "copy") and path:
+            listing = await host_runner.call_fs(action="list", path=path)
+            exists = bool(listing.get("ok"))
+        return policy.judge_fs(
+            action=action, path=path, to=to, exists=exists, recursive=recursive
+        )
+
+    if name in APPROVABLE_TOOLS:
+        return policy.Verdict(
+            policy.DECISION_APPROVE,
+            "sandbox",
+            "这一步要在 SciLoop 自己的工作区里执行，请你确认后我再动手。",
+            ("执行命令",),
+        )
+    if name in AUTONOMOUS_TOOLS:
+        return policy.Verdict(policy.DECISION_ALLOW, "read", "只读查询，可以直接做")
+    return policy.Verdict(
+        policy.DECISION_FORBID, "unknown", f"我不认识这个工具（{name}），不执行。"
+    )
 
 
 def _public_schema(raw: dict[str, Any]) -> dict[str, Any]:
@@ -267,6 +374,37 @@ async def run_tool_call(
     name = str(fn.get("name") or "")
     arguments = _arguments(call)
 
+    # 「在研究者的电脑上干活」这一类：逐次裁决 + 走宿主执行器。
+    # ⚠️ 这里**再判一次**（`_agent_loop` 已判过）：批准链路可以被别的入口复用，
+    # 把边界放在执行点上，才不会因为"某个调用方忘了先判"而放水。
+    if name in HOST_TOOLS:
+        verdict = await judge(call)
+        if verdict.forbidden:
+            return {"ok": False, "error": verdict.message, "refused": True}, verdict.message
+        if verdict.needs_approval and not approval_token:
+            return (
+                {"ok": False, "error": "这一步属于高危操作，需要研究者确认后才会执行"},
+                "等待研究者确认",
+            )
+        if name == "run_on_computer":
+            argv = arguments.get("argv") if isinstance(arguments.get("argv"), list) else None
+            result = await host_runner.call_exec(
+                argv=argv,
+                command=arguments.get("command") if isinstance(arguments.get("command"), str) else None,
+                cwd=arguments.get("cwd") if isinstance(arguments.get("cwd"), str) else None,
+                timeout_s=int(arguments.get("timeout_s") or 120),
+            )
+        else:
+            result = await host_runner.call_fs(
+                action=str(arguments.get("action") or ""),
+                path=str(arguments.get("path") or ""),
+                to=arguments.get("to") if isinstance(arguments.get("to"), str) else None,
+                content=arguments.get("content") if isinstance(arguments.get("content"), str) else None,
+                recursive=bool(arguments.get("recursive")),
+            )
+        summary = _summarize(name, result)
+        return {"ok": bool(result.get("ok")), "tool": name, "result": result}, summary
+
     if requires_approval(name):
         if not approval_token:
             return (
@@ -315,6 +453,37 @@ def _summarize(name: str, data: dict[str, Any]) -> str:
         if code is None:
             return "执行完成"
         return f"退出码 {code}" + ("（成功）" if code == 0 else "（命令返回非零，不是工具失败）")
+
+    # 宿主工具：摘要会显示在对话里的过程行上（研究者看得到），所以只说人话与事实
+    if name == "run_on_computer":
+        if data.get("unreachable"):
+            return "还没连上这台电脑的执行器"
+        if data.get("timed_out"):
+            return "跑超时了，已停下"
+        code = data.get("exit_code")
+        if code is None:
+            return f"没跑起来：{str(data.get('error') or '')[:60]}"
+        return f"执行完成（退出码 {code}）" if code == 0 else f"执行结束但返回了错误码 {code}"
+
+    if name == "files_on_computer":
+        if data.get("unreachable"):
+            return "还没连上这台电脑的执行器"
+        if not data.get("ok"):
+            return f"没做成：{str(data.get('error') or '')[:60]}"
+        action = str(data.get("action") or "")
+        children = data.get("children")
+        if isinstance(children, list):
+            return f"这个目录下有 {len(children)} 项"
+        if action == "write":
+            return f"已写入 {data.get('bytes') or 0} 个字符"
+        if action == "read":
+            return f"读到 {len(str(data.get('content') or ''))} 个字符"
+        if action == "delete":
+            return "已删除"
+        if action == "move":
+            return "已移动"
+        return "完成"
+
     return "完成"
 
 
