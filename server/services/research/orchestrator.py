@@ -920,124 +920,29 @@ async def _run_node_events(
         hits = await store.search_library(session, query=text or research_question)
         real_preflight = preflight_mod.latest_preflight(conversation_id, project_id)
 
-        # 缺研究问题就别硬跑：拿 3 次重试去撞一个注定失败的检索，既费钱又给出
-        # 「修复重试达上限」这种**误导性**结论（真正的原因是缺输入，不是模型修不好）。
+        # 程序只报事实，**不替研究者或模型决定跑不跑**（2026-09-22 用户明确要求）。
+        # 缺研究问题、论文库没命中，这些都会被如实写进提示词交给模型；
+        # 由模型决定是继续、换个说法再检索、去网上找，还是回头问研究者。
+        # 原来的写法是"程序直接拦下并转人工"，那等于用程序替模型做了判断。
         if len(research_question.strip()) < 4 and not upstream:
-            await store.upsert_node_run(
-                session,
-                conversation_id=conversation_id,
-                project_id=project_id,
-                node=target,
-                entry_index=entry_index,
-                status="waiting_human",
-                retry_count=0,
-                validation={
-                    "ok": False,
-                    "level": "L1",
-                    "rules": ["needs_input"],
-                    "items": [
-                        {
-                            "rule": "needs_input",
-                            "level": "L1",
-                            "message": "缺少研究问题，无法开始本节点",
-                            "path": "research_question",
-                        }
-                    ],
-                },
-                finished_at=_utcnow(),
-            )
-            await store.record_transition(
-                session,
-                conversation_id=conversation_id,
-                project_id=project_id,
-                from_node=target,
-                to_node=target,
-                kind="stop",
-                trigger="program",
-                reason="缺少研究问题，未执行（没有把输入缺失当成模型失败）",
-                budget_snapshot={"retry_count": 0, "max_retry": max_retry},
-            )
-            yield "waiting_human", {
+            yield "notice", {
                 "node": target,
-                "node_label": graph.NODE_LABELS.get(target, target),
-                "retry_count": 0,
-                "items": [],
-                "needs_input": "research_question",
+                "code": "missing_research_question",
                 "message": (
-                    f"要跑「{graph.NODE_LABELS.get(target, target)}」，我需要一个研究问题——"
-                    "一句话说明你想搞清楚什么，例如「某方法在什么场景下解决什么问题」。"
-                    "给我这句话我立刻开始。"
+                    "还没拿到研究问题。这一点会如实告诉模型，由它决定是追问你，"
+                    "还是先按现有信息推进。"
                 ),
             }
-            yield "done", {
+        if not hits:
+            yield "notice", {
                 "node": target,
-                "status": "waiting_human",
-                "display_status": graph.display_status("waiting_human"),
-                "cost_usd": 0.0,
-                "llm_call_count": 0,
-            }
-            return
-
-        # 检索命中 0 篇：**不要拿 3 次重试去撞同一堵墙**。
-        # 材料没变、模型没有新信息可用，重试注定还是「证据 0 条」，
-        # 只会白花钱，并把**材料不足**说成「模型修不好」，属于误导。
-        if target == "literature_review" and not hits:
-            await store.upsert_node_run(
-                session,
-                conversation_id=conversation_id,
-                project_id=project_id,
-                node=target,
-                entry_index=entry_index,
-                status="waiting_human",
-                retry_count=0,
-                validation={
-                    "ok": False,
-                    "level": "L1",
-                    "rules": ["no_library_hits"],
-                    "items": [
-                        {
-                            "rule": "no_library_hits",
-                            "level": "L1",
-                            "message": "论文库检索命中 0 篇，缺少可用材料",
-                            "path": "evidence",
-                        }
-                    ],
-                },
-                finished_at=_utcnow(),
-            )
-            await store.record_transition(
-                session,
-                conversation_id=conversation_id,
-                project_id=project_id,
-                from_node=target,
-                to_node=target,
-                kind="stop",
-                trigger="program",
-                reason="论文库检索命中 0 篇，未执行（没有把材料不足当成模型失败）",
-                budget_snapshot={"retry_count": 0, "max_retry": max_retry},
-            )
-            yield "waiting_human", {
-                "node": target,
-                "node_label": graph.NODE_LABELS.get(target, target),
-                "retry_count": 0,
-                "items": [],
-                "needs_input": "library_material",
+                "code": "no_library_hits",
                 "message": (
-                    f"论文库里没有命中与「{research_question[:40]}」相关的材料，本次不执行——"
-                    "没有材料就没有证据，重试也不会变出材料来。\n\n"
-                    "三个可行的下一步：① 换更常见的英文关键词（当前库以英文论文为主，"
-                    "例如把「语料似然」写成 corpus likelihood）；② 先往论文库补一批相关论文；"
-                    "③ 直接说「从 idea 生成开始」，跳过文献核查先做可行性分析。"
+                    f"论文库里没有命中与「{research_question[:40]}」相关的材料。"
+                    "这一点会如实告诉模型（它可以换个说法再检索、去网上找，"
+                    "或者直接告诉你库里缺什么），跑不跑由它决定。"
                 ),
             }
-            yield "done", {
-                "node": target,
-                "status": "waiting_human",
-                "display_status": graph.display_status("waiting_human"),
-                "cost_usd": 0.0,
-                "llm_call_count": 0,
-            }
-            return
 
     payload: dict[str, Any] | None = None
     total_cost = 0.0
