@@ -124,13 +124,17 @@ def test_fs_delete_carries_recursive_flag() -> None:
     assert seen["body"]["recursive"] is True
 
 
-def test_runner_does_not_read_token_from_repo(monkeypatch: pytest.MonkeyPatch) -> None:
-    """密钥只来自环境/设置，不许硬编码在仓库里（防止开源时把密钥带出去）。"""
+def test_runner_uses_the_single_owner_token() -> None:
+    """只有一枚 Owner 密钥（研究者 2026-09-22：「不要搞那么多密钥」）。
 
-    monkeypatch.delenv(host_runner.TOKEN_ENV, raising=False)
-    assert host_runner.runner_token() == ""
-    monkeypatch.setenv(host_runner.TOKEN_ENV, " abc ")
-    assert host_runner.runner_token() == "abc"
+    顺带钉住"后端这一侧不许自己生成密钥"：执行器那边也不生成，两边都用 Owner 那一枚。
+    """
+
+    import inspect
+
+    source = inspect.getsource(host_runner)
+    assert "token_urlsafe" not in source, "不许自己生成密钥"
+    assert "TOKEN_ENV" not in source, "不再有执行器专用密钥的环境变量"
 
 
 # --------------------------------------------------------------------------- #

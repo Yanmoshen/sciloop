@@ -46,7 +46,6 @@ __all__ = [
 #: 容器里访问宿主的默认地址（Linux 下由 compose 的 extra_hosts 提供同名映射）
 DEFAULT_URL = "http://host.docker.internal:8765"
 URL_ENV = "SCILOOP_HOST_RUNNER_URL"
-TOKEN_ENV = "SCILOOP_HOST_RUNNER_TOKEN"
 DEFAULT_TIMEOUT_S = 30.0
 
 #: 宿主路径的学习缓存（`/health` 里带回；60 秒内不重复问）
@@ -58,7 +57,7 @@ START_HINT = (
     "我还没连上你这台电脑上的执行器，所以现在只能读数据、动不了你机器上的文件。"
     "在项目目录里打开一个终端，运行这一行就能连上：\n\n"
     "    python tools/host-runner/host_runner.py\n\n"
-    "它启动后会打印一串密钥，把那串密钥填到设置页里就可以了。"
+    "它用的是你项目里那一枚 Owner 密钥，不用另外配什么。"
 )
 
 
@@ -67,7 +66,15 @@ def runner_url() -> str:
 
 
 def runner_token() -> str:
-    return os.environ.get(TOKEN_ENV, "").strip()
+    """执行器用**同一枚 Owner 密钥**（研究者 2026-09-22：不要多搞一套密钥）。
+
+    后端校验写操作的那枚令牌，就是调执行器时带的那枚 —— 少一套密钥，
+    就少一处"两把钥匙对不上"的故障面。
+    """
+
+    from core.config import get_settings
+
+    return (get_settings().owner_token or "").strip()
 
 
 def _headers() -> dict[str, str]:

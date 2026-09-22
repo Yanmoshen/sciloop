@@ -46,7 +46,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DEFAULT_PORT = 8765
 DEFAULT_TIMEOUT_S = 120
 MAX_OUTPUT_CHARS = 200_000
@@ -61,9 +61,41 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 #: 研究工作项目的默认根目录（新建项目时在这里建目录；用户选本地文件夹时不受它限制）
 PROJECT_ROOT = REPO_ROOT / "research-workspaces"
 
+#: **执行器不自己生成密钥**（研究者 2026-09-22 明确要求：「不要做执行器密钥，
+#: 不要搞那么多密钥，只要 owner 密钥就够了」）—— 它直接用项目 `.env` 里那枚
+#: Owner 令牌：优先环境变量，其次读 `.env`。
+OWNER_TOKEN_ENV = "SCILOOP_OWNER_TOKEN"
+ENV_FILE = REPO_ROOT / ".env"
+
+
+def read_owner_token() -> str:
+    """取 Owner 令牌：环境变量 → 项目 `.env`（**必须剥掉行内注释**）。
+
+    ⚠️ 踩过的坑：`.env` 写成 `OWNER_TOKEN=abc  # 说明` 时，不剥注释会把中文注释
+    一起当进令牌值里 → 比较时抛 `TypeError: comparing strings with non-ASCII characters`，
+    表现为接口 500（看着像鉴权坏了，其实是值里带了中文）。
+    """
+
+    from_env = (os.environ.get(OWNER_TOKEN_ENV) or "").strip()
+    if from_env:
+        return from_env
+    try:
+        for raw in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            if key.strip() != "OWNER_TOKEN":
+                continue
+            value = value.split("#", 1)[0].strip().strip('"').strip("'")
+            return value
+    except OSError:
+        return ""
+    return ""
+
 
 # --------------------------------------------------------------------------- #
-# 状态：密钥与端口（写在用户主目录，不放在仓库里）
+# 状态：只有端口与版本（**不再存任何密钥**）
 # --------------------------------------------------------------------------- #
 def load_or_create_state(port: int) -> dict[str, Any]:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -73,12 +105,11 @@ def load_or_create_state(port: int) -> dict[str, Any]:
             state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             state = {}
-    if not state.get("token"):
-        state["token"] = secrets.token_urlsafe(32)
+    # 老版本在这个文件里存过自生成密钥 —— 就地清掉，避免"到底哪枚密钥才算数"的混乱
+    state.pop("token", None)
     state["port"] = port
     state["version"] = VERSION
     state["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    # 只给当前用户读写：密钥不是机密，但没必要让同机其他账户看见
     try:
         STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
         os.chmod(STATE_FILE, 0o600)
@@ -423,12 +454,26 @@ def _selftest() -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="SciLoop 宿主执行器：让 SciLoop 能在你这台电脑上跑命令、读写文件")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"监听端口（默认 {DEFAULT_PORT}）")
-    parser.add_argument("--print-token", action="store_true", help="只打印密钥后退出（不启动服务）")
     parser.add_argument("--selftest", action="store_true", help="自检本机能不能跑命令、读文件后退出")
+    parser.add_argument(
+        "--token",
+        default="",
+        help="Owner 密钥（默认从环境变量或项目 .env 读，一般不用手动给）",
+    )
     args = parser.parse_args(argv)
 
     if args.selftest:
         return _selftest()
+
+    # 认证就用 Owner 那一枚密钥 —— 不再有"执行器自己的密钥"
+    token = (args.token or "").strip() or read_owner_token()
+    if not token:
+        print("")
+        print("启动失败：没有找到 Owner 密钥。")
+        print(f"请确认项目里的 {ENV_FILE} 有一行 OWNER_TOKEN=...（或用环境变量 {OWNER_TOKEN_ENV} 给）。")
+        print("密钥就这一枚，SciLoop 的后端和执行器共用它。")
+        print("")
+        return 2
 
     # 研究工作项目的根目录先建好：模型"没有特别指定目录"时就在这儿干活
     try:
@@ -436,18 +481,14 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:  # pragma: no cover - 权限异常时只说一声，不让启动失败
         print(f"（提示：没能创建 {PROJECT_ROOT}：{exc}）")
 
-    state = load_or_create_state(args.port)
-    token = str(state["token"])
-
-    if args.print_token:
-        print(token)
-        return 0
+    load_or_create_state(args.port)
 
     Handler.token = token
     Handler.started_at = time.time()
 
-    # 启动时先探一次"能不能起子进程"：不行就当场说清，别等用户点了半天才发现
-    probe = run_command(argv=[sys.executable, "-c", "print('ok')"], cwd=str(Path.home()), timeout_s=20)
+    # 启动时先探一次"能不能起子进程"：不行就当场说清，别等用户点了半天才发现。
+    # 超时给 5 秒就够（正常是毫秒级）；探测卡住不该拖着用户看不到启动横幅。
+    probe = run_command(argv=[sys.executable, "-c", "print('ok')"], cwd=str(Path.home()), timeout_s=5)
 
     # 绑定 127.0.0.1：局域网/外网都连不上，只有本机能调
     try:
@@ -460,14 +501,10 @@ def main(argv: list[str] | None = None) -> int:
         print("")
         return 2
 
-    # 启动时先探一次"能不能起子进程"：不行就当场说清，别等用户点了半天才发现。
-    # 超时给 5 秒就够（正常是毫秒级）；探测卡住不该拖着用户看不到启动横幅。
-    probe = run_command(argv=[sys.executable, "-c", "print('ok')"], cwd=str(Path.home()), timeout_s=5)
     _say("")
     _say("SciLoop 宿主执行器已启动（保持这个窗口开着）")
     _say(f"  监听地址：http://127.0.0.1:{args.port}（只有本机能访问）")
-    _say(f"  密钥文件：{STATE_FILE}")
-    _say(f"  把这行密钥复制到 SciLoop 的设置页：{token}")
+    _say("  认证：用项目 .env 里的 Owner 密钥（不显示明文）")
     _say("  停止：按 Ctrl+C")
     if not probe.get("ok"):
         _say("")
