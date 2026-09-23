@@ -37,12 +37,17 @@ STATE_NAME = "skills-state.json"
 
 
 def state_path(root: Path | str | None = None) -> Path:
+    """状态文件位置：**必须在挂载卷里**，否则重建容器就全丢（2026-09-23 实测踩到）。
+
+    `.cache/artifacts` 是挂着的（宿主 `./.data/artifacts`），所以放在它下面；
+    下划线开头标明它**不是产物**，只是技能库自己的状态。
+    """
+
     if root is not None:
-        return Path(root) / "skills" / STATE_NAME
+        return Path(root) / STATE_NAME
     from services.translate.artifacts import default_artifact_root
 
-    # 与产物同一个根（compose 已把宿主 `./.data` 绑进来），但单独一个 skills/ 子目录
-    return default_artifact_root().parent / "skills" / STATE_NAME
+    return default_artifact_root() / "_skills" / STATE_NAME
 
 
 def load_state(root: Path | str | None = None) -> dict[str, Any]:
