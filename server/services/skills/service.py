@@ -20,9 +20,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+from services.skills import health as health_mod
 from services.skills import registry, runner, state
 
 __all__ = [
+    "health_check",
     "library",
     "prompt_catalog",
     "run",
@@ -56,6 +58,9 @@ def library(*, root: Path | str | None = None) -> dict[str, Any]:
 
     packs = all_packs(root=root)
     enabled_map = state.load_state(root).get("enabled") or {}
+    # 体检结论（**没体检过就是空**：界面据此说"还没体检"，而不是假装知道能不能跑）
+    checked = state.cached_health(root=root)
+    checked_skills = (checked or {}).get("skills") or {}
     by_stage: dict[str, list[str]] = {}
     items: list[dict[str, Any]] = []
     for pack in packs:
@@ -77,6 +82,8 @@ def library(*, root: Path | str | None = None) -> dict[str, Any]:
             "problems": list(pack.problems),
             "requires_env": list(getattr(pack, "requires_env", []) or []),
             "missing_env": _requires_ready(pack),
+            # 体检结论（可能为空 = 还没体检）
+            "health": checked_skills.get(pack.name) or None,
         }
         items.append(item)
         by_stage.setdefault(pack.stage_label, []).append(pack.name)
@@ -84,6 +91,9 @@ def library(*, root: Path | str | None = None) -> dict[str, Any]:
         "items": items,
         "stages": [{"label": label, "names": names} for label, names in by_stage.items()],
         "mounts": state.mounts(root=root),
+        "health_checked_at": (checked or {}).get("checked_at", ""),
+        "health_probe_error": (checked or {}).get("probe_error", ""),
+        "health_python": (checked or {}).get("python", ""),
         "total": len(items),
         "enabled": sum(1 for item in items if item["enabled"]),
         "runnable": sum(1 for item in items if item["runnable"]),
@@ -194,3 +204,19 @@ def save_skill(name: str, content: str, *, root: Path | str | None = None) -> di
         "problems": pack.problems,
         "message": "已保存。" if not pack.problems else "保存了，但还有问题要修：" + "；".join(pack.problems[:3]),
     }
+
+
+async def health_check(*, root: Path | str | None = None) -> dict[str, Any]:
+    """体检一次：算依赖（静态）+ 让宿主用跑技能的解释器报一遍包在不在（一次只读探针）。
+
+    ⚠️ 会**在研究者电脑上跑一条只读命令**；结论缓存下来，界面直接读缓存。
+    探针失败时如实记 `probe_error`，不假装体检通过。
+    """
+
+    import time as _time
+
+    packs = all_packs(root=root)
+    result = await health_mod.check_all(packs=packs, python=runner.python_bin())
+    result["checked_at"] = _time.strftime("%Y-%m-%dT%H:%M:%SZ", _time.gmtime())
+    state.save_health(result, root=root)
+    return result

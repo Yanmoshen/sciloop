@@ -20,7 +20,18 @@ import time
 from pathlib import Path
 from typing import Any
 
-__all__ = ["STATE_NAME", "add_mount", "is_enabled", "load_state", "mounts", "remove_mount", "set_enabled", "state_path"]
+__all__ = [
+    "STATE_NAME",
+    "add_mount",
+    "cached_health",
+    "is_enabled",
+    "load_state",
+    "mounts",
+    "remove_mount",
+    "save_health",
+    "set_enabled",
+    "state_path",
+]
 
 STATE_NAME = "skills-state.json"
 
@@ -57,10 +68,24 @@ def save_state(state: dict[str, Any], root: Path | str | None = None) -> Path:
     payload = {
         "enabled": dict(state.get("enabled") or {}),
         "mounts": [str(item) for item in (state.get("mounts") or [])],
+        # 依赖体检结果（有就跑过，没有就是"还没体检"——界面不许假装知道）
+        "health": dict(state.get("health") or {}),
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
+
+
+def cached_health(*, root: Path | str | None = None) -> dict[str, Any]:
+    """上次体检的结果（没体检过就是空字典）。"""
+
+    return dict(load_state(root).get("health") or {})
+
+
+def save_health(health: dict[str, Any], *, root: Path | str | None = None) -> Path:
+    state = load_state(root)
+    state["health"] = health
+    return save_state(state, root)
 
 
 def is_enabled(name: str, *, root: Path | str | None = None) -> bool:

@@ -15,6 +15,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import {
   fetchLibrary,
   fetchSkillDetail,
+  runSkillHealthCheck,
   mountSkillsDir,
   saveSkill,
   setSkillEnabled,
@@ -44,6 +45,10 @@ const stage = ref<string>('全部')
 const keyword = ref('')
 const onlyRunnable = ref(false)
 const busyName = ref('')
+const healthBusy = ref(false)
+/** 体检结论（跑完就更新；`null` = 还没体检过） */
+const healthAt = ref('')
+const healthError = ref('')
 
 const mountDialog = reactive({ open: false, path: '', busy: false })
 const editDialog = reactive({ open: false, name: '', content: '', busy: false, canEditName: true })
@@ -181,6 +186,30 @@ function modeLabel(item: SkillItem): string {
   return item.mode === 'scripts' ? `可跑 ${item.steps} 步` : '说明书'
 }
 
+
+/**
+ * 体检一次：算每个技能要用哪些第三方包，并在**研究者电脑上跑一条只读探针**看这些包与密钥在不在。
+ *
+ * 为什么要它：本机实测有过两种"跑到一半才炸"——缺 Python 包、缺 API key（还有包本身是坏的）。
+ * 提前说清"这个技能现在跑不了、缺什么"，比跑一半报错强得多。
+ */
+async function runHealthCheck(): Promise<void> {
+  healthBusy.value = true
+  errorText.value = ''
+  healthError.value = ''
+  try {
+    const result = await runSkillHealthCheck()
+    healthAt.value = result.checked_at
+    healthError.value = result.probe_error || ''
+    noticeText.value = result.probe_error ? '体检没做成（见下方提示）' : '体检完成'
+    await reload()
+  } catch (err) {
+    errorText.value = readableError(err, '体检没做成（要研究者身份）')
+  } finally {
+    healthBusy.value = false
+  }
+}
+
 onMounted(reload)
 </script>
 
@@ -193,8 +222,10 @@ onMounted(reload)
           装了 {{ counts.total }} 个 · 启用 {{ counts.enabled }} 个 · 能真跑 {{ counts.runnable }} 个
           <span v-if="counts.instructions">（其中 {{ counts.instructions }} 个是说明书型，不用跑脚本）</span>
         </p>
+        <span v-if="healthAt"> · 上次体检 {{ healthAt.slice(0, 16).replace('T', ' ') }}</span>
       </div>
       <div class="sk__acts">
+        <el-button size="small" :loading="healthBusy" @click="runHealthCheck">体检</el-button>
         <el-button size="small" @click="mountDialog.open = true">挂载技能目录</el-button>
         <el-button size="small" @click="openEditor()">新建技能</el-button>
       </div>
@@ -219,6 +250,7 @@ onMounted(reload)
 
     <p v-if="noticeText" class="sk__notice">{{ noticeText }}</p>
     <p v-if="errorText" class="sk__error">{{ errorText }}</p>
+    <p v-if="healthError" class="sk__warn">{{ healthError }}</p>
     <p v-if="loading && !library" class="sk__hint">正在读技能库…</p>
 
     <ul class="sk__list">
@@ -233,8 +265,15 @@ onMounted(reload)
             <span v-if="item.version" class="sk__tag sk__tag--muted">v{{ item.version }}</span>
           </div>
           <p class="sk__desc">{{ item.description }}</p>
-          <p v-if="item.missing_env.length" class="sk__warn">
-            现在跑不了：缺 {{ item.missing_env.join('、') }}（在设置里配好就能用）
+          <!-- ⚠️ 只有**带脚本**的技能才谈"跑不了"；说明书型本来就不跑脚本，说它跑不了是误导 -->
+          <p v-if="item.mode === 'scripts' && item.health && !item.health.can_run" class="sk__warn">
+            现在跑不了：
+            <template v-if="item.health.missing_python.length">缺包 {{ item.health.missing_python.join('、') }}</template>
+            <template v-if="item.health.missing_python.length && item.health.missing_env.length">；</template>
+            <template v-if="item.health.missing_env.length">缺 {{ item.health.missing_env.join('、') }}</template>
+          </p>
+          <p v-else-if="item.mode === 'scripts' && !item.health && item.missing_env.length" class="sk__warn">
+            可能跑不了：缺 {{ item.missing_env.join('、') }}（点「体检」确认）
           </p>
           <p v-if="item.problems.length" class="sk__warn">{{ item.problems.join('；') }}</p>
         </div>

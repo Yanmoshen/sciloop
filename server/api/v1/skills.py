@@ -63,6 +63,20 @@ async def set_disabled(name: str) -> dict[str, Any]:
     return state.set_enabled(name, False)
 
 
+@router.post(
+    "/skills/health-check",
+    summary="体检：哪些技能在这台机器上跑不了（需研究者身份）",
+    dependencies=[Depends(require_owner)],
+)
+async def health_check() -> dict[str, Any]:
+    """算一遍依赖、并在研究者电脑上跑一条**只读**探针（看包在不在），结论缓存下来。
+
+    跑技能是执行类动作，所以这条也要研究者身份；但它只是 import 检查，不改任何东西。
+    """
+
+    return await service.health_check()
+
+
 @router.post("/skills/mounts", summary="挂载一个外部技能目录（需研究者身份）", dependencies=[Depends(require_owner)])
 async def add_mount(payload: MountBody = Body(...)) -> dict[str, Any]:
     result = state.add_mount(payload.path)

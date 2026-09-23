@@ -25,12 +25,24 @@ export interface SkillItem {
   requires_env: Array<{ name: string; required: boolean }>
   /** 声明了环境变量但当前没配的（界面据此说"现在跑不了"） */
   missing_env: string[]
+  /** 依赖体检结论（**没体检过是 null**：界面不许假装知道能不能跑） */
+  health: SkillHealth | null
+}
+
+export interface SkillHealth {
+  packages: string[]
+  missing_python: string[]
+  missing_env: string[]
+  can_run: boolean
 }
 
 export interface SkillLibrary {
   items: SkillItem[]
   stages: Array<{ label: string; names: string[] }>
   mounts: string[]
+  health_checked_at?: string
+  health_probe_error?: string
+  health_python?: string
   total: number
   enabled: number
   runnable: number
@@ -77,6 +89,17 @@ export function fetchSkillDetail(name: string): Promise<{
   problems: string[]
 }> {
   return get(`/skills/${encodeURIComponent(name)}`)
+}
+
+/** 体检一次：算依赖 + 在研究者的电脑上跑一条只读探针（看包/密钥在不在） */
+export function runSkillHealthCheck(): Promise<{
+  python: string
+  probe_error: string
+  probed_packages: string[]
+  skills: Record<string, SkillHealth>
+  checked_at: string
+}> {
+  return post('/skills/health-check', { body: {} })
 }
 
 export function fetchSkillRuns(taskId: string): Promise<{ task_id: string; runs: SkillRunRecord[] }> {
