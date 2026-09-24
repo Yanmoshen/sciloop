@@ -38,6 +38,7 @@ from services.aggregation.cards import existing_paper_ids, load_cards
 from services.aggregation.evolution import build_evolution_payload
 from services.aggregation.gap_finder import build_gaps_payload
 from services.aggregation.matrix import MAX_PAPERS, MIN_PAPERS, build_matrix_payload
+from services.aggregation.synthesis import generate_synthesis
 
 logger = logging.getLogger("sciloop.wp08.aggregation_service")
 
@@ -114,6 +115,15 @@ async def create_aggregation(
 ) -> dict[str, Any]:
     """构造并落库 ``aggregations`` + ``gaps``；返回含 id 的完整产物。"""
     payload = await build_aggregation_payload(session, paper_ids)
+
+    # 跨篇综述：**只用卡片与速览**（聚合不吃原论文）。
+    # 放在写路径而不是 build_aggregation_payload：后者是"只读预览"，不该为此产生模型调用。
+    # generate_synthesis 从不抛异常 —— 聚合是主体，综述失败不连累落库。
+    cards = await load_cards(session, payload["paper_ids"])
+    synthesis = await generate_synthesis(cards, project_id=project_id)
+    # 挂在 comparison_matrix 下：与既有的 matrix["missing"] 同一做法，避免加列（要动迁移链）
+    payload["comparison_matrix"]["synthesis"] = synthesis
+
     aggregation = Aggregation(
         project_id=project_id,
         paper_ids=payload["paper_ids"],
@@ -254,6 +264,8 @@ async def get_aggregation(session: AsyncSession, aggregation_id: int) -> dict[st
         "gap_count": len(gaps),
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "dimension_count": len(matrix.get("dimensions") or []),
+        # 跨篇综述（矩阵之外的另一半产物）：直接透出 comparison_matrix 里那份
+        "synthesis": matrix.get("synthesis"),
         "compliance_note": "本内容由 AI 辅助生成，需研究者自行核验",
     }
 

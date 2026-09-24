@@ -74,6 +74,12 @@ from services.aggregation.span_locator import (
     locate_in_spans,
     span_payload,
 )
+from services.aggregation.synthesis import (
+    SYNTHESIS_PURPOSE,
+    SYNTHESIS_SYSTEM,
+    build_synthesis_messages,
+    generate_synthesis,
+)
 
 __all__ = [
     # 卡片读取层
@@ -89,6 +95,11 @@ __all__ = [
     "existing_paper_ids",
     "load_cards",
     "scope_of",
+    # 跨篇综述（矩阵之外的另一半产物）
+    "SYNTHESIS_PURPOSE",
+    "SYNTHESIS_SYSTEM",
+    "build_synthesis_messages",
+    "generate_synthesis",
     # 定位层
     "LOCATOR_CARD",
     "LOCATOR_EXACT",

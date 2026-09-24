@@ -31,6 +31,7 @@ import MatrixTable from '@/components/MatrixTable.vue'
 import ViewStatePanel from '@/components/ViewStatePanel.vue'
 import { useIdeaStore } from '@/stores/idea'
 import { useSessionStore } from '@/stores/session'
+import { toBoldHtml } from '@/utils/richText'
 
 const route = useRoute()
 const router = useRouter()
@@ -66,12 +67,13 @@ const busy = computed(() =>
   ['createAggregation', 'loadAggregation', 'loadAggregations'].includes(store.busy ?? ''),
 )
 
-/** 降级：矩阵声明了取不到卡片的论文，或存在仅摘要级证据的行 */
-const matrixMissing = computed(() => store.aggregation?.comparison_matrix?.missing ?? [])
-const abstractOnlyRows = computed(
-  () =>
-    (store.aggregation?.comparison_matrix?.rows ?? []).filter((row) => row.scope === 'abstract_only'),
-)
+/** 跨篇综述（矩阵之外的另一半产物）：只用各篇卡片与速览生成，失败时如实显示「生成失败」 */
+const synthesisText = computed(() => {
+  const value = store.aggregation?.comparison_matrix?.synthesis
+  if (!value || value.status !== 'ok') return ''
+  return String(value.text ?? '').trim()
+})
+const synthesisHtml = computed(() => toBoldHtml(synthesisText.value))
 
 const paperInput = ref('')
 const tab = ref<'matrix' | 'evolution' | 'gaps'>('matrix')
@@ -296,6 +298,12 @@ const aggregation = computed(() => store.aggregation)
       />
     </section>
 
+    <!-- 跨篇综述：矩阵之外的另一半产物（只用各篇卡片与速览生成）；失败如实显示 -->
+    <section v-if="aggregation" class="agg__synthesis" data-role="aggregate-synthesis">
+      <p v-if="synthesisText" class="agg__synthesis-text" v-html="synthesisHtml" />
+      <p v-else class="agg__synthesis-failed">生成失败</p>
+    </section>
+
     <nav class="agg__tabs">
       <button type="button" :class="['agg__tab', { 'agg__tab--on': tab === 'matrix' }]" @click="tab = 'matrix'">
         对比矩阵
@@ -382,6 +390,28 @@ const aggregation = computed(() => store.aggregation)
 <style scoped>
 .agg {
   padding: var(--space-4);
+}
+
+/* 跨篇综述：与解析页的速览块同一形态（同一类产物，样式不该两样） */
+.agg__synthesis {
+  margin-bottom: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background-color: var(--color-bg-subtle);
+}
+
+.agg__synthesis-text {
+  margin: 0;
+  font-size: var(--font-size-md);
+  line-height: var(--line-height-base);
+  color: var(--color-text-primary);
+}
+
+.agg__synthesis-failed {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
 }
 .agg__header {
   display: flex;

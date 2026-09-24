@@ -104,6 +104,20 @@ export interface ComparisonMatrix {
   missing?: Array<{ paper_id: number; reason: string }>
   notes?: string[]
   compliance_note?: string
+  /** 跨篇综述（矩阵之外的另一半产物）：随聚合一起生成，失败时 status='failed' */
+  synthesis?: AggregationSynthesis | null
+}
+
+/** 跨篇综述：一段 200–400 字（中文按字、英文术语按词），**只用各篇卡片与速览** */
+export interface AggregationSynthesis {
+  status: 'ok' | 'failed'
+  text?: string
+  chars?: number
+  paper_count?: number
+  model_ref?: string | null
+  generated_at?: string | null
+  /** 失败原因码（内部口径，**前端不显示**） */
+  reason?: string
 }
 
 export interface EvolutionRelation {

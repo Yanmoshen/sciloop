@@ -27,6 +27,7 @@ import { useRoute } from 'vue-router'
 
 import MarkdownText from '@/components/MarkdownText.vue'
 import ViewStatePanel from '@/components/ViewStatePanel.vue'
+import { toBoldHtml } from '@/utils/richText'
 import { ApiError } from '@/api/client'
 import { useSessionStore } from '@/stores/session'
 import {
@@ -164,14 +165,8 @@ const summaryText = computed(() => {
   return String(summary.text ?? '').trim()
 })
 
-/** 速览只允许 `**加粗**`：**先转义再替换**，不放任正文里的 HTML 进来 */
-const summaryHtml = computed(() => {
-  const escaped = summaryText.value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-  return escaped.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-})
+/** 速览只允许 `**加粗**`（转义与替换收在 utils/richText，避免两处各写一遍写歪） */
+const summaryHtml = computed(() => toBoldHtml(summaryText.value))
 
 /** 当前高亮片段 */
 const activeSpan = computed<PaperSpan | null>(() => {
