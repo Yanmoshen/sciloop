@@ -58,11 +58,59 @@ START_HINT = (
     "在项目目录里打开一个终端，运行这一行就能连上：\n\n"
     "    python tools/host-runner/host_runner.py\n\n"
     "它用的是你项目里那一枚 Owner 密钥，不用另外配什么。"
+    "（没装也能用：`docker compose up` 会带一个容器执行环境，只是它只能碰挂进去的目录。）"
 )
 
 
+#: compose 自带的容器执行环境（零手工；没起真机执行器时用它）
+COMPOSE_URL = "http://executor:8765"
+
+#: 挑选结果缓存（避免每条命令都试一遍）
+_PICKED: dict[str, Any] = {"url": "", "at": 0.0}
+PICK_TTL_S = 20.0
+
+
 def runner_url() -> str:
+    """`.env` 明确指定（或默认值）——**显式配置优先**。"""
+
     return (os.environ.get(URL_ENV) or DEFAULT_URL).rstrip("/")
+
+
+async def resolve_url(*, client: httpx.AsyncClient | None = None, force: bool = False) -> str:
+    """挑一个**能用的**执行环境（研究者 2026-09-24 定的顺序）：
+
+    1. `.env` 里明确写了地址 → 用它（想接自己那台机器的人照旧）；
+    2. **宿主机执行器**（研究者装了开机自启的那个，能力最强：能碰整台机器）→ 用它；
+    3. compose 自带的**容器执行环境**（零手工兜底）→ 用它。
+
+    这样"别人拿去 `docker compose up`"开箱可用，而"想用真机"的人装上自启就自动优先真机。
+    """
+
+    explicit = (os.environ.get(URL_ENV) or "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+
+    now = time.monotonic()
+    if not force and _PICKED["url"] and now - float(_PICKED["at"] or 0.0) < PICK_TTL_S:
+        return str(_PICKED["url"])
+
+    owns = client is None
+    probe = client or httpx.AsyncClient(timeout=3.0)
+    try:
+        for candidate in (DEFAULT_URL, COMPOSE_URL):
+            try:
+                response = await probe.get(f"{candidate.rstrip('/')}/health")
+                if response.status_code == 200:
+                    _PICKED.update({"url": candidate.rstrip("/"), "at": now})
+                    return str(_PICKED["url"])
+            except httpx.HTTPError:
+                continue
+    finally:
+        if owns:
+            await probe.aclose()
+
+    _PICKED.update({"url": "", "at": now})
+    return DEFAULT_URL.rstrip("/")
 
 
 def runner_token() -> str:
@@ -92,7 +140,7 @@ async def health(*, client: httpx.AsyncClient | None = None) -> dict[str, Any]:
     owns = client is None
     client = client or httpx.AsyncClient(timeout=5.0)
     try:
-        response = await client.get(f"{runner_url()}/health")
+        response = await client.get(f"{await resolve_url(client=client)}/health")
         if response.status_code != 200:
             return {"reachable": False, "status": response.status_code}
         data = response.json()
@@ -116,7 +164,7 @@ async def _post(
     owns = client is None
     client = client or httpx.AsyncClient(timeout=timeout_s)
     try:
-        response = await client.post(f"{runner_url()}{path}", json=payload, headers=_headers())
+        response = await client.post(f"{await resolve_url(client=client)}{path}", json=payload, headers=_headers())
         if response.status_code == 401:
             return {
                 "ok": False,

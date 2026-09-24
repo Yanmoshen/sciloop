@@ -71,7 +71,7 @@ def python_bin() -> str:
 HOST_ARTIFACT_SUFFIX = Path(".data") / "artifacts"
 
 
-def host_mirror(container_path: Path | str, *, host_root: str | None) -> Path | None:
+def host_mirror(container_path: Path | str, *, host_root: str | None, artifacts_view: str | None = None) -> Path | None:
     """把**容器里的产物路径**换成**宿主上的同一路径**。
 
     ⚠️ 不加这一步，脚本在宿主上跑时会拿到 `/app/server/...` 这种路径 → "工作目录不存在"（实测踩过）。
@@ -86,6 +86,10 @@ def host_mirror(container_path: Path | str, *, host_root: str | None) -> Path | 
         relative = path.resolve().relative_to(container_root.resolve())
     except ValueError:
         return None
+    # 执行环境**自报**它把产物目录挂在哪（容器执行器是 /artifacts；宿主机执行器没报，就用默认的 .data/artifacts）
+    view = str(artifacts_view or "").strip()
+    if view:
+        return Path(view) / relative
     return Path(host_root) / HOST_ARTIFACT_SUFFIX / relative
 
 
@@ -267,8 +271,9 @@ async def run_skill(
 
     project = project_dir or str(info.get("default_cwd") or host_root or "")
     # ⚠️ 给脚本的参数必须是**宿主路径**（脚本在宿主上跑）；读产物仍用容器路径（卷映射，同一份文件）
-    host_work = host_mirror(work_dir, host_root=host_root) or work_dir
-    host_out = host_mirror(base, host_root=host_root) or base
+    view = str(info.get("artifacts_root") or "")
+    host_work = host_mirror(work_dir, host_root=host_root, artifacts_view=view) or work_dir
+    host_out = host_mirror(base, host_root=host_root, artifacts_view=view) or base
     plan = plan_commands(
         pack,
         topic=topic,

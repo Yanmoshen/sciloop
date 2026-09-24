@@ -129,6 +129,41 @@ services:
       retries: 5
       start_period: 20s
 
+  # 容器执行环境（2026-09-24）：`docker compose up` 之后就能在"执行环境"里跑命令，
+  # **不需要研究者再去起什么本机进程**。想用真机执行的人装上 tools/host-runner 的自启即可，
+  # 后端会自动优先用真机（见 services/agent/host_runner.py 的候选顺序）。
+  executor:
+    build:
+      context: ./server
+      dockerfile: Dockerfile.executor
+    container_name: sciloop-executor
+    restart: unless-stopped
+    environment:
+      # 与后端同一枚 Owner 密钥（少一套密钥就少一处故障面）
+      OWNER_TOKEN: ${OWNER_TOKEN:-}
+      EXEC_WORKSPACE: /workspace
+      EXEC_ARTIFACTS: /artifacts
+      EXEC_DEFAULT_CWD: /workspace
+      TZ: UTC
+    volumes:
+      # 整个项目根（研究者 2026-09-24 明确要的：技能要能直接读项目里的文件）
+      - ./:/workspace
+      # 产物目录：与后端看到的是**同一份**（宿主 ./.data/artifacts）
+      - ./.data/artifacts:/artifacts
+    # ⚠️ 故意不发布端口：只在 compose 内网可达，外面连不上
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8765/health', timeout=3).status == 200 else 1)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
   frontend:
     build:
       context: ./web

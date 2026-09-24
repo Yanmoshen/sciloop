@@ -176,6 +176,92 @@ function durationText(turn: Turn): string {
   return ''
 }
 
+/**
+ * 这一轮是不是「正在跑」的那一轮 —— 给它加图标自转与文案流光，跑完就停
+ */
+function isLiveTurn(index: number): boolean {
+  return phase.value === 'thinking' && index === turns.value.length - 1
+}
+
+/**
+ * 过程行左侧图标：**由前端按标签关键词 + 语气（tone）映射**。
+ *
+ * 为什么不在后端给：过程行是后端 `tool_row()` 生成的、随 SSE 与落盘走，
+ * 为图标扩字段要动协议与存储格式；而"用什么图标"本来就是展示层的事。
+ */
+function rowIcon(row: TurnRow): string {
+  const tone = String(row.tone ?? 'idle')
+  // tone 是后端给的权威终态：完成/失败先按它定，别指望标签里一定带"完成"两个字
+  if (tone === 'err') return 'x'
+  if (tone === 'ok') return 'check'
+  const label = String(row.label ?? '')
+  if (/批准|确认|等待/.test(label)) return 'shield'
+  if (/搜索|检索|联网|网络/.test(label)) return 'globe'
+  if (/论文库|知识库|文献库|复检|摘录|解析/.test(label)) return 'db'
+  if (/写|保存|导出|生成文件/.test(label)) return 'pen'
+  // 文字里已经写明结果的行（tone 可能是 warn，靠标签认不出来）
+  if (/未完成|失败|拒绝|不在允许/.test(String(row.text ?? ''))) return 'x'
+  if (/删除|清空/.test(label)) return 'x'
+  return 'term'
+}
+
+/** 「降级说明」这类标签没有信息量（正文里已经说清楚），研究者要求不显示 */
+const HIDDEN_ROW_LABELS = new Set(['降级说明'])
+
+/** 过程行的药丸标签：空标签与"无信息量标签"都不渲染 —— 否则会剩一个空框 */
+function rowKind(row: TurnRow): string {
+  const label = String(row.label ?? '').trim()
+  return HIDDEN_ROW_LABELS.has(label) ? '' : label
+}
+
+/**
+ * 这一行现在是不是"还在跑"：只有**开始行**（tone=info）且**后面还没有结果行**才算在跑。
+ * 命令一结束（成功或失败）点就消失 —— 否则「调用…」那行会一直转，看着像卡住了。
+ */
+function rowIsRunning(rows: TurnRow[], index: number): boolean {
+  const row = rows[index]
+  if (!row || String(row.tone ?? '') !== 'info') return false
+  const label = String(row.label ?? '')
+  for (let i = index + 1; i < rows.length; i++) {
+    const tone = String(rows[i].tone ?? '')
+    if (tone === 'ok' || tone === 'err' || tone === 'warn') {
+      if (!label || String(rows[i].label ?? '') === label) return false
+    }
+  }
+  return true
+}
+
+/** 运行态动效：等人是呼吸；"在跑"才是三点；其余（完成/失败/静态）什么都不加 */
+function rowMotion(rows: TurnRow[], index: number): string {
+  const row = rows[index]
+  if (!row) return ''
+  if (/等待研究者批准|需要你确认/.test(String(row.text ?? ''))) return 'mo-breathe'
+  return rowIsRunning(rows, index) ? 'mo-dots' : ''
+}
+
+/**
+ * **还没落成"行内思考段"的那部分思考** = 累计思考文本减去已提交的片段。
+ * 后端把每轮思考按顺序拼进 `turn.reasoning`，同时把每轮以 `row.kind='reasoning'` 落成一行，
+ * 所以"总长 - 已提交"就是还在顶部显示的那段（正在想的那一轮）。
+ * 用逐段 indexOf 定位（后端每段都 strip 过，直接减长度会差几个空白字符）；
+ * 一段都对不上就退回整段显示 —— 宁可重复，也不丢字。
+ */
+function liveReasoning(turn: Turn): string {
+  const full = String(turn.reasoning ?? '')
+  const segments = (turn.rows ?? [])
+    .filter((row) => row.kind === 'reasoning')
+    .map((row) => String(row.text ?? ''))
+  if (segments.length === 0) return full
+  let cursor = 0
+  for (const segment of segments) {
+    if (!segment) continue
+    const at = full.indexOf(segment, cursor)
+    if (at === -1) return full
+    cursor = at + segment.length
+  }
+  return full.slice(cursor)
+}
+
 /** 思考过程折叠入口的文案：进行中「思考中…」，结束后「已思考 Ns」 */
 function reasonLabel(turn: Turn): string {
   if (turn.status === 'streaming') return '思考中…'
@@ -202,6 +288,21 @@ function removeFile(index: number): void {
   files.value = files.value.filter((_, i) => i !== index)
 }
 
+/**
+ * 这一条是不是**本轮的最后一条助手消息**（本轮 = 到下一个提问为止）？
+ *
+ * 复制按钮只挂在它下面 —— 一轮里助手会说好几段话（说一句、调工具、再说一句…），
+ * 中间那几段挂按钮就成了"内容还没完，复制先冒出来"（2026-09-24 实测报的）。
+ */
+function isLastOfRound(index: number): boolean {
+  for (let next = index + 1; next < turns.value.length; next += 1) {
+    const turn = turns.value[next]
+    if (turn.role === 'user') return true
+    if (turn.role === 'assistant') return false
+  }
+  return true
+}
+
 async function copyAnswer(index: number, text: string): Promise<void> {
   try {
     await navigator.clipboard.writeText(text)
@@ -223,10 +324,26 @@ async function autoGrow(): Promise<void> {
   el.style.height = `${Math.min(el.scrollHeight, 200)}px`
 }
 
-async function scrollToBottom(): Promise<void> {
+/**
+ * 是否"粘住底部"：**只有用户本来就在底部时，新内容才自动滚过去** ——
+ * 否则他在往上翻旧内容时，每次流式输出都会把他拽回底部，根本没法读。
+ */
+const followBottom = ref(true)
+const FOLLOW_SLACK_PX = 80
+
+function onThreadScroll(): void {
+  const el = threadEl.value
+  if (!el) return
+  followBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_SLACK_PX
+}
+
+/** `force = true` 用于"用户自己发起"的动作（发送 / 切会话），这些必须落到底部 */
+async function scrollToBottom(force = false): Promise<void> {
   await nextTick()
   const el = threadEl.value
-  if (el) el.scrollTop = el.scrollHeight
+  if (!el) return
+  if (!force && !followBottom.value) return
+  el.scrollTop = el.scrollHeight
 }
 
 function startTicker(): void {
@@ -277,6 +394,8 @@ async function resetToNewConversation(): Promise<void> {
 }
 
 async function loadConversation(id: string): Promise<void> {
+  // 切会话是用户主动动作 → 重新粘住底部
+  followBottom.value = true
   stopTicker()
   phase.value = 'idle'
   errorText.value = ''
@@ -674,6 +793,23 @@ function showContent(turn: Turn): boolean {
  * ------------------------------------------------------------------ */
 const reasonOpen = ref<Set<number>>(new Set())
 
+/**
+ * 行内思考段（`row.kind === 'reasoning'`）的展开状态 —— 与按"轮"折叠的 reasonOpen 分开存，
+ * key 用 `轮下标-行下标`：同一轮里可能有好几段思考，不能共用一个 boolean。
+ */
+const inlineReasonOpen = ref<Set<string>>(new Set())
+
+function isInlineReasonOpen(key: string): boolean {
+  return inlineReasonOpen.value.has(key)
+}
+
+function toggleInlineReason(key: string): void {
+  const next = new Set(inlineReasonOpen.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  inlineReasonOpen.value = next
+}
+
 function isReasonOpen(index: number): boolean {
   return reasonOpen.value.has(index)
 }
@@ -779,6 +915,8 @@ function maybeAutoContinue(done: StreamDone): void {
 
 async function send(): Promise<void> {
   if (!canSend.value || phase.value === 'thinking') return
+  // 自己发出去的这句话必须看得到 → 重新粘住底部
+  followBottom.value = true
   const text = prompt.value.trim() || files.value.map((file) => file.name).join('、')
   if (!text) return
   const model = pickedModel()
@@ -962,7 +1100,51 @@ onUnmounted(() => {
 
     <!-- 对话态不再显示标题栏：标题在左栏会话行上（已高亮），「流水线工作台」入口移到左栏项目行的 ⋯ 菜单，
          消息区因此直接顶上，可用高度更大。 -->
-    <div v-if="active" ref="threadEl" class="thread scroll-y">
+    <!-- 思考/过程图标集（内联 sprite，16px，吃 currentColor）。
+         放在对话流里一次定义，所有过程行与「思考中」都引用它 —— 不用引图标库，也不加网络请求。 -->
+    <svg width="0" height="0" style="position: absolute" aria-hidden="true">
+      <defs>
+        <symbol id="sl-atom" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25">
+          <ellipse cx="8" cy="8" rx="7" ry="3.1" />
+          <ellipse cx="8" cy="8" rx="7" ry="3.1" transform="rotate(62 8 8)" />
+          <circle cx="8" cy="8" r="1.5" fill="currentColor" stroke="none" />
+        </symbol>
+        <symbol id="sl-globe" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25">
+          <circle cx="8" cy="8" r="6.1" /><ellipse cx="8" cy="8" rx="2.6" ry="6.1" /><path d="M2.2 8h11.6" />
+        </symbol>
+        <symbol id="sl-db" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25">
+          <ellipse cx="8" cy="3.9" rx="5.4" ry="2.2" />
+          <path d="M2.6 3.9v8.2M13.4 3.9v8.2" />
+          <path d="M2.6 8c0 1.2 2.4 2.2 5.4 2.2s5.4-1 5.4-2.2" />
+          <path d="M2.6 12.1c0 1.2 2.4 2.2 5.4 2.2s5.4-1 5.4-2.2" />
+        </symbol>
+        <symbol id="sl-term" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="1.6" y="3" width="12.8" height="10" rx="2" />
+          <path d="M4.3 6.4 6.4 8l-2.1 1.6M8.3 10h3.4" />
+        </symbol>
+        <symbol id="sl-pen" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round">
+          <path d="M3 2.6h6.2L13 6.4V13a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V3.6a1 1 0 0 1 1-1Z" />
+          <path d="M8.9 2.8v3.9h3.9" /><path d="M5.4 11.6l3.1-3.1" />
+        </symbol>
+        <symbol id="sl-shield" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round">
+          <path d="M8 1.9 13.2 4v4.1c0 3-2.2 5.3-5.2 6-3-.7-5.2-3-5.2-6V4L8 1.9Z" />
+          <path d="M6.3 7.9 7.7 9.4l2.2-2.5" />
+        </symbol>
+        <symbol id="sl-check" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3.4 8.6 6.4 11.6 12.6 4.9" />
+        </symbol>
+        <symbol id="sl-x" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+          <path d="M4.2 4.2 11.8 11.8M11.8 4.2 4.2 11.8" />
+        </symbol>
+      </defs>
+    </svg>
+
+    <div
+      v-if="active"
+      ref="threadEl"
+      class="thread scroll-y"
+      @scroll.passive="onThreadScroll"
+    >
       <template v-for="(turn, index) in turns" :key="index">
         <div v-if="turn.role === 'user'" class="turn turn--user">
           <!-- 编辑态：原地把这条消息换成编辑框（不另开弹窗），改完直接从这里重开 -->
@@ -1057,8 +1239,10 @@ onUnmounted(() => {
             <span class="meta__model">{{ turn.model }}</span>
             <span class="meta__time">{{ durationText(turn) }}</span>
           </div>
-          <!-- 思考过程：折叠在耗时那一行下面，**不是答复** -->
-          <div v-if="turn.reasoning" class="reason">
+          <!-- 思考过程：**只显示"还没落成过程行"的那一段**（正在想的那一轮）。
+               已经结束的各轮思考会跟着过程行一起按顺序出现（见 row.kind === 'reasoning'），
+               不再把所有思考都堆在这一轮的最上方。 -->
+          <div v-if="liveReasoning(turn)" class="reason">
             <button
               class="reason__head"
               type="button"
@@ -1075,10 +1259,14 @@ onUnmounted(() => {
               >
                 <path d="M3 1.5 6.5 5 3 8.5" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round" />
               </svg>
-              <span>{{ reasonLabel(turn) }}</span>
+              <span class="reason__ico" :class="{ 'mo-spin': isLiveTurn(index) }" aria-hidden="true">
+                <svg width="14" height="14"><use href="#sl-atom" /></svg>
+              </span>
+              <span :class="{ 'mo-shimmer': isLiveTurn(index) }">{{ reasonLabel(turn) }}</span>
+              <span v-if="isLiveTurn(index)" class="mo-dots" aria-hidden="true"><i /><i /><i /></span>
             </button>
             <div class="fold" :class="{ 'fold--open': isReasonOpen(index) }">
-              <pre class="reason__body">{{ turn.reasoning }}</pre>
+              <pre class="reason__body">{{ liveReasoning(turn) }}</pre>
             </div>
           </div>
           <!-- 过程行：节点执行 / 工具调用 / **批准卡**（先于结论出现） -->
@@ -1091,13 +1279,56 @@ onUnmounted(() => {
                 v-if="!isApprovalCard(row) && searchReportFor(row)"
                 :report="searchReportFor(row)!"
               />
+              <!-- 一轮结束后的思考：按顺序落在它之后的过程行**之前**，与过程行交叉展示 -->
+              <div v-else-if="row.kind === 'reasoning'" class="reason reason--inline">
+                <button
+                  class="reason__head"
+                  type="button"
+                  :aria-expanded="isInlineReasonOpen(`${index}-${rowIndex}`)"
+                  @click="toggleInlineReason(`${index}-${rowIndex}`)"
+                >
+                  <svg
+                    class="reason__caret"
+                    :class="{ 'reason__caret--open': isInlineReasonOpen(`${index}-${rowIndex}`) }"
+                    width="10"
+                    height="10"
+                    viewBox="0 0 10 10"
+                    aria-hidden="true"
+                  >
+                    <path d="M3 1.5 6.5 5 3 8.5" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                  <span class="reason__ico" aria-hidden="true">
+                    <svg width="14" height="14"><use href="#sl-atom" /></svg>
+                  </span>
+                  <span>思考过程</span>
+                </button>
+                <div class="fold" :class="{ 'fold--open': isInlineReasonOpen(`${index}-${rowIndex}`) }">
+                  <pre class="reason__body">{{ row.text }}</pre>
+                </div>
+              </div>
               <div
                 v-else-if="!isApprovalCard(row) && !isSettledApprovalRow(row)"
                 class="row"
                 :class="`row--${row.tone ?? 'idle'}`"
               >
-                <span class="row__kind">{{ row.label }}</span>
-                <span class="row__text">{{ row.text }}</span>
+                <span
+                  class="row__ico"
+                  :class="rowMotion(turn.rows ?? [], rowIndex)"
+                  aria-hidden="true"
+                >
+                  <svg width="16" height="16"><use :href="`#sl-${rowIcon(row)}`" /></svg>
+                </span>
+                <!-- 标签为空时不渲染药丸：否则会剩一个没有内容的空框，看着像个"莫名其妙的块" -->
+                <span v-if="rowKind(row)" class="row__kind">{{ rowKind(row) }}</span>
+                <span
+                  class="row__text"
+                  :class="{ 'mo-shimmer': rowMotion(turn.rows ?? [], rowIndex) === 'mo-dots' }"
+                >{{ row.text }}</span>
+                <span
+                  v-if="rowMotion(turn.rows ?? [], rowIndex) === 'mo-dots'"
+                  class="mo-dots"
+                  aria-hidden="true"
+                ><i /><i /><i /></span>
               </div>
             </template>
           </div>
@@ -1147,7 +1378,7 @@ onUnmounted(() => {
             </template>
           </div>
           <div v-if="turn.status === 'interrupted'" class="cut">已中断 / 出错</div>
-          <div v-if="turn.content" class="acts">
+          <div v-if="turn.content && isLastOfRound(index) && turn.status !== 'streaming'" class="acts">
             <button
               class="icon-btn"
               type="button"
@@ -1586,6 +1817,63 @@ onUnmounted(() => {
   align-items: baseline;
   gap: 8px;
   font-size: var(--font-size-sm);
+}
+
+/* 过程行左侧图标（16px）。对齐方式：**跟第一行对齐**（flex-start + 3px 微调），
+   而不是按整行居中 —— 行文字折成两行时，居中会让图标掉到两行中间、跟同行文字错开。 */
+.row__ico {
+  flex: none;
+  align-self: flex-start;
+  margin-top: 3px;
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--h-fg-muted);
+}
+
+.row__ico svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+
+.row--ok .row__ico {
+  color: var(--h-ok);
+}
+
+.row--err .row__ico {
+  color: var(--h-err);
+}
+
+.row--warn .row__ico {
+  color: var(--h-warn);
+}
+
+/* 「思考中…」左侧的原子图标 */
+.reason__ico {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: currentColor;
+}
+
+.reason__ico svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+
+.reason--inline {
+  margin: 4px 0 2px;
+}
+
+.reason--inline .reason__head {
+  color: var(--h-fg-subtle);
 }
 
 .row__kind {

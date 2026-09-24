@@ -1,0 +1,50 @@
+# Copyright 2026 SciLoop contributors
+# Licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
+# SciLoop 容器执行环境镜像：`docker compose up` 之后它就在，**不需要任何手工步骤**。
+#
+# 为什么单独一个镜像：执行器要装**科学基础包**（pandas/matplotlib/pptx…），
+# 塞进后端镜像会把后端也吹大；分开之后后端保持干净，执行器自己带着工具箱。
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    TZ=UTC
+
+WORKDIR /app/server
+ENV PYTHONPATH=/app/server
+
+# 中文字体：matplotlib 画中文标签时不再是一堆方块（研究者做图表会用到）
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY exec_service ./exec_service
+
+# 服务本身的依赖 + **科学基础包**（研究者 2026-09-24 确认：预装，开箱能跑出图与 PPT）
+RUN pip install --no-cache-dir "fastapi>=0.115,<1.0" "uvicorn[standard]>=0.30,<1.0" \
+    && pip install --no-cache-dir \
+        "numpy>=1.26" \
+        "scipy>=1.11" \
+        "pandas>=2.1" \
+        "matplotlib>=3.8" \
+        "seaborn>=0.13" \
+        "python-pptx>=0.6.23" \
+        "python-docx>=1.1" \
+        "openpyxl>=3.1" \
+        "pint>=0.24" \
+        "uncertainties>=3.1" \
+        "sympy>=1.12" \
+        "networkx>=3.2" \
+        "statsmodels>=0.14" \
+        "scikit-learn>=1.4" \
+        "requests>=2.31" \
+        "pyyaml>=6.0" \
+        "beautifulsoup4>=4.12" \
+        "lxml>=5.1" \
+        "markdown>=3.5"
+
+EXPOSE 8765
+
+CMD ["python", "-m", "exec_service"]
