@@ -19,6 +19,7 @@ import { useRouter } from 'vue-router'
 import { createAggregation } from '@/api/idea'
 import { searchPapers, type PaperSearchItem } from '@/api/papers'
 import { rebuildCard } from '@/api/parse'
+import { registerReaderDocument } from '@/api/reader'
 import Pager from '@/components/Pager.vue'
 import SmoothSelect from '@/components/SmoothSelect.vue'
 import { useSessionStore } from '@/stores/session'
@@ -196,6 +197,40 @@ function openParse(id: number): void {
   void router.push({ path: `/papers/parse/${id}` })
 }
 
+/**
+ * 点标题 = **进这篇论文的正文阅读页**（研究者 2026-09-24 口径：全文界面就是阅读页，不是解析页）。
+ *
+ * 论文库这页是检索结果（只有 arXiv/S2 的 id，没有已导入文档），所以先进一次"登记"：
+ * `POST /reader/documents` 用 paper_id 解析原文 PDF 并登记，**已登记时直接返回既有记录**，
+ * 拿到 document id 再跳 `/papers/reader/{id}`。
+ *
+ * 两处要有耐心：① 首次登记要真解析 PDF，接口超时给到 180s → 期间把按钮置忙并给一句提示；
+ * ② 这是写操作，只读（public_demo / 未启用编辑）会被拒 → 按项目口径提示去「设置」里启用编辑。
+ */
+async function openReader(row: PaperSearchItem): Promise<void> {
+  if (busy.value) return
+  busy.value = `reader-${row.id}`
+  notice.value = '正在登记全文（首次需要解析 PDF，稍等）…'
+  try {
+    const doc = await registerReaderDocument(row.id)
+    if (doc?.id) {
+      notice.value = ''
+      await router.push({ path: `/papers/reader/${doc.id}` })
+      return
+    }
+    notice.value = '登记成功但没有返回文档号，请到「全文阅读」里刷新看看。'
+  } catch (error) {
+    notice.value =
+      (error as { status?: number })?.status === 403
+        ? writeDenied('登记全文')
+        : error instanceof Error
+          ? error.message
+          : String(error)
+  } finally {
+    busy.value = ''
+  }
+}
+
 async function aggregateSelected(): Promise<void> {
   if (busy.value || selectedCount.value < 2) return
   busy.value = 'aggregate'
@@ -330,17 +365,20 @@ defineExpose({
             <input type="checkbox" :checked="isSelected(row.id)" @change="toggleRow(row)" />
           </td>
           <td class="title-cell">
-            <!-- 标题即选中（用户 2026-09-24 口径）：以前点标题是跳解析详情，
-                 现在统一变成勾选/取消勾选；要看详情走「深度解析」（选文弹窗里不给这个入口）。 -->
+            <!-- 标题点击**按场景分开**（研究者 2026-09-24 明确要求：两处不是一回事）
+                 · 选文弹窗（selectMode）：**点标题 = 勾选/取消勾选**（挑论文时整行可点最顺手）；
+                 · 论文库（非 selectMode）：**点标题 = 打开该篇的全文阅读**，选中只认左边的勾选框。
+                 论文库是 arXiv 检索结果、没有已登记文档 id，所以 openReader 先
+                 `POST /reader/documents` 用 paper_id 解析并登记原文 PDF（服务端会按
+                 papers.pdf_url 现拉一份落盘缓存），再跳阅读页。 -->
             <a
               href="#"
-              role="button"
-              :aria-pressed="isSelected(row.id)"
-              :title="isSelected(row.id) ? '取消选中' : '选中这篇'"
-              @click.prevent="toggleRow(row)"
+              :class="{ 'is-busy': busy === `reader-${row.id}` }"
+              @click.prevent="props.selectMode ? toggleRow(row) : openReader(row)"
             >
               {{ row.title }}
             </a>
+            <span v-if="busy === `reader-${row.id}`" class="title-cell__busy">正在打开全文…</span>
             <a
               v-if="paperLink(row)"
               class="title-cell__link"
@@ -515,6 +553,17 @@ defineExpose({
 .table tbody tr.is-selected {
 
   background: var(--color-brand-soft);
+}
+
+.title-cell__busy {
+  margin-left: var(--space-2, 8px);
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+
+.title-cell a.is-busy {
+  opacity: 0.55;
+  cursor: progress;
 }
 
 .col-check {

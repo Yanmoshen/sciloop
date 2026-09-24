@@ -28,7 +28,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -93,6 +95,9 @@ async def resolve_paper_source(session: AsyncSession, paper_id: int) -> dict[str
                 (upload_dir / url.removeprefix("upload://"), "paper_documents.source_url")
             )
 
+    # ③ 本模块兜底下载的原文缓存（抓取来源的论文靠它；也是第二次打开秒开的原因）
+    candidates.append((upload_dir / _source_cache_name(paper), "reader.source_cache"))
+
     checked: list[dict[str, Any]] = []
     for path, via in candidates:
         try:
@@ -124,11 +129,133 @@ async def resolve_paper_source(session: AsyncSession, paper_id: int) -> dict[str
             "source_url": ingest_storage.upload_source_url(path.name),
         }
 
+    # 本地没有 → 抓取来源的论文按 papers.pdf_url 现拉一份（落盘缓存，下次直接命中）
+    fetched = await _fetch_source_pdf(paper, upload_dir / _source_cache_name(paper), checked)
+    if fetched is not None:
+        return fetched
+
     raise NoSourceDocumentError(
-        f"论文 {paper_id} 没有可用的本地原文（未导入 PDF 或文件已被清理）："
-        "请先用 POST /papers/import 导入原文，再创建阅读文档",
+        f"论文 {paper_id} 没有可用的本地原文（未导入 PDF，且按来源地址也拉不到原文）："
+        "可改用 POST /papers/import 直接导入 PDF",
         detail={"paper_id": int(paper_id), "candidates": checked or "no_candidate_record"},
     )
+
+
+#: 抓取来源兜底下载的超时（arXiv PDF 几 MB，给足 60 秒）
+_SOURCE_FETCH_TIMEOUT_SECONDS = 60.0
+#: 单个地址最多试几次（arXiv 的 CDN 会按节点回 406 或中途掐断，退避重试通常就过了）
+_SOURCE_FETCH_ATTEMPTS = 3
+#: 每次重试的退避基数（第 n 次等 n 秒）
+_SOURCE_FETCH_BACKOFF_SECONDS = 1.0
+#: 与解析链路同口径的 UA（避免被来源方当成爬虫拦掉）
+_SOURCE_USER_AGENT = "SciLoop/0.1 (reader; +https://arxiv.org)"
+#: 显式声明可接受 PDF：arXiv 对不带 Accept 的请求会直接回 406
+_SOURCE_ACCEPT_HEADERS = {"Accept": "application/pdf,*/*"}
+#: PDF 魔数：允许文件头有少量空白/注释
+_PDF_MAGIC = b"%PDF"
+#: ``…/pdf/2508.00141v3`` → ``…/pdf/2508.00141``（个别版本的直链会失效，无版本号那条兜底）
+_ARXIV_VERSION_SUFFIX = re.compile(r"v\d+$")
+
+
+def _source_url_candidates(url: str) -> list[str]:
+    """原文地址候选：先按记录里的地址，再试 arXiv 的无版本号地址（与解析链路同一手法）。"""
+    candidates = [url]
+    if "arxiv.org" in url:
+        unversioned = _ARXIV_VERSION_SUFFIX.sub("", url.rstrip("/"))
+        if unversioned != url:
+            candidates.append(unversioned)
+    return candidates
+
+
+def _source_cache_name(paper: Paper) -> str:
+    """兜底下载的**确定性**文件名（同一条论文第二次打开直接命中缓存，不再下载）。"""
+    raw = f"{paper.source}-{paper.external_id}" if paper.external_id else f"{paper.source}-{paper.id}"
+    name = ingest_storage.sanitize_filename(raw)
+    return name if name.lower().endswith(".pdf") else f"{name}.pdf"
+
+
+async def _fetch_source_pdf(
+    paper: Paper, target: Path, checked: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """抓取来的论文（arXiv / S2 / OpenAlex）在本地没有原文文件时，按 ``papers.pdf_url`` 拉一份。
+
+    为什么需要它：阅读器原先只认「用户上传的 PDF」
+    （``papers.raw.upload.stored_path`` 与 ``upload://`` 记录），而抓取入库的论文从来不在本地
+    落文件 —— 于是**论文库里几乎所有论文点标题都会报「没有可用的本地原文」**
+    （用户 2026-09-24 实测反馈）。这里补上兜底：拉到就落到上传目录缓存，
+    拉不到就如实返回 ``None``，由调用方报错，**绝不假装成功**。
+    """
+    url = str(paper.pdf_url or "").strip()
+    if not url:
+        checked.append({"path": str(target), "via": "papers.pdf_url", "reason": "no_pdf_url"})
+        return None
+    try:
+        import httpx
+    except ImportError:  # pragma: no cover - 依赖运行环境
+        return None
+
+    content: bytes | None = None
+    for candidate_url in _source_url_candidates(url):
+        for attempt in range(_SOURCE_FETCH_ATTEMPTS):
+            try:
+                async with httpx.AsyncClient(
+                    timeout=_SOURCE_FETCH_TIMEOUT_SECONDS,
+                    follow_redirects=True,
+                    headers={"User-Agent": _SOURCE_USER_AGENT, **_SOURCE_ACCEPT_HEADERS},
+                ) as client:
+                    response = await client.get(candidate_url)
+            except Exception as exc:  # noqa: BLE001 - 下载失败如实降级，不抛给调用方
+                # arXiv 的 CDN 会中途掐断大响应（RemoteProtocolError）或按节点回 406；
+                # 换个节点/退避一次通常就过了，所以这里**重试**而不是直接判"没有全文"。
+                logger.warning(
+                    "reader_source_fetch_retry paper_id=%s url=%s %s: %s",
+                    paper.id,
+                    candidate_url,
+                    type(exc).__name__,
+                    exc,
+                )
+                checked.append(
+                    {"path": str(target), "via": candidate_url, "reason": f"fetch_failed:{type(exc).__name__}"}
+                )
+                await asyncio.sleep(_SOURCE_FETCH_BACKOFF_SECONDS * (attempt + 1))
+                continue
+
+            payload = response.content or b""
+            if response.status_code == 200 and _PDF_MAGIC in payload[:1024]:
+                content = payload
+                break
+            checked.append(
+                {"path": str(target), "via": candidate_url, "reason": f"http_{response.status_code}"}
+            )
+            logger.warning(
+                "reader_source_fetch_bad paper_id=%s url=%s status=%s bytes=%d",
+                paper.id,
+                candidate_url,
+                response.status_code,
+                len(payload),
+            )
+            await asyncio.sleep(_SOURCE_FETCH_BACKOFF_SECONDS * (attempt + 1))
+        if content is not None:
+            break
+    if content is None:
+        return None
+    if len(content) > storage.MAX_SOURCE_BYTES:
+        raise SourceTooLargeError(
+            f"原文体积 {len(content)} 字节超过上限 {storage.MAX_SOURCE_BYTES} 字节",
+            detail={"size_bytes": len(content), "limit_bytes": storage.MAX_SOURCE_BYTES},
+        )
+
+    saved = ingest_storage.save_upload(target.parent, target.name, content)
+    path = ingest_storage.safe_target_path(target.parent, saved.name)
+    payload = path.read_bytes()
+    logger.info("reader_source_cached paper_id=%s file=%s bytes=%d", paper.id, path.name, len(payload))
+    return {
+        "filename": path.name,
+        "bytes": payload,
+        "sha256": storage.sha256_bytes(payload),
+        "via": "papers.pdf_url",
+        "source_url": ingest_storage.upload_source_url(path.name),
+    }
 
 
 # --------------------------------------------------------------------------- #
