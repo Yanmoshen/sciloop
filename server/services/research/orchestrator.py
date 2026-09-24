@@ -95,21 +95,23 @@ NODE_KEYWORDS: dict[str, tuple[str, ...]] = {
 _DEFAULT_ORDER: tuple[str, ...] = graph.NODE_ORDER
 
 #: 节点输出的 token 上限。
-#: 为什么需要显式给：默认 1536 会把契约 JSON 截断在中间（实测 finish_reason=length），
-#: 截断的 JSON 一定解析失败，于是节点会在「模型其实答得挺好」的情况下被反复驳回。
-NODE_MAX_TOKENS = 8000
+# ⚠️ 这里原先是一个"每个节点多少 token"的表格（默认 8000、"论文写作" 12000），
+# 一次次按节点手动放大 —— 每次都是同一类症状：**契约 JSON 被截断在中间**，
+# 于是节点在"模型其实答得挺好"的情况下被反复驳回。
+# 2026-09-24 用户口径：**所有渠道所有模型统一，输出不设上限**。
+# 截断问题从根上消失（不再有"够不够用"的猜测），这里也不再需要按节点调参。
+NODE_MAX_TOKENS: int | None = None
 
-#: 单独放大某些节点的输出上限。
-#: ⚠️ "论文写作"要产出一整篇草稿（长 Markdown 塞进 JSON 字符串），
-#: 8000 tokens 很容易**被截断** —— 而截断的 JSON 一定不合法，表现为
-#: 「产出不是可解析的 JSON 对象」，宽松解析也救不回来（实测踩到过一次）。
-NODE_MAX_TOKENS_BY_NODE: dict[str, int] = {
-    "paper_writing": 12000,
-}
+#: 已废弃：保留空表只为兼容旧引用，**不要往里加值**（加回去就等于按节点区别对待）。
+NODE_MAX_TOKENS_BY_NODE: dict[str, int] = {}
 
 
-def max_tokens_for(node: str) -> int:
-    """该节点的输出上限。"""
+def max_tokens_for(node: str) -> int | None:
+    """该节点的输出上限。**恒为 ``None``（不设上限）**。
+
+    极少数节点若真需要限制，应在调用点显式传，而不是回来改这张表 ——
+    按节点/渠道分别设限正是这次被统一掉的东西。
+    """
 
     return NODE_MAX_TOKENS_BY_NODE.get(node, NODE_MAX_TOKENS)
 

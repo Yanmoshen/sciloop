@@ -51,10 +51,14 @@ logger = logging.getLogger("sciloop.chat")
 router = APIRouter(tags=["chat"])
 
 TITLE_MAX_CHARS = 20
-#: 思考过程的落盘上限（超长截断）：它可能比正文长几倍，全存会让会话文件迅速膨胀
-REASONING_MAX_CHARS = 6000
-#: 64 太小：思考型模型会把预算全花在 reasoning 上，content 为空 → 标题静默降级。
-TITLE_MAX_TOKENS = 400
+#: 思考过程的落盘上限。**``None`` = 不截断**（2026-09-24 用户口径：不设限制）。
+#: 原先 6000 —— 它只截存储、不改模型输出，且会**如实标出**"已截断"；
+#: 但同为"悄悄变短"，一并放开。
+REASONING_MAX_CHARS: int | None = None
+#: 输出上限统一为 ``None``（不设限）：所有渠道所有模型一致，不按节点/供应商区别对待。
+#: 历史上这里写 400，理由是"思考型模型会把预算花在 reasoning 上、content 为空"——
+#: 那个症状的根因就是**给了预算上限**；不设限之后 reasoning 与正文各得其所。
+TITLE_MAX_TOKENS: int | None = None
 
 #: 标题调用的 user 提示（约束在 `conversations.TITLE_SYSTEM` 里，两边都留着更稳）
 TITLE_PROMPT = "为下面这段研究需求拟一个标题。\n\n研究需求：\n{text}"
@@ -102,9 +106,11 @@ def skills_system_block() -> str:
             lines.append(f"- {item['name']}：{item['description']}")
     return "\n".join(lines)
 
-#: 通用回答的输出上限。默认 1536 会被思考型模型的长思考吃光，正文只挤出半句就断
-#: （实测有一轮只落了 26 个字符）。放宽到 4096 让正文有地方落。
-REPLY_MAX_TOKENS = 4096
+#: 通用回答的输出上限：``None`` = **不设限**（2026-09-24 用户口径）。
+#: 历史上这里从 1536 放宽到 4096，每次都是同一个症状——思考型模型的推理与正文
+#: **共用**这份预算，推理一多吃，正文就被截断（实测有一轮只落了 26 个字符）。
+#: 修正方向不是"再放宽一点"，而是**不给上限**。
+REPLY_MAX_TOKENS: int | None = None
 
 
 class HomeChatRequest(BaseModel):
@@ -689,7 +695,7 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
             reasoning_text = "".join(reasoning_buffer)
             if not reasoning_text and result is not None:
                 reasoning_text = str((getattr(result, "raw", None) or {}).get("reasoning") or "")
-            if len(reasoning_text) > REASONING_MAX_CHARS:
+            if REASONING_MAX_CHARS is not None and len(reasoning_text) > REASONING_MAX_CHARS:
                 reasoning_text = reasoning_text[:REASONING_MAX_CHARS] + "\n…（思考过程过长，已截断）"
             if not generated and reasoning_text and error_info is None:
                 # 模型只给了思考过程：如实说明，**不拿思考过程冒充答复**
@@ -1036,7 +1042,7 @@ async def _approval_stream(
         reasoning_text = "".join(reasoning_buffer)
         if not reasoning_text and result is not None:
             reasoning_text = str((getattr(result, "raw", None) or {}).get("reasoning") or "")
-        if len(reasoning_text) > REASONING_MAX_CHARS:
+        if REASONING_MAX_CHARS is not None and len(reasoning_text) > REASONING_MAX_CHARS:
             reasoning_text = reasoning_text[:REASONING_MAX_CHARS] + "\n…（思考过程过长，已截断）"
         # 裁决 + 卡片状态 + 这一轮答复**一次写入**：`append_turns` 写的就是整份记录，
         # 所以不会出现"批准记下了、卡片没更新"或反过来的半成品状态。

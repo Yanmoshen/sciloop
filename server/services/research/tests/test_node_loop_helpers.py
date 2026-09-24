@@ -398,11 +398,18 @@ def test_writing_and_review_contracts_carry_what_we_persist() -> None:
     ]
 
 
-def test_writing_node_gets_more_output_room() -> None:
-    """草稿要长：输出上限被截断时 JSON 一定不合法（实测踩过一次）。"""
+def test_all_nodes_share_one_no_limit_policy() -> None:
+    """**所有节点统一不设输出上限**（用户口径 2026-09-24）。
 
-    assert orchestrator.max_tokens_for("paper_writing") > orchestrator.NODE_MAX_TOKENS
-    assert orchestrator.max_tokens_for("literature_review") == orchestrator.NODE_MAX_TOKENS
+    原先这里是一张"每个节点多少 token"的表（默认 8000、"论文写作" 12000），
+    靠手动放大来避免契约 JSON 被截断 —— 现在改成不设上限，从根上不再有
+    "够不够用"的猜测，也不再按节点区别对待。
+    """
+
+    assert orchestrator.NODE_MAX_TOKENS is None
+    assert orchestrator.NODE_MAX_TOKENS_BY_NODE == {}
+    for node in ("paper_writing", "literature_review", "experiment_design", "ideation"):
+        assert orchestrator.max_tokens_for(node) is None, node
 
 
 def test_writing_guide_warns_about_json_escaping() -> None:

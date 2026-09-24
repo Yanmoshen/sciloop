@@ -503,7 +503,8 @@ class LLMTranslator:
                 purpose=f"block_{mode}",
                 project_id=self.project_id,
                 temperature=0.2,
-                max_tokens=2048,
+                # 不设输出上限（块级翻译也是一次对话调用，同口径统一）
+                max_tokens=None,
                 allow_fallback=True,
             )
         except Exception as exc:  # noqa: BLE001 - 统一转成「模型不可用」，由 jobs 如实降级

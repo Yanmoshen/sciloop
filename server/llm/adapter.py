@@ -262,7 +262,10 @@ async def _live_call(
         resolved_temperature = (
             temperature if temperature is not None else (model.temperature or DEFAULT_TEMPERATURE)
         )
-        resolved_max_tokens = max_tokens or model.max_tokens or DEFAULT_MAX_TOKENS
+        resolved_max_tokens = max_tokens if max_tokens is not None else DEFAULT_MAX_TOKENS
+        # ⚠️ **不再读 ``model.max_tokens``**（2026-09-24 用户口径：所有渠道所有模型统一）。
+        # 按供应商/模型各自注入上限等于"换个渠道结果不同"，而推理类模型的上限与推理
+        # 共享同一份预算，直接决定这次调用成不成。
 
         # 循环变量通过默认参数在定义时绑定，避免闭包捕获后续迭代的值（B023）。
         def _builder(
@@ -584,7 +587,10 @@ async def chat_stream(
         resolved_temperature = (
             temperature if temperature is not None else (model.temperature or DEFAULT_TEMPERATURE)
         )
-        resolved_max_tokens = max_tokens or model.max_tokens or DEFAULT_MAX_TOKENS
+        resolved_max_tokens = max_tokens if max_tokens is not None else DEFAULT_MAX_TOKENS
+        # ⚠️ **不再读 ``model.max_tokens``**（2026-09-24 用户口径：所有渠道所有模型统一）。
+        # 按供应商/模型各自注入上限等于"换个渠道结果不同"，而推理类模型的上限与推理
+        # 共享同一份预算，直接决定这次调用成不成。
         base_payload = _build_stream_payload(
             model=model,
             messages=msg_list,

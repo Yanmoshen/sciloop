@@ -203,7 +203,8 @@ async def _classify_with_llm(
             purpose="highlight_classify",
             project_id=project_id,
             temperature=0.0,
-            max_tokens=1536,
+            # 不设输出上限（同口径统一）：限死会让契约 JSON 被截断在中间
+            max_tokens=None,
             json_schema=prompts.highlight_json_schema(),
             allow_fallback=True,
         )

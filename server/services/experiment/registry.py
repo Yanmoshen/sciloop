@@ -117,9 +117,11 @@ COMMON_PARAMS: dict[str, dict[str, Any]] = {
     "max_tokens": {
         "type": "integer",
         "min": 1,
-        "max": 2048,
-        "default": 256,
-        "description": "单次回答的 token 上限",
+        # 默认 None = **不设上限**（2026-09-24 用户口径：不设限制）；
+        # 这里**保留可显式指定**，因为实验平台要靠"固定它"来保证变体之间的可比性
+        # （T1/T3 的设计就是"除自变量外全部固定"）—— 那是实验控制，不是渠道差异。
+        "default": None,
+        "description": "单次回答的 token 上限；留空 = 不设上限",
     },
     "sample_offset": {
         "type": "integer",

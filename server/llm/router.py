@@ -275,7 +275,11 @@ class ModelRouter:
             config=config,
             model_id=routing.model_id,
             temperature=routing.temperature,
-            max_tokens=routing.max_tokens,
+            # ⚠️ **不再把路由行的 max_tokens 注入下去**（2026-09-24 用户口径：
+            # 所有渠道所有模型统一，不设输出上限）。历史上它按环节/供应商各配一份，
+            # 结果同一个任务换个环节就可能被截断 —— 而截断的 JSON 一定不合法。
+            # 库里的 ``stage_model_routing.max_tokens`` 列保留作历史记录，但不再生效。
+            max_tokens=None,
             source="project" if routing.project_id is not None else "global",
         )
 
@@ -305,7 +309,8 @@ class ModelRouter:
             model_id=model_id,
             api_key=api_key,
             temperature=temperature if temperature is not None else _float_or_none(entry.get("temperature")),
-            max_tokens=max_tokens if max_tokens is not None else _int_or_none(entry.get("max_tokens")),
+            # ⚠️ 同上：供应商 models[] 里那项 ``max_tokens`` 也不再兜底注入（统一不设上限）。
+            max_tokens=max_tokens,
             source=source,
             model_config_id=config.id,
             provider_name=config.name,

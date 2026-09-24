@@ -498,7 +498,8 @@ async def test_model_config(
             ],
             model_ref,
             temperature=0.0,
-            max_tokens=8,
+            # 同口径不设输出上限：探针只需一个词，但"所有渠道所有模型统一"优先于省这一点
+            max_tokens=None,
             stage=None,
             purpose=CONNECTIVITY_TEST_PURPOSE,
             allow_fallback=False,

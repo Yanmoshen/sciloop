@@ -102,7 +102,8 @@ class GenerateRequest(BaseModel):
         default=None, description="显式模型 ``provider_slug:model_id``；为空按 stage 路由"
     )
     temperature: float = Field(default=0.4, ge=0.0, le=2.0)
-    max_tokens: int | None = Field(default=2000, ge=64, le=8192)
+    # 默认不设上限（原先 default=2000 / le=8192，两处都是"悄悄截断"的来源）
+    max_tokens: int | None = Field(default=None, gt=0)
 
 
 class ManualIdeaRequest(BaseModel):
