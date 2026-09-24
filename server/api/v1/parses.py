@@ -282,6 +282,155 @@ async def recent_card_jobs(
     return {"items": items, "total": len(items), "note": "进程内任务登记，重启后清空"}
 
 
+# --------------------------------------------------------------------------------------
+# GET /papers/parse-home（解析首屏：最近解析 + 聚合解析）
+# --------------------------------------------------------------------------------------
+@router.get("/papers/parse-home", summary="论文解析首屏：最近解析 + 聚合解析")
+async def read_parse_home(
+    session: DbSession,
+    limit: int = Query(20, ge=1, le=100, description="每个区块最多返回多少行"),
+) -> dict[str, Any]:
+    """首屏两个区块**一次拿全**（合成一个口，免得首屏发两次请求、两处各拼一套时间口径）。
+
+    「最近解析」是**合并**出来的，两处缺一不可：
+
+    - **进行中 / 失败的建卡任务**（进程内登记）—— 不显示的话，研究者点了"解析"会以为没反应；
+    - **已落库的卡片**（``paper_cards`` 每篇取最新版本）—— 任务登记在进程重启后会清空，
+      已完成的解析要靠它兜底，否则首屏会空。
+
+    同一篇论文只出现一行：有进行中/失败的任务就以任务态为准（那是最近发生的事），
+    否则用落库那行（已完成）。**不做任何编造**：标题一律来自 ``papers.title``。
+    """
+    from sqlalchemy import bindparam, text
+
+    size = int(limit)
+
+    # ① 进程内任务：只取"未落库"的进行态/失败态（done 的以落库那行为准，避免同一篇出现两行）
+    task_rows: list[dict[str, Any]] = []
+    busy_ids: set[int] = set()
+    for task in list_card_tasks(limit=max(size, 20)):
+        params = task.get("params") or {}
+        try:
+            paper_id = int(task.get("paper_id") or params.get("paper_id"))
+        except (TypeError, ValueError):
+            continue
+        status = str(task.get("status") or "")
+        if status in ("accepted", "running"):
+            state = "running"
+        elif status == "failed":
+            state = "failed"
+        else:
+            continue
+        busy_ids.add(paper_id)
+        task_rows.append(
+            {
+                "paper_id": paper_id,
+                "status": state,
+                "at": task.get("finished_at") or task.get("started_at"),
+            }
+        )
+
+    titles: dict[int, str] = {}
+    if busy_ids:
+        rows = (
+            await session.execute(
+                text("SELECT id, title FROM papers WHERE id IN :ids").bindparams(
+                    bindparam("ids", expanding=True)
+                ),
+                {"ids": sorted(busy_ids)},
+            )
+        ).mappings().all()
+        titles = {int(row["id"]): (row["title"] or "") for row in rows}
+
+    recent: list[dict[str, Any]] = [
+        {
+            "paper_id": row["paper_id"],
+            "title": titles.get(row["paper_id"], ""),
+            "status": row["status"],
+            "at": row["at"],
+            "version": None,
+        }
+        for row in task_rows
+    ]
+
+    # ② 已落库：每篇论文的最新卡片
+    stored = (
+        await session.execute(
+            text(
+                """
+                SELECT c.paper_id, c.version, c.created_at, p.title
+                FROM paper_cards c
+                JOIN papers p ON p.id = c.paper_id
+                WHERE c.version = (
+                    SELECT MAX(c2.version) FROM paper_cards c2 WHERE c2.paper_id = c.paper_id
+                )
+                ORDER BY c.created_at DESC
+                LIMIT :limit
+                """
+            ),
+            {"limit": size},
+        )
+    ).mappings().all()
+    for row in stored:
+        paper_id = int(row["paper_id"])
+        if paper_id in busy_ids:
+            continue
+        busy_ids.add(paper_id)
+        created = row["created_at"]
+        recent.append(
+            {
+                "paper_id": paper_id,
+                "title": row["title"] or "",
+                "status": "ok",
+                "at": created.isoformat() if created is not None else None,
+                "version": int(row["version"]),
+            }
+        )
+
+    recent.sort(key=lambda item: str(item.get("at") or ""), reverse=True)
+
+    # ③ 聚合解析：聚合能力已在 WP08 落库，这里只把"N 篇聚合 + 参与论文标题"拼成一行标题
+    from services.aggregation import list_aggregations
+
+    raw = await list_aggregations(session, limit=size)
+    all_ids: set[int] = set()
+    for item in raw:
+        all_ids.update(int(pid) for pid in (item.get("paper_ids") or []))
+    agg_titles: dict[int, str] = {}
+    if all_ids:
+        rows = (
+            await session.execute(
+                text("SELECT id, title FROM papers WHERE id IN :ids").bindparams(
+                    bindparam("ids", expanding=True)
+                ),
+                {"ids": sorted(all_ids)},
+            )
+        ).mappings().all()
+        agg_titles = {int(row["id"]): (row["title"] or "") for row in rows}
+
+    aggregations: list[dict[str, Any]] = []
+    for item in raw:
+        ids = [int(pid) for pid in (item.get("paper_ids") or [])]
+        short = [agg_titles.get(pid) or f"论文 {pid}" for pid in ids]
+        aggregations.append(
+            {
+                "aggregation_id": int(item["id"]),
+                "paper_ids": ids,
+                "paper_count": len(ids),
+                "title": f"{len(ids)} 篇聚合：" + " / ".join(short),
+                "status": "ok",
+                "at": item.get("created_at"),
+            }
+        )
+
+    return {
+        "recent": recent[:size],
+        "aggregations": aggregations[:size],
+        "limit": size,
+        "note": "最近解析 = 进行中/失败的任务 ∪ 已落库的最新卡片（同一篇只出现一行）",
+    }
+
+
 __all__ = [
     "CardBuildRequest",
     "router",

@@ -58,7 +58,7 @@ export const MODULE_GROUPS: ModuleGroup[] = [
     items: [
       { key: 'papers', label: '文献总览', path: '/papers', hint: '论文库总览与解析入口' },
       { key: 'feed', label: '论文库', path: '/papers/feed', hint: '三视图推荐（口径分离）' },
-      { key: 'parse', label: '论文解析', path: '/papers/parse/demo', hint: '8 字段卡片 + 原文高亮' },
+      { key: 'parse', label: '论文解析', path: '/papers/parse', hint: '解析首屏：最近解析与聚合' },
       {
         key: 'aggregate',
         label: '聚合对比',
@@ -159,6 +159,17 @@ export const routes: RouteRecordRaw[] = [
         name: 'feed',
         component: () => import('@/views/FeedView.vue'),
         meta: { title: '论文库', module: 'feed' },
+      },
+      {
+        path: 'papers/parse',
+        name: 'parse-home',
+        component: () => import('@/views/ParseHomeView.vue'),
+        meta: { title: '论文解析', module: 'parse', homeNav: 'literature' },
+      },
+      // 旧的占位路径（导航曾直接指向 /papers/parse/demo，会被 :paperId 当成论文 id 吞掉）
+      {
+        path: 'papers/parse/demo',
+        redirect: { path: '/papers/parse' },
       },
       {
         path: 'papers/parse/:paperId',

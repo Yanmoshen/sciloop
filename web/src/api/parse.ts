@@ -429,3 +429,40 @@ export const SECTION_NAMES = [
   'conclusion',
   'other',
 ] as const
+
+// --------------------------------------------------------------------------- //
+// 解析首屏（GET /papers/parse-home）：一次拿全「最近解析」+「聚合解析」两个区块
+// --------------------------------------------------------------------------- //
+/** `status`：`running` 解析中 / `failed` 失败 / `ok` 已完成 —— 前端只按它选状态图标 */
+export interface ParseHomeRecentRow {
+  paper_id: number
+  title: string
+  status: 'running' | 'failed' | 'ok'
+  at: string | null
+  version: number | null
+}
+
+export interface ParseHomeAggregationRow {
+  aggregation_id: number
+  paper_ids: number[]
+  paper_count: number
+  /** 服务端拼好的一行标题，如「3 篇聚合：A / B / C」 */
+  title: string
+  status: string
+  at: string | null
+}
+
+export interface ParseHomeResponse {
+  recent: ParseHomeRecentRow[]
+  aggregations: ParseHomeAggregationRow[]
+  limit: number
+}
+
+/** 解析首屏数据源（服务端已把时间口径与标题拼好，前端不再各自拼一遍） */
+export function fetchParseHome(
+  limit = 20,
+  signal?: AbortSignal,
+): Promise<ParseHomeResponse> {
+  return get<ParseHomeResponse>('/papers/parse-home', { query: { limit }, signal })
+}
+

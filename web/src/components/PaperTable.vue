@@ -50,6 +50,13 @@ const SORT_SELECT_OPTIONS = [
 const router = useRouter()
 const session = useSessionStore()
 
+/** 选择模式：给「解析首屏」的选文弹窗复用。
+ *
+ * 打开后**只隐藏自带的批量操作栏**（那排按钮由弹窗自己提供），
+ * 搜索 / 筛选 / 分页 / 跨页选择 / 「查看已选」全部照旧 —— 论文库自身的用法一字不变。
+ */
+const props = withDefaults(defineProps<{ selectMode?: boolean }>(), { selectMode: false })
+
 const items = ref<PaperSearchItem[]>([])
 const total = ref(0)
 const page = ref(1)
@@ -215,14 +222,22 @@ async function buildCardsForSelected(): Promise<void> {
   notice.value = ''
   let ok = 0
   const failed: number[] = []
-  for (const id of selectedIds.value) {
-    try {
-      await rebuildCard(id, true)
-      ok += 1
-    } catch {
-      failed.push(id)
+  // **并发上限 3**：一次把几十篇全推给上游会把链路打满、失败原因也混在一起；
+  // 顺序取任务、3 个 worker 并行，既压住并发又不把总时长拖成串行。
+  const queue = [...selectedIds.value]
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const id = queue.shift()
+      if (id === undefined) return
+      try {
+        await rebuildCard(id, true)
+        ok += 1
+      } catch {
+        failed.push(id)
+      }
     }
   }
+  await Promise.all(Array.from({ length: Math.min(3, queue.length) }, () => worker()))
   notice.value =
     failed.length === 0
       ? `已提交 ${ok} 篇的建卡任务（后台执行）。`
@@ -232,6 +247,20 @@ async function buildCardsForSelected(): Promise<void> {
 
 onMounted(() => {
   void loadList()
+})
+
+/** 给复用方（解析首屏的选文弹窗）的接口：不改变论文库自身的任何用法 */
+defineExpose({
+  selectedCount,
+  selectedList,
+  aggregateSelected,
+  buildCardsForSelected,
+  openPicked: () => {
+    pickedOpen.value = true
+  },
+  closePicked: () => {
+    pickedOpen.value = false
+  },
 })
 </script>
 
@@ -328,8 +357,8 @@ onMounted(() => {
       <Pager :page="page" :page-count="pageCount" :disabled="loading" @change="changePage" />
     </div>
 
-    <!-- 跨页固定操作栏：已选数量不随翻页/改筛选丢失 -->
-    <div v-if="selectedCount > 0" class="bulk">
+    <!-- 跨页固定操作栏：已选数量不随翻页/改筛选丢失（选择模式下由复用方自备操作栏） -->
+    <div v-if="!props.selectMode && selectedCount > 0" class="bulk">
       已选 <b>{{ selectedCount }}</b> 篇
       <button class="btn" type="button" @click="pickedOpen = true">查看已选</button>
       <button

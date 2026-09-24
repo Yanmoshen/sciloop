@@ -31,6 +31,7 @@ import { setConversationArchived, type ConversationBrief } from '@/api/conversat
 import type { CreatedProject } from '@/api/projects'
 import { setProjectArchived } from '@/api/projects'
 import ConfirmDialog from '@/components/home/ConfirmDialog.vue'
+import SciLoopMark from '@/components/SciLoopMark.vue'
 import ConversationRenameDialog from '@/components/ConversationRenameDialog.vue'
 import MoveConversationDialog from '@/components/home/MoveConversationDialog.vue'
 import ProjectNameDialog from '@/components/home/ProjectNameDialog.vue'
@@ -74,7 +75,7 @@ const HOME_NAV: HomeNavItem[] = [
       { key: 'feed', label: '论文库', path: '/papers/feed' },
       { key: 'translate', label: '论文翻译', path: '/papers/translate' },
       { key: 'reader', label: '全文阅读', path: '/papers/reader' },
-      { key: 'parse', label: '论文解析', path: '/papers/parse/demo' },
+      { key: 'parse', label: '论文解析', path: '/papers/parse' },
       { key: 'aggregate', label: '聚合对比', path: '/papers/aggregate/demo' },
       { key: 'export', label: '多格式导出', path: '/papers/export' },
     ],
@@ -104,6 +105,32 @@ const railCollapsed = ref(localStorage.getItem(RAIL_COLLAPSED_KEY) === '1')
 function toggleRail(): void {
   railCollapsed.value = !railCollapsed.value
   localStorage.setItem(RAIL_COLLAPSED_KEY, railCollapsed.value ? '1' : '0')
+}
+
+/**
+ * 「未分组 / 项目」两个分组各自的折叠开关（2026-09-24 研究者要求：分组标题旁给个折叠角）。
+ *
+ * 口径与左栏折叠一致：**状态存 localStorage**（不存的话每次刷新又要重新折一遍）；
+ * 默认展开。收起只隐藏**直接子级**（`.crow-block` / `.group__empty`），
+ * 不动嵌套在项目下的对话 —— 那些归项目自己的箭头管。
+ */
+const GROUP_OPEN_KEYS = {
+  ungrouped: 'sciloop.rail.ungroupedOpen',
+  projects: 'sciloop.rail.projectsOpen',
+} as const
+
+/** 只有明确存过 '0' 才算收起，其余（首次访问 / 存了脏值）一律按展开处理 */
+function readGroupOpen(key: string): boolean {
+  return localStorage.getItem(key) !== '0'
+}
+
+const ungroupedOpen = ref(readGroupOpen(GROUP_OPEN_KEYS.ungrouped))
+const projectsOpen = ref(readGroupOpen(GROUP_OPEN_KEYS.projects))
+
+function toggleGroup(which: 'ungrouped' | 'projects'): void {
+  const target = which === 'ungrouped' ? ungroupedOpen : projectsOpen
+  target.value = !target.value
+  localStorage.setItem(GROUP_OPEN_KEYS[which], target.value ? '1' : '0')
 }
 
 /* ------------------------------------------------------------------ *
@@ -300,10 +327,17 @@ function onDocumentKeydown(event: KeyboardEvent): void {
 // --------------------------------------------------------------------------- //
 // 已归档折叠区与项目展开
 // --------------------------------------------------------------------------- //
-const archivedOpen = ref(false)
+/**
+ * 已归档折叠区：**展开态要持久化**（2026-09-24 研究者反馈「展开后刷新又折起来了」）。
+ * 口径与左栏、未分组/项目一致：存 localStorage，只能明确存过 '1' 才算展开。
+ * 数据侧不用额外处理 —— onMounted 里本来就无条件拉了已归档对话与项目（徽标条数要真）。
+ */
+const ARCHIVED_OPEN_KEY = 'sciloop.rail.archivedOpen'
+const archivedOpen = ref(localStorage.getItem(ARCHIVED_OPEN_KEY) === '1')
 
 async function toggleArchived(): Promise<void> {
   archivedOpen.value = !archivedOpen.value
+  localStorage.setItem(ARCHIVED_OPEN_KEY, archivedOpen.value ? '1' : '0')
   if (archivedOpen.value) {
     await Promise.all([conversations.loadArchived(), session.loadArchivedProjects()])
   }
@@ -604,7 +638,7 @@ onUnmounted(() => {
       :inert="railCollapsed || undefined"
     >
       <div class="brand">
-        <div class="brand__mark">SL</div>
+        <SciLoopMark class="brand__mark" />
         <div class="brand__name">SciLoop</div>
         <button
           class="rail-toggle"
@@ -641,7 +675,6 @@ onUnmounted(() => {
                 <button
                   class="nav__item nav__item--group"
                   type="button"
-                  :title="literatureOpen ? '收起文献调研' : '展开文献调研'"
                   :aria-expanded="literatureOpen"
                   @click="toggleLiterature"
                 >
@@ -798,8 +831,33 @@ onUnmounted(() => {
         </nav>
 
         <!-- 未分组对话 -->
-        <div class="group">
-          <div class="group__head">
+        <div class="group" :class="{ 'group--closed': !ungroupedOpen }">
+          <div class="group__head group__head--foldable">
+            <button
+              class="group__chev"
+              type="button"
+              :aria-expanded="ungroupedOpen"
+              aria-label="折叠或展开未分组"
+              @click="toggleGroup('ungrouped')"
+            >
+              <svg
+                class="group__caret"
+                :class="{ 'group__caret--open': ungroupedOpen }"
+                width="10"
+                height="10"
+                viewBox="0 0 10 10"
+                fill="none"
+                aria-hidden="true"
+              >
+                <path
+                  d="M3 1.5 6.5 5 3 8.5"
+                  stroke="currentColor"
+                  stroke-width="1.4"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </button>
             <span class="group__title">未分组</span>
           </div>
           <p v-if="conversations.ungrouped.length === 0" class="group__empty">
@@ -898,8 +956,33 @@ onUnmounted(() => {
         </div>
 
         <!-- 项目（1 : N 对话） -->
-        <div class="group">
-          <div class="group__head">
+        <div class="group" :class="{ 'group--closed': !projectsOpen }">
+          <div class="group__head group__head--foldable">
+            <button
+              class="group__chev"
+              type="button"
+              :aria-expanded="projectsOpen"
+              aria-label="折叠或展开项目"
+              @click="toggleGroup('projects')"
+            >
+              <svg
+                class="group__caret"
+                :class="{ 'group__caret--open': projectsOpen }"
+                width="10"
+                height="10"
+                viewBox="0 0 10 10"
+                fill="none"
+                aria-hidden="true"
+              >
+                <path
+                  d="M3 1.5 6.5 5 3 8.5"
+                  stroke="currentColor"
+                  stroke-width="1.4"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </button>
             <span class="group__title">项目</span>
             <button
               class="icon-btn"
@@ -1383,7 +1466,19 @@ onUnmounted(() => {
         </button>
 
         <div class="avatar-wrap">
-          <div class="avatar" tabindex="0" :title="session.accessLabel">Y</div>
+          <!-- 身份说明**只放在悬停菜单里**（.menu__meta），不再给头像挂 title ——
+               2026-09-24 实测：title 会被全局 tooltip 渲染成气泡，而它和悬停菜单是同一个落点
+               （都在头像下方 48px 内），气泡正好压在菜单右上角，看着像"菜单没出来"。
+               读屏需要的那份说明改用 aria-label 带（视觉不重复、也不打架）。 -->
+          <div
+            class="avatar"
+            tabindex="0"
+            role="button"
+            aria-haspopup="menu"
+            :aria-label="`账号：${session.accessLabel}`"
+          >
+            Y
+          </div>
           <div class="menu" role="menu">
             <button class="menu__item" type="button" role="menuitem" @click="openSettings">设置</button>
             <div class="menu__sep" />
@@ -1405,7 +1500,6 @@ onUnmounted(() => {
         v-if="isHomeLike && !pipelineDrawer.open"
         class="panel-entry"
         type="button"
-        title="研究流程"
         aria-label="研究流程"
         @click="pipelineDrawer.toggle()"
       >
@@ -1781,6 +1875,47 @@ onUnmounted(() => {
   gap: 2px;
 }
 
+/* 可折叠的分组头：把左侧 12px 内边距让给折叠角，**标题位置保持不动**
+   （原来是 padding-left:12px，现在 = 0 + 折叠角 12px + gap 0） */
+.group__head--foldable {
+  padding-left: 0;
+  gap: 0;
+}
+
+.group__chev {
+  width: 12px;
+  height: 18px;
+  flex: none;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--h-fg-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.group__chev:hover {
+  color: var(--h-fg);
+}
+
+.group__caret {
+  transition: transform 160ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.group__caret--open {
+  transform: rotate(90deg);
+}
+
+/* 收起分组：只藏**直接子级**（除标题行外全藏），项目下嵌套的对话归项目自己的箭头管。
+   ⚠️ 别按具体类名写（`.crow-block`）：两个分组的下挂结构并不一样 ——
+   未分组是 `.crow-block`，项目是 `.crow` + 每个项目各自的 `.fold`；
+   按类名写就会"未分组生效、项目纹丝不动"（2026-09-24 实测踩过）。 */
+.group--closed > *:not(.group__head) {
+  display: none;
+}
+
 .group__head {
   display: flex;
   align-items: center;
@@ -2148,7 +2283,7 @@ onUnmounted(() => {
   height: 36px;
   border-radius: 40px;
   background: var(--h-secondary);
-  color: #ffffff; /* ui-polish-allow: 品牌底上的白字 */
+  color: var(--color-text-inverse); /* ui-polish-allow: 品牌底上的白字 */
   font-size: var(--font-size-md);
   font-weight: 600;
   display: flex;
@@ -2181,7 +2316,9 @@ onUnmounted(() => {
     border-color 300ms cubic-bezier(0.4, 0, 0.2, 1);
   z-index: 20;
 }
+/* 悬停**和键盘聚焦**都能开菜单（原来只有 :hover —— 头像有 tabindex 但键盘用户永远进不去菜单） */
 .avatar-wrap:hover .menu,
+.avatar-wrap:focus-within .menu,
 .menu:hover {
   opacity: 1;
   visibility: visible;

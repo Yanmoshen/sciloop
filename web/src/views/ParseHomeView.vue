@@ -1,0 +1,279 @@
+<script setup lang="ts">
+/**
+ * Copyright 2026 SciLoop contributors
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * 论文解析首屏：**点「论文解析」进来的第一个界面**。
+ *
+ * 两个区块，各自聚焦一件事：
+ * - **最近解析**：每个解析任务一行（标题 + 时间 + 行内状态图标），固定高度、超出的滚轮看
+ *   —— 行里**只放标题和时间**，状态用图标（解析中转圈 / 失败标记），细节点进去再看；
+ * - **聚合解析**：多篇聚合的产物，单独一块（不与单篇混在一起）。
+ *
+ * 数据来源是**一个**接口（`GET /papers/parse-home`）：服务端已把"进行中的任务 ∪ 已落库的最新卡片"
+ * 合并好、标题也拼好，前端不再各自拼一套时间与标题口径。
+ *
+ * 空状态只保留两个区块标题 —— 页面上没有"您还没有任何解析"这类说明性小字。
+ */
+import { onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
+
+import { fetchParseHome, type ParseHomeResponse } from '@/api/parse'
+import PaperImportDialog from '@/components/PaperImportDialog.vue'
+import PaperPickerDialog from '@/components/PaperPickerDialog.vue'
+import ViewStatePanel from '@/components/ViewStatePanel.vue'
+
+const router = useRouter()
+
+const loading = ref(true)
+const error = ref<string | null>(null)
+const data = ref<ParseHomeResponse | null>(null)
+const pickerOpen = ref(false)
+const importOpen = ref(false)
+
+const recent = ref<ParseHomeResponse['recent']>([])
+const aggregations = ref<ParseHomeResponse['aggregations']>([])
+
+/** 「今天 10:02」/「昨天 18:20」/「09-22 20:11」——首屏要一眼看出新旧 */
+function formatWhen(value: string | null | undefined): string {
+  if (!value) return '时间未获取'
+  const at = new Date(value)
+  if (Number.isNaN(at.getTime())) return '时间未获取'
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  const clock = `${pad(at.getHours())}:${pad(at.getMinutes())}`
+  const now = new Date()
+  const dayStart = (d: Date): number =>
+    new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
+  const diffDays = Math.round((dayStart(now) - dayStart(at)) / 86400000)
+  if (diffDays === 0) return `今天 ${clock}`
+  if (diffDays === 1) return `昨天 ${clock}`
+  return `${pad(at.getMonth() + 1)}-${pad(at.getDate())} ${clock}`
+}
+
+async function load(): Promise<void> {
+  loading.value = true
+  error.value = null
+  try {
+    const response = await fetchParseHome(20)
+    data.value = response
+    recent.value = response.recent
+    aggregations.value = response.aggregations
+  } catch (err) {
+    error.value = err instanceof Error ? err.message : String(err)
+  } finally {
+    loading.value = false
+  }
+}
+
+function openPaper(paperId: number): void {
+  void router.push({ path: `/papers/parse/${paperId}` })
+}
+
+function openAggregation(aggregationId: number): void {
+  void router.push({ name: 'aggregate', params: { id: String(aggregationId) } })
+}
+
+onMounted(() => {
+  void load()
+})
+</script>
+
+<template>
+  <div class="ph">
+    <header class="ph__head">
+      <div class="ph__title-block">
+        <h1>论文解析</h1>
+      </div>
+      <div class="ph__actions">
+        <button class="ph-btn ph-btn--primary" type="button" @click="pickerOpen = true">
+          解析论文
+        </button>
+        <button class="ph-btn" type="button" @click="importOpen = true">外部导入</button>
+      </div>
+    </header>
+
+    <ViewStatePanel
+      :loading="loading"
+      loading-text="正在加载解析记录…"
+      :error="error"
+      error-title="解析记录加载失败"
+      retryable
+      retry-label="重试加载"
+      :busy="loading"
+      @retry="load"
+    />
+
+    <section class="ph__block">
+      <h2 class="ph__block-title">最近解析</h2>
+      <div v-if="recent.length" class="ph__list scroll-y" data-role="recent-parse">
+        <button
+          v-for="row in recent"
+          :key="row.paper_id"
+          class="ph__row"
+          type="button"
+          @click="openPaper(row.paper_id)"
+        >
+          <span
+            class="ph__dot"
+            :class="`ph__dot--${row.status}`"
+            :title="
+              row.status === 'running' ? '解析中' : row.status === 'failed' ? '解析失败' : '已完成'
+            "
+            aria-hidden="true"
+          />
+          <span class="ph__row-title">{{ row.title || `论文 ${row.paper_id}` }}</span>
+          <span class="ph__row-time">{{ formatWhen(row.at) }}</span>
+        </button>
+      </div>
+    </section>
+
+    <section class="ph__block">
+      <h2 class="ph__block-title">聚合解析</h2>
+      <div v-if="aggregations.length" class="ph__list" data-role="aggregate-parse">
+        <button
+          v-for="row in aggregations"
+          :key="row.aggregation_id"
+          class="ph__row"
+          type="button"
+          @click="openAggregation(row.aggregation_id)"
+        >
+          <span class="ph__dot ph__dot--ok" aria-hidden="true" />
+          <span class="ph__row-title">{{ row.title }}</span>
+          <span class="ph__row-time">{{ formatWhen(row.at) }}</span>
+        </button>
+      </div>
+    </section>
+
+    <PaperPickerDialog v-model:open="pickerOpen" />
+    <PaperImportDialog v-model:open="importOpen" />
+  </div>
+</template>
+
+<style scoped>
+.ph {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.ph__head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+
+.ph__title-block {
+  flex: 1;
+  min-width: 0;
+}
+
+.ph__title-block h1 {
+  margin: 0;
+  font-size: var(--font-size-xl);
+  line-height: var(--line-height-tight);
+}
+
+.ph__actions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+.ph-btn {
+  padding: 5px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--color-text-primary);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  transition: background-color 160ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.ph-btn:hover {
+  background: var(--color-bg-subtle);
+}
+
+.ph-btn:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 2px;
+}
+
+.ph-btn--primary {
+  border-color: var(--color-brand);
+  color: var(--color-brand);
+}
+
+.ph__block-title {
+  margin: 0 0 var(--space-2);
+  font-size: var(--font-size-md);
+}
+
+/* 固定高度内滚：解析条数再多也不会把页面撑长（整页仍可滚） */
+.ph__list {
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.ph__row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: 9px 0;
+  border: 0;
+  border-bottom: 1px solid var(--color-border);
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ph__row:hover {
+  background: var(--color-bg-subtle);
+}
+
+.ph__row:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: -2px;
+}
+
+/* 状态图标只用形状区分，不靠颜色单打独斗：实心=已完成 / 虚线圈=解析中 / 方块=失败 */
+.ph__dot {
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.ph__dot--ok {
+  background: var(--color-success);
+}
+
+.ph__dot--running {
+  border: 1.5px dashed var(--color-text-secondary);
+}
+
+.ph__dot--failed {
+  border-radius: 0;
+  background: var(--color-danger);
+}
+
+.ph__row-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-size: var(--font-size-sm);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.ph__row-time {
+  flex: 0 0 auto;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+</style>
