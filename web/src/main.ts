@@ -34,6 +34,10 @@ import '@/styles/a11y.css'
 import '@/styles/scrollbar.css'
 // 对话正文 Markdown 排版（基础 + 代码高亮 + KaTeX 公式），只在 .md 容器内生效
 import '@/styles/markdown.css'
+// 思考可视化动效（.mo-spin / .mo-shimmer / .mo-breathe / .mo-dots / .mo-bars）
+// 自带 prefers-reduced-motion 降级，排在 a11y.css 之后
+// ⚠️ 2026-09-24 事故：`styles/thinking-motion.css` 在批量删除中丢失且无副本，
+// 导入会让构建 ENOENT，故暂时摘掉；该文件重建后把这一行加回来即可。
 
 const app = createApp(App)
 

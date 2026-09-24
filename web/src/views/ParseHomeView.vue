@@ -12,7 +12,6 @@
  * 两个区块，各自聚焦一件事：
  * - **最近解析**：每个解析任务一行（标题 + 时间 + 行内状态图标），固定高度、超出的滚轮看
  *   —— 行里**只放标题和时间**，状态用图标（解析中转圈 / 失败标记），细节点进去再看；
- * - **聚合解析**：多篇聚合的产物，单独一块（不与单篇混在一起）。
  *
  * 数据来源是**一个**接口（`GET /papers/parse-home`）：服务端已把"进行中的任务 ∪ 已落库的最新卡片"
  * 合并好、标题也拼好，前端不再各自拼一套时间与标题口径。
@@ -37,7 +36,6 @@ const pickerOpen = ref(false)
 const importOpen = ref(false)
 
 const recent = ref<ParseHomeResponse['recent']>([])
-const aggregations = ref<ParseHomeResponse['aggregations']>([])
 
 /** 「今天 10:02」/「昨天 18:20」/「09-22 20:11」——首屏要一眼看出新旧 */
 function formatWhen(value: string | null | undefined): string {
@@ -62,7 +60,6 @@ async function load(): Promise<void> {
     const response = await fetchParseHome(20)
     data.value = response
     recent.value = response.recent
-    aggregations.value = response.aggregations
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err)
   } finally {
@@ -139,10 +136,6 @@ onBeforeUnmount(() => {
 
 function openPaper(paperId: number): void {
   void router.push({ path: `/papers/parse/${paperId}` })
-}
-
-function openAggregation(aggregationId: number): void {
-  void router.push({ name: 'aggregate', params: { id: String(aggregationId) } })
 }
 
 /** 导入完成 → 追问是否解析（产品口径：导入成功才问，且只问一次）。
@@ -236,22 +229,7 @@ async function onImported(paperIds: number[]): Promise<void> {
       </p>
     </section>
 
-    <section class="ph__block">
-      <h2 class="ph__block-title">聚合解析</h2>
-      <div v-if="aggregations.length" class="ph__list" data-role="aggregate-parse">
-        <button
-          v-for="row in aggregations"
-          :key="row.aggregation_id"
-          class="ph__row"
-          type="button"
-          @click="openAggregation(row.aggregation_id)"
-        >
-          <span class="ph__dot ph__dot--ok" aria-hidden="true" />
-          <span class="ph__row-title">{{ row.title }}</span>
-          <span class="ph__row-time">{{ formatWhen(row.at) }}</span>
-        </button>
-      </div>
-    </section>
+    <!-- 「聚合解析」区块 2026-09-24 从界面下掉（后端聚合能力与数据保留） -->
 
     <PaperPickerDialog v-model:open="pickerOpen" @submitted="onPickerSubmitted" />
     <PaperImportDialog v-model:open="importOpen" @imported="onImported" />

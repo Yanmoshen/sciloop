@@ -16,13 +16,11 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
-import { createAggregation } from '@/api/idea'
 import { searchPapers, type PaperSearchItem } from '@/api/papers'
 import { rebuildCard } from '@/api/parse'
 import { registerReaderDocument } from '@/api/reader'
 import Pager from '@/components/Pager.vue'
 import SmoothSelect from '@/components/SmoothSelect.vue'
-import { useSessionStore } from '@/stores/session'
 import { writeDenied } from '@/utils/messages'
 
 const PAGE_SIZE = 20
@@ -49,7 +47,6 @@ const SORT_SELECT_OPTIONS = [
 ]
 
 const router = useRouter()
-const session = useSessionStore()
 
 /** 选择模式：给「解析首屏」的选文弹窗复用。
  *
@@ -231,27 +228,6 @@ async function openReader(row: PaperSearchItem): Promise<void> {
   }
 }
 
-async function aggregateSelected(): Promise<void> {
-  if (busy.value || selectedCount.value < 2) return
-  busy.value = 'aggregate'
-  notice.value = ''
-  try {
-    const aggregation = await createAggregation({
-      paper_ids: selectedIds.value,
-      project_id: session.currentProjectId,
-    })
-    await router.push({ name: 'aggregate', params: { id: String(aggregation.id) } })
-  } catch (error) {
-    notice.value =
-      (error as { status?: number })?.status === 403
-        ? writeDenied('创建对比分析（聚合）')
-        : error instanceof Error
-          ? error.message
-          : String(error)
-  } finally {
-    busy.value = ''
-  }
-}
 
 async function buildCardsForSelected(): Promise<void> {
   if (busy.value || selectedCount.value === 0) return
@@ -290,7 +266,6 @@ onMounted(() => {
 defineExpose({
   selectedCount,
   selectedList,
-  aggregateSelected,
   buildCardsForSelected,
   openPicked: () => {
     pickedOpen.value = true
@@ -395,9 +370,6 @@ defineExpose({
           <td><span class="badge" :class="parseBadge(row).cls">{{ parseBadge(row).text }}</span></td>
           <td v-if="!props.selectMode" class="row-actions">
             <button class="link-btn" type="button" @click="openParse(row.id)">深度解析</button>
-            <button class="link-btn link-btn--mute" type="button" @click="toggleRow(row)">
-              {{ isSelected(row.id) ? '移出聚合' : '加入聚合' }}
-            </button>
           </td>
         </tr>
       </tbody>
@@ -412,15 +384,6 @@ defineExpose({
     <div v-if="!props.selectMode && selectedCount > 0" class="bulk">
       已选 <b>{{ selectedCount }}</b> 篇
       <button class="btn" type="button" @click="pickedOpen = true">查看已选</button>
-      <button
-        class="btn btn--primary"
-        type="button"
-        :disabled="selectedCount < 2 || busy === 'aggregate'"
-        :title="selectedCount < 2 ? '至少选择 2 篇才能对比' : ''"
-        @click="aggregateSelected"
-      >
-        {{ busy === 'aggregate' ? '聚合中…' : '对比分析' }}
-      </button>
       <button class="btn" type="button" :disabled="busy === 'cards'" @click="buildCardsForSelected">
         {{ busy === 'cards' ? '提交中…' : '批量深度解析' }}
       </button>
@@ -451,14 +414,6 @@ defineExpose({
           </ul>
           <footer class="picked__foot">
             <button class="btn" type="button" @click="clearSelection">清空</button>
-            <button
-              class="btn btn--primary"
-              type="button"
-              :disabled="selectedCount < 2 || busy === 'aggregate'"
-              @click="aggregateSelected"
-            >
-              对比分析
-            </button>
           </footer>
         </section>
       </div>

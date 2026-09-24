@@ -59,12 +59,7 @@ export const MODULE_GROUPS: ModuleGroup[] = [
       { key: 'papers', label: '文献总览', path: '/papers', hint: '论文库总览与解析入口' },
       { key: 'feed', label: '论文库', path: '/papers/feed', hint: '三视图推荐（口径分离）' },
       { key: 'parse', label: '论文解析', path: '/papers/parse', hint: '解析首屏：最近解析与聚合' },
-      {
-        key: 'aggregate',
-        label: '聚合对比',
-        path: '/papers/aggregate',
-        hint: '对比矩阵 + 方法演进 + 空白',
-      },
+      // 「聚合对比」2026-09-24 从界面下掉（导航项与路由均已移除，后端聚合能力保留）
     ],
   },
   {
@@ -177,24 +172,13 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('@/views/ParseView.vue'),
         meta: { title: '论文解析', module: 'parse' },
       },
-      // 不带 id 的入口：AggregateView 自己会拉聚合列表当选择器用（原来导航指向 /aggregate/demo，
-      // 那个 demo 会被当成聚合 id 去请求，必然失败）
-      {
-        path: 'papers/aggregate',
-        name: 'aggregate-home',
-        component: () => import('@/views/AggregateView.vue'),
-        meta: { title: '聚合对比', module: 'aggregate' },
-      },
-      {
-        path: 'papers/aggregate/demo',
-        redirect: { path: '/papers/aggregate' },
-      },
-      {
-        path: 'papers/aggregate/:id',
-        name: 'aggregate',
-        component: () => import('@/views/AggregateView.vue'),
-        meta: { title: '聚合对比', module: 'aggregate' },
-      },
+      // ---- 聚合对比：界面已下掉（2026-09-24）----
+      // 页面与路由一并移除；后端 `services/aggregation` 与数据保留
+      // （研究构思 / 流水线评审 / 可行性评分 / 研究编排仍在用）。
+      // 旧地址重定向兜底，避免书签/历史进来白屏。
+      { path: 'papers/aggregate', redirect: '/papers/parse' },
+      { path: 'papers/aggregate/demo', redirect: '/papers/parse' },
+      { path: 'papers/aggregate/:id', redirect: '/papers/parse' },
       // ---- 知识库 ----
       // 2026-09-22：入口交给用户自己管的知识库（文件 / 论文与 Idea 摘录 / 技能 / 记忆）。
       // 原「知识资产」四页签（论文卡片 / 证据 / 决策 / Passport）不在导航里出现了，
@@ -267,7 +251,7 @@ export const routes: RouteRecordRaw[] = [
       // ---- 旧路径兼容（书签/历史链接不失效）----
       { path: 'feed', redirect: '/papers/feed' },
       { path: 'parse/:paperId', redirect: (to) => `/papers/parse/${to.params.paperId}` },
-      { path: 'aggregate/:id', redirect: (to) => `/papers/aggregate/${to.params.id}` },
+      { path: 'aggregate/:id', redirect: '/papers/parse' },
       {
         // 兜底：未知路径回首页（不跳页、不报错）
         path: ':pathMatch(.*)*',

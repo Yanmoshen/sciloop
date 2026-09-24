@@ -38,7 +38,6 @@ const selectedCount = computed(() => table.value?.selectedCount ?? 0)
 // 底层 `buildCardsForSelected` 本来就是"逐篇建卡 + 并发 3 + 跑完汇总"，
 // 之前只是被这里 "=== 1" 的判断挡住了。
 const canSingle = computed(() => selectedCount.value >= 1)
-const canAggregate = computed(() => selectedCount.value >= 2)
 
 /** 选 1 篇就是单篇解析；选多篇时动作变成"逐篇解析"，按钮文案跟着说清楚 */
 const singleLabel = computed(() => (selectedCount.value > 1 ? '逐篇解析' : '单篇解析'))
@@ -55,12 +54,7 @@ async function runSingle(): Promise<void> {
   close()
 }
 
-async function runAggregate(): Promise<void> {
-  if (!canAggregate.value) return
-  await table.value?.aggregateSelected()
-  emit('submitted')
-  close()
-}
+// 「多篇聚合解析」2026-09-24 从界面下掉（后端聚合能力保留）
 </script>
 
 <template>
@@ -91,14 +85,6 @@ async function runAggregate(): Promise<void> {
           <span class="picker__spacer" />
           <button class="pk-btn" type="button" :disabled="!canSingle" @click="runSingle">
             {{ singleLabel }}
-          </button>
-          <button
-            class="pk-btn pk-btn--primary"
-            type="button"
-            :disabled="!canAggregate"
-            @click="runAggregate"
-          >
-            多篇聚合解析
           </button>
           <button class="pk-btn" type="button" @click="table?.openPicked()">查看已选</button>
           <button class="pk-btn" type="button" @click="close">关闭</button>

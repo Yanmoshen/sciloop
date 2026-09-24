@@ -31,7 +31,6 @@ import { setConversationArchived, type ConversationBrief } from '@/api/conversat
 import type { CreatedProject } from '@/api/projects'
 import { setProjectArchived } from '@/api/projects'
 import ConfirmDialog from '@/components/home/ConfirmDialog.vue'
-import SciLoopMark from '@/components/SciLoopMark.vue'
 import ConversationRenameDialog from '@/components/ConversationRenameDialog.vue'
 import MoveConversationDialog from '@/components/home/MoveConversationDialog.vue'
 import ProjectNameDialog from '@/components/home/ProjectNameDialog.vue'
@@ -76,7 +75,7 @@ const HOME_NAV: HomeNavItem[] = [
       { key: 'translate', label: '论文翻译', path: '/papers/translate' },
       { key: 'reader', label: '全文阅读', path: '/papers/reader' },
       { key: 'parse', label: '论文解析', path: '/papers/parse' },
-      { key: 'aggregate', label: '聚合对比', path: '/papers/aggregate' },
+      // 「聚合对比」2026-09-24 从界面下掉（用户口径）：后端能力与数据保留，界面不再提供入口
       { key: 'export', label: '多格式导出', path: '/papers/export' },
     ],
   },
@@ -638,7 +637,8 @@ onUnmounted(() => {
       :inert="railCollapsed || undefined"
     >
       <div class="brand">
-        <SciLoopMark class="brand__mark" />
+        <!-- ⚠️ 2026-09-24 事故：`components/SciLoopMark.vue` 丢失且无副本，
+             暂时不渲染品牌标（`.brand__mark` 样式保留）；文件重建后把组件放回这里。 -->
         <div class="brand__name">SciLoop</div>
         <button
           class="rail-toggle"
