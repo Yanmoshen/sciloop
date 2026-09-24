@@ -37,7 +37,12 @@ PARSER_NAME = "ar5iv_html"
 #: 被 ``ltx_authors`` 子串规则整体排除导致"解析后没有可用正文块"的问题。
 #: 1.0.2：补上 ``handle_data`` —— 原实现未接管文本节点，DOM 里只剩元素与属性，
 #: 正文文字全部丢失（只有 ``<math alttext>`` 残留），会产出公式源码级假段落。
-PARSER_VERSION = "1.0.2"
+#: 1.1.0：**公式不再被丢弃/拍平**。原先 ``ltx_equation`` 等公式容器在排除清单里 →
+#: 块级公式整块消失（正文只剩编号）；``<math>`` 无 ``alttext`` 时退化成"把可见文本拼起来" →
+#: ``w_t`` 变 ``wt``、``α^2`` 变 ``α2``（**语义错误**，不只是排版问题）。
+#: 现在改为：公式一律还原成 **LaTeX 源码并加定界**（行内 ``$…$``、块级 ``$$…$$``），
+#: 还原不出来就如实写「公式未能还原」，绝不输出错的。
+PARSER_VERSION = "1.1.0"
 
 VOID_TAGS = frozenset(
     {
@@ -69,7 +74,9 @@ EXCLUDE_SUBTREE_TAGS = frozenset(
     {"script", "style", "noscript", "head", "nav", "svg", "table", "thead", "tbody", "tfoot", "tr", "td", "th", "iframe", "form", "button", "select", "textarea"}
 )
 
-#: class 命中即丢弃整棵子树（参考文献、页眉页脚、作者信息、公式源码等）
+#: class 命中即丢弃整棵子树（参考文献、页眉页脚、作者信息等）
+#: ⚠️ **公式容器不在这里**：``ltx_equation`` / ``ltx_eqn`` / ``ltx_align`` 原先被排除，
+#: 导致块级公式整块消失（正文只剩编号）。现在它们由 ``EQUATION_CLASS_SUBSTRINGS`` 单独处理。
 EXCLUDE_CLASS_SUBSTRINGS = (
     "bibliograph",
     "bibitem",
@@ -86,12 +93,9 @@ EXCLUDE_CLASS_SUBSTRINGS = (
     "ltx_title_document",
     "ltx_subtitle",
     "ltx_note",
-    "ltx_equation",
-    "ltx_eqn",
     "ltx_toc",
     "ltx_tag_",
     "ltx_rule",
-    "ltx_align",
     "screen-reader",
     "sr-only",
     "visually-hidden",
@@ -101,6 +105,11 @@ EXCLUDE_CLASS_SUBSTRINGS = (
     "sidebar",
     "toc",
 )
+
+#: 公式容器：**不丢** —— 独立成块，交给前端按 ``$$…$$`` 渲染成数学体。
+#: 注意它**不参与** ``_is_block_element`` 的块判定：否则含公式的段落会被
+#: ``_has_block_descendant`` 判成"有子块"从而整段被跳过，反而丢正文。
+EQUATION_CLASS_SUBSTRINGS = ("ltx_equation", "ltx_eqn", "ltx_align")
 
 #: class 命中即整棵子树视为摘要
 ABSTRACT_CLASS_SUBSTRINGS = ("ltx_abstract", "abstract")
@@ -222,8 +231,174 @@ def _has_abstract_container(node: _Element) -> bool:
     return False
 
 
+#: MathML 里"只做容器"的标签：递归即可
+_MATH_PASSTHROUGH_TAGS = frozenset(
+    {"math", "mrow", "mstyle", "mpadded", "mphantom", "merror", "menclose", "mfenced"}
+)
+#: MathML 里的文本令牌
+_MATH_TOKEN_TAGS = frozenset({"mi", "mn", "mo", "mtext", "ms"})
+#: MathML 递归深度上限（防御性：畸形文档可能极深）
+_MATH_MAX_DEPTH = 12
+
+#: 还原不出来时的**如实标注**（绝不用拼凑的文本冒充公式）
+MATH_UNRECOVERED_MARKER = "[公式未能还原]"
+
+
+def _text_of(node: _Element) -> str:
+    """节点下全部文本（含嵌套）。"""
+    parts: list[str] = []
+    for child in node.children:
+        parts.append(child if isinstance(child, str) else _text_of(child))
+    return "".join(parts)
+
+
+def _tex_annotation(node: _Element) -> str:
+    """取 MathML 里的 TeX annotation —— ar5iv 常用 ``<annotation encoding="application/x-tex">``，
+    它就是作者写的 LaTeX，比"从结构重建"准得多。"""
+    for child in node.children:
+        if isinstance(child, str):
+            continue
+        if child.tag == "annotation" and "tex" in (child.attrs.get("encoding") or "").lower():
+            return _text_of(child).strip()
+        found = _tex_annotation(child)
+        if found:
+            return found
+    return ""
+
+
+def _render_mathml(node: _Element, depth: int = 0) -> str:
+    """MathML → LaTeX（覆盖常用结构；覆盖不到返回空串，由调用方如实标注）。
+
+    只做"结构保真"，不猜语义：``msup`` → ``^{}``、``msub`` → ``_{}``、``mfrac`` → ``\\frac``。
+    """
+    if depth > _MATH_MAX_DEPTH:
+        return ""
+    tag = node.tag
+    if tag in _MATH_TOKEN_TAGS:
+        return _text_of(node).strip()
+
+    children = [child for child in node.children if not isinstance(child, str)]
+
+    if tag in {"msup", "msub", "msubsup"}:
+        if len(children) < 2:
+            return ""
+        base = _render_mathml(children[0], depth + 1)
+        if not base:
+            return ""
+        sub = _render_mathml(children[1], depth + 1)
+        if tag == "msup":
+            return f"{base}^{{{sub}}}" if sub else ""
+        if not sub:
+            return ""
+        if tag == "msub":
+            return f"{base}_{{{sub}}}"
+        sup = _render_mathml(children[2], depth + 1) if len(children) > 2 else ""
+        return f"{base}_{{{sub}}}^{{{sup}}}" if sup else f"{base}_{{{sub}}}"
+
+    if tag == "mfrac":
+        if len(children) < 2:
+            return ""
+        numerator = _render_mathml(children[0], depth + 1)
+        denominator = _render_mathml(children[1], depth + 1)
+        return f"\\frac{{{numerator}}}{{{denominator}}}" if numerator and denominator else ""
+
+    if tag == "msqrt":
+        inner = "".join(_render_mathml(child, depth + 1) for child in children)
+        return f"\\sqrt{{{inner}}}" if inner else ""
+
+    if tag == "mroot":
+        if len(children) < 2:
+            return ""
+        base = _render_mathml(children[0], depth + 1)
+        degree = _render_mathml(children[1], depth + 1)
+        return f"\\sqrt[{degree}]{{{base}}}" if base and degree else ""
+
+    if tag in {"mover", "munder", "munderover"}:
+        if len(children) < 2:
+            return ""
+        base = _render_mathml(children[0], depth + 1)
+        if not base:
+            return ""
+        script = _render_mathml(children[1], depth + 1)
+        if tag == "mover":
+            return f"{base}^{{{script}}}" if script else ""
+        if not script:
+            return ""
+        if tag == "munder":
+            return f"{base}_{{{script}}}"
+        over = _render_mathml(children[2], depth + 1) if len(children) > 2 else ""
+        return f"{base}_{{{script}}}^{{{over}}}" if over else f"{base}_{{{script}}}"
+
+    if tag in _MATH_PASSTHROUGH_TAGS or tag == "semantics":
+        # semantics 的 annotation 分支是"人看的注释"，不是公式内容 —— 排除掉，避免重复
+        inner_children = [c for c in children if c.tag != "annotation"] if tag == "semantics" else children
+        return "".join(_render_mathml(child, depth + 1) for child in inner_children)
+
+    if not children:
+        return _text_of(node).strip()
+    return "".join(_render_mathml(child, depth + 1) for child in children)
+
+
+def math_to_latex(node: _Element) -> str:
+    """``<math>`` → LaTeX 源码。
+
+    优先级：``alttext`` → MathML 里的 TeX annotation → 从 MathML 结构重建；都拿不到返回空串。
+    **绝不退化成"把可见文本拼起来"** —— 那会把 ``w_t`` 变成 ``wt``、``α^2`` 变成 ``α2``，
+    是语义错误而不只是排版问题。
+    """
+    alt = (node.attrs.get("alttext") or "").strip()
+    if alt:
+        return alt
+    tex = _tex_annotation(node)
+    if tex:
+        return tex
+    return _render_mathml(node).strip()
+
+
+def _collect_equation_text(node: _Element, out: list[str]) -> None:
+    """公式容器内部取 LaTeX：**只认 ``<math>``**。
+
+    为什么不能复用 :func:`_collect_text`：arXiv 把块级公式渲染成
+    ``<table class="ltx_equation ltx_eqn_table">``，而 ``table/tr/td`` 在
+    ``EXCLUDE_SUBTREE_TAGS`` 里（那是为了丢弃**数据表格**）→ 公式会被连带跳过。
+    这里把表格当排版壳，另外排除公式编号（``ltx_tag``）。
+    """
+    for child in node.children:
+        if isinstance(child, str):
+            continue
+        if child.tag == "math":
+            latex = math_to_latex(child)
+            if latex:
+                out.append(latex)
+            continue
+        if "ltx_tag" in child.class_blob():
+            continue
+        _collect_equation_text(child, out)
+
+
+def _as_display_math(text: str) -> str:
+    """把"整块就是公式"的文本统一成 ``$$…$$``。
+
+    为什么不能只看 ``<math display="block">``：arXiv 的 ``display`` 常常标在
+    **容器 class**（``ltx_equation``）上而不是 ``<math>`` 属性上，于是块级公式会被
+    当成行内 ``$…$`` 输出 —— 渲染出来是挤在段落里的一小串，不是独立公式。
+    """
+    stripped = text.strip()
+    if stripped.startswith("$$") and stripped.endswith("$$") and len(stripped) > 4:
+        return stripped
+    if stripped.startswith("$") and stripped.endswith("$") and len(stripped) > 2:
+        return f"$${stripped[1:-1]}$$"
+    return f"$${stripped}$$"
+
+
+def _is_equation_container(element: _Element) -> bool:
+    """是否是公式容器（独立成块的 ``ltx_equation`` / ``ltx_eqn`` / ``ltx_align``）。"""
+    blob = element.class_blob()
+    return any(marker in blob for marker in EQUATION_CLASS_SUBSTRINGS)
+
+
 def _collect_text(node: _Element, out: list[str]) -> None:
-    """收集块内文本（inline 直接拼接，math 用 alttext，br 转换行）。"""
+    """收集块内文本（inline 直接拼接，``<math>`` 一律还原成带定界的 LaTeX）。"""
     for child in node.children:
         if isinstance(child, str):
             out.append(child)
@@ -234,13 +409,14 @@ def _collect_text(node: _Element, out: list[str]) -> None:
             out.append("\n")
             continue
         if child.tag == "math":
-            alt = child.attrs.get("alttext") or ""
-            if alt:
-                out.append(f" {alt} ")
+            latex = math_to_latex(child)
+            if not latex:
+                out.append(f" {MATH_UNRECOVERED_MARKER} ")
+            elif (child.attrs.get("display") or "").strip() == "block":
+                # 块级公式用 $$…$$（前端按数学体渲染，独占一行）
+                out.append(f"\n$${latex}$$\n")
             else:
-                inner: list[str] = []
-                _collect_text(child, inner)
-                out.append(f" {''.join(inner)} ")
+                out.append(f" ${latex}$ ")
             continue
         if child.tag in {"img", "object", "embed", "input", "source"}:
             continue
@@ -321,11 +497,20 @@ class _BlockCollector:
 
     # -- 收集 -----------------------------------------------------------
     def walk(self, element: _Element, in_abstract: bool = False) -> None:
+        child_abstract = in_abstract or _is_abstract_container(element)
+
+        # ⚠️ **公式容器优先于排除规则**：arXiv 把块级公式渲染成
+        # ``<table class="ltx_equation ltx_eqn_table">``，而 ``table`` 在
+        # ``EXCLUDE_SUBTREE_TAGS`` 里（为了丢数据表格）→ 若先走排除，公式会被整棵丢掉
+        # （实测：143 个块级公式一个都没留下，$$ 数为 0）。
+        if _is_equation_container(element):
+            self._enter_page_context(element)
+            self._emit(element, "equation", child_abstract)
+            return
+
         if _is_excluded(element):
             return
         self._enter_page_context(element)
-
-        child_abstract = in_abstract or _is_abstract_container(element)
 
         kind = _is_block_element(element)
         if kind is not None and not _has_block_descendant(element):
@@ -360,7 +545,13 @@ class _BlockCollector:
         return self.current_section
 
     def _emit(self, element: _Element, kind: str, in_abstract: bool) -> None:
-        text = block_text(element)
+        if kind == "equation":
+            # 公式容器：内部只认 <math>（表格壳与公式编号都不算），整块统一成 $$…$$
+            parts: list[str] = []
+            _collect_equation_text(element, parts)
+            text = _as_display_math(" \\\\ ".join(part for part in parts if part.strip()))
+        else:
+            text = block_text(element)
         if not text:
             return
         section = self._resolve_section(element, kind, text, in_abstract)
