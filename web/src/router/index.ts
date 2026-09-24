@@ -62,7 +62,7 @@ export const MODULE_GROUPS: ModuleGroup[] = [
       {
         key: 'aggregate',
         label: '聚合对比',
-        path: '/papers/aggregate/demo',
+        path: '/papers/aggregate',
         hint: '对比矩阵 + 方法演进 + 空白',
       },
     ],
@@ -176,6 +176,18 @@ export const routes: RouteRecordRaw[] = [
         name: 'parse',
         component: () => import('@/views/ParseView.vue'),
         meta: { title: '论文解析', module: 'parse' },
+      },
+      // 不带 id 的入口：AggregateView 自己会拉聚合列表当选择器用（原来导航指向 /aggregate/demo，
+      // 那个 demo 会被当成聚合 id 去请求，必然失败）
+      {
+        path: 'papers/aggregate',
+        name: 'aggregate-home',
+        component: () => import('@/views/AggregateView.vue'),
+        meta: { title: '聚合对比', module: 'aggregate' },
+      },
+      {
+        path: 'papers/aggregate/demo',
+        redirect: { path: '/papers/aggregate' },
       },
       {
         path: 'papers/aggregate/:id',

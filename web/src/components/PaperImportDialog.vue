@@ -31,7 +31,11 @@ import { useSessionStore } from '@/stores/session'
 import { writeDenied } from '@/utils/messages'
 
 const props = withDefaults(defineProps<{ open: boolean }>(), { open: false })
-const emit = defineEmits<{ 'update:open': [open: boolean] }>()
+const emit = defineEmits<{
+  'update:open': [open: boolean]
+  /** 一次导入走到终态且**确实进了库**（有 paper_id）时抛给复用方，用于追问"要不要接着解析" */
+  imported: [paperIds: number[]]
+}>()
 
 const router = useRouter()
 const session = useSessionStore()
@@ -55,6 +59,8 @@ const dragging = ref(false)
 const busy = ref('')
 const notice = ref('')
 const job = ref<ImportJob | null>(null)
+/** 一次任务只追问一次解析（轮询可能多次命中终态，也避免同一次导入反复弹） */
+const importedEmitted = ref(false)
 const history = ref<ImportHistoryItem[]>([])
 const historyTotal = ref(0)
 const historyPage = ref(1)
@@ -120,6 +126,14 @@ function startPolling(taskId: string): void {
         if (TERMINAL.includes(String(snapshot.status))) {
           stopPolling()
           await loadHistory(1)
+          // 只把"确实进库了的"抛出去（有 paper_id 才算），失败/重复的不必追问解析
+          const ids = (snapshot.items ?? [])
+            .map((item) => item.paper_id)
+            .filter((id): id is number => typeof id === 'number' && id > 0)
+          if (ids.length > 0 && !importedEmitted.value) {
+            importedEmitted.value = true
+            emit('imported', ids)
+          }
         }
       } catch {
         /* 轮询抖动不打断界面 */
@@ -142,6 +156,7 @@ async function submitFiles(): Promise<void> {
     const accepted = await importPdfs(files.value)
     files.value = []
     job.value = { task_id: accepted.task_id, status: 'accepted' }
+    importedEmitted.value = false
     startPolling(accepted.task_id)
   } catch (error) {
     notice.value = ownerHint(error)
@@ -162,6 +177,7 @@ async function submitIdentifiers(): Promise<void> {
     const accepted = await importIdentifiers(values)
     identifiers.value = ''
     job.value = { task_id: accepted.task_id, status: 'accepted' }
+    importedEmitted.value = false
     startPolling(accepted.task_id)
   } catch (error) {
     notice.value = ownerHint(error)

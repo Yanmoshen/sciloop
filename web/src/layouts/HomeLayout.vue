@@ -76,7 +76,7 @@ const HOME_NAV: HomeNavItem[] = [
       { key: 'translate', label: '论文翻译', path: '/papers/translate' },
       { key: 'reader', label: '全文阅读', path: '/papers/reader' },
       { key: 'parse', label: '论文解析', path: '/papers/parse' },
-      { key: 'aggregate', label: '聚合对比', path: '/papers/aggregate/demo' },
+      { key: 'aggregate', label: '聚合对比', path: '/papers/aggregate' },
       { key: 'export', label: '多格式导出', path: '/papers/export' },
     ],
   },

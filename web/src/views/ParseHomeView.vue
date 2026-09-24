@@ -19,10 +19,11 @@
  *
  * 空状态只保留两个区块标题 —— 页面上没有"您还没有任何解析"这类说明性小字。
  */
+import { ElMessageBox } from 'element-plus'
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
-import { fetchParseHome, type ParseHomeResponse } from '@/api/parse'
+import { fetchParseHome, rebuildCard, type ParseHomeResponse } from '@/api/parse'
 import PaperImportDialog from '@/components/PaperImportDialog.vue'
 import PaperPickerDialog from '@/components/PaperPickerDialog.vue'
 import ViewStatePanel from '@/components/ViewStatePanel.vue'
@@ -75,6 +76,42 @@ function openPaper(paperId: number): void {
 
 function openAggregation(aggregationId: number): void {
   void router.push({ name: 'aggregate', params: { id: String(aggregationId) } })
+}
+
+/** 导入完成 → 追问是否解析（产品口径：导入成功才问，且只问一次）。
+ *
+ * 一次导入多篇时按"各按单篇解析"处理 —— 聚合是"多篇放一起比"，语义上不等价，
+ * 不该替研究者替他决定。并发同样限 3。
+ */
+async function onImported(paperIds: number[]): Promise<void> {
+  importOpen.value = false
+  const count = paperIds.length
+  try {
+    await ElMessageBox.confirm(
+      count === 1
+        ? '已导入 1 篇论文，是否立即解析？'
+        : `已导入 ${count} 篇论文，是否解析这 ${count} 篇（各按单篇解析）？`,
+      '导入完成',
+      { confirmButtonText: '开始解析', cancelButtonText: '暂不解析', type: 'info' },
+    )
+  } catch {
+    return // 选了"暂不解析"：什么都不做，论文已在库里，随时可从「解析论文」再选
+  }
+
+  const queue = [...paperIds]
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const id = queue.shift()
+      if (id === undefined) return
+      try {
+        await rebuildCard(id, true)
+      } catch {
+        /* 单篇失败不连累其它：首屏列表会如实把它标成失败 */
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(3, queue.length) }, () => worker()))
+  await load()
 }
 
 onMounted(() => {
@@ -149,7 +186,7 @@ onMounted(() => {
     </section>
 
     <PaperPickerDialog v-model:open="pickerOpen" />
-    <PaperImportDialog v-model:open="importOpen" />
+    <PaperImportDialog v-model:open="importOpen" @imported="onImported" />
   </div>
 </template>
 
