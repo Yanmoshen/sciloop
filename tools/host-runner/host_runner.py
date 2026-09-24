@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import locale
 import os
 import secrets
 import shlex
@@ -175,8 +176,8 @@ def run_command(
             "exit_code": None,
             "timed_out": True,
             "duration_ms": int((time.perf_counter() - started) * 1000),
-            "stdout": _clip((exc.stdout or b"").decode("utf-8", "replace")),
-            "stderr": _clip((exc.stderr or b"").decode("utf-8", "replace")),
+            "stdout": _clip(_decode(exc.stdout or b"")),
+            "stderr": _clip(_decode(exc.stderr or b"")),
             "error": f"超过 {timeout_s}s 未结束，已终止",
             "workdir": workdir,
         }
@@ -188,8 +189,8 @@ def run_command(
         "exit_code": proc.returncode,
         "timed_out": timed_out,
         "duration_ms": int((time.perf_counter() - started) * 1000),
-        "stdout": _clip(proc.stdout.decode("utf-8", "replace")),
-        "stderr": _clip(proc.stderr.decode("utf-8", "replace")),
+        "stdout": _clip(_decode(proc.stdout or b"")),
+        "stderr": _clip(_decode(proc.stderr or b"")),
         "workdir": workdir,
     }
 
@@ -299,6 +300,27 @@ def _say(text: str = "") -> None:
     """
 
     print(text, flush=True)
+
+
+def _decode(raw: bytes) -> str:
+    """解子进程输出。
+
+    ⚠️ **不能一律按 UTF-8 解**：Windows 的 cmd/程序输出是本机代码页（中文系统是 GBK），
+    一律 UTF-8 会把中文变成一串 `�`（2026-09-25 实测 `cmd /c ver`）。
+    顺序：UTF-8 → 本机默认编码 → GBK → 兜底 replace（尽量别丢字）。
+    """
+
+    if not raw:
+        return ""
+    candidates = ["utf-8", locale.getpreferredencoding(False) or "", "gbk"]
+    for encoding in candidates:
+        if not encoding:
+            continue
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", "replace")
 
 
 def _clip(text: str) -> str:

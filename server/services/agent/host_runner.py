@@ -86,18 +86,21 @@ async def resolve_url(*, client: httpx.AsyncClient | None = None, force: bool = 
     这样"别人拿去 `docker compose up`"开箱可用，而"想用真机"的人装上自启就自动优先真机。
     """
 
-    explicit = (os.environ.get(URL_ENV) or "").strip()
-    if explicit:
-        return explicit.rstrip("/")
-
     now = time.monotonic()
     if not force and _PICKED["url"] and now - float(_PICKED["at"] or 0.0) < PICK_TTL_S:
         return str(_PICKED["url"])
 
+    # ⚠️ 显式配置只是**第一个候选**，不是"独占"：
+    # 实测踩过——真机执行器进程没了，而 .env 还指着它，于是既不真机也不兜底，一条命令都跑不了。
+    explicit = (os.environ.get(URL_ENV) or "").strip().rstrip("/")
+    candidates = [item for item in (explicit, DEFAULT_URL, COMPOSE_URL) if item]
+    seen: set[str] = set()
+    ordered = [item for item in candidates if not (item in seen or seen.add(item))]
+
     owns = client is None
     probe = client or httpx.AsyncClient(timeout=3.0)
     try:
-        for candidate in (DEFAULT_URL, COMPOSE_URL):
+        for candidate in ordered:
             try:
                 response = await probe.get(f"{candidate.rstrip('/')}/health")
                 if response.status_code == 200:
