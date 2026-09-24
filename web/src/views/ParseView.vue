@@ -25,6 +25,7 @@
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 
+import MarkdownText from '@/components/MarkdownText.vue'
 import ViewStatePanel from '@/components/ViewStatePanel.vue'
 import { ApiError } from '@/api/client'
 import { useSessionStore } from '@/stores/session'
@@ -174,28 +175,6 @@ const activeSpan = computed<PaperSpan | null>(() => {
     ) ?? null
   )
 })
-
-/** 高亮片段内部的子区间（仅高亮字段引用的那一段） */
-const markRange = computed<[number, number] | null>(() => {
-  const span = activeSpan.value
-  const current = target.value
-  if (!span || !current) return null
-  const start = Math.max(current.start, span.char_start) - span.char_start
-  const end = Math.min(current.end, span.char_end) - span.char_start
-  if (end <= start) return null
-  return [start, end]
-})
-
-function spanParts(span: PaperSpan): { before: string; mark: string; after: string } {
-  const range = span.id === activeSpan.value?.id ? markRange.value : null
-  if (!range) return { before: span.quote_text, mark: '', after: '' }
-  const [start, end] = range
-  return {
-    before: span.quote_text.slice(0, start),
-    mark: span.quote_text.slice(start, end),
-    after: span.quote_text.slice(end),
-  }
-}
 
 function formatTime(value: string | null | undefined): string {
   if (!value) return '未获取'
@@ -805,13 +784,7 @@ onMounted(() => {
               <span class="chip chip--section">{{ span.section_name ?? 'other' }}</span>
               <span>页 {{ span.page_number ?? '未获取' }}</span>
             </div>
-            <p class="span-block__text">
-              <template v-if="activeSpan?.id === span.id && markRange">
-                {{ spanParts(span).before }}<mark class="hl">{{ spanParts(span).mark }}</mark
-                >{{ spanParts(span).after }}
-              </template>
-              <template v-else>{{ span.quote_text }}</template>
-            </p>
+            <MarkdownText class="span-block__text" :content="span.quote_text" />
             <p v-if="activeSpan?.id === span.id" class="span-block__reason sl-source-tag">
               {{ verdictReason(span) }}
             </p>
@@ -1179,20 +1152,12 @@ onMounted(() => {
   align-items: center;
 }
 
+/* 原文片段正文：交给 MarkdownText 渲染（LaTeX 走 KaTeX，上下标才显示得出来）。
+ * 选中态由 `.span-block--active` 体现，正文本身不做任何标记 —— 原先的 `<mark class="hl">`
+ * 拆分子区间已删除：那个标记在第 1 片就按要求清成"零视觉效果"了，留着只是一段死代码。 */
 .span-block__text {
   margin: 0;
   font-size: var(--font-size-sm);
-}
-
-/* 选中片段**不做任何视觉标记**：不加下划线、不加底色、不加竖条。
- * 选中态由右侧视图高亮该段落本身（`.span-block--active`）来体现。
- * 这里必须显式清掉 background —— 否则 <mark> 会退回浏览器默认的黄底，
- * 等于换了个颜色的"标记"，与"什么都不要"不是一回事。 */
-.hl {
-  padding: 0;
-  background-color: transparent;
-  color: inherit;
-  box-shadow: none;
 }
 
 .span-block__reason {
