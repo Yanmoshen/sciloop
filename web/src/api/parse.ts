@@ -282,6 +282,18 @@ export interface FieldStats {
   unlocated: number
 }
 
+/** 全文总结速览：一段 100–200 字（中文按字、英文术语按词），**不参与证据核验** */
+export interface CardSummary {
+  /** `ok` = 有 text 可显示；`failed` = 页面如实显示「生成失败」 */
+  status: 'ok' | 'failed'
+  text?: string
+  chars?: number
+  generated_at?: string | null
+  model_ref?: string | null
+  /** 失败原因码（内部口径，**前端不显示**，只用于排查） */
+  reason?: string
+}
+
 /** 解析卡片：GET /papers/{id}/card?version= */
 export interface CardResponse {
   paper_id: number
@@ -305,6 +317,8 @@ export interface CardResponse {
   compliance_note: string | null
   llm_call_log: CardCallLog | null
   llm_call_log_traceable: boolean
+  /** 全文总结速览（随卡片生成）。`null` = 本功能上线前建的老卡片，此时显示「生成失败」 */
+  summary?: CardSummary | null
   versions: CardVersionBrief[]
   is_latest: boolean
   fulltext_gate_threshold: number | null

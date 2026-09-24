@@ -67,6 +67,7 @@ from services.parsing.locator import (
     locate_card,
     placeholder_entries,
 )
+from services.parsing.summary import generate_summary
 
 logger = logging.getLogger("sciloop.wp06.card_builder")
 
@@ -1122,6 +1123,18 @@ async def _build_card_impl(
         }
 
     setup = dict(located_card.get("experimental_setup") or {})
+
+    # 全文总结速览：**随卡片一起生成**（用户口径），失败不拖累卡片 —— generate_summary 从不抛异常，
+    # 失败只落 status='failed'，页面如实显示「生成失败」。
+    summary = await generate_summary(
+        paper_id=int(paper_id),
+        document_version=context.document_version,
+        title=context.title,
+        abstract=context.abstract,
+        blocks=context.blocks,
+        project_id=project_id,
+    )
+
     meta = {
         "available_scope": context.available_scope,
         "evidence_scope": context.available_scope,
@@ -1142,6 +1155,7 @@ async def _build_card_impl(
         "context": context.to_audit(),
         "generated_at": _utc_now(),
         "card_builder_version": CARD_BUILDER_VERSION,
+        "summary": summary,
         "locate_rule": (
             "quote_text 为落库 span 的真实切片，quote_sha256 由服务端重新计算；"
             "定位不到一律 evidence_span=null，禁止编造引用"

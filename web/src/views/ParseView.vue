@@ -145,6 +145,22 @@ const documentVersions = computed(
   () => new Set((documents.value?.items ?? []).map((doc) => doc.document_version)),
 )
 
+/** 全文总结速览正文；`failed` 或缺失时为空串（模板据此显示「生成失败」） */
+const summaryText = computed(() => {
+  const summary = card.value?.summary
+  if (!summary || summary.status !== 'ok') return ''
+  return String(summary.text ?? '').trim()
+})
+
+/** 速览只允许 `**加粗**`：**先转义再替换**，不放任正文里的 HTML 进来 */
+const summaryHtml = computed(() => {
+  const escaped = summaryText.value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+  return escaped.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+})
+
 /** 当前高亮片段 */
 const activeSpan = computed<PaperSpan | null>(() => {
   const current = target.value
@@ -587,6 +603,12 @@ onMounted(() => {
       </template>
     </el-alert>
 
+    <!-- 全文总结速览：标题下面、卡片上面。随卡片一起生成；失败如实显示「生成失败」，不编内容 -->
+    <section v-if="card" class="parse__summary" data-role="paper-summary">
+      <p v-if="summaryText" class="parse__summary-text" v-html="summaryHtml" />
+      <p v-else class="parse__summary-failed">生成失败</p>
+    </section>
+
     <div class="parse__grid">
       <!-- 左：8 字段卡片 -->
       <div class="parse__fields scroll-y">
@@ -877,6 +899,27 @@ onMounted(() => {
 
 .parse__alert-body {
   font-size: var(--font-size-xs);
+}
+
+/* 全文总结速览：标题下、两栏（卡片/原文）上的导读段 */
+.parse__summary {
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background-color: var(--color-bg-subtle);
+}
+
+.parse__summary-text {
+  margin: 0;
+  font-size: var(--font-size-md);
+  line-height: var(--line-height-base);
+  color: var(--color-text-primary);
+}
+
+.parse__summary-failed {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
 }
 
 .parse__grid {

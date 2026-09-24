@@ -171,6 +171,9 @@ async def read_card(
     computed["is_latest"] = bool(versions) and int(versions[0]["version"]) == int(row.version)
     computed["fulltext_gate_threshold"] = FULLTEXT_GATE_COVERAGE
     computed["card_builder_version"] = CARD_BUILDER_VERSION
+    # 全文总结速览（随卡片一起生成）：直接透出 evidence_meta 里那份，缺失即为 None ——
+    # 老卡片（本功能上线前建的）没有它，前端据此显示「生成失败」，而不是编一段出来。
+    computed["summary"] = row.evidence_meta.get("summary")
     logger.info(
         "read_card paper_id=%s version=%s scope=%s located=%s unlocated=%s",
         paper_id,
