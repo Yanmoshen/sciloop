@@ -114,6 +114,23 @@ def _normalize_section(section: str | None) -> str | None:
     return value
 
 
+def _parser_notes(parser: str | None) -> list[str]:
+    """解析通道的**已知能力边界**（派生，不落库）。
+
+    PDF 只有字形与坐标、拿不到数学结构，上下标会退化成同基线字符
+    （实测 ``1.0 × 10^20`` 被抽成 ``1.0 · 1020``，**量级都错**）。
+    这种错误靠文本无法可靠识别，所以只能如实声明能力边界，
+    由使用者决定是否改用 HTML 源 —— **不假装公式是对的**。
+    """
+
+    if (parser or "").strip() == "pymupdf":
+        return [
+            "PDF 通道无法还原公式：上下标会丢失（如 10^20 退化为 1020），"
+            "数学内容请以 HTML 源或原文 PDF 为准"
+        ]
+    return []
+
+
 # --------------------------------------------------------------------------------------
 # GET /papers/{id}/documents
 # --------------------------------------------------------------------------------------
@@ -132,7 +149,13 @@ async def list_paper_documents(paper_id: int, session: DbSession) -> dict[str, A
 
     documents = await repository.list_documents(paper_id)
     items = [document.to_api_dict() for document in documents]
+    # 解析通道的**已知能力边界**：在 API 层派生，不落库 ——
+    # ``paper_documents`` 没有 audit 列，加列要动迁移链（同一时间只允许一条线加）。
+    # 派生而不是省略：PDF 的公式确实会错（10^20 → 1020），必须如实告诉使用者。
+    for item in items:
+        item["parser_notes"] = _parser_notes(item.get("parser"))
     summary = summarize_documents(documents)
+    summary["parser_notes"] = _parser_notes(summary.get("parser"))
     logger.info(
         "list_documents paper_id=%s total=%d parse_status=%s coverage=%s",
         paper_id,
@@ -150,7 +173,8 @@ async def list_paper_documents(paper_id: int, session: DbSession) -> dict[str, A
         "spans_allowed": bool(summary.get("spans_allowed")),
         "evidence_scope": summary.get("evidence_scope"),
         "note": (
-            "document_version = 源 URL + 内容 SHA-256 前 12 位；"
+            "document_version = 源 URL + 内容 SHA-256 前 12 位 + 解析器标识"
+            "（如 …#413ebfb574cb-arxiv_html-1.1.1 —— 换解析器即新版本，不改动旧版本证据）；"
             "parse_status/coverage/parse_error 均为落库真实值，未解析不伪造"
         ),
     }

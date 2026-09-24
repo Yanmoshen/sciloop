@@ -314,6 +314,13 @@ def parse_pdf(
             f"PDF 共 {page_count} 页，超过 FULLTEXT_MAX_PAGES={max_pages}，"
             f"仅解析前 {keep_pages} 页；coverage 已体现截断"
         )
+    # **如实声明能力边界**（不假装公式是对的）：PDF 只有字形与坐标，拿不到数学结构，
+    # 上下标会退化成同基线字符 —— 实测 ``1.0 × 10^20`` 会被抽成 ``1.0 · 1020``（**量级都错**）。
+    # 这类错误靠文本无法可靠识别，所以只能在此标注，由使用者决定是否改用 HTML 源。
+    warnings.append(
+        "PDF 通道无法还原公式：上下标会丢失（如 10^20 退化为 1020），"
+        "数学内容请以 HTML 源或原文 PDF 为准"
+    )
 
     return ParsedDocument(
         source_type="pdf",

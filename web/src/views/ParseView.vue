@@ -146,6 +146,17 @@ const documentVersions = computed(
   () => new Set((documents.value?.items ?? []).map((doc) => doc.document_version)),
 )
 
+/** 当前所选解析版本的**能力边界说明**（服务端派生，如"PDF 通道还原不了公式"）。
+ *  这是风险警示，必须让研究者看到 —— 否则他会以为 PDF 里的 1020 就是 10^20。 */
+const parserNotes = computed<string[]>(() => {
+  const current = selectedVersion.value
+  if (!current) return []
+  const found = (documents.value?.items ?? []).find(
+    (item) => item.document_version === current,
+  )
+  return found?.parser_notes ?? []
+})
+
 /** 全文总结速览正文；`failed` 或缺失时为空串（模板据此显示「生成失败」） */
 const summaryText = computed(() => {
   const summary = card.value?.summary
@@ -767,6 +778,16 @@ onMounted(() => {
             <el-button size="small" text type="primary" @click="retryAll">重试解析记录</el-button>
           </template>
         </el-alert>
+
+        <el-alert
+          v-for="(note, index) in parserNotes"
+          :key="`parser-note-${index}`"
+          class="source-notice"
+          type="warning"
+          :closable="false"
+          show-icon
+          :title="note"
+        />
 
         <el-skeleton v-if="spansLoading" :rows="6" animated />
 

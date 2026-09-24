@@ -170,6 +170,8 @@ export interface PaperDocument {
   parsed_at: string | null
   spans_allowed: boolean
   evidence_scope: string | null
+  /** 该解析通道的**已知能力边界**（服务端派生）：例如 PDF 通道无法还原公式的上下标 */
+  parser_notes?: string[]
 }
 
 export interface DocumentsSummary {
