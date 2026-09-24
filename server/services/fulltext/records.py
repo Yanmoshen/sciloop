@@ -47,18 +47,35 @@ def quote_sha256(quote_text: str) -> str:
     return sha256_hex(quote_text.encode("utf-8"))
 
 
-def build_document_version(source_url: str, content_sha256: str) -> str:
-    """``document_version = 源 URL + 内容 SHA-256 前 12 位``（§2.8 硬约束）。
+def build_document_version(
+    source_url: str,
+    content_sha256: str,
+    parser: str | None = None,
+    parser_version: str | None = None,
+) -> str:
+    """``document_version = 源 URL + 内容 SHA-256 前 12 位 [+ 解析器标识]``（§2.8 硬约束）。
 
     超过 ``VARCHAR(64)`` 时保留尾部哈希（哈希是去重与审计的关键部分），
     并按需截断 URL 前缀。截断是确定性的，不破坏唯一性。
+
+    **为什么必须带解析器标识**（2026-09-24 实测）：不含解析器时，**换了 parser 也算同一个版本**
+    → 重解析会走"已存在"捷径，或在 ``force`` 时 DELETE 旧 span 再 INSERT；
+    而旧 span 可能已被 ``evidences.paper_span_id`` 外键引用（该外键**没有级联删除**），
+    于是整次重解析被数据库拒绝（实测 32 次 FK violation，约占三成）。
+    带上解析器后，**换 parser = 新版本 = 不动旧 span**，证据链自然保住。
     """
+
     if not source_url:
         raise ValueError("source_url 不能为空：document_version 必须可追溯到源地址")
     digest = (content_sha256 or "").lower()
     if len(digest) < CONTENT_HASH_PREFIX_LEN:
         raise ValueError("content_sha256 不合法：至少需要 12 位十六进制字符")
     suffix = digest[:CONTENT_HASH_PREFIX_LEN]
+    if parser:
+        # 只保留 [A-Za-z0-9._-]，长度也夹一下：它进的是版本串，不能带出奇怪字符
+        tag = _safe_version_tag(parser, parser_version)
+        if tag:
+            suffix = f"{suffix}-{tag}"
     prefix = source_url
     budget = DOCUMENT_VERSION_MAX_LEN - len(suffix) - 1  # 1 为 '#'
     if budget <= 0:  # pragma: no cover - 列宽远大于 13
@@ -66,6 +83,15 @@ def build_document_version(source_url: str, content_sha256: str) -> str:
     if len(prefix) > budget:
         prefix = prefix[:budget]
     return f"{prefix}#{suffix}"
+
+
+def _safe_version_tag(parser: str, parser_version: str | None) -> str:
+    """``arxiv_html-1.1.1`` 这样的标签；长度夹到 24 字符内，避免吃掉太多 URL 预算。"""
+
+    parts = [str(parser).strip(), str(parser_version).strip() if parser_version else ""]
+    tag = "-".join(part for part in parts if part)
+    tag = re.sub(r"[^A-Za-z0-9._-]", "", tag)
+    return tag[:24]
 
 
 def normalize_block_text(text: str) -> str:
@@ -154,7 +180,10 @@ class ParsedDocument:
 
     @property
     def document_version(self) -> str:
-        return build_document_version(self.source_url, self.content_sha256)
+        """版本串**必须带解析器标识**（否则换 parser 也算同一版本，重解析会撞 evidences 外键）。"""
+        return build_document_version(
+            self.source_url, self.content_sha256, self.parser, self.parser_version
+        )
 
     @property
     def text_only_sha256(self) -> str:

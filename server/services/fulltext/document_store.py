@@ -165,6 +165,15 @@ class LocalFileFetcher:
         )
 
 
+def _parser_version_for(parser: str) -> str:
+    """候选源 → 解析器版本。
+
+    **必须在"解析前"就能算出来**：它要进 ``document_version``（用于查"这份解析是否已存在"），
+    而那个判断发生在真正解析之前。
+    """
+    return PDF_PARSER_VERSION if parser == "pymupdf" else HTML_PARSER_VERSION
+
+
 @dataclass(frozen=True, slots=True)
 class SourceCandidate:
     """一个候选来源（按顺序尝试，前一个失败才试下一个）。"""
@@ -286,7 +295,12 @@ class DocumentStore:
             content = fetched.content or b""
             content_sha256 = sha256_hex(content)
             source_url = fetched.url or candidate.url
-            document_version = build_document_version(source_url, content_sha256)
+            document_version = build_document_version(
+                source_url,
+                content_sha256,
+                candidate.parser,
+                _parser_version_for(candidate.parser),
+            )
 
             if not force:
                 existing = await self.repository.get_document(paper_ref.id, document_version)
@@ -531,7 +545,12 @@ class DocumentStore:
         parse_error: str,
         page_count: int | None,
     ) -> PaperDocumentRecord:
-        document_version = build_document_version(source_url, content_sha256)
+        document_version = build_document_version(
+            source_url,
+            content_sha256,
+            parser,
+            PDF_PARSER_VERSION if source_type == "pdf" else HTML_PARSER_VERSION,
+        )
         record = PaperDocumentRecord(
             paper_id=int(paper_ref.id),
             document_version=document_version,
@@ -569,7 +588,7 @@ class DocumentStore:
 
         record = PaperDocumentRecord(
             paper_id=int(paper_ref.id),
-            document_version=build_document_version(source_url, content_sha256),
+            document_version=build_document_version(source_url, content_sha256, "none", "0"),
             source_type="abstract_only",
             source_url=source_url,
             parser="none",

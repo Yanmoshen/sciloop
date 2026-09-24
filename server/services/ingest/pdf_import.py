@@ -227,7 +227,12 @@ async def _persist_document(
         coverage=coverage,
         min_coverage=min_coverage,
     )
-    document_version = build_document_version(source_url, content_sha256)
+    document_version = build_document_version(
+        source_url,
+        content_sha256,
+        parsed.parser or PDF_PARSER,
+        parsed.parser_version,
+    )
     record = PaperDocumentRecord(
         paper_id=int(paper_id),
         document_version=document_version,
