@@ -38,8 +38,11 @@ from llm.types import ResolvedModel, Usage
 
 logger = logging.getLogger(__name__)
 
-#: 统一超时（connect/read/write/pool 各自上限，秒）
-DEFAULT_TIMEOUT_SECONDS = 60.0
+#: 统一超时（connect/read/write/pool 各自上限，秒）。
+#: 2026-09-24 由 60 提到 300：实测推理类模型输出 3000 tokens 要 45–70 秒
+#: （约 50 tokens/秒），60 秒会让**正常**的长回答被误判成超时 ——
+#: 卡片的输出上限本身就是 3000+ tokens，属于必然踩线的长度。
+DEFAULT_TIMEOUT_SECONDS = 300.0
 #: 流式调用的读超时：按"两个 chunk 之间"计算，长思考模型需要更宽的窗口
 DEFAULT_STREAM_TIMEOUT_SECONDS = 180.0
 DEFAULT_MAX_RETRIES = 2

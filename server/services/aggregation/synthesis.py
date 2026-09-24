@@ -179,8 +179,8 @@ async def generate_synthesis(
             result = await chat(
                 conversation,
                 temperature=0.3,
-                # 综述比速览长：给足额度，否则会被截断成"半句话"
-                max_tokens=1200,
+                # 不设输出上限（原先 1200；推理类模型的推理与正文共用同一份预算，限死会截断正文）
+                max_tokens=None,
                 project_id=project_id,
                 stage="parse",
                 purpose=SYNTHESIS_PURPOSE,

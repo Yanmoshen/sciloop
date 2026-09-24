@@ -197,7 +197,8 @@ async def generate_summary(
             result = await chat(
                 conversation,
                 temperature=0.3,
-                max_tokens=512,
+                # 不设输出上限（推理类模型的推理与正文共用同一份预算，限死会把正文截断成空）
+                max_tokens=None,
                 project_id=project_id,
                 stage="parse",
                 purpose=SUMMARY_PURPOSE,

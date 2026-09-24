@@ -45,7 +45,16 @@ PRESETS: dict[str, ProviderCapability] = {
         "openai", "OpenAI", supports_json_schema=True, default_base_url="https://api.openai.com/v1"
     ),
     "deepseek": ProviderCapability(
-        "deepseek", "DeepSeek", supports_json_schema=True, default_base_url="https://api.deepseek.com/v1"
+        # ⚠️ **实测纠正**（2026-09-24）：DeepSeek **不支持** ``json_schema`` ——
+        # 带 ``response_format={"type":"json_schema"}`` 拿到的是
+        # ``400 This response_format type is unavailable now``；
+        # 而 ``{"type":"json_object"}`` 正常返回合法 JSON。
+        # 原先写 True 是**过度声明**，代价是每次调用先白撞一次 400 再降档。
+        "deepseek",
+        "DeepSeek",
+        supports_json_schema=False,
+        supports_json_object=True,
+        default_base_url="https://api.deepseek.com/v1",
     ),
     "siliconflow": ProviderCapability(
         "siliconflow",

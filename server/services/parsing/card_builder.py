@@ -78,10 +78,13 @@ SCOPE_ABSTRACT_ONLY = "abstract_only"
 #: 全文级卡片的 ``available_scope``
 SCOPE_FULLTEXT = "fulltext"
 
-#: 送进模型的段落字符预算（先 abstract/method/experiment，预算不足时从低优先级章节丢弃）
-MAX_CONTEXT_CHARS = 12000
-#: 单个段落在提示词里的最大长度（截断后的前缀仍与原文逐字一致）
-MAX_BLOCK_CHARS = 1800
+#: 送进模型的段落字符预算。**``None`` = 不设预算**：全量纳入，不因预算丢章节。
+#: 原先写 12000，代价是"预算不足时从低优先级章节丢弃" —— 那是**悄悄丢内容**，
+#: 卡片却看不出来（用户口径：输入不设限）。
+MAX_CONTEXT_CHARS: int | None = None
+#: 单个段落在提示词里的最大长度。**``None`` = 不截断**（截断后的前缀虽与原文逐字一致，
+#: 但会丢掉段落后半的内容，同样属于"悄悄丢内容"）。
+MAX_BLOCK_CHARS: int | None = None
 #: 正文章节优先顺序
 SECTION_PRIORITY: tuple[str, ...] = (
     "abstract",
@@ -499,7 +502,7 @@ class CardContext:
 
 
 def _truncate_block(text: str) -> tuple[str, bool]:
-    if len(text) <= MAX_BLOCK_CHARS:
+    if MAX_BLOCK_CHARS is None or len(text) <= MAX_BLOCK_CHARS:
         return text, False
     return text[:MAX_BLOCK_CHARS], True
 
@@ -507,20 +510,19 @@ def _truncate_block(text: str) -> tuple[str, bool]:
 def build_prompt_blocks(
     spans: Sequence[PaperSpanRecord],
     *,
-    max_chars: int = MAX_CONTEXT_CHARS,
+    max_chars: int | None = MAX_CONTEXT_CHARS,
 ) -> tuple[list[dict[str, Any]], dict[str, int], list[str]]:
-    """按 ``SECTION_PRIORITY`` 与字符预算挑选正文章节。
+    """按 ``SECTION_PRIORITY`` 挑选正文章节（**默认不设字符预算**）。
 
     选择策略（对应 WP06-T1「先 abstract + method，必要时追加 experiment」）：
 
     1. 章节按 ``SECTION_PRIORITY`` 依次纳入（abstract → method → experiment → conclusion
-       → introduction → related_work → other），即"必要时追加"的落地形式：
-       预算先给 abstract/method，剩余预算再依次分给后续章节；
+       → introduction → related_work → other），即"必要时追加"的落地形式；
     2. 同一章节内按 ``char_start`` 升序纳入，保持段落连续可读；
-    3. 某章节遇到放不下的段落即停止纳入该章节剩余段落，并把章节名记入
+    3. ``max_chars`` 为 ``None``（默认）时**全量纳入、不丢任何章节**；
+       只有当调用方显式给了预算时，才在超预算时停止纳入该章节剩余段落并把章节名记入
        ``dropped_sections``（如实记录"有内容没进上下文"）；
-    4. 单段超长按 ``MAX_BLOCK_CHARS`` 截断；截断后的前缀仍与原文逐字一致，
-       因此模型从中复制出的引用依然可以逐字核对。
+    4. 单段超长按 ``MAX_BLOCK_CHARS`` 截断（默认 ``None`` = 不截断）。
 
     返回 ``(blocks, section_chars, dropped_sections)``；``blocks`` 按章节优先级排序。
     """
@@ -547,7 +549,7 @@ def build_prompt_blocks(
             text, _ = _truncate_block(span.quote_text or "")
             if not text:
                 continue
-            if char_total + len(text) > max_chars:
+            if max_chars is not None and char_total + len(text) > max_chars:
                 section_dropped = True
                 continue
             blocks.append(
@@ -702,7 +704,9 @@ async def call_card_llm(
             conversation,
             json_schema=CARD_SCHEMA,
             temperature=0.2,
-            max_tokens=2048,
+            # 不设输出上限：推理类模型的推理与正文共用这份预算，
+            # 限死会让正文被截断（实测 max_tokens=2048 时 content 为空 → 解析失败）
+            max_tokens=None,
             project_id=project_id,
             stage="parse",
             purpose="card_build",

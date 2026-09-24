@@ -371,7 +371,8 @@ def _resolve_chat_fn() -> Any:
 
 def _attempt_kwargs(model_ref: Any) -> list[dict[str, Any]]:
     """按"参数由多到少"生成 chat 调用参数，兼容 WP02 适配层的签名演进。"""
-    full: dict[str, Any] = {"temperature": 0.0, "max_tokens": 512, "json_schema": _NOVELTY_SCHEMA}
+    # 不设输出上限（原先 512）：推理类模型的推理与正文共用同一份预算，限死会让正文被截断
+    full: dict[str, Any] = {"temperature": 0.0, "max_tokens": None, "json_schema": _NOVELTY_SCHEMA}
     if model_ref:
         full["model_ref"] = model_ref
     variants: list[dict[str, Any]] = [dict(full)]

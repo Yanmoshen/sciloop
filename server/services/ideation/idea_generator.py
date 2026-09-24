@@ -314,7 +314,8 @@ async def generate_ideas(
     mode: str = MODE_AUTO,
     model_ref: str | None = None,
     temperature: float = 0.4,
-    max_tokens: int | None = 2000,
+    # 不设输出上限（原先 2000；推理类模型的推理与正文共用同一份预算，限死会让正文被截断）
+    max_tokens: int | None = None,
 ) -> dict[str, Any]:
     """生成 idea → 绑定证据 → **丢弃无证据条目** → 落库。"""
     if mode not in (MODE_LLM, MODE_TEMPLATE, MODE_AUTO):

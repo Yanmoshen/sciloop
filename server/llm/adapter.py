@@ -39,6 +39,7 @@ from llm.errors import (
     ReplayMissError,
 )
 from llm.http_client import (
+    DEFAULT_TIMEOUT_SECONDS,
     OpenAICompatibleClient,
     extract_delta,
     extract_tool_call_deltas,
@@ -61,7 +62,12 @@ from llm.types import CallLogEntry, LLMResult, Message, ResolvedModel, Usage
 logger = logging.getLogger(__name__)
 
 DEFAULT_TEMPERATURE = 0.2
-DEFAULT_MAX_TOKENS = 1536
+#: 输出 token 的兜底上限。**``None`` = 不发送 ``max_tokens``**，由模型自己决定什么时候收尾。
+#: 为什么不留一个数字（2026-09-24 实测）：推理类模型（deepseek-flash 等）的**推理与正文共用**
+#: 这份预算，重的抽取任务里推理会把它吃光 —— 实测 ``max_tokens=2048`` 时
+#: ``reasoning_tokens=2048``、``content`` 长度 0，JSON 解析在 char 0 就失败；
+#: 给到 8192 同一次调用立刻产出合法 JSON。限一个数只会把"能成的调用"变成"假失败"。
+DEFAULT_MAX_TOKENS: int | None = None
 
 
 async def chat(
@@ -102,7 +108,7 @@ async def chat(
     """
     active_store = store or get_store()
     active_router = router or get_router()
-    client = transport or OpenAICompatibleClient(timeout=timeout or 60.0)
+    client = transport or OpenAICompatibleClient(timeout=timeout or DEFAULT_TIMEOUT_SECONDS)
     msg_list = _normalize_messages(messages)
 
     chain = await _resolve_chain(active_router, model_ref, stage, project_id, allow_fallback)
@@ -262,7 +268,7 @@ async def _live_call(
         def _builder(
             current_strategy: str,
             _resolved_temperature: float = resolved_temperature,
-            _resolved_max_tokens: int = resolved_max_tokens,
+            _resolved_max_tokens: int | None = resolved_max_tokens,
         ) -> tuple[dict[str, Any], list[Message]]:
             return _build_payload(
                 model=model,
@@ -541,7 +547,7 @@ async def chat_stream(
     """
     active_store = store or get_store()
     active_router = router or get_router()
-    client = transport or OpenAICompatibleClient(timeout=timeout or 60.0)
+    client = transport or OpenAICompatibleClient(timeout=timeout or DEFAULT_TIMEOUT_SECONDS)
     msg_list = _normalize_messages(messages)
 
     chain = await _resolve_chain(active_router, model_ref, stage, project_id, allow_fallback)
@@ -767,17 +773,18 @@ def _build_stream_payload(
     model: ResolvedModel,
     messages: list[Message],
     temperature: float,
-    max_tokens: int,
+    max_tokens: int | None,
     with_usage: bool,
     tools: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model.model_id,
         "temperature": temperature,
-        "max_tokens": max_tokens,
         "stream": True,
         "messages": messages,
     }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
     if with_usage:
         # 不带这个参数时，多数供应商在流式模式下压根不返回 usage（成本只能记 null）
         payload["stream_options"] = {"include_usage": True}
@@ -801,7 +808,7 @@ def _build_payload(
     model: ResolvedModel,
     messages: list[Message],
     temperature: float,
-    max_tokens: int,
+    max_tokens: int | None,
     json_schema: dict[str, Any] | None,
     strategy: str,
     stage: str | None,
@@ -812,9 +819,12 @@ def _build_payload(
     payload: dict[str, Any] = {
         "model": model.model_id,
         "temperature": temperature,
-        "max_tokens": max_tokens,
         "stream": False,
     }
+    if max_tokens is not None:
+        # 不设上限时不发这个字段：交给模型自己收尾。
+        # 推理类模型的推理与正文**共用**这份预算，限死会把正常调用变成"假失败"。
+        payload["max_tokens"] = max_tokens
     if json_schema is not None:
         if strategy == "json_schema":
             payload["response_format"] = {
