@@ -91,20 +91,37 @@ def _authorised(token: str | None) -> bool:
     return bool(token) and token == expected
 
 
+def _roots() -> dict[str, Any]:
+    """执行环境"自述它能看到什么"——后端据此做路径换算（别在后端写死路径）。"""
+
+    workspace = _workspace()
+    return {
+        "mode": "container",
+        "host_root": str(workspace),
+        "project_roots": [str(workspace)],
+        "default_cwd": str(_default_cwd()),
+        "artifacts_root": str(_artifacts()),
+    }
+
+
 @app.get("/health")
 async def health() -> dict[str, Any]:
-    """情况汇报（不鉴权：后端要用它判断"在不在"，不含敏感信息）。"""
+    """情况汇报（不鉴权）。
+
+    ⚠️ **必须把 `host_root` / `default_cwd` / `artifacts_root` 一起报** ——
+    后端只读这一份当"执行环境的自述"（`host_runner.ensure_host_roots()` 用的是 `/health`，
+    不是 `/info`）。第一版只报了 `workspace`，于是后端拿到 `host_root=None`，
+    技能脚本的路径换不出来 → 报"找不到这个技能在研究者电脑上的位置"（实测踩到）。
+    """
 
     return {
         "ok": True,
         "name": "SciLoop 容器执行环境",
         "version": VERSION,
-        "mode": "container",
         "platform": f"{platform.system()} {platform.release()}",
         "python": _python(),
         "uptime_s": int(time.monotonic() - _STARTED),
-        "workspace": str(_workspace()),
-        "artifacts_root": str(_artifacts()),
+        **_roots(),
     }
 
 
@@ -115,11 +132,7 @@ async def info() -> dict[str, Any]:
     workspace = _workspace()
     return {
         "ok": True,
-        "mode": "container",
-        "host_root": str(workspace),
-        "project_roots": [str(workspace)],
-        "default_cwd": str(_default_cwd()),
-        "artifacts_root": str(_artifacts()),
+        **_roots(),
         "python": _python(),
         "workspace_exists": workspace.is_dir(),
         "artifacts_exists": _artifacts().is_dir(),

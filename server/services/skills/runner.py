@@ -62,7 +62,18 @@ PLACEHOLDERS = ("topic", "in", "out", "skill_dir", "project_dir", "task_id")
 _SAFE_NAME = re.compile(r"[^0-9A-Za-z._\-\u4e00-\u9fff]+")
 
 
-def python_bin() -> str:
+def python_bin(executor_python: str | None = None) -> str:
+    """跑技能脚本用哪个解释器。
+
+    ⚠️ 优先用**执行环境自报**的那个（2026-09-24 踩过）：真机执行器报的是
+    "启动它的那个 python"，容器执行器报的是自己镜像里的 python —— 两者本来就不是一个，
+    让一个环境变量去压过它，就会出现"找不到这个程序：C:/Users/.../python.exe"。
+    `SCILOOP_SKILL_PYTHON` 只当"执行环境没报"时的兜底。
+    """
+
+    explicit = (executor_python or "").strip()
+    if explicit:
+        return explicit
     return (os.environ.get(PYTHON_ENV) or "python").strip() or "python"
 
 
@@ -206,12 +217,22 @@ class RunResult:
         }
 
 
-def plan_commands(pack: SkillPack, *, topic: str, host_dir: Path, work_dir: Path, out_dir: Path, project_dir: str, task_id: str) -> list[dict[str, Any]]:
+def plan_commands(
+    pack: SkillPack,
+    *,
+    topic: str,
+    host_dir: Path,
+    work_dir: Path,
+    out_dir: Path,
+    project_dir: str,
+    task_id: str,
+    executor_python: str | None = None,
+) -> list[dict[str, Any]]:
     """把 `steps` 渲染成"将要执行什么" —— **批准卡上给人看的就是这份**。"""
 
     plan: list[dict[str, Any]] = []
     for step in pack.steps:
-        argv = [python_bin()]
+        argv = [python_bin(executor_python)]
         argv.append(str(host_dir / step.script))
         argv.extend(
             render_args(
@@ -282,6 +303,7 @@ async def run_skill(
         out_dir=host_out,
         project_dir=project,
         task_id=task_id,
+        executor_python=str(info.get("python") or "") or None,
     )
     result.plan = plan
 
@@ -353,7 +375,7 @@ async def run_skill(
     record = {
         **result.as_dict(),
         "planned": plan,
-        "python": python_bin(),
+        "python": python_bin(str(info.get("python") or "") or None),
         "host_pack_dir": str(host_dir),
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
