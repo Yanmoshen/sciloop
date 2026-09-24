@@ -10,9 +10,15 @@
  * 单篇论文解析页（WP07-T5）：左侧 8 字段卡片 + 右侧原文/摘要视图。
  *
  * 交互与诚实标注（计划书 §2.8 / WP05/WP06 边界）：
- * - 点击字段条目 → 右侧滚动到对应 char 区间并高亮（偏移口径与 paper_spans 一致，文档级）；
- * - 显示 document_version / parser / page_number；HTML 版本 page_number 恒为 1 且**不是物理页码**；
- * - 定位不可用（无 span / verdict=valid_by_hash）时提示「以引用文本为准」；
+ * - 点击字段条目 → 右侧视图高亮对应片段；
+ * - **界面只给研究者看得懂的状态**：未定位 / 未校验 / 章节名 / 页 N。
+ *   `document_version`、`char[a:b]`、`verdict=`、`quote_sha256`、`parser · source_type`、
+ *   `experimental_setup.datasets` 这类机器口径一律不透出（面向用户不许出现内部术语）；
+ * - **来源不再由研究者手选**：原「来源下拉」已删，改用解析记录里自动选定的那一份。
+ *   选源只影响看原文时能否对上，不影响卡片与速览的质量；
+ * - 定位不可用（无 span / 哈希命中但偏移不可校验）时如实提示「请以引用文本为准」；
+ * - 选中片段**不做任何视觉标记**（无下划线/底色/竖条），靠右侧视图高亮该段落体现选中；
+ * - **左右两栏各自滚动**（各自固定高度），互不带动；
  * - 顶部显示证据覆盖范围；解析失败/未解析论文只给摘要级视图，不伪报已定位；
  * - 覆盖率与定位状态一律用接口真实值，缺失显示「未获取」。
  */
@@ -129,19 +135,15 @@ const aiSummary = computed(() => {
   return rows
 })
 
-const documentOptions = computed(() => {
-  const list = (documents.value?.items ?? []).map((doc) => ({
-    value: doc.document_version,
-    label: `${doc.parser} · ${doc.source_type} · ${doc.parse_status}${
-      doc.coverage === null ? '（覆盖率未获取）' : `（覆盖 ${Math.round(doc.coverage * 1000) / 10}%）`
-    }`,
-  }))
-  const cardVersion = card.value?.document_version
-  if (cardVersion && !list.some((item) => item.value === cardVersion)) {
-    list.unshift({ value: cardVersion, label: `${cardVersion}（卡片定位版本）` })
-  }
-  return list
-})
+/** 解析记录里出现过的 document_version。
+ *
+ * 只用于判断「条目定位版本是否在解析记录里」；**不再让研究者手选来源** ——
+ * 原来那个下拉把 `parser · source_type · parse_status（覆盖 99%）` 这类机器口径摊在界面上，
+ * 而现在按覆盖率自动选一份即可（选源不影响卡片与速览的质量，只影响看原文时能否对上）。
+ */
+const documentVersions = computed(
+  () => new Set((documents.value?.items ?? []).map((doc) => doc.document_version)),
+)
 
 /** 当前高亮片段 */
 const activeSpan = computed<PaperSpan | null>(() => {
@@ -239,6 +241,34 @@ function fieldStatus(def: CardFieldDef): {
   return { text: `已定位 ${located}/${total}`, tone: 'ok', detail: '该字段条目均已定位到原文片段' }
 }
 
+/** `unknown_fields` 里是 `experimental_setup.datasets` 这类内部键名，这里换成研究者看得懂的说法 */
+const SETUP_PART_LABELS: Record<string, string> = {
+  datasets: '数据集',
+  baselines: '基线',
+  metrics: '指标',
+}
+
+function unknownFieldLabel(key: string): string {
+  const [head, tail] = key.split('.', 2)
+  if (tail) return SETUP_PART_LABELS[tail] ?? tail
+  return CARD_FIELDS.find((item) => item.key === head)?.label ?? head
+}
+
+/** 校验说明：**不直接透出后端的 `reason`** —— 那里面是 `quote_sha256` 这类机器口径，
+ *  面向研究者要说人话。按 verdict 给一句话即可（后端契约不动，避免打坏证据链断言）。 */
+function verdictReason(span: PaperSpan): string {
+  switch (span.verification?.verdict) {
+    case 'valid':
+      return '已与原文逐字比对通过'
+    case 'valid_by_hash':
+      return '已按原文匹配校验通过；定位偏移暂不可用'
+    case 'invalid':
+      return '引用文本与原文不一致，证据不成立'
+    default:
+      return '未校验'
+  }
+}
+
 function verdictLabel(entry: CardEntry): string {
   const verdict = entry.evidence_span?.verification?.verdict
   if (!verdict) return '未校验'
@@ -246,7 +276,7 @@ function verdictLabel(entry: CardEntry): string {
     case 'valid':
       return '精确校验通过'
     case 'valid_by_hash':
-      return '哈希命中（偏移不可校验）'
+      return '已校验通过（定位偏移暂不可用）'
     default:
       return '校验失败'
   }
@@ -256,16 +286,16 @@ async function locate(def: CardFieldDef, entry: CardEntry, index: number): Promi
   const span = entry.evidence_span
   if (!span) {
     target.value = null
-    notice.value = `该条目未定位（evidence_note=${entry.evidence_note ?? '未提供'}）：定位不可用，以引用文本为准`
+    notice.value = '该条目未定位，请以引用文本为准'
     return
   }
   if (span.document_version !== selectedVersion.value) {
-    const exists = documentOptions.value.some((item) => item.value === span.document_version)
+    const exists = documentVersions.value.has(span.document_version)
     if (exists) {
       selectedVersion.value = span.document_version
       await loadSpans()
     } else {
-      notice.value = `条目定位版本（${span.document_version}）不在解析记录中，无法切换视图；以引用文本为准`
+      notice.value = '该条目定位所用的解析版本不在当前记录中，无法切换视图；请以引用文本为准'
     }
   }
   target.value = {
@@ -281,7 +311,7 @@ async function locate(def: CardFieldDef, entry: CardEntry, index: number): Promi
   }
   notice.value =
     span.verification?.verdict === 'valid_by_hash'
-      ? '精确定位不可用（全文缓存缺失，偏移不可校验）→ 已按哈希命中的片段高亮，以引用文本为准'
+      ? '定位偏移暂不可用，已按原文匹配的片段高亮；请以引用文本为准'
       : entry.evidence_note
         ? `定位方式：${entry.evidence_note}`
         : null
@@ -559,7 +589,7 @@ onMounted(() => {
 
     <div class="parse__grid">
       <!-- 左：8 字段卡片 -->
-      <div class="parse__fields">
+      <div class="parse__fields scroll-y">
         <el-skeleton v-if="loading" :rows="8" animated />
         <template v-else>
           <section
@@ -643,7 +673,7 @@ onMounted(() => {
                   </div>
                 </dl>
                 <p v-if="card.unknown_fields.length" class="field-note sl-source-tag">
-                  卡片自报未报告项：{{ card.unknown_fields.join('、') }}
+                  论文未报告：{{ card.unknown_fields.map(unknownFieldLabel).join('、') }}
                 </p>
               </template>
               <p v-else class="field-empty">卡片未获取</p>
@@ -678,11 +708,10 @@ onMounted(() => {
                       {{ verdictLabel(entry) }}
                     </span>
                     <span v-if="entry.evidence_span" class="sl-source-tag">
-                      char[{{ entry.evidence_span.char_start }}:{{ entry.evidence_span.char_end }}] ·
                       {{ entry.evidence_span.section_name ?? '章节未获取' }} · 页
                       {{ entry.evidence_span.page_number ?? '未获取' }}
                     </span>
-                    <span v-else class="missing">未定位（{{ entry.evidence_note ?? '原因未提供' }}）</span>
+                    <span v-else class="missing">未定位</span>
                   </div>
                 </li>
               </ol>
@@ -695,29 +724,11 @@ onMounted(() => {
       <aside class="parse__source sl-card scroll-y">
         <header class="source-head">
           <h2>原文片段视图</h2>
-          <el-select
-            v-if="documentOptions.length"
-            :model-value="selectedVersion"
-            size="small"
-            class="source-head__version"
-            @update:model-value="(v: string) => { selectedVersion = v; target = null; void loadSpans() }"
-          >
-            <el-option
-              v-for="item in documentOptions"
-              :key="item.value"
-              :label="item.label"
-              :value="item.value"
-            />
-          </el-select>
         </header>
 
         <p class="locator-status" data-role="locator-status">
-          <template v-if="target">
-            已定位：{{ target.label }}[{{ target.entryIndex }}] → document_version={{
-              target.version
-            }} char[{{ target.start }}:{{ target.end }}] verdict={{ target.verdict ?? '未校验' }}
-          </template>
-          <template v-else-if="spans.length">未选中字段（点击左侧条目以定位并高亮原文片段）</template>
+          <template v-if="target">已定位：{{ target.label }} 第 {{ target.entryIndex + 1 }} 条</template>
+          <template v-else-if="spans.length">点击左侧条目定位原文</template>
           <template v-else>无可定位片段</template>
         </p>
 
@@ -770,9 +781,7 @@ onMounted(() => {
           >
             <div class="span-block__meta sl-source-tag">
               <span class="chip chip--section">{{ span.section_name ?? 'other' }}</span>
-              <span>char[{{ span.char_start }}:{{ span.char_end }}]</span>
               <span>页 {{ span.page_number ?? '未获取' }}</span>
-              <span>verdict={{ span.verification?.verdict ?? '未获取' }}</span>
             </div>
             <p class="span-block__text">
               <template v-if="activeSpan?.id === span.id && markRange">
@@ -782,7 +791,7 @@ onMounted(() => {
               <template v-else>{{ span.quote_text }}</template>
             </p>
             <p v-if="activeSpan?.id === span.id" class="span-block__reason sl-source-tag">
-              {{ span.verification?.reason ?? '未提供校验理由' }}
+              {{ verdictReason(span) }}
             </p>
           </article>
         </div>
@@ -878,9 +887,14 @@ onMounted(() => {
 }
 
 .parse__fields {
+  position: sticky;
+  top: calc(var(--layout-header-height) + var(--space-3));
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
+  /* 与右栏同高、各自滚动：左栏以前随整页滚，鼠标放在右栏滚轮却带动左栏（两侧不同步）。 */
+  max-height: calc(100vh - var(--layout-header-height) - var(--layout-footer-height) - var(--space-6));
+  overflow-y: auto;
 }
 
 .field-card {
@@ -1078,11 +1092,6 @@ onMounted(() => {
   font-size: var(--font-size-md);
 }
 
-.source-head__version {
-  margin-left: auto;
-  width: 260px;
-}
-
 .locator-status {
   margin: 0;
   padding: var(--space-1) var(--space-2);
@@ -1132,11 +1141,15 @@ onMounted(() => {
   font-size: var(--font-size-sm);
 }
 
+/* 选中片段**不做任何视觉标记**：不加下划线、不加底色、不加竖条。
+ * 选中态由右侧视图高亮该段落本身（`.span-block--active`）来体现。
+ * 这里必须显式清掉 background —— 否则 <mark> 会退回浏览器默认的黄底，
+ * 等于换了个颜色的"标记"，与"什么都不要"不是一回事。 */
 .hl {
-  padding: 0 2px;
-  background-color: var(--color-warning-soft);
-  color: var(--color-text-primary);
-  box-shadow: inset 0 -2px 0 var(--color-warning);
+  padding: 0;
+  background-color: transparent;
+  color: inherit;
+  box-shadow: none;
 }
 
 .span-block__reason {
