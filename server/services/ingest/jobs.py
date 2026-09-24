@@ -308,7 +308,95 @@ async def _run_identifier_batch(
                 "source": result.get("source"),
             },
         )
+
+    await _drop_created_without_fulltext(task_id, results)
     finish_task(task_id, status=STATUS_DONE)
+
+
+#: 导入门禁的提示语（用户 2026-09-24 口径：「没有全文就不应该允许导入」）
+FULLTEXT_GATE_NOTE = "论文库只留能拿到全文的论文"
+
+
+async def _drop_created_without_fulltext(task_id: str, results: Sequence[Any]) -> None:
+    """**导入门禁**：本次新建的论文，拿不到全文就从库里移除。
+
+    用户口径：「没有全文就不应该允许导入，没全文你算什么论文；能拉取到全文就拉取，
+    拉取不到就删除」。
+
+    为什么放在**导入之后立刻执行**而不是插入前同步拦：插入前拦意味着每篇都要先下载解析完
+    才能继续，导入会慢到不可用；先入库再清理的结果等价，而且失败能如实记进任务笔记。
+    只处理本次 ``created`` 的论文 —— ``reused``（库里已有）属于存量数据，
+    由专门的清理负责，避免这里误删。
+    """
+    created = [
+        int(result["paper_id"])
+        for result in results
+        if isinstance(result, dict)
+        and result.get("status") == ITEM_CREATED
+        and result.get("paper_id") is not None
+    ]
+    if not created:
+        return
+
+    try:
+        from tasks.jobs.parse_fulltext import run_parse_fulltext
+
+        report = await run_parse_fulltext(paper_ids=created, force=False, delay_seconds=0.0)
+    except Exception as exc:  # noqa: BLE001 - 门禁失败不改写导入结果，只如实记一笔
+        logger.exception("fulltext_gate_failed task_id=%s", task_id)
+        add_note(task_id, f"导入后的全文解析异常，本次未做清理：{type(exc).__name__}: {exc}")
+        return
+
+    ok_ids = {
+        int(item.get("paper_id") or 0)
+        for item in (report.results or [])
+        if str(item.get("parse_status") or "") == "ok"
+    }
+    doomed = [paper_id for paper_id in created if paper_id not in ok_ids]
+    if not doomed:
+        add_note(task_id, f"{FULLTEXT_GATE_NOTE}（本次 {len(created)} 篇全部拿到全文）")
+        return
+
+    removed = _delete_papers(doomed)
+    add_note(
+        task_id,
+        f"{FULLTEXT_GATE_NOTE}：本次新建的 {len(created)} 篇里有 {len(removed)} 篇拿不到全文，"
+        f"已从论文库移除（paper_id={removed}）",
+    )
+
+
+def _delete_papers(paper_ids: Sequence[int]) -> list[int]:
+    """按同一口径删论文：``evidences`` 不是级联、要先删，其余靠外键级联清掉。
+
+    ⚠️ **必须用同步会话**：导入任务跑在后台线程里（自己一个新事件循环），
+    拿主循环创建的 asyncpg 引擎会炸 ``attached to a different loop``
+    （2026-09-24 实测踩到，任务被标成 failed）。``parse_fulltext`` 的 ``_open_session``
+    同样是这个道理。
+    """
+    if not paper_ids:
+        return []
+    from sqlalchemy import bindparam, text
+
+    from db.session import SessionLocal
+
+    if SessionLocal is None:  # pragma: no cover - 部署期驱动缺失
+        return []
+    ids = [int(pid) for pid in paper_ids]
+    deleting_evidences = text("DELETE FROM evidences WHERE paper_id IN :ids").bindparams(
+        bindparam("ids", expanding=True)
+    )
+    deleting_papers = text("DELETE FROM papers WHERE id IN :ids").bindparams(
+        bindparam("ids", expanding=True)
+    )
+    session = SessionLocal()
+    try:
+        session.execute(deleting_evidences, {"ids": ids})
+        session.execute(deleting_papers, {"ids": ids})
+        session.commit()
+    finally:
+        session.close()
+    logger.warning("fulltext_gate_removed paper_ids=%s", ids)
+    return ids
 
 
 __all__ = [

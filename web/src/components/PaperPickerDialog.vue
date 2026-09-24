@@ -25,7 +25,11 @@ import { computed, ref } from 'vue'
 import PaperTable from '@/components/PaperTable.vue'
 
 const props = defineProps<{ open: boolean }>()
-const emit = defineEmits<{ (e: 'update:open', value: boolean): void }>()
+const emit = defineEmits<{
+  (e: 'update:open', value: boolean): void
+  /** 已提交解析任务：复用方据此立刻刷新列表并开始轮询（否则要等一轮才发现） */
+  (e: 'submitted'): void
+}>()
 
 const table = ref<InstanceType<typeof PaperTable> | null>(null)
 
@@ -47,12 +51,14 @@ async function runSingle(): Promise<void> {
   if (!canSingle.value) return
   await table.value?.buildCardsForSelected()
   // 提交完就退出这个界面（用户口径）；进度看首屏「最近解析」的状态图标
+  emit('submitted')
   close()
 }
 
 async function runAggregate(): Promise<void> {
   if (!canAggregate.value) return
   await table.value?.aggregateSelected()
+  emit('submitted')
   close()
 }
 </script>

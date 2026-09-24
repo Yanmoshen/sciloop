@@ -20,7 +20,7 @@
  * 空状态只保留两个区块标题 —— 页面上没有"您还没有任何解析"这类说明性小字。
  */
 import { ElMessageBox } from 'element-plus'
-import { onMounted, ref } from 'vue'
+import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
 import { fetchParseHome, rebuildCard, type ParseHomeResponse } from '@/api/parse'
@@ -67,8 +67,75 @@ async function load(): Promise<void> {
     error.value = err instanceof Error ? err.message : String(err)
   } finally {
     loading.value = false
+    ensurePolling()
   }
 }
+
+// --------------------------------------------------------------------------- #
+// 自动更新（用户 2026-09-24 实测反馈：提交后不刷新、跑完也不会变绿，都得手动刷）
+//
+// 口径：**有任务在跑就每 3 秒拉一次，跑到没有进行中就自动停**；
+// 最多盯 5 分钟 —— 超过就停止轮询并如实提示"可能异常"，不做无限轮询。
+// 标签页切到后台时暂停（省流量，回来再继续）。
+// --------------------------------------------------------------------------- #
+const POLL_INTERVAL_MS = 3000
+const POLL_TIMEOUT_MS = 5 * 60 * 1000
+
+const pollTimer = ref<number | null>(null)
+const pollStartedAt = ref(0)
+/** 盯超过 5 分钟仍未结束：停止轮询并提示可能异常 */
+const pollTimedOut = ref(false)
+
+function stopPolling(): void {
+  if (pollTimer.value !== null) {
+    window.clearTimeout(pollTimer.value)
+    pollTimer.value = null
+  }
+}
+
+function ensurePolling(): void {
+  const running = recent.value.some((row) => row.status === 'running')
+  if (!running) {
+    // 都跑完了：复位并停表
+    pollStartedAt.value = 0
+    pollTimedOut.value = false
+    stopPolling()
+    return
+  }
+  if (!pollStartedAt.value) pollStartedAt.value = Date.now()
+  if (Date.now() - pollStartedAt.value > POLL_TIMEOUT_MS) {
+    pollTimedOut.value = true
+    stopPolling()
+    return
+  }
+  if (pollTimer.value !== null) return
+  if (document.hidden) return // 后台标签页不轮询；回到前台由 visibilitychange 接管
+  pollTimer.value = window.setTimeout(() => {
+    pollTimer.value = null
+    void load()
+  }, POLL_INTERVAL_MS)
+}
+
+/** 弹窗提交了解析任务 → 立刻拉一次并开始盯（否则要等下一轮才发现有新任务） */
+function onPickerSubmitted(): void {
+  pollStartedAt.value = Date.now()
+  pollTimedOut.value = false
+  void load()
+}
+
+function onVisibilityChange(): void {
+  if (!document.hidden) ensurePolling()
+}
+
+onMounted(() => {
+  document.addEventListener('visibilitychange', onVisibilityChange)
+  void load()
+})
+
+onBeforeUnmount(() => {
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+  stopPolling()
+})
 
 function openPaper(paperId: number): void {
   void router.push({ path: `/papers/parse/${paperId}` })
@@ -114,9 +181,6 @@ async function onImported(paperIds: number[]): Promise<void> {
   await load()
 }
 
-onMounted(() => {
-  void load()
-})
 </script>
 
 <template>
@@ -166,6 +230,10 @@ onMounted(() => {
           <span class="ph__row-time">{{ formatWhen(row.at) }}</span>
         </button>
       </div>
+      <!-- 盯满 5 分钟仍未结束：停止轮询并如实提示（不做无限轮询，也不假装它还在跑） -->
+      <p v-if="pollTimedOut" class="ph__stale" data-role="poll-timeout">
+        解析已超过 5 分钟仍未完成，可能异常，可稍后手动刷新查看。
+      </p>
     </section>
 
     <section class="ph__block">
@@ -185,7 +253,7 @@ onMounted(() => {
       </div>
     </section>
 
-    <PaperPickerDialog v-model:open="pickerOpen" />
+    <PaperPickerDialog v-model:open="pickerOpen" @submitted="onPickerSubmitted" />
     <PaperImportDialog v-model:open="importOpen" @imported="onImported" />
   </div>
 </template>
@@ -313,6 +381,12 @@ onMounted(() => {
 .ph__dot--failed {
   border-radius: 0;
   background: var(--color-danger);
+}
+
+.ph__stale {
+  margin: var(--space-2) 0 0;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
 }
 
 .ph__row-title {

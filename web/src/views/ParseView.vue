@@ -113,29 +113,30 @@ const subMeta = computed(() => {
  */
 const parseState = computed<{ text: string; tone: 'ok' | 'busy' | 'muted' }>(() => {
   if (rebuilding.value) return { text: '解析中', tone: 'busy' }
-  if (card.value) return { text: '已解析', tone: 'ok' }
+  if (card.value) {
+    // ⚠️ **摘要级不能显示「已解析」**（用户 2026-09-24）：那种卡片没有全文，
+    // 速览与引用定位都还是缺的，标成"已解析"会让人以为已经解析完整了。
+    if (card.value.available_scope === 'abstract_only') return { text: '仅摘要', tone: 'busy' }
+    return { text: '已解析', tone: 'ok' }
+  }
   return { text: '未解析', tone: 'muted' }
 })
 
-/**
- * AI 总结：内容**全部取自 AI 产出的卡片字段**（研究问题 / 核心方法 / 主要结论），
- * 逐句可回溯，不做任何补写；卡片缺失时返回空串，由模板决定不渲染。
+/** 右列没有片段时**说清原因**（用户 2026-09-24：不要含糊的"无可定位片段"）。
+ *
+ * 两种完全不同的情况必须分开说：
+ * ① 这篇根本没有解析出全文（`parse_status !== 'ok'`）→ 没有片段可提取，先解析；
+ * ② 有全文但卡片里的引用没能对上 → 重新解析一次即可。
  */
-const aiSummary = computed(() => {
-  const payload = card.value?.card
-  if (!payload) return []
-  const rows: Array<{ label: string; text: string }> = []
-  const research = String(payload.research_problem ?? '').trim()
-  if (research && !isUnknown(research)) rows.push({ label: '研究问题', text: research })
-  const method = String(payload.core_method ?? '').trim()
-  if (method && !isUnknown(method)) rows.push({ label: '核心方法', text: method })
-  const conclusions = Array.isArray(payload.main_conclusions) ? payload.main_conclusions : []
-  const first = conclusions
-    .map((item) => String(item?.conclusion ?? item?.point ?? '').trim())
-    .filter((text) => text && !isUnknown(text))
-    .join('；')
-  if (first) rows.push({ label: '主要结论', text: first })
-  return rows
+const noSpansReason = computed(() => {
+  const status = documents.value?.summary?.parse_status
+  if (status !== 'ok') {
+    return '这篇还没有解析出全文，所以没有原文片段可提取。'
+  }
+  if (!card.value) {
+    return '这篇还没有解析卡片，先解析一次才会产出可定位的引用。'
+  }
+  return '卡片里的引用没能定位到原文片段，重新解析一次即可。'
 })
 
 /** 解析记录里出现过的 document_version。
@@ -798,7 +799,7 @@ onMounted(() => {
         </template>
       </div>
 
-      <!-- 右：原文片段定位（无可定位片段时退化为 AI 总结，不放原始摘要） -->
+      <!-- 右：原文片段定位（没有片段时说清原因 + 给解析入口；**不再退化成 AI 总结**） -->
       <aside class="parse__source sl-card scroll-y">
         <header class="source-head">
           <h2>原文片段视图</h2>
@@ -889,16 +890,19 @@ onMounted(() => {
           </article>
         </div>
 
-        <!-- 无可定位片段：AI 总结（内容全部取自 AI 产出的卡片字段，不展示原始摘要） -->
-        <div v-else-if="!spansLoading" class="source-abstract">
-          <h3>AI 总结</h3>
-          <template v-if="aiSummary.length">
-            <div v-for="row in aiSummary" :key="row.label" class="summary-row">
-              <span class="summary-row__label">{{ row.label }}</span>
-              <p class="summary-row__text">{{ row.text }}</p>
-            </div>
-          </template>
-          <p v-else class="summary-empty">该论文尚未生成解析卡片</p>
+        <!-- 没有可定位片段：**说清为什么** + 给一个解析入口。
+             原先这里退化成「AI 总结」（内容从卡片字段拼的，与左列重复），
+             用户 2026-09-24 明确要求删掉 —— 右列只干"提取原文片段"这一件事。 -->
+        <div v-else-if="!spansLoading" class="source-empty" data-role="no-spans-reason">
+          <p class="source-empty__text">{{ noSpansReason }}</p>
+          <el-button
+            size="small"
+            type="primary"
+            :loading="rebuilding"
+            @click="rebuild"
+          >
+            解析并重建卡片
+          </el-button>
         </div>
       </aside>
     </div>
@@ -1271,33 +1275,17 @@ onMounted(() => {
   margin: 0;
 }
 
-.source-abstract {
+.source-empty {
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
 }
 
-.source-abstract h3 {
+.source-empty__text {
   margin: 0;
-  font-size: var(--font-size-sm);
-}
-
-.summary-row {
-  display: flex;
-  gap: var(--space-2);
-  align-items: baseline;
-}
-
-.summary-row__label {
-  flex: 0 0 64px;
   color: var(--color-text-secondary);
-  font-size: var(--font-size-xs);
-}
-
-.summary-row__text {
-  margin: 0;
-  flex: 1;
-  min-width: 0;
   font-size: var(--font-size-sm);
   line-height: var(--line-height-base);
 }

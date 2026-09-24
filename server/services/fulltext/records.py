@@ -31,6 +31,9 @@ SHA256_HEX_LEN = 64
 
 _WHITESPACE_RE = re.compile(r"[ \t\u00a0\u3000]+")
 _BLANKLINE_RE = re.compile(r"\n{3,}")
+#: 不可落库的控制字符（含 NUL）：Postgres 的 text 字段拒收 NUL，其余控制字符也都是噪声。
+#: 保留 ``\t``(09) 与 ``\n``(0a)：它们是正文的一部分（后续由空白折叠统一处理）。
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 
 def sha256_hex(data: bytes) -> str:
@@ -95,14 +98,23 @@ def _safe_version_tag(parser: str, parser_version: str | None) -> str:
 
 
 def normalize_block_text(text: str) -> str:
-    """段落文本归一：折叠行内空白、去掉空行、统一换行。
+    """段落文本归一：**剔除不可落库的控制字符**、折叠行内空白、去掉空行、统一换行。
 
     ``char_start`` / ``char_end`` 全部相对归一后的全文文本，
     因此本函数是偏移可复现的前提。
+
+    ⚠️ 2026-09-24 实测踩到：PDF 抽出的文本里夹着 ``NUL (0x00)``，
+    PostgreSQL 的 text 字段**不接受**它 → 整批 ``paper_spans`` 写入失败，
+    而 ``paper_documents`` 那行已经提交 → 留下「文档 ok、覆盖 0.97，但一个片段都没有」的
+    **不一致态**（全文门槛还会据此冒充 fulltext：卡片能建、却无处可定位）。
+    在这里统一剔除 —— 两个解析器共用同一条清洗路径。
     """
     if not text:
         return ""
     collapsed = text.replace("\r\n", "\n").replace("\r", "\n")
+    # NUL 与除 \t \n 外的 ASCII 控制字符一律剔除：在任何文档里都是噪声，
+    # 而 Postgres 拒收 NUL —— 留着只会让落库在最后一步炸掉。
+    collapsed = _CONTROL_CHARS_RE.sub("", collapsed)
     lines = [_WHITESPACE_RE.sub(" ", line).strip() for line in collapsed.split("\n")]
     lines = [line for line in lines if line]
     joined = "\n".join(lines)

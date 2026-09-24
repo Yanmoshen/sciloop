@@ -1037,6 +1037,38 @@ def _card_from_row(row: dict[str, Any]) -> CardRow:
 # --------------------------------------------------------------------------- #
 # 建卡主流程
 # --------------------------------------------------------------------------- #
+async def _ensure_fulltext_before_card(paper_id: int) -> str:
+    """建卡前先把**全文解析**跑一遍，返回结果状态（``ok`` / 其他 / ``error``）。
+
+    用户 2026-09-24 口径：**「单篇解析」就该是"解析全文 + 建卡"两步**，而且是**每次都重新解析**。
+    在此之前建卡只读已有文档，于是没有全文的论文会建出``abstract_only``卡片 ——
+    随之而来的是三个看起来"哪里都不对"的现象：速览必然失败、引用无处定位、右列没有原文片段。
+
+    **失败不阻断建卡**：拉不到全文时如实降级为摘要级卡片（页面会标「仅摘要」），
+    绝不因为解析失败就让整个建卡任务报错。
+
+    用 ``tasks.jobs.parse_fulltext`` 而不是直接调 ``DocumentStore``：那是全库重解析走同一条路，
+    下载分级（HTML(ar5iv → arXiv HTML5) 优先、回退 PDF）、覆盖率计算、片段落库都在里面，
+    两边不会走样。惰性导入以避免 services → tasks 的导入环。
+    """
+
+    from tasks.jobs.parse_fulltext import run_parse_fulltext
+
+    try:
+        report = await run_parse_fulltext(paper_ids=[int(paper_id)], force=True, delay_seconds=0.0)
+    except Exception as exc:  # noqa: BLE001 - 解析失败不阻断建卡，只如实降级
+        logger.warning("建卡前的全文解析异常，按摘要级建卡：paper=%s %s: %s", paper_id, type(exc).__name__, exc)
+        return "error"
+
+    best = "unavailable"
+    for item in report.results or []:
+        if int(item.get("paper_id") or 0) == int(paper_id):
+            best = str(item.get("parse_status") or "unavailable")
+            break
+    logger.info("建卡前全文解析：paper=%s status=%s", paper_id, best)
+    return best
+
+
 async def build_card(
     paper_id: int,
     *,
@@ -1046,6 +1078,9 @@ async def build_card(
 ) -> dict[str, Any]:
     """生成（或复用）单篇论文的 8 字段卡片并落库。
 
+    ⚠️ 会**先跑一遍全文解析**（见 :func:`_ensure_fulltext_before_card`）——
+    「单篇解析」对使用者就是"把这篇解析出来"，不该只建一张摘要级卡片。
+
     :param force: ``True`` 时无视已有版本，直接生成 ``version = MAX+1`` 的新卡片
         （旧版本保留，符合 ``UNIQUE(paper_id, version)``）
     :param session: 注入的 SQLAlchemy 会话（``AsyncSession`` 或同步 ``Session``）；
@@ -1053,6 +1088,9 @@ async def build_card(
     :raises PaperNotFoundError: ``papers`` 表中不存在该 paper_id
     :raises CardValidationError: 模型输出连续不符合契约
     """
+    # 全文解析用**它自己的会话**，放在最外层：避免和外层事务互相压锁
+    await _ensure_fulltext_before_card(int(paper_id))
+
     if session is not None:
         return await _build_card_impl(paper_id, force=force, session=session, project_id=project_id)
 
