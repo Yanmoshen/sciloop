@@ -30,6 +30,7 @@ import json
 import logging
 import time
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -73,13 +74,80 @@ REPLY_SYSTEM = (
 )
 
 
+#: 技能目录块的缓存（用户口径 2026-09-25：缓存 1 小时 + 技能库一变立即失效）。
+#:
+#: 为什么必须缓存：`all_packs()` 会对**每个技能包的每个脚本**做一次 `ast.parse` 语法体检
+#: （实测本机 42 个技能包、175 个脚本、2.2MB）——**每次请求 8.3 秒**（首帧前那 8.6s 的真凶）。
+#: 而给模型看目录只需要 name / 一句话 / 环节，"能不能跑"的结论应该等到 `load_skill` /
+#: `run_skill` 时再要。缓存把这段从"每次请求"降到"一小时一次或技能库变更时一次"。
+SKILLS_BLOCK_TTL_SECONDS = 3600.0
+_SKILLS_BLOCK_CACHE: dict[str, Any] = {"signature": "", "at": 0.0, "text": ""}
+
+
+def skills_signature() -> str:
+    """技能库的「新鲜度指纹」：包目录 + 每个技能的 SKILL.md + 挂载目录 + 状态文件的 mtime。
+
+    覆盖四种变更，任何一个都会让指纹变掉、缓存立即失效，所以**不牺牲新鲜度**：
+    - 新增 / 删除技能包 → 包目录（`packs`）的 mtime 变；
+    - 改某个技能的 SKILL.md（描述 / 环节 / 正文）→ 该文件的 mtime 与大小变；
+    - 拨技能开关 → 状态文件的 mtime 变；
+    - 动挂载目录 → 挂载项或其 mtime 变。
+
+    ⚠️ 只看包**目录**的 mtime 是不够的：改 SKILL.md 不会动目录 mtime ——
+    2026-09-25 实测踩到（指纹判"没变"，于是改了描述也不生效）。
+    指纹算不出来（凭空串）时**不缓存**。
+    """
+
+    from services.skills import registry, state
+
+    parts: list[str] = []
+    try:
+        packs_dir = Path(registry.PACKS_DIR)
+        parts.append(f"packs={packs_dir.stat().st_mtime_ns if packs_dir.exists() else 0}")
+        if packs_dir.is_dir():
+            for item in sorted(packs_dir.iterdir()):
+                skill_md = item / "SKILL.md"
+                if item.is_dir() and skill_md.is_file():
+                    info = skill_md.stat()
+                    parts.append(f"{item.name}={info.st_mtime_ns}:{info.st_size}")
+        state_file = state.state_path()
+        parts.append(f"state={state_file.stat().st_mtime_ns if state_file.exists() else 0}")
+        for mount in state.mounts():
+            mount_dir = Path(mount)
+            parts.append(
+                f"mount:{mount}={mount_dir.stat().st_mtime_ns if mount_dir.exists() else 0}"
+            )
+    except Exception as exc:  # noqa: BLE001 - 指纹算不出来就退化为"每次都算"，不能因此少给技能
+        logger.warning("技能目录指纹计算失败，本轮不做缓存：%s", exc)
+        return ""
+    return "|".join(parts)
+
+
 def skills_system_block() -> str:
-    """技能清单（两级披露的**第一级**）：只给名字 + 一句话 + 环节。
+    """技能清单（两级披露的**第一级**）：只给名字 + 一句话 + 环节。**带 1 小时缓存。**
 
     ⚠️ 正文**不能**放进来 —— 40 多个技能的全文会把提示词撑爆，而且大多数跟当前这一步无关。
     模型需要哪个，就 `load_skill` 哪个（那才是第二级）。
     只列**启用**的技能（研究者关掉的不该被模型选中）。
     """
+
+    signature = skills_signature()
+    now = time.monotonic()
+    if (
+        signature
+        and _SKILLS_BLOCK_CACHE["signature"] == signature
+        and now - float(_SKILLS_BLOCK_CACHE["at"]) < SKILLS_BLOCK_TTL_SECONDS
+    ):
+        return str(_SKILLS_BLOCK_CACHE["text"])
+
+    text = _build_skills_system_block()
+    if signature:
+        _SKILLS_BLOCK_CACHE.update({"signature": signature, "at": now, "text": text})
+    return text
+
+
+def _build_skills_system_block() -> str:
+    """真正去扫技能库并拼清单（只在缓存未命中时走这里）。"""
 
     from services.skills import service
 
@@ -244,6 +312,17 @@ async def _agent_loop(
         if round_reasoning:
             assistant_call["reasoning_content"] = round_reasoning
         messages_now.append(assistant_call)
+
+        # **这一轮的思考也落成一行**（2026-09-24 研究者要求）：
+        # 原来整个回合的思考只存在 turn.reasoning 里，界面只能把它整段堆在正文最上方；
+        # 落成行以后，它就能跟在它后面那些过程行**按顺序交叉展示**
+        # （前端按 `kind === 'reasoning'` 渲染成一段可折叠的思考）。
+        # ⚠️ 顺序要紧：必须在本轮的工具行之前 yield，否则思考会跑到自己的动作后面。
+        if round_reasoning:
+            reasoning_row = {"kind": "reasoning", "tone": "idle", "text": round_reasoning}
+            rows.append(reasoning_row)
+            yield _sse("row", {"row": reasoning_row})
+
         stopped_for_approval = False
         for call in calls:
             tool_name = str((call.get("function") or {}).get("name") or "")

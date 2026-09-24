@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
 import time
@@ -146,6 +147,28 @@ def _mount_routers(app: FastAPI) -> None:
         logger.warning("未挂载（等待并行工作包）: %s", ", ".join(skipped))
 
 
+async def _warm_up_prompt_caches() -> None:
+    """预热两块「每次请求现算」的提示词料：技能目录块 + 工具声明。
+
+    不预热的话，**每次后端重启后的第一条消息**要额外等约 8.8 秒（技能目录全量扫描
+    175 个脚本做语法体检），用户实测就是"每次回复 10 秒"里的那 8 秒。
+    这里在启动后**后台**跑一次，把它变成"一小时一次或技能库变更时一次"。
+
+    失败只记日志：预热失败不该影响服务可用性（首次请求会照旧现算）。
+    """
+
+    try:
+        from api.v1.chat import skills_system_block
+        from services.agent import mcp_tools
+
+        started = time.perf_counter()
+        await asyncio.to_thread(skills_system_block)
+        await mcp_tools.tool_schemas()
+        logger.info("提示词料预热完成，用时 %.0f ms", (time.perf_counter() - started) * 1000)
+    except Exception as exc:  # noqa: BLE001 - 预热失败不影响可用性
+        logger.warning("提示词料预热失败（首次请求会照旧现算）：%s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期：启动探测数据库 + 按开关挂载批量任务调度器，关闭时释放资源。"""
@@ -159,7 +182,10 @@ async def lifespan(app: FastAPI):
     # WP01-T6：调度器默认关闭（SCHEDULER_ENABLED=0），关闭时由 scheduler 打印「未启用」；
     # 打开时注册 fetch_papers / score_papers / parse_fulltext（任一任务模块缺失只告警）。
     job_scheduler.start_scheduler()
+    # 后台预热（不阻塞启动）：否则重启后第一条消息要多等约 8.8 秒
+    warm_task = asyncio.create_task(_warm_up_prompt_caches())
     yield
+    warm_task.cancel()
     job_scheduler.shutdown_scheduler()
     await db_session.dispose_engines()
     logger.info("数据库连接池已释放")

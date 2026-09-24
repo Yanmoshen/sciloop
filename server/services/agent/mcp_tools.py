@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -267,8 +268,33 @@ def requires_approval(name: str) -> bool:
     return name in APPROVABLE_TOOLS
 
 
+#: 工具声明的缓存（用户口径 2026-09-25：缓存 1 小时）。
+#: 为什么必须缓存：`list_tools()` 每次都做一遍 **MCP stdio 握手**
+#: （起子进程 → initialize → list_tools → 关），实测 947ms / 846ms，且**完全没有缓存**。
+#: 指纹（mcp_server 源码 mtime + 宿主默认目录 + 出网白名单）一变立即失效。
+SCHEMAS_TTL_SECONDS = 3600.0
+_SCHEMAS_CACHE: dict[str, Any] = {"signature": "", "at": 0.0, "json": ""}
+
+
+def _schemas_signature(default_dir: str | None) -> str:
+    """工具声明的"新鲜度指纹"：MCP 子进程源码 + 宿主默认目录 + 出网白名单。
+
+    任何一个变了就立即失效 —— 所以缓存**不牺牲正确性**，只是不再每次请求都握手一次。
+    """
+
+    root = Path(__file__).resolve().parents[2] / "mcp_server"
+    newest = 0
+    try:
+        if root.is_dir():
+            for item in root.rglob("*.py"):
+                newest = max(newest, item.stat().st_mtime_ns)
+    except OSError:
+        return ""  # 指纹算不出来 → 不缓存
+    return f"{root}={newest}|cwd={default_dir or ''}|hosts={_allowed_hosts()}"
+
+
 async def tool_schemas() -> list[dict[str, Any]]:
-    """OpenAI 兼容的工具声明（只含当前允许摆给模型的那两类）。
+    """OpenAI 兼容的工具声明（只含当前允许摆给模型的那两类）。**带 1 小时缓存。**
 
     两类来源：
     - **MCP server 提供**的（`query_library` / `fetch_url` / `run_command`）——
@@ -280,6 +306,31 @@ async def tool_schemas() -> list[dict[str, Any]]:
 
     **必须是 async**：调用点在对话的 async 生成器里，用 `asyncio.run()` 会直接抛
     `RuntimeError: asyncio.run() cannot be called from a running event loop`。
+    """
+
+    signature = _schemas_signature(await host_runner.default_cwd())
+    now = time.monotonic()
+    if (
+        signature
+        and _SCHEMAS_CACHE["signature"] == signature
+        and now - float(_SCHEMAS_CACHE["at"]) < SCHEMAS_TTL_SECONDS
+    ):
+        # 每次返回**全新副本**：调用方可能改动这份声明，不能让缓存被污染
+        return json.loads(str(_SCHEMAS_CACHE["json"]))
+    schemas, mcp_ok = await _build_tool_schemas()
+    # ⚠️ **只在 MCP 握手成功时才缓存**：握手瞬时失败若被缓存下来，就会把"工具缺失"
+    # 钉住一小时（研究者会看到模型突然什么工具都没有）——宁可那时每次重试。
+    if signature and mcp_ok:
+        _SCHEMAS_CACHE.update(
+            {"signature": signature, "at": now, "json": json.dumps(schemas, ensure_ascii=False)}
+        )
+    return schemas
+
+
+async def _build_tool_schemas() -> tuple[list[dict[str, Any]], bool]:
+    """真正去装配工具声明（只在缓存未命中时走这里）。
+
+    返回 ``(声明列表, MCP 握手是否拿到工具)`` —— 第二项决定这次结果能不能进缓存。
     """
 
     import json as _json
@@ -308,7 +359,9 @@ async def tool_schemas() -> list[dict[str, Any]]:
     try:
         listed = await list_tools(mcp_params())
     except Exception:  # noqa: BLE001 - 工具侧不可用不该拖垮对话
-        return schemas
+        return schemas, False  # 握手失败 → 不缓存（否则会把"工具缺失"钉住一小时）
+    if not listed:
+        return schemas, False
 
     for item in listed:
         name = item.get("name")
@@ -326,7 +379,7 @@ async def tool_schemas() -> list[dict[str, Any]]:
                 },
             }
         )
-    return schemas
+    return schemas, True
 
 
 async def judge(call: dict[str, Any]) -> policy.Verdict:

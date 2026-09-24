@@ -49,7 +49,11 @@ logger = logging.getLogger("sciloop.conversations")
 
 DEFAULT_DIR = "/app/server/.cache/conversations"
 ID_PATTERN = re.compile(r"^[0-9a-zA-Z_-]{6,64}$")
-MAX_TURNS_FOR_CONTEXT = 12
+#: 喂给模型的历史轮数上限（用户口径 2026-09-25：**不缩减，扩到 20 轮**）。
+#: 原先 12 —— 长对话里更早的结论会被丢掉，模型只好反复问。
+#: 输入侧不做字符裁剪；超出上下文窗口（默认 200k）时走"先压工具结果、再摘要早期轮次"，
+#: 而不是在这里少给历史。
+MAX_TURNS_FOR_CONTEXT = 20
 
 #: 未分组对话所在子目录名（不是数字，因此不会与任何真实项目 id 冲突）
 UNGROUPED_KEY = "_ungrouped"
