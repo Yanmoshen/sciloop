@@ -49,14 +49,20 @@ def test_char_count_ignores_empty_input() -> None:
 
 
 def test_system_prompt_pins_the_confirmed_contract() -> None:
+    """口径按用户给的 skill ``paper-summary-300``（2026-09-24 确认）。"""
+
     for fragment in (
         f"{MIN_CHARS}–{MAX_CHARS} 字",
         "中文按字",
         "保留英文",
-        "一段连续文字",
-        "不要换行",
+        "必须覆盖完整逻辑链",
+        "研究痛点",
+        "性能结论",
+        "自然段",
+        "不要用列表",
         "套话开头",
-        "不要写任何免责声明",
+        "免责声明",
+        "只用给定材料",
     ):
         assert fragment in SUMMARY_SYSTEM, fragment
 
@@ -114,9 +120,9 @@ _UNIT = "作者证明当记录策略依赖历史时评估目标值无法从有�
 
 
 def _ok_text() -> str:
-    """长度确定落在 100–200 之间的中文（按字算）：42 × 3 = 126 字。"""
+    """长度确定落在 252–352 之间的中文（按字算）：42 × 7 = 294 字。"""
 
-    return _UNIT * 3
+    return _UNIT * 7
 
 
 class _Usage:
@@ -173,12 +179,41 @@ def test_ok_path_returns_normalized_text(monkeypatch) -> None:
 
     assert result["status"] == "ok"
     assert MIN_CHARS <= result["chars"] <= MAX_CHARS
-    assert "\n" not in result["text"]
     assert result["model_ref"] == "fake:model"
     assert result["attempts"] == 1
     # 路由口径：premise 用 parse 环节 + 独立 purpose
     assert record["calls"][0]["stage"] == "parse"
     assert record["calls"][0]["purpose"] == SUMMARY_PURPOSE
+
+
+def test_multi_paragraph_output_keeps_paragraph_breaks(monkeypatch) -> None:
+    """**允许多段**（用户 2026-09-24 口径）：段间换行必须保留，段内换行才折成空格。
+
+    这条是回归用例：``_normalize`` 以前会把所有换行折成空格，
+    于是"可以分成 2–3 个自然段"这条要求等于白提。
+    """
+
+    part = _UNIT * 2 + "。"  # 84 字
+    tail = "实验在三车道网格世界上完成并给出匹配下界。"  # 20 字
+    _patch_chat(monkeypatch, [f"{part}\n\n{part}\n\n{part}{tail}"])
+    result = _generate()
+
+    assert result["status"] == "ok"
+    assert MIN_CHARS <= result["chars"] <= MAX_CHARS, result["chars"]
+    assert result["text"].count("\n\n") == 2, result["text"]
+    assert "\n" not in result["text"].replace("\n\n", ""), "段内不该再有换行"
+
+
+def test_too_many_paragraphs_is_rejected(monkeypatch) -> None:
+    """段落最多 3 段（口径是"可以分成 2–3 个自然段"，不是随便分）。"""
+
+    part = _UNIT + "。"
+    too_many = "\n\n".join([part] * 8)
+    _patch_chat(monkeypatch, [too_many, too_many])
+    result = _generate()
+
+    assert result["status"] == "failed"
+    assert result["reason"].startswith("too_many_paragraphs")
 
 
 def test_too_short_then_fixed_retries_once_with_corrective_message(monkeypatch) -> None:
@@ -204,7 +239,7 @@ def test_too_long_twice_fails_with_reason(monkeypatch) -> None:
 def test_banned_opener_is_rejected(monkeypatch) -> None:
     """长度合格但用套话开头 → 仍算不合格（长度检查在前，所以样本必须先够长）。"""
 
-    text = "本文" + _UNIT * 3
+    text = "本文" + _UNIT * 7
     _patch_chat(monkeypatch, [text, text])
     result = _generate()
 

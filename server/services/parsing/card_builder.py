@@ -18,7 +18,7 @@
 - **8 字段全部必填且非空**：``research_problem`` / ``core_method`` / ``key_innovation[]``
   / ``technical_route[]`` / ``experimental_setup{datasets,baselines,metrics}`` /
   ``main_conclusions[]`` / ``limitations[]`` / ``transferable[]``；数组字段非空数组，
-  论文未报告的信息写 ``"unknown"``（如实标注，禁止编造）。
+  论文未报告的信息写 ``"未提及"``（如实标注，禁止编造）。
 - **结论性条目必须带 evidence**：模型的 ``evidence_quote`` 只是"候选引用"，由
   :mod:`services.parsing.locator` 回原文核对；核对不上就 ``evidence_span=null``。
 - **全文闸门**：只有 ``parse_status='ok'`` 且 ``coverage>=0.60`` 才带正文章节，
@@ -61,6 +61,7 @@ from services.fulltext.text_cache import default_text_cache
 from services.parsing.locator import (
     FIELD_TEXT_KEYS,
     FULLTEXT_GATE_COVERAGE,
+    UNKNOWN_VALUES,
     LocateReport,
     SpanIndex,
     gate_state,
@@ -70,6 +71,12 @@ from services.parsing.locator import (
 from services.parsing.summary import generate_summary
 
 logger = logging.getLogger("sciloop.wp06.card_builder")
+
+#: 「原文没提」的占位值（用户 2026-09-24 口径：卡片一律中文，不再用英文 ``unknown``）。
+#: 它同时承担两个职责，改名字必须两边一起改：
+#: ① 给研究者看的「这条字段没有原文支撑」；② 让 ``locator.is_usable_quote`` 判定
+#: **这条引用不可用** —— 所以它必须同时出现在 ``locator.UNKNOWN_VALUES`` 里。
+UNKNOWN_PLACEHOLDER = "未提及"
 
 CARD_BUILDER_VERSION = "1.0.0"
 
@@ -116,15 +123,22 @@ SYSTEM_PROMPT = (
     "你是科研辅助系统的「论文解析（parse）」模块。你的输出将作为结构化数据被程序消费。\n"
     "必须严格遵守：1) 只输出合法 JSON，不要任何解释性文字；2) 所有结论性字段必须附带 evidence"
     "（evidence_quote 必须是用户给出的 title/abstract/full_text_sections 中**逐字连续**的一段原文，"
-    '不要改写、不要拼接、不要翻译）；3) 不确定时输出 "unknown" 而不是编造；'
+    '不要改写、不要拼接、**不要翻译**）；3) 不确定时输出 "未提及" 而不是编造；'
     "禁止生成任何指向投稿的表述（禁止出现投稿/期刊推荐/影响因子等内容）。\n"
     "补充要求：4) 8 个字段全部必填，数组字段至少 1 条；"
     "5) limitations 必须引用论文原文中真实出现的表述（如作者自述的失败场景/局限），"
-    '原文没有提到时写 "unknown"；6) 语言与论文原文一致（英文论文用英文，中文论文用中文）。'
+    '原文没有提到时写 "未提及"；'
+    # ⚠️ 2026-09-24 改：原为"语言与论文原文一致（英文论文用英文）"，导致英文论文出英文卡片。
+    # 用户口径：**卡片一律中文**，但术语/方法名/模型名/数据集名保留英文标准名称；
+    # evidence_quote 仍然必须逐字照抄原文（英文论文就是英文原文）—— 它是证据，不能被翻译。
+    "6) **所有字段的值用中文**（含数组项里的 point/conclusion/limitation/step 等）；"
+    "专业术语、方法名、模型名、数据集名保留英文标准名称，不做口语化改写；"
+    "evidence_quote 例外：必须逐字照抄原文，英文论文保留英文原文，**不得翻译**；"
+    '7) 论文未报告的要素统一写 "未提及"，不要留空、不要猜测。'
 )
 
 #: 8 字段的 JSON Schema（结构化输出契约 + 本地校验第一道闸门）
-#: 说明：``evidence_quote`` 允许 ``"unknown"``（长度下限 1），表示"原文无支撑内容"；
+#: 说明：``evidence_quote`` 允许占位值 ``"未提及"``（长度下限 1），表示"原文无支撑内容"；
 #: 能否作为证据由 ``locator.is_usable_quote``（>=8 字符且非占位值）+ 原文逐字核对共同决定，
 #: 因此放宽长度不会让编造的短引用变成证据。
 CARD_SCHEMA: dict[str, Any] = {
@@ -282,16 +296,16 @@ class _StrictModel(BaseModel):
     @field_validator("*", mode="before")
     @classmethod
     def _no_blank(cls, value: Any) -> Any:
-        # 空串补成 unknown（如实标注"不确定"，而不是留空或编造）
+        # 空串补成占位值（如实标注"不确定"，而不是留空或编造）
         if isinstance(value, str):
             text = value.strip()
-            return text if text else "unknown"
+            return text if text else UNKNOWN_PLACEHOLDER
         return value
 
 
 class InnovationItem(_StrictModel):
     point: str = Field(min_length=1)
-    evidence_quote: str = Field(default="unknown", min_length=1)
+    evidence_quote: str = Field(default=UNKNOWN_PLACEHOLDER, min_length=1)
 
 
 class RouteStep(_StrictModel):
@@ -301,12 +315,12 @@ class RouteStep(_StrictModel):
 
 class ConclusionItem(_StrictModel):
     conclusion: str = Field(min_length=1)
-    evidence_quote: str = Field(default="unknown", min_length=1)
+    evidence_quote: str = Field(default=UNKNOWN_PLACEHOLDER, min_length=1)
 
 
 class LimitationItem(_StrictModel):
     limitation: str = Field(min_length=1)
-    evidence_quote: str = Field(default="unknown", min_length=1)
+    evidence_quote: str = Field(default=UNKNOWN_PLACEHOLDER, min_length=1)
 
 
 class TransferableItem(_StrictModel):
@@ -373,13 +387,13 @@ def unknown_fields(card: dict[str, Any]) -> list[str]:
     """如实统计"模型自述不确定"的字段（前端可据此提示证据不足）。"""
     flagged: list[str] = []
     for name in SCALAR_FIELDS:
-        if str(card.get(name) or "").strip().lower() in {"unknown", "未知", "n/a"}:
+        if str(card.get(name) or "").strip().lower() in UNKNOWN_VALUES:
             flagged.append(name)
     setup = card.get("experimental_setup")
     if isinstance(setup, dict):
         for key in ("datasets", "baselines", "metrics"):
             values = [str(v).strip().lower() for v in (setup.get(key) or [])]
-            if values and all(v in {"unknown", "未知", "n/a"} for v in values):
+            if values and all(v in UNKNOWN_VALUES for v in values):
                 flagged.append(f"experimental_setup.{key}")
     return flagged
 
@@ -392,7 +406,7 @@ def _submission_language_hits(text: str) -> list[str]:
 def guard_submission_language(card: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """剔除任何"指向投稿"的表述（附录 D system 模板硬约束）。
 
-    命中时：同字段还有其它条目则丢弃命中条目；只剩这一条时把文本置为 ``unknown``。
+    命中时：同字段还有其它条目则丢弃命中条目；只剩这一条时把文本置为占位值 ``未提及``。
     所有处置留痕在 ``evidence_meta.guardrail``，不做静默修改。
     """
     flags: list[dict[str, Any]] = []
@@ -404,7 +418,7 @@ def guard_submission_language(card: dict[str, Any]) -> tuple[dict[str, Any], lis
             flags.append(
                 {"field": name, "entry_index": None, "patterns": hits, "action": "set_unknown"}
             )
-            cleaned[name] = "unknown"
+            cleaned[name] = UNKNOWN_PLACEHOLDER
 
     for name, key in FIELD_TEXT_KEYS.items():
         entries = cleaned.get(name)
@@ -430,8 +444,8 @@ def guard_submission_language(card: dict[str, Any]) -> tuple[dict[str, Any], lis
             )
         if not kept and entries:
             fallback = dict(entries[0]) if isinstance(entries[0], dict) else {}
-            fallback[key] = "unknown"
-            fallback["evidence_quote"] = "unknown"
+            fallback[key] = UNKNOWN_PLACEHOLDER
+            fallback["evidence_quote"] = UNKNOWN_PLACEHOLDER
             kept = [fallback]
         if kept:
             cleaned[name] = kept
@@ -459,7 +473,7 @@ def guard_submission_language(card: dict[str, Any]) -> tuple[dict[str, Any], lis
             if not isinstance(values, list):
                 continue
             filtered = [item for item in values if not _submission_language_hits(str(item))]
-            setup[key] = filtered or ["unknown"]
+            setup[key] = filtered or [UNKNOWN_PLACEHOLDER]
     return cleaned, flags
 
 
@@ -648,15 +662,17 @@ def build_messages(context: CardContext) -> list[dict[str, Any]]:
             '7) limitations: 数组，每条 {"limitation": 局限, "evidence_quote": 作者自述局限的原文片段}；\n'
             '8) transferable: 数组，每条 {"point": 可迁移做法, "target_problem": 可迁移到的问题}。\n'
             "evidence_quote 必须从上面的 title/abstract/full_text_sections.text 中逐字复制一段连续原文"
-            '（不要改写、不要跨段拼接、不要翻译）；原文确实没有支撑内容时写 "unknown"。\n'
-            '论文未报告的实验要素（数据集/基线/指标）用 "unknown" 占位，禁止猜测。\n'
+            '（不要改写、不要跨段拼接、不要翻译）；原文确实没有支撑内容时写 "未提及"。\n'
+            '论文未报告的实验要素（数据集/基线/指标）用 "未提及" 占位，禁止猜测。\n'
+            "字段的值一律用中文（术语/方法名/模型名/数据集名保留英文标准名称）；"
+            "evidence_quote 保持原文语言，英文论文就是英文原文，不得翻译。\n"
             "禁止出现任何与投稿、期刊/会议推荐、影响因子相关的内容。"
         ),
     }
     if not context.blocks:
         payload["scope_note"] = (
             "本论文仅摘要可用（全文未能解析或覆盖率不足）：请只依据 title/abstract 作答，"
-            'experimental_setup 等未在摘要中出现的要素写 "unknown"。'
+            'experimental_setup 等未在摘要中出现的要素写 "未提及"。'
         )
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -670,8 +686,8 @@ def _corrective_message(issues: Sequence[str]) -> dict[str, str]:
         "content": (
             "上一次输出不符合契约，请严格修正后重新输出完整 JSON（不要任何解释）："
             f"{'; '.join(issues[:10]) or '结构与 required 字段不匹配'}。"
-            "注意：8 个字段全部必填，数组字段至少 1 条，"
-            'evidence_quote 必须是被引用原文里的逐字片段或 "unknown"。'
+            "注意：8 个字段全部必填，数组字段至少 1 条，字段值用中文（术语保留英文），"
+            'evidence_quote 必须是被引用原文里的逐字片段或 "未提及"。'
         ),
     }
 

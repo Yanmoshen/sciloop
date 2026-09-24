@@ -78,6 +78,8 @@ const pickedOpen = ref(false)
 
 const busy = ref('')
 const notice = ref('')
+/** 表头列数随「选文弹窗隐藏操作列」而变（加载/空态那一行要跨正确列数，否则表格会错位） */
+const columnCount = computed(() => (props.selectMode ? 6 : 7))
 /** 旧后端会静默忽略 source/parse_status/sort → 如实提示，不装作筛过了 */
 const staleFiltersNotice = ref('')
 
@@ -307,15 +309,16 @@ defineExpose({
           <th class="col-date">发表时间</th>
           <th class="col-cite">引用</th>
           <th class="col-parse">解析状态</th>
-          <th class="col-ops">操作</th>
+          <!-- 选文弹窗（select-mode）里不提供行内操作：挑论文只靠勾选，动作在底部统一给 -->
+          <th v-if="!props.selectMode" class="col-ops">操作</th>
         </tr>
       </thead>
       <tbody>
         <tr v-if="loading">
-          <td colspan="7" class="empty">加载中…</td>
+          <td :colspan="columnCount" class="empty">加载中…</td>
         </tr>
         <tr v-else-if="visibleItems.length === 0">
-          <td colspan="7" class="empty">没有符合条件的论文：可放宽筛选后重试。</td>
+          <td :colspan="columnCount" class="empty">没有符合条件的论文：可放宽筛选后重试。</td>
         </tr>
         <tr
           v-for="row in visibleItems"
@@ -327,7 +330,17 @@ defineExpose({
             <input type="checkbox" :checked="isSelected(row.id)" @change="toggleRow(row)" />
           </td>
           <td class="title-cell">
-            <a href="#" @click.prevent="openParse(row.id)">{{ row.title }}</a>
+            <!-- 标题即选中（用户 2026-09-24 口径）：以前点标题是跳解析详情，
+                 现在统一变成勾选/取消勾选；要看详情走「深度解析」（选文弹窗里不给这个入口）。 -->
+            <a
+              href="#"
+              role="button"
+              :aria-pressed="isSelected(row.id)"
+              :title="isSelected(row.id) ? '取消选中' : '选中这篇'"
+              @click.prevent="toggleRow(row)"
+            >
+              {{ row.title }}
+            </a>
             <a
               v-if="paperLink(row)"
               class="title-cell__link"
@@ -342,7 +355,7 @@ defineExpose({
           <td>{{ row.published_at ?? '未获取' }}</td>
           <td>{{ num(row.citation_count) }}</td>
           <td><span class="badge" :class="parseBadge(row).cls">{{ parseBadge(row).text }}</span></td>
-          <td class="row-actions">
+          <td v-if="!props.selectMode" class="row-actions">
             <button class="link-btn" type="button" @click="openParse(row.id)">深度解析</button>
             <button class="link-btn link-btn--mute" type="button" @click="toggleRow(row)">
               {{ isSelected(row.id) ? '移出聚合' : '加入聚合' }}
@@ -703,8 +716,23 @@ defineExpose({
   color: var(--color-brand);
 }
 
-:global(:root[data-theme='dark']) .picked-overlay {
+/* ⚠️ 这里原先**只有**暗色主题那一条 background 覆盖，没有基础规则 ——
+   于是「查看已选」点开后面板是个普通块：没有 fixed、没有遮罩、没有层级，
+   被外层弹窗整个盖住，用户看到的就是"点了没反应"。
+   （同一类坑：类名有、规则没有 → 声明整条静默失效。）
+   现在补齐定位/遮罩/层级；层级取 modal+10，因为它的宿主可能就是选文弹窗。 */
+.picked-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: calc(var(--z-modal) + 10);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-4);
+  background: rgba(15, 23, 42, 0.45);
+}
 
+:global(:root[data-theme='dark']) .picked-overlay {
   background: rgba(0, 0, 0, 0.55);
 }
 

@@ -49,9 +49,12 @@ SCOPE_NOTE = (
 #: 合规声明（contracts.ui_mandatory_elements.ComplianceBanner）
 DISCLAIMER = "本内容由 AI 辅助生成，需研究者自行核验"
 
-#: 卡片域对"论文未报告"的如实占位（导出时必须清洗掉，不得当作真实值）
+#: 卡片域对"论文未报告"的如实占位（导出时必须清洗掉，不得当作真实值）。
+#: ⚠️ 卡片自 2026-09-24 起用中文占位「未提及」（原为 ``unknown``）—— 漏一个的后果是
+#: 占位值被当成真实数据导出给下游。改占位口径时**必须同步** ``locator.UNKNOWN_VALUES``、
+#: 本集合、以及 ``feasibility.scorer`` 的占位集合这三处。
 PLACEHOLDER_TOKENS: frozenset[str] = frozenset(
-    {"unknown", "未知", "n/a", "na", "none", "null", "-", "--", ""}
+    {"unknown", "未知", "未提及", "n/a", "na", "none", "null", "-", "--", ""}
 )
 
 #: EasyPaper ↔ SciLoop 字段映射表（每个导出产物都会带上）

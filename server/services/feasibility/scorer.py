@@ -70,9 +70,24 @@ DIMENSION_CARD_FIELD: dict[str, str] = {
     "novelty_gap": "limitations",
 }
 
-#: 卡片占位值（WP06 在材料未提供时会写这些词，不可当作真实取值）
+#: 卡片占位值（WP06 在材料未提供时会写这些词，不可当作真实取值）。
+#: ⚠️ 卡片自 2026-09-24 起用中文占位「未提及」（原为 ``unknown``）—— 漏掉的话
+#: 占位值会被当成真实数据集/基线参与可行性打分（等于拿"没数据"去算分）。
 PLACEHOLDERS: frozenset[str] = frozenset(
-    {"unknown", "n/a", "na", "none", "null", "-", "", "not specified", "unspecified", "待定"}
+    {
+        "unknown",
+        "未知",
+        "未提及",
+        "n/a",
+        "na",
+        "none",
+        "null",
+        "-",
+        "",
+        "not specified",
+        "unspecified",
+        "待定",
+    }
 )
 
 #: 成本护栏兜底（与 contracts.guardrails.cost 一致，实际值由 runtime 传入）

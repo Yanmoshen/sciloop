@@ -72,8 +72,16 @@ _WS_RE = re.compile(r"\s+")
 _SENTENCE_RE = re.compile(r"[^.!?;。！？；\n]+[.!?;。！？；]?")
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9\-_]{2,}|[\u4e00-\u9fff]{2,}")
 
-#: 视为"模型没有给出可用引用"的占位值
-_UNKNOWN_VALUES = frozenset({"", "unknown", "n/a", "na", "none", "null", "-", "未提供", "未知"})
+#: 视为"模型没有给出可用引用"的占位值。
+#: ⚠️ 这里是**占位值的单一来源**：``card_builder`` 判定"未提及"也用它，两边必须同步 ——
+#: 漏一个的后果是**占位值被当成真引用去定位**（等于让证据链造假）。
+#: 2026-09-24 卡片改中文口径后占位值用「未提及」，故一并收进本集合。
+UNKNOWN_VALUES = frozenset(
+    {"", "unknown", "n/a", "na", "none", "null", "-", "未提供", "未知", "未提及"}
+)
+
+#: 兼容旧的私有名（本模块内历史引用）
+_UNKNOWN_VALUES = UNKNOWN_VALUES
 
 
 # --------------------------------------------------------------------------- #
@@ -630,6 +638,7 @@ __all__ = [
     "LocateReport",
     "LocatedQuote",
     "SpanIndex",
+    "UNKNOWN_VALUES",
     "gate_state",
     "is_usable_quote",
     "locate_card",

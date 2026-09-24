@@ -394,6 +394,23 @@ export function fetchCardJob(
   return get<CardJobStatus>(`/papers/${paperId}/card-jobs/${taskId}`, { signal })
 }
 
+/** 「最近解析」里那个红方块（建卡任务失败）也要能在详情页说清楚，所以要能列出最近任务。 */
+export interface CardJobListItem {
+  paper_id: number
+  status: string
+  error?: unknown
+  finished_at?: string | null
+}
+
+export function fetchRecentCardJobs(
+  limit = 50,
+  signal?: AbortSignal,
+): Promise<{ items: CardJobListItem[]; note?: string }> {
+  return get<{ items: CardJobListItem[]; note?: string }>(`/papers/card-jobs?limit=${limit}`, {
+    signal,
+  })
+}
+
 /**
  * 8 字段定义（顺序即左侧卡片顺序，附录 C.2）
  * - `pick`：从卡片内容取展示用条目

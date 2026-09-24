@@ -292,6 +292,22 @@ onMounted(() => {
 
 .ph__dot--running {
   border: 1.5px dashed var(--color-text-secondary);
+  /* 虚线圆自转 = 经典 loading。以前这里只有虚线、没有动画，
+     而文件注释写着"解析中转圈" —— 自述与实现不一致（用户一眼就看出来了）。 */
+  animation: ph-dot-spin 0.9s linear infinite;
+}
+
+@keyframes ph-dot-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 尊重系统的「减少动效」偏好：不转，但仍保留虚线形状以区分"进行中" */
+@media (prefers-reduced-motion: reduce) {
+  .ph__dot--running {
+    animation: none;
+  }
 }
 
 .ph__dot--failed {

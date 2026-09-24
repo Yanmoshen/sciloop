@@ -4,7 +4,13 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""全文总结速览：解析详情页「标题下面、卡片上面」那一段 100–200 字。
+"""全文总结速览：解析详情页「标题下面、卡片上面」那 250–350 字。
+
+口径来源：用户 2026-09-24 给定的 skill ``paper-summary-300`` ——
+目标 280–320 字（判定按 ±10% 放行）、必须覆盖
+「研究痛点 → 核心方案 → 技术创新 → 实验验证 → 性能结论」完整逻辑链、
+可以分成 2–3 个自然段但**不用列表**、保留术语标准名称、客观陈述不含主观评价。
+（改口径前是"100–200 字、只一段"，见 git 历史。）
 
 为什么要有独立提示词
 --------------------
@@ -52,25 +58,48 @@ __all__ = [
 #: ``llm_call_logs.purpose`` —— 与卡片的 ``card_build`` 分开，便于成本追溯与计费区分
 SUMMARY_PURPOSE = "paper_summary"
 
-MIN_CHARS = 100
-MAX_CHARS = 200
+#: 目标区间 280–320 字，判定时按 **±10%** 放行（252–352）——
+#: 用户 2026-09-24 确认：「280-320字，误差不超过10%」当作容差处理，而不是逐字卡死，
+#: 免得模型为了凑字数反复重试（自然语言约束不像 JSON 能靠 schema 兜住）。
+MIN_CHARS = 252
+MAX_CHARS = 352
+
+#: 允许的自然段数上限（用户口径：可以分 2–3 段、但仍不用列表）
+MAX_PARAGRAPHS = 3
 
 #: 长度/格式不合规时最多再让模型改一次（自然语言约束，不像 JSON 那样能靠 schema 兜住）
 MAX_ATTEMPTS = 2
 
 #: 禁用的套话开头（用户明确点名：首先 / 其次 / 综上所述 / 本文）
-BANNED_OPENERS: tuple[str, ...] = ("本文", "首先", "其次", "综上所述", "这篇论文旨在")
+BANNED_OPENERS: tuple[str, ...] = (
+    "本文",
+    "首先",
+    "其次",
+    "综上所述",
+    "这篇论文旨在",
+    "该文",
+    "本项研究",
+)
 
 SUMMARY_SYSTEM = (
-    "你是科研辅助系统的「论文速览」模块：把一篇论文压缩成研究者 30 秒能读完的一段话。\n"
+    "你是科研辅助系统的「论文速览」模块：把一篇论文压缩成 300 字左右、"
+    "信息密度最高的精简总结，供研究者快速筛选文献与记录要点。\n"
     "硬性要求（不满足即视为失败）：\n"
-    "1. 只输出**一段连续文字**：不要标题、不要分点、不要换行、不要代码块；\n"
-    f"2. 长度 {MIN_CHARS}–{MAX_CHARS} 字（**中文按字算、英文术语按词算 1 字**）；\n"
-    "3. 专业术语、方法名、数据集名保留英文原样，其余用中文；\n"
-    "4. 可以直接写论文里的具体数字，不必标注来源；\n"
-    "5. 允许用 **加粗** 标出 1–2 个核心术语，其余不要加任何标记；\n"
-    "6. 不要用「本文」「首先」「其次」「综上所述」这类套话开头，直接讲这篇论文做了什么；\n"
-    "7. 不要写任何免责声明、评价或建议（例如「需进一步验证」「值得关注」）。"
+    f"1. 长度 {MIN_CHARS}–{MAX_CHARS} 字（**中文按字算、英文术语按词算 1 字**）；\n"
+    "2. **必须覆盖完整逻辑链**：研究痛点 → 核心方案 → 技术创新 → 实验验证 → 性能结论，"
+    "一条都不能缺；\n"
+    "3. 按这个结构组织（**可以分成 2–3 个自然段**）：\n"
+    "   开篇：点明该领域的核心问题，引出论文提出的框架/方法名称；\n"
+    "   主体：讲清核心技术思路、关键创新点，以及解决问题的核心机制；\n"
+    "   收尾：说明实验配置、数据集与核心量化结果，总结整体性能水平；\n"
+    "4. **不要用列表**（不用 `-` `/ 1.` 这类符号，也不要小标题）—— 用连贯自然段；\n"
+    "5. 去背景常识与冗余铺垫，每句都要承载核心信息；\n"
+    "6. 专业术语、方法名、模型名、数据集名保留英文标准名称，不做口语化改写，其余用中文；\n"
+    "7. 可以直接写论文里的具体数字，不必标注来源；\n"
+    "8. 允许用 **加粗** 标出 1–2 个核心术语，其余不要加任何标记；\n"
+    "9. 不要用「本文」「首先」「其次」「综上所述」这类套话开头，直接讲这篇论文做了什么；\n"
+    "10. **只用给定材料**：卡片与摘要里没有的内容不要推断、不要补充；\n"
+    "11. 客观陈述，不写任何主观评价、免责声明或建议（例如「值得关注」「需进一步验证」）。"
 )
 
 _CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
@@ -89,18 +118,35 @@ def summary_char_count(text: str) -> int:
 
 
 def _normalize(text: str) -> str:
-    """压成一段：折换行、剥代码围栏、去行首列表符号（模型偶尔会带出来）。"""
+    """清理模型输出：剥代码围栏、去行首列表符号、**保留段落分隔**。
+
+    ⚠️ 2026-09-24 改：这里以前把换行**折成空格**（强制"只一段"）。用户确认口径改为
+    「允许多段、但仍不用列表」之后，折行只能作用于**段内** —— 否则模型分好的
+    2–3 段会被压成一坨，"可以分成 2–3 个自然段"这条要求就白提了。
+    """
 
     plain = str(text or "").strip()
     plain = re.sub(r"^```[A-Za-z0-9]*\s*", "", plain)
     plain = re.sub(r"\s*```$", "", plain)
-    plain = re.sub(r"\s*\n+\s*", " ", plain)
-    plain = re.sub(r"^\s*[-*•]\s+", "", plain)
-    return plain.strip()
+    # 段内折行折成空格；段间空行保留
+    blocks = [re.sub(r"\s*\n\s*", " ", block) for block in re.split(r"\n\s*\n", plain)]
+    cleaned: list[str] = []
+    for block in blocks:
+        line = block.strip()
+        # 模型偶尔会带出列表符号或小标题符号：都按"不用列表/不要标题"的要求去掉
+        line = re.sub(r"^\s*(?:[-*•·]|\d+[.、)])\s*", "", line)
+        line = re.sub(r"^\s*#{1,6}\s*", "", line)
+        if line.strip():
+            cleaned.append(line.strip())
+    return "\n\n".join(cleaned)
 
 
 def _has_banned_opener(text: str) -> bool:
     return text.startswith(BANNED_OPENERS)
+
+
+def _paragraph_count(text: str) -> int:
+    return len([block for block in str(text or "").split("\n\n") if block.strip()])
 
 
 def _issue_of(text: str) -> tuple[str | None, int]:
@@ -113,6 +159,8 @@ def _issue_of(text: str) -> tuple[str | None, int]:
         return f"too_short:{chars}", chars
     if chars > MAX_CHARS:
         return f"too_long:{chars}", chars
+    if _paragraph_count(text) > MAX_PARAGRAPHS:
+        return f"too_many_paragraphs:{_paragraph_count(text)}", chars
     if _has_banned_opener(text):
         return "banned_opener", chars
     return None, chars

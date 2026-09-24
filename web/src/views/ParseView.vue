@@ -27,7 +27,7 @@ import { useRoute } from 'vue-router'
 
 import MarkdownText from '@/components/MarkdownText.vue'
 import ViewStatePanel from '@/components/ViewStatePanel.vue'
-import { toBoldHtml } from '@/utils/richText'
+import { toParagraphHtmlList } from '@/utils/richText'
 import { ApiError } from '@/api/client'
 import { useSessionStore } from '@/stores/session'
 import {
@@ -38,6 +38,7 @@ import {
   fetchPaperDetail,
   rebuildCard,
   fetchCardJob,
+  fetchRecentCardJobs,
   type CardEntry,
   type CardFieldDef,
   type CardResponse,
@@ -147,6 +148,71 @@ const documentVersions = computed(
   () => new Set((documents.value?.items ?? []).map((doc) => doc.document_version)),
 )
 
+/** **上一次建卡任务失败了** → 一句人话。
+ *
+ * 首屏「最近解析」里那个红方块就是它（状态来自进程内的建卡任务登记，不是文档解析状态），
+ * 所以详情页也必须说一句 —— 否则就是"列表说失败、点进来什么也不说"（用户实测反馈）。
+ *
+ * 只说人话，不摊技术原因（用户口径）；任务登记在进程重启后会清空，
+ * 那时这里自然为空，退回到下面按文档状态给的那句。
+ */
+const cardTaskNotice = ref<string | null>(null)
+
+const FAILED_TASK_SENTENCES: Array<[RegExp, string]> = [
+  [/API Key|api.?key|401|unauthor|认证|鉴权/i, '模型服务还没配置好，暂时没法解析这篇。'],
+  [/timeout|timed out|超时/i, '模型服务响应超时了，稍后重试一次即可。'],
+  [/502|503|504|connection|unreachable|不可用|连接/i, '模型服务暂时不可用，稍后重试一次即可。'],
+  [/JSON|json_schema|schema|校验|validation/i, '模型这次返回的结果不合规，重试一次即可。'],
+]
+
+function humanizeTaskError(error: unknown): string {
+  let text = ''
+  try {
+    text = typeof error === 'string' ? error : JSON.stringify(error ?? '')
+  } catch {
+    text = ''
+  }
+  for (const [pattern, sentence] of FAILED_TASK_SENTENCES) {
+    if (pattern.test(text)) return sentence
+  }
+  return '上一次解析没有成功，重试一次即可。'
+}
+
+async function loadCardTask(): Promise<void> {
+  try {
+    const response = await fetchRecentCardJobs(50)
+    const mine = (response.items ?? []).filter(
+      (item) => String(item.paper_id) === String(paperId.value),
+    )
+    // 列表按时间倒序：只看最近一条，它成了就不该再提示旧的失败
+    const newest = mine[0]
+    cardTaskNotice.value =
+      newest && newest.status === 'failed' ? humanizeTaskError(newest.error) : null
+  } catch {
+    // 查不到任务不提示、也不报错：它只是"补充说明"，不该影响页面
+    cardTaskNotice.value = null
+  }
+}
+
+/** **解析状态的一句话**（用户 2026-09-24：解析失败点进来要有提示，只说人话、不摊技术原因）。
+ *
+ * 以前这里对 `parse_status` 一个字都不提：全文没解析出来时页面只是"没有原文片段"，
+ * 研究者会以为是自己看错地方。现在按当前版本的状态如实说一句。
+ */
+const parseNotice = computed<string | null>(() => {
+  const current = selectedVersion.value
+  const list = documents.value?.items ?? []
+  const doc = current
+    ? list.find((item) => item.document_version === current)
+    : list[0]
+  const status = doc?.parse_status ?? documents.value?.summary?.parse_status
+  if (!status || status === 'ok') return null
+  if (status === 'unavailable') return '这篇没有可用的全文，目前只能看摘要与卡片。'
+  if (status === 'failed') return '这篇的全文解析失败了，目前只能看摘要与卡片。'
+  if (status === 'partial') return '这篇只解析到部分全文，原文片段可能不全。'
+  return null
+})
+
 /** 当前所选解析版本的**能力边界说明**（服务端派生，如"PDF 通道还原不了公式"）。
  *  这是风险警示，必须让研究者看到 —— 否则他会以为 PDF 里的 1020 就是 10^20。 */
 const parserNotes = computed<string[]>(() => {
@@ -166,7 +232,8 @@ const summaryText = computed(() => {
 })
 
 /** 速览只允许 `**加粗**`（转义与替换收在 utils/richText，避免两处各写一遍写歪） */
-const summaryHtml = computed(() => toBoldHtml(summaryText.value))
+/** 速览按段渲染（后端可以给 2–3 段；`v-html` 会把换行折叠，所以这里切好再循环） */
+const summaryParagraphs = computed(() => toParagraphHtmlList(summaryText.value))
 
 /** 当前高亮片段 */
 const activeSpan = computed<PaperSpan | null>(() => {
@@ -417,6 +484,7 @@ async function loadAll(): Promise<void> {
     const first = documents.value?.items?.[0]?.document_version ?? null
     selectedVersion.value = first
   }
+  await loadCardTask()
   await loadSpans()
   loading.value = false
 }
@@ -590,7 +658,10 @@ onMounted(() => {
 
     <!-- 全文总结速览：标题下面、卡片上面。随卡片一起生成；失败如实显示「生成失败」，不编内容 -->
     <section v-if="card" class="parse__summary" data-role="paper-summary">
-      <p v-if="summaryText" class="parse__summary-text" v-html="summaryHtml" />
+      <div v-if="summaryText" class="parse__summary-text">
+        <!-- 按段渲染：`v-html` 会把换行当空白折叠，一整段塞进一个 <p> 就白分了段 -->
+        <p v-for="(paragraph, index) in summaryParagraphs" :key="`sum-${index}`" v-html="paragraph" />
+      </div>
       <p v-else class="parse__summary-failed">生成失败</p>
     </section>
 
@@ -774,6 +845,17 @@ onMounted(() => {
           </template>
         </el-alert>
 
+        <!-- 解析状态的一句话：建卡任务失败优先（那是"最近发生的事"），否则按文档状态说 -->
+        <el-alert
+          v-if="cardTaskNotice || parseNotice"
+          class="source-notice"
+          data-role="parse-notice"
+          type="warning"
+          :closable="false"
+          show-icon
+          :title="cardTaskNotice ?? parseNotice"
+        />
+
         <el-alert
           v-for="(note, index) in parserNotes"
           :key="`parser-note-${index}`"
@@ -903,6 +985,15 @@ onMounted(() => {
   font-size: var(--font-size-md);
   line-height: var(--line-height-base);
   color: var(--color-text-primary);
+}
+
+/* 速览现在可以是 2–3 段：段间留一点呼吸，段内不额外留白 */
+.parse__summary-text p {
+  margin: 0;
+}
+
+.parse__summary-text p + p {
+  margin-top: var(--space-2);
 }
 
 .parse__summary-failed {

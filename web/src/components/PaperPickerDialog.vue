@@ -13,8 +13,12 @@
  * 为什么复用而不是另写一个搜索：论文库那个模块已包含关键词/领域/来源/解析状态筛选、排序、
  * 服务端分页与**跨页选择**（用户实测过的痛点：翻页丢失已选）。另写一份必然走样。
  *
- * 可用规则（不猜、不灰得没道理）：选 1 篇才能「单篇解析」；选 2 篇及以上才能「多篇聚合解析」
- * —— 聚合的语义就是"多篇放一起比"，1 篇没有可比的第二篇。
+ * 可用规则（2026-09-24 用户口径）：
+ * - 「单篇解析」**选 1 篇及以上**都能点 —— 选多篇时是**每篇各自独立解析一次**
+ *   （按钮文案相应变成「逐篇解析」，底层 `buildCardsForSelected` 本就是逐篇 + 并发 3）；
+ * - 「多篇聚合解析」仍需 2 篇及以上 —— 聚合的语义就是"多篇放一起比"，1 篇没有可比的第二篇；
+ * - 两个动作提交后**都自动关窗**（进度看首屏「最近解析」的状态图标）；
+ * - 「查看已选」是叠在弹窗之上的浮层（`PaperTable` 的 `.picked-overlay`）。
  */
 import { computed, ref } from 'vue'
 
@@ -26,8 +30,14 @@ const emit = defineEmits<{ (e: 'update:open', value: boolean): void }>()
 const table = ref<InstanceType<typeof PaperTable> | null>(null)
 
 const selectedCount = computed(() => table.value?.selectedCount ?? 0)
-const canSingle = computed(() => selectedCount.value === 1)
+// 用户 2026-09-24 口径：**选多篇也能「单篇解析」** —— 每篇各自独立解析一次。
+// 底层 `buildCardsForSelected` 本来就是"逐篇建卡 + 并发 3 + 跑完汇总"，
+// 之前只是被这里 "=== 1" 的判断挡住了。
+const canSingle = computed(() => selectedCount.value >= 1)
 const canAggregate = computed(() => selectedCount.value >= 2)
+
+/** 选 1 篇就是单篇解析；选多篇时动作变成"逐篇解析"，按钮文案跟着说清楚 */
+const singleLabel = computed(() => (selectedCount.value > 1 ? '逐篇解析' : '单篇解析'))
 
 function close(): void {
   emit('update:open', false)
@@ -36,6 +46,8 @@ function close(): void {
 async function runSingle(): Promise<void> {
   if (!canSingle.value) return
   await table.value?.buildCardsForSelected()
+  // 提交完就退出这个界面（用户口径）；进度看首屏「最近解析」的状态图标
+  close()
 }
 
 async function runAggregate(): Promise<void> {
@@ -72,7 +84,7 @@ async function runAggregate(): Promise<void> {
           <span class="picker__count">已选 {{ selectedCount }} 篇</span>
           <span class="picker__spacer" />
           <button class="pk-btn" type="button" :disabled="!canSingle" @click="runSingle">
-            单篇解析
+            {{ singleLabel }}
           </button>
           <button
             class="pk-btn pk-btn--primary"
