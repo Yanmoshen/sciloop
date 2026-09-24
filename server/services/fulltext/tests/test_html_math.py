@@ -146,9 +146,27 @@ def test_table_wrapped_equation_is_not_dropped() -> None:
     assert "(7)" not in display[0].text
 
 
+def test_unparsed_math_plain_latex_gets_delimiters() -> None:
+    """**第五类**：arXiv 自己没解析成功的公式（``ltx_math_unparsed``）是**纯文本 LaTeX**，
+    不是 ``<math>`` 元素，走不到 ``<math>`` 分支 —— 实测仍有 4 篇论文正文里留着
+    ``{\\color[rgb]{…}\\mathbf{c}}`` 这类裸 LaTeX，必须单独补定界。"""
+
+    document = parse_html(
+        '<html><body><article class="ltx_document"><section><h2>Method</h2>'
+        '<p class="ltx_para">where '
+        '<span class="ltx_math_unparsed">\\mathcal{T}_{K}</span>'
+        " denotes whichever class is under consideration.</p>"
+        "</section></article></body></html>",
+        source_url="https://arxiv.org/html/0000.00005",
+        content_sha256="5" * 64,
+    )
+    text = "\n".join(block.text for block in document.blocks)
+    assert "$\\mathcal{T}_{K}$" in text, text
+
+
 def test_parser_version_is_bumped() -> None:
     """版本号是"解析结果变了"的对外信号，必须跟着改（document_version 会随之变化）。"""
 
     from services.fulltext.html_parser import PARSER_VERSION
 
-    assert PARSER_VERSION >= "1.1.0"
+    assert PARSER_VERSION >= "1.1.1"

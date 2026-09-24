@@ -42,7 +42,10 @@ PARSER_NAME = "ar5iv_html"
 #: ``w_t`` 变 ``wt``、``α^2`` 变 ``α2``（**语义错误**，不只是排版问题）。
 #: 现在改为：公式一律还原成 **LaTeX 源码并加定界**（行内 ``$…$``、块级 ``$$…$$``），
 #: 还原不出来就如实写「公式未能还原」，绝不输出错的。
-PARSER_VERSION = "1.1.0"
+#: 1.1.1：补上**第五类** —— arXiv 自己没解析成功的公式（``ltx_math_unparsed``）是
+#: **纯文本 LaTeX**，不是 ``<math>`` 元素，走不到上面的分支；实测仍有 4 篇论文的
+#: 正文里留着 ``{\color[rgb]{…}\mathbf{c}}`` 这类裸 LaTeX，现在给它们补定界。
+PARSER_VERSION = "1.1.1"
 
 VOID_TAGS = frozenset(
     {
@@ -110,6 +113,11 @@ EXCLUDE_CLASS_SUBSTRINGS = (
 #: 注意它**不参与** ``_is_block_element`` 的块判定：否则含公式的段落会被
 #: ``_has_block_descendant`` 判成"有子块"从而整段被跳过，反而丢正文。
 EQUATION_CLASS_SUBSTRINGS = ("ltx_equation", "ltx_eqn", "ltx_align")
+
+#: arXiv 自己**没解析成功**的公式：以 **纯文本 LaTeX** 留在正文里（不是 ``<math>`` 元素），
+#: 例如 ``where \mathcal{T}_{K} denotes…``、``{\color[rgb]{0.27,0.46,1}\mathbf{c}}``。
+#: 这类走不到 ``<math>`` 分支，必须单独识别并补上定界，否则正文里就是裸 LaTeX。
+MATH_UNPARSED_CLASS_SUBSTRINGS = ("ltx_math_unparsed",)
 
 #: class 命中即整棵子树视为摘要
 ABSTRACT_CLASS_SUBSTRINGS = ("ltx_abstract", "abstract")
@@ -391,6 +399,12 @@ def _as_display_math(text: str) -> str:
     return f"$${stripped}$$"
 
 
+def _is_unparsed_math(element: _Element) -> bool:
+    """是否是 arXiv 自己没解析成功的公式（纯文本 LaTeX，不是 ``<math>`` 元素）。"""
+    blob = element.class_blob()
+    return any(marker in blob for marker in MATH_UNPARSED_CLASS_SUBSTRINGS)
+
+
 def _is_equation_container(element: _Element) -> bool:
     """是否是公式容器（独立成块的 ``ltx_equation`` / ``ltx_eqn`` / ``ltx_align``）。"""
     blob = element.class_blob()
@@ -416,6 +430,12 @@ def _collect_text(node: _Element, out: list[str]) -> None:
                 # 块级公式用 $$…$$（前端按数学体渲染，独占一行）
                 out.append(f"\n$${latex}$$\n")
             else:
+                out.append(f" ${latex}$ ")
+            continue
+        if _is_unparsed_math(child):
+            # arXiv 自己没解析成功的公式：正文里就是**裸 LaTeX** —— 补上定界才能渲染
+            latex = _text_of(child).strip()
+            if latex:
                 out.append(f" ${latex}$ ")
             continue
         if child.tag in {"img", "object", "embed", "input", "source"}:
