@@ -65,16 +65,56 @@ def test_repair_fills_missing_reasoning_before_sending() -> None:
     assert str(messages[2].get("reasoning_content") or "").strip(), "补上的必须非空"
 
 
-def test_repair_leaves_healthy_messages_alone() -> None:
+def test_repair_fills_plain_history_assistant_too() -> None:
+    """**2026-09-26 的真实事故**：只补「带 `tool_calls` 的那些」**不够**。
+
+    受控实验（四种报文形状各跑一次真实调用）证明，DeepSeek thinking 模式的规则是：
+    **只要请求里出现带 `tool_calls` 的 assistant 消息，请求里所有 assistant 消息都必须带
+    `reasoning_content`** —— 缺任何一条都 400：
+
+    | 报文形状 | 实测 |
+    |---|---|
+    | 历史 assistant 无该字段 + 工具助理有 | **400** |
+    | 历史 assistant 补上真实思考 | 通过 |
+    | 干脆没有那条 assistant | 通过 |
+    | 历史 assistant 补**空串** | 通过 |
+
+    而历史轮走 `conversations.context_messages()`，只回 `role`/`content`（不带思考）
+    → 「已有对话里的多轮工具调用」与「批准后续答」**必 400、整轮被强制中断**。
+    这条用例就是那个形状（旧实现在这里会返回 0，正是 bug 本身）。
+    """
+
     messages: list[dict[str, Any]] = [
-        _assistant_with_calls(reasoning_content="已有的思考"),
-        {"role": "assistant", "content": "普通回答"},
+        {"role": "user", "content": "第一轮"},
+        {"role": "assistant", "content": "普通回答"},  # ← 历史轮：旧实现漏掉的那一条
+        _assistant_with_calls(reasoning_content="工具轮的思考"),
         {"role": "tool", "tool_call_id": "c1", "content": "结果"},
     ]
+    fixed = chat_api.repair_reasoning_echo(messages, "ds:deepseek-flash")
+    assert fixed == 1
+    assert "reasoning_content" in messages[1], "历史里的 assistant 也必须带上这个字段"
+    assert messages[1]["content"] == "普通回答", "只补字段，不动正文（不塞占位句冒充它的思考）"
+
+
+def test_repair_is_idempotent() -> None:
+    """补两次不该重复计数、也不该改写已补好的值。"""
+
+    messages: list[dict[str, Any]] = [
+        {"role": "assistant", "content": "普通回答"},
+        _assistant_with_calls(),
+    ]
+    assert chat_api.repair_reasoning_echo(messages, "ds:deepseek-flash") == 2
+    assert messages[0]["reasoning_content"] == ""
     assert chat_api.repair_reasoning_echo(messages, "ds:deepseek-flash") == 0
 
 
 def test_repair_is_a_noop_for_other_providers() -> None:
-    messages: list[dict[str, Any]] = [_assistant_with_calls()]
+    """非思考型供应商不需要这个字段 —— 别给它塞（免得被当成未知字段拒收）。"""
+
+    messages: list[dict[str, Any]] = [
+        _assistant_with_calls(),
+        {"role": "assistant", "content": "普通回答"},
+    ]
     assert chat_api.repair_reasoning_echo(messages, "openai:gpt-5") == 0
     assert "reasoning_content" not in messages[0]
+    assert "reasoning_content" not in messages[1]

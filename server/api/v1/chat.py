@@ -205,6 +205,16 @@ def _build_skills_system_block() -> str:
 #: 修正方向不是"再放宽一点"，而是**不给上限**。
 REPLY_MAX_TOKENS: int | None = None
 
+#: 模型这一跳失败时的**自动重试次数**（用户口径 2026-09-26：「不再允许所有的强制中断」）。
+#:
+#: 为什么要有它：旧行为是模型这一跳一旦抛错就整轮 `interrupted=true` 收场 ——
+#: 研究者拿到的是一个错误码，而不是一个说完的答复。而实测里最常见的那个 400
+#: （`reasoning_content ... must be passed back`）**修一下报文就能过**，根本不该判死。
+#:
+#: 重试只在「这一次尝试还没吐过任何增量」时进行：已经上屏的字不能再来一遍，
+#: 否则研究者会看到重复的两段正文。
+MODEL_ROUND_MAX_ATTEMPTS = 3
+
 
 class HomeChatRequest(BaseModel):
     """首页单轮对话入参。"""
@@ -266,19 +276,54 @@ def reasoning_echo(reasoning: str, model_ref: str) -> str | None:
 
 
 def repair_reasoning_echo(messages: list[dict[str, Any]], model_ref: str) -> int:
-    """给「带 `tool_calls` 却缺（或为空）`reasoning_content`」的 assistant 消息补上占位。
+    """给缺 `reasoning_content` 的 assistant 消息补上。返回补了几条。
 
-    返回补了几条。**发送前先修**，比"等 400 再重发"更直接：
-    请求永远不会以不合规的形状发出去，也就不会再把对话打断。
+    **发送前先修**，比「等 400 再重发」更直接：请求永远不会以不合规的形状发出去，
+    也就不会再把对话打断。
+
+    ⚠️ 2026-09-26 受控实验（`probe_reasoning_rule.py`：四种报文形状各跑一次真实调用）
+    发现**旧实现漏了一半**。DeepSeek thinking 模式的真实规则不是「带 `tool_calls` 的
+    assistant 要回传」，而是 —— **只要请求里出现带 `tool_calls` 的 assistant 消息，
+    请求里所有 assistant 消息都必须带 `reasoning_content`**：
+
+    | 报文形状 | 实测结果 |
+    |---|---|
+    | 历史 assistant 无该字段 + 工具助理有 | **400 `The reasoning_content … must be passed back`** |
+    | 历史 assistant 补上真实思考 | 通过 |
+    | 干脆没有那条 assistant | 通过 |
+    | 历史 assistant 补**空串** | 通过 |
+
+    旧实现只补带 `tool_calls` 的那些；而历史轮走 `conversations.context_messages()`，
+    只回 `role`/`content`（不带思考）→ **批准后续答、以及任何已在进行的多轮工具调用必 400**，
+    表现就是整轮被强制中断（`interrupted=true`）。用户 2026-09-26 报的就是这个。
+
+    两档取值，都是实测过的：
+
+    - 带 `tool_calls` 的 assistant：**非空占位**（空串不算回传，2026-09-25 实测）；
+    - 其余 assistant（历史里说过的一句话）：**空串**即可 —— 不塞占位句，否则模型会
+      以为它当时想的就是那句占位。这一步只对思考型供应商做：非思考型供应商不需要
+      这个字段，多传反而可能被拒。
     """
 
-    if not _thinking_provider(model_ref):
+    thinking = _thinking_provider(model_ref)
+    if not thinking:
+        # 非思考型供应商**根本不需要**这个字段 —— 多传反而可能被当成未知字段拒收。
+        # 这条守卫沿用旧实现（有回归用例守着），别为了"统一"拆掉它。
         return 0
     fixed = 0
-    for message in messages or []:
-        if str(message.get("role") or "") != "assistant" or not message.get("tool_calls"):
+    for message in messages:
+        if str(message.get("role") or "") != "assistant":
             continue
-        if str(message.get("reasoning_content") or "").strip():
+        value = message.get("reasoning_content")
+        if isinstance(value, str) and value.strip():
+            continue
+        if not message.get("tool_calls"):
+            # 普通历史轮：补空串即可（实测被接受）。不塞占位句 —— 那会让模型
+            # 以为它当时想的就是那句占位；已补过就不重复计数。
+            if "reasoning_content" in message:
+                continue
+            message["reasoning_content"] = ""
+            fixed += 1
             continue
         message["reasoning_content"] = REASONING_PLACEHOLDER
         fixed += 1
@@ -379,13 +424,20 @@ async def _agent_loop(
             # 所以排在后面；失败就保持原样继续 —— 口径是"不因超窗停止"）。
             if meter.project(messages_now, tools=tool_defs) > meter.limit_tokens:
                 span = compaction_mod.select_summary_span(messages_now)
-                summary_record = (
-                    await compaction_mod.summarize_early_turns(
-                        messages_now, span=span, model_ref=ref
+                # ⚠️ 这一步**本身是一次模型调用**，所以它会失败（供应商 400/超时/额度）。
+                # 口径是「不因超窗停止」→ 摘要失败也必须**保持原样继续**，
+                # 不能让它把整轮拖成强制中断（用户口径 2026-09-26）。
+                try:
+                    summary_record = (
+                        await compaction_mod.summarize_early_turns(
+                            messages_now, span=span, model_ref=ref
+                        )
+                        if span is not None
+                        else None
                     )
-                    if span is not None
-                    else None
-                )
+                except Exception as exc:  # noqa: BLE001 - 摘要只是优化，失败不该拖垮对话
+                    logger.warning("上下文摘要失败，保持原样继续：%s", exc)
+                    summary_record = None
                 if summary_record is not None and span is not None:
                     freed_chars = compaction_mod.apply_turn_summary(
                         messages_now, span=span, summary=str(summary_record["summary"])
@@ -411,43 +463,93 @@ async def _agent_loop(
                     logger.warning(
                         "上下文超预算但无可压缩内容（工具结果与早期轮次都没有可动的），继续执行"
                     )
-        # 发送前先把消息修好（用户口径 2026-09-25：400 修法 A+C）：
-        # 带 tool_calls 却缺 reasoning_content 的 assistant 消息补上非空占位 ——
+        # 发送前先把消息修好（用户口径 2026-09-25：400 修法 A+C；2026-09-26 补全规则）：
+        # **所有**缺 reasoning_content 的 assistant 消息都补上，而不只是带 tool_calls 的那些 ——
         # 这样就不会再因协议字段被供应商拒收而**打断"让模型重新决定"**。
         repaired = repair_reasoning_echo(messages_now, ref)
         if repaired:
-            logger.info("补了 %d 条 assistant 消息的 reasoning_content 占位后继续", repaired)
+            logger.info("补了 %d 条 assistant 消息的 reasoning_content 后继续", repaired)
         estimate_before = meter.estimate(messages_now, tools=tool_defs)
         round_result: Any = None
         #: 这一轮的思考过程从 `state["reasoning"]` 的哪个下标开始 —— 用于把**本轮**的
         #: reasoning_content 跟着 assistant.tool_calls 一起回喂（见下面 append 处）。
         reasoning_from = len(state["reasoning"])
-        async for update in adapter.chat_stream(
-            messages_now,
-            model_ref=ref,
-            purpose="home_reply",
-            max_tokens=REPLY_MAX_TOKENS,
-            # 首轮与原有行为一致；**工具轮回喂时关掉降级**：实测降级链会切到
-            # 没配 key 的供应商，把真正的 `bad_request` 掩盖成一句无关的
-            # 「env 未配置 API Key」。宁可如实报第一跳的错，也不要换一家继续跑。
-            #
-            # 批准后的续答同理：它**不是**用户的第一句，`allow_fallback_first=False`
-            # 才能把真因如实报出来（实测这里真因是"assistant 的 tool_calls 没带
-            # reasoning_content"，被降级链掩盖成了一句无关的 auth 错误）。
-            allow_fallback=allow_fallback_first and model_calls == 1,
-            tools=tool_defs or None,
-        ):
-            if update.kind == "delta":
-                state["text"].append(update.text)
-                yield _sse("delta", {"text": update.text})
-            elif update.kind == "reasoning":
-                # **思考过程走独立通道**：它不是答复。前端折叠展示在耗时那一行下面，
-                # 落盘也单独存一个字段。此前它只被收集、最后被塞进 content 冒充正文，
-                # 结果「界面上看到的回答」和「库里存的」不是同一个东西。
-                state["reasoning"].append(update.text)
-                yield _sse("reasoning", {"text": update.text})
-            elif update.kind == "done":
-                round_result = update.result
+        # ---------------------------------------------------------------- #
+        # 「不再强制中断」（用户口径 2026-09-26）：模型这一跳失败**不再直接判死整轮**。
+        # 先自愈（把报文形状修好）再重试；重试仍不成，就把失败如实摊开、
+        # 让这一轮**正常收尾**（由调用方落成一句说完的话），而不是甩一个错误码就断开。
+        # ⚠️ 只有在「这一次尝试还没吐过任何增量」时才重试 —— 已经上屏的字不能再来一遍。
+        # ---------------------------------------------------------------- #
+        attempt = 0
+        while True:
+            attempt += 1
+            emitted_before = len(state["text"])
+            try:
+                async for update in adapter.chat_stream(
+                    messages_now,
+                    model_ref=ref,
+                    purpose="home_reply",
+                    max_tokens=REPLY_MAX_TOKENS,
+                    # 首轮与原有行为一致；**工具轮回喂时关掉降级**：实测降级链会切到
+                    # 没配 key 的供应商，把真正的 `bad_request` 掩盖成一句无关的
+                    # 「env 未配置 API Key」。宁可如实报第一跳的错，也不要换一家继续跑。
+                    #
+                    # 批准后的续答同理：它**不是**用户的第一句，`allow_fallback_first=False`
+                    # 才能把真因如实报出来（实测这里真因是"assistant 的 tool_calls 没带
+                    # reasoning_content"，被降级链掩盖成了一句无关的 auth 错误）。
+                    allow_fallback=allow_fallback_first and model_calls == 1,
+                    tools=tool_defs or None,
+                ):
+                    if update.kind == "delta":
+                        state["text"].append(update.text)
+                        yield _sse("delta", {"text": update.text})
+                    elif update.kind == "reasoning":
+                        # **思考过程走独立通道**：它不是答复。前端折叠展示在耗时那一行下面，
+                        # 落盘也单独存一个字段。此前它只被收集、最后被塞进 content 冒充正文，
+                        # 结果「界面上看到的回答」和「库里存的」不是同一个东西。
+                        state["reasoning"].append(update.text)
+                        yield _sse("reasoning", {"text": update.text})
+                    elif update.kind == "done":
+                        round_result = update.result
+                break
+            except LLMError as exc:
+                emitted = len(state["text"]) > emitted_before
+                # 自愈：实测最常见的 400（reasoning_content 没回传）修完就能过。
+                healed = repair_reasoning_echo(messages_now, ref) if not emitted else 0
+                logger.warning(
+                    "模型这一跳失败（第 %d/%d 次，已上屏=%s，自愈修了 %d 条）：%s",
+                    attempt,
+                    MODEL_ROUND_MAX_ATTEMPTS,
+                    emitted,
+                    healed,
+                    exc,
+                )
+                if attempt < MODEL_ROUND_MAX_ATTEMPTS and not emitted:
+                    retry_row = {
+                        "kind": "system",
+                        "tone": "warn",
+                        "text": (
+                            f"模型这一跳没有成功（{type(exc).__name__}），"
+                            f"已自动修正报文形状并重试（第 {attempt + 1}/{MODEL_ROUND_MAX_ATTEMPTS} 次）。"
+                        ),
+                    }
+                    rows.append(retry_row)
+                    yield _sse("row", {"row": retry_row})
+                    continue
+                # 不再抛给外层（抛出去 = 整轮 `interrupted` 强制中断）：
+                # 如实记下，交给调用方落成一句说完的话。
+                state["soft_failure"] = str(exc)
+                break
+
+        if state.get("soft_failure"):
+            fail_row = {
+                "kind": "system",
+                "tone": "warn",
+                "text": "本轮未拿到模型的完整回答，已在正文里如实说明（没有丢已经跑过的步骤）。",
+            }
+            rows.append(fail_row)
+            yield _sse("row", {"row": fail_row})
+            break
 
         if round_result is not None:
             state["result"] = round_result
@@ -924,6 +1026,9 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
         pending_approval: dict[str, Any] | None = None
         #: 本轮正文是**系统说明**（模型只给了思考过程）而不是模型说的话
         note_only = False
+        #: 非空 = 模型这一跳彻底失败、但**没有**把整轮判死（见 `MODEL_ROUND_MAX_ATTEMPTS`）。
+        #: 在 try 之前先初始化：`finally` 里要读它，不能因为"异常发生在赋值之前"而 NameError。
+        soft_failure: str | None = None
         started = time.perf_counter()
         result: Any = None
         error_info: dict[str, Any] | None = None
@@ -970,6 +1075,7 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
                 yield frame
             result = state["result"]
             pending_approval = state["pending"]
+            soft_failure = state.get("soft_failure")
         except LLMError as exc:
             aborted = True
             error_info = {
@@ -983,6 +1089,20 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
             aborted = True
             error_info = {"code": "client_disconnected", "message": "客户端已断开", "kind": "Cancelled"}
             raise
+        except Exception as exc:  # noqa: BLE001 - 兜底：未预期异常也不该"甩个码就断"
+            # 用户口径 2026-09-26：不允许把整轮变成强制中断。分两种情况处理最诚实：
+            #   · 已经有字上屏 → 确实答了一半，如实标中断（不假装答完）；
+            #   · 一个字都没说出去 → 落成一句说完的话（见 finally 里的 MODEL_FAILED_TEXT）。
+            logger.exception("首页流式出现未预期异常 conversation=%s", conversation_id)
+            if buffer:
+                aborted = True
+                error_info = {
+                    "code": getattr(exc, "code", "unexpected_error") or "unexpected_error",
+                    "message": f"服务端异常：{type(exc).__name__}: {exc}",
+                    "kind": type(exc).__name__,
+                }
+            else:
+                soft_failure = f"服务端异常 {type(exc).__name__}：{exc}"
         finally:
             if aborted and title_task is not None and not title_task.done():
                 # 本轮已经失败/断开，标题结果用不上了，别留悬挂任务
@@ -998,6 +1118,12 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
                 reasoning_text = str((getattr(result, "raw", None) or {}).get("reasoning") or "")
             if REASONING_MAX_CHARS is not None and len(reasoning_text) > REASONING_MAX_CHARS:
                 reasoning_text = reasoning_text[:REASONING_MAX_CHARS] + "\n…（思考过程过长，已截断）"
+            if not generated and soft_failure and error_info is None:
+                # 模型这一跳彻底失败（自动重试也没成）：**不甩错误码**，落成一句说完的话
+                # （用户口径 2026-09-26）。它是系统在说话 → 标 `note_only`，
+                # 不进下一轮上下文，也不冒充模型的答复。
+                generated = messages.MODEL_FAILED_TEXT.format(reason=soft_failure[:220])
+                note_only = True
             if not generated and reasoning_text and error_info is None:
                 # 模型只给了思考过程：如实说明，**不拿思考过程冒充答复**
                 generated = messages.NODE_ONLY_REASONING_TEXT
@@ -1206,6 +1332,11 @@ async def _approval_stream(
     card: dict[str, Any] | None = None
     result: Any = None
     error_info: dict[str, Any] | None = None
+    #: 非空 = 模型这一跳彻底失败但没把整轮判死（见 `MODEL_ROUND_MAX_ATTEMPTS`）。
+    #: 在 try 之前初始化：`finally` 里要读它。
+    soft_failure: str | None = None
+    #: 正文是**系统说明**（模型彻底失败后的如实交代），不是模型说的话
+    note_only = False
     started = time.perf_counter()
 
     try:
@@ -1347,6 +1478,7 @@ async def _approval_stream(
                 yield frame
             result = state["result"]
             pending = state["pending"]
+            soft_failure = state.get("soft_failure")
     except LLMError as exc:
         error_info = {
             "code": getattr(exc, "code", "llm_failed") or "llm_failed",
@@ -1357,6 +1489,16 @@ async def _approval_stream(
     except asyncio.CancelledError:
         error_info = {"code": "client_disconnected", "message": "客户端已断开", "kind": "Cancelled"}
         raise
+    except Exception as exc:  # noqa: BLE001 - 兜底：未预期异常也不该"甩个码就断"
+        logger.exception("批准裁决后续答出现未预期异常 conversation=%s", conversation_id)
+        if buffer:
+            error_info = {
+                "code": getattr(exc, "code", "unexpected_error") or "unexpected_error",
+                "message": f"服务端异常：{type(exc).__name__}: {exc}",
+                "kind": type(exc).__name__,
+            }
+        else:
+            soft_failure = f"服务端异常 {type(exc).__name__}：{exc}"
     finally:
         duration_ms = int((time.perf_counter() - started) * 1000)
         # **裁决这件事必须留在记录里，哪怕续答失败**：卡片的终态先换上。
@@ -1367,6 +1509,11 @@ async def _approval_stream(
         answer = "".join(buffer)
         if not answer and result is not None:
             answer = str(getattr(result, "content", "") or "")
+        if not answer and soft_failure and error_info is None:
+            # 续答这一跳彻底失败（自动重试也没成）：**不甩错误码**，落成一句说完的话
+            # （用户口径 2026-09-26）。系统在说话 → `note_only`，不冒充模型的答复。
+            answer = messages.MODEL_FAILED_TEXT.format(reason=soft_failure[:220])
+            note_only = True
         reasoning_text = "".join(reasoning_buffer)
         if not reasoning_text and result is not None:
             reasoning_text = str((getattr(result, "raw", None) or {}).get("reasoning") or "")
@@ -1391,6 +1538,8 @@ async def _approval_stream(
                         "approvals": approvals_out,
                         "awaiting_approval": pending["id"] if pending else None,
                         "routing": "approval",
+                        # 正文是系统说明（不是模型说的话）→ 别让它进下一轮的上下文
+                        "note_only": note_only or None,
                         "interrupted": bool(error_info),
                     }
                 ],
