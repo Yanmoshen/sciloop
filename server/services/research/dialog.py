@@ -132,15 +132,32 @@ async def _node_run_count(session: Any, conversation_id: str) -> int:
     return int((await session.execute(stmt)).scalar_one() or 0)
 
 
-async def route(text: str, conversation_id: str, *, force_plain: bool = False) -> intent_mod.Intent:
+async def route(
+    text: str,
+    conversation_id: str,
+    *,
+    force_plain: bool = False,
+    model_ref: str | None = None,
+) -> intent_mod.Intent:
     """判定这句话该走哪条分支。
 
     ``force_plain`` = 本对话已声明为「普通对话」→ 只有**明确的执行意图**能把它拉回研究模式，
     其余一律走通用回答（不反复问用户要不要开研究链）。
+
+    **规则兜明确的 + 模型兜底**（用户口径 2026-09-25）：规则（词表匹配）命中明确意图就直接用，
+    零延迟；规则拿不准、且这句话**看着像指令**时，再让模型判一次 —— 中英混排与口语说法
+    只有这一层盖得住（词表是纯子串匹配，`start a literature review` 必掉进通用回答）。
+    模型超时/失败/给不可信值都不影响结果：一律回落规则结论。
     """
 
     chained = await has_chain(conversation_id)
     result = intent_mod.resolve_intent(text, has_chain=chained)
+    if result.kind in ("chat", "guide") and intent_mod.looks_like_command(text):
+        judged = await intent_mod.classify_with_model(
+            text, model_ref=model_ref, has_chain=chained
+        )
+        if judged is not None:
+            result = judged
     if force_plain and result.kind != "node":
         return intent_mod.Intent(
             kind="chat",

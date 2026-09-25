@@ -731,7 +731,11 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
         )
 
     routing = await dialog.route(
-        text, conversation_id, force_plain=bool(conversation.get("plain_chat"))
+        text,
+        conversation_id,
+        force_plain=bool(conversation.get("plain_chat")),
+        # 规则兜底要用模型判一次 —— 用**这次对话选的模型**（不硬编码供应商）
+        model_ref=ref,
     )
     if routing.kind == "guide":
         return _streaming(dialog.stream_guide(conversation_id=conversation_id, scope=scope))

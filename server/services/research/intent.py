@@ -33,12 +33,17 @@ from typing import Any, Literal
 from services.research import graph
 
 __all__ = [
+    "COMMAND_HINTS_EN",
+    "COMMAND_HINTS_ZH",
     "GUIDE_WORDS",
     "Intent",
     "NODE_ALIASES",
     "QUERY_ACTIONS",
     "QUERY_TOPICS",
+    "ROUTE_TIMEOUT_SECONDS",
+    "classify_with_model",
     "detect_query_topic",
+    "looks_like_command",
     "resolve_intent",
     "strip_command_words",
 ]
@@ -293,3 +298,179 @@ def resolve_intent(
 
     # ⑤ 其余
     return Intent(kind="chat", reason="普通对话")
+
+
+# --------------------------------------------------------------------------- #
+# 规则兜明确的 + **模型兜底**（2026-09-25 用户口径）
+#
+# 为什么要有模型这一层：规则是**词表匹配**，中英混排与口语说法盖不住 ——
+# 实测 `_find_node` 是纯子串匹配（只做 lower），别名表里是 `literature_review`（下划线）、
+# 动作词只有 `开始/跑/执行/启动/continue/run/start`，于是
+# 「start a literature review」这类英文祈使句**必然掉进通用回答**。
+#
+# 但兜底不能无条件：它要花一次模型调用、也加延迟。所以先判**像不像指令**：
+# 纯闲聊（「你好」「谢谢」）与提问（「文献调研该怎么做」）都不过这一关 ——
+# 不为闲聊付钱、也不给它加延迟。
+# --------------------------------------------------------------------------- #
+
+#: 中文祈使/委托线索
+COMMAND_HINTS_ZH: tuple[str, ...] = (
+    "帮我",
+    "请你",
+    "请帮",
+    "给我",
+    "替我",
+    "麻烦",
+    "做一下",
+    "做个",
+    "来一下",
+    "帮我做",
+    "开始",
+    "跑",
+    "执行",
+    "启动",
+    "搞",
+    "进行",
+    "继续",
+    "接着",
+)
+
+#: 英文祈使/委托线索（用户口径：中英文都有）
+COMMAND_HINTS_EN: tuple[str, ...] = (
+    "please",
+    "help me",
+    "run",
+    "start",
+    "begin",
+    "execute",
+    "launch",
+    "go ahead",
+    "carry on",
+    "continue",
+    "do a",
+    "make a",
+)
+
+
+def looks_like_command(text: str) -> bool:
+    """这句话像不像「要我做事」（而不是闲聊或提问）。
+
+    只决定**值不值得**多花一次模型调用去判意图，不决定意图本身。
+    提问一律不算指令：带问号 / 以「怎么、如何、是什么、吗」收尾的都不走模型兜底。
+    """
+
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if _looks_like_question(raw):
+        return False
+    lowered = raw.lower()
+    if _has_action(raw) or _find_node(raw) is not None:
+        return True
+    if any(word in raw for word in COMMAND_HINTS_ZH):
+        return True
+    return any(word in lowered for word in COMMAND_HINTS_EN)
+
+
+#: 模型兜底的超时（用户口径：超时就回退规则结果，绝不把对话卡在路由上）
+ROUTE_TIMEOUT_SECONDS = 1.5
+
+ROUTE_SYSTEM = (
+    "你是一个**意图判定器**。只输出一个 JSON 对象，"
+    "不要输出解释、思考过程、前后缀或代码块围栏。"
+)
+
+ROUTE_TEMPLATE = (
+    "判断下面这句话属于哪一类，只输出 JSON（**花括号照抄，不要加围栏**）：\n"
+    '{{"kind": "node|query|chat", "node": "<节点 id，仅 kind=node 时>", '
+    '"topic": "<主题，仅 kind=query 时>", "reason": "<一句话依据>"}}\n\n'
+    "判定边界（**严格照此，别热情过头**）：\n"
+    "- node：**明确要求开始执行**某个环节（祈使句、有动作词）。只是提到某个环节名、"
+    "或者拿不准 → **一律不要 node**；\n"
+    "- query：在问本地已有的数据（库里有什么论文、我的项目、上次的分析结果）；\n"
+    "- chat：其余全部（闲聊、提问、想法讨论）。\n\n"
+    "可用节点 id 与含义：\n{nodes}\n\n"
+    "本对话是否已经开过研究流程：{chained}\n"
+    "要判断的话：{text}"
+)
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    """从模型输出里取出第一个 JSON 对象（容忍它前后夹带文字/围栏）。"""
+
+    import json
+
+    raw = text or ""
+    start = raw.find("{")
+    while start >= 0:
+        try:
+            value, _end = json.JSONDecoder().raw_decode(raw[start:])
+        except ValueError:
+            start = raw.find("{", start + 1)
+            continue
+        return value if isinstance(value, dict) else None
+    return None
+
+
+async def classify_with_model(
+    text: str,
+    *,
+    model_ref: str | None,
+    has_chain: bool,
+) -> Intent | None:
+    """让模型判一次意图。**任何失败/超时都返回 None** → 调用方回落到规则结果。
+
+    只接受**清单里的**节点 id 与**已知的**查询主题 —— 模型给的值一律当"不可信输入"，
+    不认识的节点名直接降级成 chat，绝不让它凭一个字符串把某个流程跑起来。
+    """
+
+    if not model_ref:
+        return None
+
+    from llm import adapter
+
+    nodes = "\n".join(f"- {key}：{label}" for key, label in graph.NODE_LABELS.items())
+    prompt = ROUTE_TEMPLATE.format(
+        nodes=nodes, chained="是" if has_chain else "否", text=str(text or "").strip()
+    )
+    try:
+        result = await adapter.chat(
+            [
+                {"role": "system", "content": ROUTE_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
+            model_ref=model_ref,
+            temperature=0.0,
+            purpose="intent_route",
+            allow_fallback=False,
+            strict_logging=False,
+            timeout=ROUTE_TIMEOUT_SECONDS,
+        )
+    except Exception:  # noqa: BLE001 - 路由失败不该把对话带崩
+        return None
+
+    payload = _extract_json_object(str(getattr(result, "content", "") or ""))
+    if payload is None:
+        return None
+
+    kind = str(payload.get("kind") or "").strip()
+    reason = str(payload.get("reason") or "").strip()[:120]
+    if kind == "node":
+        node = str(payload.get("node") or "").strip()
+        if node not in graph.NODE_LABELS:
+            # 模型编了个不存在的节点名 → 降级，绝不放行
+            return Intent(kind="chat", reason=f"模型给的节点名不在清单里（{node or '空'}），按普通对话处理")
+        return Intent(
+            kind="node",
+            node=node,
+            keyword=node,
+            reason=f"模型判定为执行意图：{graph.NODE_LABELS.get(node, node)}" + (f"（{reason}）" if reason else ""),
+        )
+    if kind == "query":
+        topic = str(payload.get("topic") or "").strip()
+        if topic not in QUERY_TOPICS:
+            return Intent(kind="chat", reason="模型给的查询主题不认识，按普通对话处理")
+        return Intent(kind="query", topic=topic, reason=f"模型判定为查询本地数据：{topic}")
+    if kind == "chat":
+        return Intent(kind="chat", reason="模型判定为普通对话" + (f"（{reason}）" if reason else ""))
+    return None
