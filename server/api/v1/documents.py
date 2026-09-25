@@ -201,6 +201,15 @@ async def list_paper_spans(
 
     ``verification_summary`` 统计全部匹配片段的三种 verdict，
     ``valid`` 需全文缓存命中（偏移可校验），缓存缺失时退化为 ``valid_by_hash``。
+
+    ⚠️ **不传 ``document_version`` 时收口到"一个"版本**（2026-09-25 修）：
+    同一篇论文可能有多个解析版本（实测 paper 123 有 3 个：pdf 版 / html 版 / html 1.1.1 版），
+    而 ``fulltext_cache_available`` 是**响应级**的一个布尔 —— 响应里若混着"有缓存"与
+    "没缓存"两种版本的片段，这个布尔**取真取假都会自相矛盾**：契约测试
+    `test_p0_span_hash_first_across_cache_states` 正是这么挂的（它要求"缓存可用 ⇒
+    每条哈希命中的片段偏移都可校验"，而没缓存那版必然给 ``offset_match=null``）。
+    所以默认**优先选有全文缓存的版本**（只有它能做偏移校验），都没有缓存时取最后一个
+    （通常是最近解析的）；``document_versions`` 仍列出全部版本，要看别的版本就显式传参。
     """
     normalized_section = _normalize_section(section)
     repository = SqlDocumentRepository(session)
@@ -208,12 +217,6 @@ async def list_paper_spans(
 
     documents = await repository.list_documents(paper_id)
     summary = summarize_documents(documents)
-
-    spans = await repository.list_spans(
-        paper_id, document_version=document_version, section=normalized_section
-    )
-    total = len(spans)
-    start = (page - 1) * page_size
 
     # 每个 document_version 只读一次全文缓存，避免 N 次磁盘读
     cache = default_text_cache()
@@ -223,6 +226,21 @@ async def list_paper_spans(
         if version not in texts:
             texts[version] = cache.get(paper_id, version)
         return texts[version]
+
+    spans = await repository.list_spans(
+        paper_id, document_version=document_version, section=normalized_section
+    )
+    #: **过滤前**记下出现过的版本：响应里的 `document_versions` 要如实列出全部，
+    #: 否则界面会以为这篇论文只有一个解析版本（收口只影响返回哪些片段，不隐藏事实）。
+    all_versions = sorted(
+        {str(span.document_version) for span in spans if getattr(span, "document_version", None)}
+    )
+    if document_version is None and spans:
+        with_text = [version for version in all_versions if _text_for(version)]
+        document_version = (with_text or all_versions)[-1]
+        spans = [span for span in spans if str(span.document_version) == document_version]
+    total = len(spans)
+    start = (page - 1) * page_size
 
     verdicts = {"valid": 0, "valid_by_hash": 0, "invalid": 0}
     verified: list[tuple[Any, dict[str, Any]]] = []
@@ -253,7 +271,7 @@ async def list_paper_spans(
         "page_size": page_size,
         "section": normalized_section,
         "document_version": document_version,
-        "document_versions": sorted({span.document_version for span in spans}),
+        "document_versions": all_versions,
         "verification_summary": verdicts,
         "fulltext_cache_available": text_available,
         "coverage_note": summary.get("coverage_note"),
