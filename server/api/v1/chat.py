@@ -386,7 +386,12 @@ async def _agent_loop(
                     agent_approvals.load(conversation_id) or {}
                 )
                 high_risk = verdict.needs_approval
-                allowed_by_grant = agent_approvals.allows(grants_now, high_risk=high_risk)
+                # 三档授权：本对话默认允许（含高危）/ 完全访问模式 / **按工具授权**
+                # （用户口径 2026-09-25：批准一次命令 = 本对话内允许这个工具，换参数不再问；
+                #  高危永远逐次批准）。
+                allowed_by_grant = agent_approvals.allows(
+                    grants_now, high_risk=high_risk, tool=tool_name
+                )
                 if not allowed_by_grant:
                     # 动手类：**只建请求，不执行**。连一次执行都不发出去。
                     arguments = agent_tools.arguments_of(call)
@@ -1080,6 +1085,21 @@ async def _approval_stream(
             )
             # 选「此对话中默认允许执行」：把授权写进**这个对话**（下一个对话要重新决定）。
             # 这是比「完全访问模式」更宽的一档：连高危操作也不再弹卡。
+            #
+            # 选普通的「批准」= **按工具授权**（用户口径 2026-09-25）：把**这个工具**加进
+            # 本对话的授权清单，之后同一工具换参数不再逐条问；**高危仍然每次都问**。
+            # 原先「批准」只放行这一条完全匹配的命令（`args_digest`），换个参数又要问一遍。
+            if payload.decision == agent_approvals.DECISION_APPROVE:
+                summary = agent_approvals.set_grants(record, tool=str(request.get("tool") or ""))
+                agent_approvals.save(record)
+                grant_row = {
+                    "kind": "tool",
+                    "tone": "ok",
+                    "text": f"已允许在本对话内直接执行「{label}」（高危操作仍会先问你）",
+                }
+                rows.append(grant_row)
+                yield _sse("row", {"row": grant_row})
+                logger.info("会话 %s 获得按工具授权：%s", conversation_id, summary)
             if payload.decision == agent_approvals.DECISION_APPROVE_CONVERSATION:
                 summary = agent_approvals.set_grants(record, allow_exec=True)
                 agent_approvals.save(record)

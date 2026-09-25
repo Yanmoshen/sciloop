@@ -106,18 +106,38 @@ def test_conversation_grants_default_off_and_are_settable() -> None:
     """按对话的授权：默认全关；可以分别打开（两个是不同的事）。"""
 
     record: dict[str, Any] = {"id": "c1", "turns": []}
-    assert approvals.grants(record) == {"full_access": False, "allow_exec": False}
+    assert approvals.grants(record) == {"full_access": False, "allow_exec": False, "tools": []}
 
     approvals.set_grants(record, full_access=True)
     assert approvals.grants(record)["full_access"] is True
     assert approvals.grants(record)["allow_exec"] is False, "开完全访问模式不等于放行高危"
 
     approvals.set_grants(record, allow_exec=True)
-    assert approvals.grants(record) == {"full_access": True, "allow_exec": True}
+    assert approvals.grants(record) == {"full_access": True, "allow_exec": True, "tools": []}
 
     # 关掉"高危也放行"时，不该顺手把完全访问模式也关掉
     approvals.set_grants(record, allow_exec=False)
     assert approvals.grants(record)["full_access"] is True
+
+
+def test_per_tool_grant_is_its_own_thing() -> None:
+    """按工具授权（2026-09-25 用户口径）：批准一次 = 本对话内允许**这个工具**。
+
+    - 加进清单后可以重复加，不会堆重复项；
+    - 清单与那两个布尔互不干扰（关掉完全访问模式不该把工具清单清掉）。
+    """
+
+    record: dict[str, Any] = {"id": "c1", "turns": []}
+    approvals.set_grants(record, tool="run_command")
+    approvals.set_grants(record, tool="run_command")
+    assert approvals.grants(record)["tools"] == ["run_command"], "同一个工具不该重复入列"
+
+    approvals.set_grants(record, tool="files_on_computer")
+    assert approvals.grants(record)["tools"] == ["run_command", "files_on_computer"]
+
+    approvals.set_grants(record, full_access=True)
+    approvals.set_grants(record, full_access=False)
+    assert approvals.grants(record)["tools"] == ["run_command", "files_on_computer"]
 
 
 def test_grants_summary_says_it_in_human_words() -> None:
@@ -128,24 +148,34 @@ def test_grants_summary_says_it_in_human_words() -> None:
     approvals.set_grants(record, allow_exec=True)
     assert "高危操作也直接执行" in approvals.grants_summary(record)["note"]
 
+    # 只授权了某个工具时，摘要里要点出**是哪个工具**（否则研究者不知道批了什么）
+    only_tool: dict[str, Any] = {"id": "c2", "turns": []}
+    approvals.set_grants(only_tool, tool="run_command")
+    note = approvals.grants_summary(only_tool)["note"]
+    assert "run_command" in note and "高危" in note
+
 
 def test_allows_matrix() -> None:
     """授权 → 能不能直接执行。
 
     这段判定决定了"会不会不打招呼就动研究者的机器"，所以把矩阵穷举钉住：
 
-    | 本对话默认允许 | 完全访问模式 | 高危 | 结果 |
-    |---|---|---|---|
-    | 关 | 关 | 任意 | 先问 |
-    | 关 | **开** | 否 | 直接做 |
-    | 关 | **开** | **是** | **仍然先问** |
-    | **开** | 任意 | 任意 | 直接做 |
+    | 本对话默认允许 | 完全访问模式 | 按工具授权 | 高危 | 结果 |
+    |---|---|---|---|---|
+    | 关 | 关 | 未命中 | 任意 | 先问 |
+    | 关 | **开** | 未命中 | 否 | 直接做 |
+    | 关 | **开** | 未命中 | **是** | **仍然先问** |
+    | 关 | 关 | **命中** | 否 | **直接做** |
+    | 关 | 关 | **命中** | **是** | **仍然先问** |
+    | 关 | 关 | 未命中（别的工具） | 否 | 先问 |
+    | **开** | 任意 | 任意 | 任意 | 直接做 |
     """
 
-    off = {"full_access": False, "allow_exec": False}
-    full = {"full_access": True, "allow_exec": False}
-    exec_ = {"full_access": False, "allow_exec": True}
-    both = {"full_access": True, "allow_exec": True}
+    off = {"full_access": False, "allow_exec": False, "tools": []}
+    full = {"full_access": True, "allow_exec": False, "tools": []}
+    exec_ = {"full_access": False, "allow_exec": True, "tools": []}
+    both = {"full_access": True, "allow_exec": True, "tools": []}
+    tool_grant = {"full_access": False, "allow_exec": False, "tools": ["run_command"]}
 
     assert approvals.allows(off, high_risk=False) is False
     assert approvals.allows(off, high_risk=True) is False
@@ -153,6 +183,14 @@ def test_allows_matrix() -> None:
     assert approvals.allows(full, high_risk=True) is False, "完全访问模式不该放行高危"
     assert approvals.allows(exec_, high_risk=True) is True
     assert approvals.allows(both, high_risk=True) is True
+
+    # 按工具授权（2026-09-25）：命中的工具直接做；高危一律不走这一档
+    assert approvals.allows(tool_grant, high_risk=False, tool="run_command") is True
+    assert approvals.allows(tool_grant, high_risk=True, tool="run_command") is False, (
+        "高危永远逐次批准，按工具授权也不放行"
+    )
+    assert approvals.allows(tool_grant, high_risk=False, tool="files_on_computer") is False
+    assert approvals.allows(tool_grant, high_risk=False) is False, "不传工具名时这一档不生效"
 
 
 def test_three_decisions_are_the_contract() -> None:

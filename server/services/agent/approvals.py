@@ -71,6 +71,10 @@ VALID_DECISIONS = (DECISION_APPROVE, DECISION_APPROVE_CONVERSATION, DECISION_DEN
 #: 按对话的授权键
 GRANT_FULL_ACCESS = "full_access"
 GRANT_ALLOW_EXEC = "allow_exec"
+#: 按**工具名**授权的清单（用户口径 2026-09-25：批准一条命令 = 本对话内允许这个工具）。
+#: 例如 `["run_command"]` —— 之后同一工具换参数不再逐条问。
+#: ⚠️ **高危不在此列**：`policy` 里的四类高危永远逐次批准，任何一档授权都不放行它。
+GRANT_TOOLS = "tools"
 
 #: 预览的最大长度（对话里那一行放不下更长的）
 PREVIEW_MAX_CHARS = 200
@@ -190,14 +194,21 @@ def effective_status(request: dict[str, Any], *, now: datetime | None = None) ->
 # --------------------------------------------------------------------------- #
 # 按对话的授权（完全访问模式 / 本对话默认允许）
 # --------------------------------------------------------------------------- #
-def grants(record: dict[str, Any]) -> dict[str, bool]:
-    """读这个对话当前的授权块（缺省全是 False）。"""
+def grants(record: dict[str, Any]) -> dict[str, Any]:
+    """读这个对话当前的授权块。
+
+    形状：``{full_access: bool, allow_exec: bool, tools: [工具名…]}``。
+    ``tools`` 是**按工具授权**那一档（用户口径 2026-09-25）：批准一次 ``run_command`` 之后，
+    同一工具换参数不再逐条问（高危仍然每次都问）。
+    """
 
     raw = record.get("grants")
     raw = raw if isinstance(raw, dict) else {}
+    tools = raw.get(GRANT_TOOLS)
     return {
         GRANT_FULL_ACCESS: bool(raw.get(GRANT_FULL_ACCESS)),
         GRANT_ALLOW_EXEC: bool(raw.get(GRANT_ALLOW_EXEC)),
+        GRANT_TOOLS: [str(item) for item in tools] if isinstance(tools, list) else [],
     }
 
 
@@ -206,11 +217,13 @@ def set_grants(
     *,
     full_access: bool | None = None,
     allow_exec: bool | None = None,
-) -> dict[str, bool]:
+    tool: str | None = None,
+) -> dict[str, Any]:
     """改这个对话的授权块（**只改内存**，落盘由调用方 `save`）。
 
     `None` = 不动这一项。关掉 `allow_exec` 时**不连带关掉** `full_access` ——
     它们是两件事（一个是"免点头动手"，一个是"连高危也放行"），各有各的开关。
+    `tool` 非空 = 把某个工具加进"按工具授权"清单（用户口径 2026-09-25）。
     """
 
     current = grants(record)
@@ -218,37 +231,52 @@ def set_grants(
         current[GRANT_FULL_ACCESS] = bool(full_access)
     if allow_exec is not None:
         current[GRANT_ALLOW_EXEC] = bool(allow_exec)
+    if tool:
+        tools = list(current.get(GRANT_TOOLS) or [])
+        if tool not in tools:
+            tools.append(tool)
+        current[GRANT_TOOLS] = tools
     record["grants"] = dict(current)
     return current
 
 
 def grants_summary(record: dict[str, Any]) -> dict[str, Any]:
-    """给界面看的授权摘要（人话 + 两个布尔值）。"""
+    """给界面看的授权摘要（人话 + 布尔值 + 已授权的工具清单）。"""
 
     current = grants(record)
+    tools = list(current.get(GRANT_TOOLS) or [])
     if current[GRANT_ALLOW_EXEC]:
         note = "本对话内：连高危操作也直接执行"
     elif current[GRANT_FULL_ACCESS]:
         note = "本对话内：普通操作直接执行，高危操作仍会先问你"
+    elif tools:
+        note = "本对话内：" + "、".join(tools) + " 直接执行，高危操作仍会先问你"
     else:
         note = "本对话内：动手前都会先问你"
     return {**current, "note": note}
 
 
-def allows(grant: dict[str, bool], *, high_risk: bool) -> bool:
+def allows(grant: dict[str, Any], *, high_risk: bool, tool: str | None = None) -> bool:
     """这份授权是否允许**直接执行**（不发批准卡）。
 
-    规则（研究者 2026-09-22 定的）：
+    规则（研究者 2026-09-22 定，2026-09-25 加"按工具"一档）：
     - 「此对话中默认允许执行」= 最宽的一档，**连高危也直接做**；
     - 「完全访问模式」= 普通动手操作直接做，**高危仍然先问**；
-    - 都没开 → 一概先问。
+    - 「本对话允许这个工具」（``tool`` 命中 ``grants.tools``）= 同一工具换参数不再问，
+      **高危仍然先问**；
+    - 都没命中 → 一概先问。
 
-    单拎成函数是为了能被穷举测试 —— 这段判定决定了"到底会不会不打招呼就动研究者的机器"。
+    ⚠️ **高危只认第一档**：这是"会不会不打招呼就动研究者机器"的边界，穷举测试钉住它。
     """
 
     if grant.get(GRANT_ALLOW_EXEC):
         return True
-    return bool(grant.get(GRANT_FULL_ACCESS)) and not high_risk
+    if high_risk:
+        return False
+    if grant.get(GRANT_FULL_ACCESS):
+        return True
+    tools = grant.get(GRANT_TOOLS)
+    return bool(tool) and isinstance(tools, list) and tool in tools
 
 
 def find(record: dict[str, Any], request_id: str) -> tuple[int, dict[str, Any]] | None:

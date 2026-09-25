@@ -1416,7 +1416,12 @@ onUnmounted(() => {
          这里不再占用内容列。 -->
 
     <!-- 待批准条：贴着输入框上方（研究者 2026-09-22：不放在内容输出区）。
-         四行 = 要执行的命令 + 三个选择；批准或拒绝后它自己就没了。 -->
+         四个元素 = 要执行的命令 + 三个选择；批准或拒绝后它自己就没了。
+         ⚠️ 三档语义（研究者 2026-09-25 口径，**卡片上要看得见批准的是什么**）：
+           ①「本对话允许「运行命令」」= **按工具**授权：之后同一工具换参数不再问（高危仍会问）
+           ②「本对话默认允许（含高危）」= 最宽一档，连高危也不再弹卡
+           ③「拒绝」
+         → 因此第一档按钮必须**写出工具名**，否则研究者会以为批准的只是这一条命令。 -->
     <div v-if="pendingApprovalBar" class="approval-bar" role="group" aria-label="待批准">
       <code class="approval-bar__cmd">{{ approvalCommand(pendingApprovalBar.card.preview) }}</code>
       <button
@@ -1425,7 +1430,7 @@ onUnmounted(() => {
         :disabled="phase === 'thinking' || !session.isOwner"
         @click="decideApprovalCard(pendingApprovalBar.card, 'approve')"
       >
-        批准
+        本对话允许「{{ pendingApprovalBar.card.label || pendingApprovalBar.card.tool }}」
       </button>
       <button
         class="approval-bar__action"
@@ -1433,7 +1438,7 @@ onUnmounted(() => {
         :disabled="phase === 'thinking' || !session.isOwner"
         @click="decideApprovalCard(pendingApprovalBar.card, 'approve_conversation')"
       >
-        此对话默认批准
+        本对话默认允许（含高危）
       </button>
       <button
         class="approval-bar__action"
