@@ -31,14 +31,31 @@ from dataclasses import dataclass, field
 from typing import Any
 
 __all__ = [
+    "EARLY_KEEP_TAIL",
+    "SUMMARY_MAX_CHARS",
+    "SUMMARY_SYSTEM",
     "TOOL_RESULT_KEEP_CHARS",
     "CompactionOutcome",
+    "apply_turn_summary",
+    "build_summary_prompt",
     "compress_tool_results",
     "placeholder_for",
+    "select_summary_span",
+    "summarize_early_turns",
 ]
 
 #: 压工具结果时保留的前缀长度：够模型认出"这是什么结果"，又不至于重新占满预算
 TOOL_RESULT_KEEP_CHARS = 400
+#: 摘要早期轮次时，**尾部保留多少条**原样（正在被推理的上下文不能动）
+EARLY_KEEP_TAIL = 10
+#: 摘要正文的长度上限（字符）：摘要本身也要便宜，否则白压
+SUMMARY_MAX_CHARS = 1200
+
+SUMMARY_SYSTEM = (
+    "你是对话压缩器。把较早的一段对话压成**事实摘要**：保留研究问题、已确认的口径、"
+    "已得到的结论与出处线索、未完成的待办；丢掉寒暄与重复。"
+    "只输出摘要正文，不要输出思考过程、前后缀或代码块围栏。"
+)
 
 
 @dataclass
@@ -113,3 +130,134 @@ def compress_tool_results(
         outcome.kept_chars += len(message["content"])
         outcome.indexes.append(index)
     return outcome
+
+
+# --------------------------------------------------------------------------- #
+# 第二步：摘要早期轮次（压完工具结果仍超预算时）
+#
+# ⚠️ 只能从**前缀**里裁，而且裁点要前推 ——
+# `assistant.tool_calls` 与它后面的 `tool` 消息是**成对**的协议结构：
+# 把中间一段抽掉、让 `tool` 消息失去前驱，供应商会直接 400
+# （报的还是"参数错误"，看不出是自家裁出来的）。所以：
+#   · 开头的 system 消息永不压（它承载角色与输出规范）；
+#   · 尾部 keep_tail 条原样保留（模型正在基于它们推理）；
+#   · 首个**保留**的消息若是 `tool`，就把裁点往前推一条（把它前面的 assistant 也放进保留区）。
+# --------------------------------------------------------------------------- #
+def select_summary_span(
+    messages: list[dict[str, Any]],
+    *,
+    keep_tail: int = EARLY_KEEP_TAIL,
+) -> tuple[int, int] | None:
+    """选出可摘要的**前缀区间** ``[start, end)``；不值得压时返回 None。"""
+
+    total = len(messages or [])
+    start = 0
+    while start < total and str(messages[start].get("role") or "") == "system":
+        start += 1  # 开头的 system 消息永不压
+
+    end = total - max(0, keep_tail)
+    if end - start < 2:
+        # 尾部预算比可用消息还多（短历史 / 首轮就超预算）→ **退让**：只留最后一条，
+        # 其余全压。否则"保留 10 条"会让短对话永远压不动，而它们恰恰是最容易超预算的。
+        end = total - 1
+    # 首个保留项不能是 tool（会失去它的 assistant 前驱）
+    # ⚠️ `end < total` 不能省：`keep_tail=0` 时 `end == total`，下标越界。
+    while start < end < total and str(messages[end].get("role") or "") == "tool":
+        end -= 1
+    # 区间里至少要有两条消息才值得压（一条的话省不下什么，还要搭一次模型调用）
+    if end - start < 2:
+        return None
+    return start, end
+
+
+def build_summary_prompt(messages: list[dict[str, Any]], span: tuple[int, int]) -> str:
+    """把待摘要的区间拼成提示词正文（角色 + 内容，工具结果按"工具返回"标记）。"""
+
+    start, end = span
+    lines: list[str] = []
+    for message in messages[start:end]:
+        role = str(message.get("role") or "")
+        content = message.get("content")
+        if not isinstance(content, str):
+            content = str(content or "")
+        label = {"user": "研究者", "assistant": "助手", "tool": "工具返回"}.get(role, role or "未知")
+        lines.append(f"[{label}] {content.strip()}")
+    return "\n\n".join(lines).strip()
+
+
+async def summarize_early_turns(
+    messages: list[dict[str, Any]],
+    *,
+    span: tuple[int, int],
+    model_ref: str | None,
+) -> dict[str, Any] | None:
+    """用一次模型调用把区间压成摘要。失败/没有可用模型 → None（调用方保持原样继续）。
+
+    返回的记录直接进会话级 `compactions[]`：**摘要正文 + 遮蔽区间 + 遮蔽字符数**。
+    """
+
+    if not model_ref:
+        return None
+    body = build_summary_prompt(messages, span)
+    if not body:
+        return None
+
+    from llm import adapter
+
+    try:
+        result = await adapter.chat(
+            [
+                {"role": "system", "content": SUMMARY_SYSTEM},
+                {"role": "user", "content": body},
+            ],
+            model_ref=model_ref,
+            temperature=0.0,
+            purpose="context_summary",
+            allow_fallback=False,
+            strict_logging=False,
+        )
+    except Exception:  # noqa: BLE001 - 摘要失败不该把对话带崩，保持原样继续
+        return None
+
+    summary = str(getattr(result, "content", "") or "").strip()
+    if not summary:
+        return None
+    if len(summary) > SUMMARY_MAX_CHARS:
+        summary = summary[:SUMMARY_MAX_CHARS] + "…"
+    start, end = span
+    return {
+        "kind": "turns",
+        "indexes": list(range(start, end)),
+        "count": end - start,
+        "original_chars": len(body),
+        "summary_chars": len(summary),
+        "summary": summary,
+    }
+
+
+def apply_turn_summary(
+    messages: list[dict[str, Any]],
+    *,
+    span: tuple[int, int],
+    summary: str,
+) -> int:
+    """把区间替换成**一条**摘要消息，返回释放掉的字符数。
+
+    用 `user` 角色承载：部分供应商不接受对话中途出现 `system` 消息，
+    而 `user` 角色各处都收（摘要里也明说了它是什么）。
+    """
+
+    start, end = span
+    original = sum(
+        len(str(message.get("content") or "")) for message in messages[start:end]
+    )
+    note = {
+        "role": "user",
+        "content": (
+            "（较早的对话**已压缩为下面这段摘要**，原始轮次仍完整保存在会话记录里。"
+            "需要细节时可以重新发起对应操作。）\n\n"
+            f"{summary}"
+        ),
+    }
+    messages[start:end] = [note]
+    return max(0, original - len(note["content"]))

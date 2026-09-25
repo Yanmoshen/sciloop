@@ -189,3 +189,135 @@ def test_loop_keeps_going_when_nothing_to_compress() -> None:
     assert state["compactions"] == []
     assert not any("已压缩" in frame for frame in frames)
     assert any('"delta"' in frame or "delta" in frame for frame in frames), "回答照常产出"
+
+
+# --------------------------------------------------------------------------- #
+# ③ 第二步：摘要早期轮次（裁点必须保住 tool_calls 的配对）
+# --------------------------------------------------------------------------- #
+def _messages_with_pairs(count: int) -> list[dict[str, Any]]:
+    """造一段历史：每轮 = user + assistant(带 tool_calls) + tool 结果。"""
+
+    messages: list[dict[str, Any]] = [{"role": "system", "content": "系统" * 20}]
+    for index in range(count):
+        messages.append({"role": "user", "content": f"问题{index}" * 20})
+        messages.append(
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": f"c{index}", "function": {"name": "query_library", "arguments": "{}"}}
+                ],
+            }
+        )
+        messages.append({"role": "tool", "tool_call_id": f"c{index}", "content": f"结果{index}" * 20})
+    return messages
+
+
+def test_summary_span_never_orphans_a_tool_message() -> None:
+    """首个**保留**的消息绝不能是 `tool` —— 否则它的 assistant 前驱被抽走，供应商直接 400。"""
+
+    messages = _messages_with_pairs(6)
+    span = compaction.select_summary_span(messages, keep_tail=4)
+    assert span is not None
+    start, end = span
+    assert str(messages[start].get("role")) == "user", "开头的 system 永不压"
+    assert str(messages[end].get("role")) != "tool", "裁点必须前推到不是 tool 的位置"
+
+
+def test_summary_span_returns_none_when_nothing_worth_compressing() -> None:
+    assert compaction.select_summary_span([{"role": "system", "content": "s"}]) is None
+    assert compaction.select_summary_span(
+        [{"role": "system", "content": "s"}, {"role": "user", "content": "只此一条"}],
+        keep_tail=0,
+    ) is None
+
+
+def test_build_summary_prompt_labels_every_role() -> None:
+    messages = _messages_with_pairs(2)
+    body = compaction.build_summary_prompt(messages, (1, 4))
+    assert "[研究者]" in body and "[助手]" in body and "[工具返回]" in body
+
+
+def test_summarize_early_turns_records_span_and_summary(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _Result:
+        content = "  摘要正文  "
+
+    async def fake_chat(*_args: Any, **_kwargs: Any) -> Any:
+        return _Result()
+
+    monkeypatch.setattr("llm.adapter.chat", fake_chat)
+    messages = _messages_with_pairs(4)
+    span = compaction.select_summary_span(messages, keep_tail=3)
+    assert span is not None
+    record = asyncio.run(
+        compaction.summarize_early_turns(messages, span=span, model_ref="ds:x")
+    )
+    assert record is not None
+    assert record["kind"] == "turns"
+    assert record["summary"] == "摘要正文"
+    assert record["indexes"] == list(range(span[0], span[1]))
+    assert record["original_chars"] > 0
+
+
+def test_summarize_early_turns_returns_none_without_model_or_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    messages = _messages_with_pairs(4)
+    span = compaction.select_summary_span(messages, keep_tail=3)
+    assert asyncio.run(compaction.summarize_early_turns(messages, span=span, model_ref=None)) is None
+
+    async def boom(*_args: Any, **_kwargs: Any) -> Any:
+        raise TimeoutError("摘要超时")
+
+    monkeypatch.setattr("llm.adapter.chat", boom)
+    assert asyncio.run(compaction.summarize_early_turns(messages, span=span, model_ref="ds:x")) is None
+
+
+def test_apply_turn_summary_replaces_span_with_one_honest_message() -> None:
+    messages = _messages_with_pairs(4)
+    span = compaction.select_summary_span(messages, keep_tail=3)
+    assert span is not None
+    before = len(messages)
+    freed = compaction.apply_turn_summary(messages, span=span, summary="这里是摘要")
+    assert len(messages) == before - (span[1] - span[0]) + 1
+    note = messages[span[0]]
+    assert note["role"] == "user"
+    assert "已压缩为下面这段摘要" in note["content"]
+    assert "这里是摘要" in note["content"]
+    assert freed > 0
+
+
+def test_loop_summarizes_early_turns_when_tool_results_are_not_enough(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """接线：工具结果压不动 → 摘要早期轮次，推告知行并记进 `compactions`。"""
+
+    class _Result:
+        content = "早期对话的摘要"
+
+    async def fake_chat(*_args: Any, **_kwargs: Any) -> Any:
+        return _Result()
+
+    monkeypatch.setattr("llm.adapter.chat", fake_chat)
+    meter = context_meter.get_meter()
+    original_limit = meter.limit_tokens
+    meter.limit_tokens = 200  # 系统提示 + 早期轮次必然超
+    try:
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": "系统提示" * 30},
+            {"role": "user", "content": "第一个问题" * 30},
+            {"role": "assistant", "content": "第一个回答" * 30},
+            {"role": "user", "content": "第二个问题" * 30},
+            {"role": "assistant", "content": "第二个回答" * 30},
+            {"role": "user", "content": "当前问题"},
+        ]
+        frames, state = _drive(messages)
+    finally:
+        meter.limit_tokens = original_limit
+
+    assert any("摘要化" in frame for frame in frames), "该推一行告知"
+    kinds = [item["kind"] for item in state["compactions"]]
+    assert kinds == ["turns"]
+    sent = _drive.seen[0]
+    assert "已压缩为下面这段摘要" in sent[1]["content"] or any(
+        "已压缩为下面这段摘要" in str(item.get("content") or "") for item in sent
+    ), "真正发给模型的 messages 里应当已经是摘要"

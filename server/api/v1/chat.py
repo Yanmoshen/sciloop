@@ -324,10 +324,46 @@ async def _agent_loop(
                 )
             else:
                 logger.warning(
-                    "上下文 %d 已超预算 %d，但没有可压缩的工具结果，继续执行",
+                    "上下文 %d 已超预算 %d，但已无可压缩的工具结果",
                     projected,
                     meter.limit_tokens,
                 )
+            # 第二步：压完工具结果**仍超预算** → 摘要早期轮次（这一步要花一次模型调用，
+            # 所以排在后面；失败就保持原样继续 —— 口径是"不因超窗停止"）。
+            if meter.project(messages_now, tools=tool_defs) > meter.limit_tokens:
+                span = compaction_mod.select_summary_span(messages_now)
+                summary_record = (
+                    await compaction_mod.summarize_early_turns(
+                        messages_now, span=span, model_ref=ref
+                    )
+                    if span is not None
+                    else None
+                )
+                if summary_record is not None and span is not None:
+                    freed_chars = compaction_mod.apply_turn_summary(
+                        messages_now, span=span, summary=str(summary_record["summary"])
+                    )
+                    budget_row = {
+                        "kind": "system",
+                        "tone": "warn",
+                        "text": (
+                            f"上下文仍超预算：已把最早的 {summary_record['count']} 条对话"
+                            f"摘要化（释放约 {freed_chars:,} 字符）后继续。"
+                        ),
+                    }
+                    rows.append(budget_row)
+                    yield _sse("row", {"row": budget_row})
+                    compactions.append(summary_record)
+                    logger.info(
+                        "上下文摘要 conversation=%s count=%d freed_chars=%d",
+                        conversation_id,
+                        summary_record["count"],
+                        freed_chars,
+                    )
+                elif not outcome.changed:
+                    logger.warning(
+                        "上下文超预算但无可压缩内容（工具结果与早期轮次都没有可动的），继续执行"
+                    )
         estimate_before = meter.estimate(messages_now, tools=tool_defs)
         round_result: Any = None
         #: 这一轮的思考过程从 `state["reasoning"]` 的哪个下标开始 —— 用于把**本轮**的
