@@ -173,3 +173,72 @@ def test_tool_round_falls_back_to_final_frame_reasoning(monkeypatch: pytest.Monk
     second = seen[1]
     with_calls = [m for m in second if m.get("role") == "assistant" and m.get("tool_calls")]
     assert with_calls and with_calls[0].get("reasoning_content") == "收尾帧才给的思考"
+
+
+def test_reasoning_is_emitted_as_a_row_before_the_tool_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """每轮思考要**落成一行**，而且必须排在这一轮的过程行之前。
+
+    背景（研究者 2026-09-24 要求）：以前整个回合的思考只存在 turn.reasoning 里，
+    界面只能把它整段堆在正文最上方；落成行之后前端才能把它和过程行**交叉展示**。
+    顺序错了（思考跑到自己的动作后面）读起来就是"先干活后想"。
+    """
+
+    seen: list[list[dict[str, Any]]] = []
+    monkeypatch.setattr(chat_api.adapter, "chat_stream", _stream_factory(
+        [
+            {"reasoning_deltas": ["先看目录"], "calls": [_call("run_command", "c1")]},
+            {"content": "看完了"},
+        ],
+        seen,
+    ))
+
+    async def _no_tools() -> list[dict[str, Any]]:
+        return []
+
+    async def _no_judge(_call: dict[str, Any]) -> Any:
+        class _Verdict:
+            forbidden = False
+            needs_approval = False
+            harmless = True
+
+        return _Verdict()
+
+    async def _read_run(_call: dict[str, Any], **_kwargs: Any) -> tuple[dict[str, Any], str]:
+        return {"ok": True, "result": "ok"}, "done"
+
+    from services.agent import mcp_tools as agent_tools
+
+    monkeypatch.setattr(agent_tools, "tool_schemas", _no_tools)
+    monkeypatch.setattr(agent_tools, "judge", _no_judge)
+    monkeypatch.setattr(agent_tools, "run_tool_call", _read_run)
+
+    state: dict[str, Any] = {"text": [], "reasoning": [], "result": None, "pending": None}
+    loop = chat_api._agent_loop(
+        [{"role": "user", "content": "看一下当前目录"}],
+        conversation_id="reasoning-row-test",
+        ref="fake",
+        tool_defs=[],
+        rows=[],
+        approvals_out=[],
+        state=state,
+    )
+
+    events: list[str] = []
+
+    async def _collect() -> None:
+        async for chunk in loop:
+            events.append(chunk)
+
+    asyncio.run(_collect())
+
+    reasoning_rows = [e for e in events if '"kind": "reasoning"' in e or '"kind":"reasoning"' in e]
+    assert reasoning_rows, "应当把本轮思考作为一行发出去（kind=reasoning）"
+    assert "先看目录" in reasoning_rows[0]
+
+    # 顺序：思考行必须出现在这一轮的工具行之前
+    idx_reason = next(i for i, e in enumerate(events) if "reasoning" in e and "row" in e)
+    idx_tool = next(
+        (i for i, e in enumerate(events) if "run_command" in e and "row" in e),
+        len(events),
+    )
+    assert idx_reason < idx_tool, "思考行必须排在本轮过程行之前，否则读起来像先干活后想"

@@ -33,11 +33,26 @@ from mcp.server.mcpserver.exceptions import ToolError as McpToolError
 from mcp_server.guard import Guard, GuardError
 
 #: 可执行白名单。**故意很短**：够跑脚本/测试/检索即可，不是通用 shell。
+#: 2026-09-22 扩了一小批**只读、无副作用**的命令：研究者实测模型想先看"我在哪个目录"（`pwd`）
+#: 被直接挡下，对话当场卡住。判定口径与 `services/agent/policy.py` 的 `_READONLY_TOKENS` 对齐，
+#: 但**只取其中不会吐秘密的那些**（见下面的警告）。
 ALLOWED_BINARIES = (
+    # 解释器与项目工具
     "python", "python3", "pytest", "ruff", "git",
-    "ls", "cat", "head", "tail", "wc", "grep", "rg",
-    "sed", "awk", "sort", "uniq", "find",
+    # 目录与文件：看
+    "ls", "pwd", "stat", "file", "tree", "basename", "dirname", "realpath",
+    # 文本：看
+    "cat", "head", "tail", "wc", "grep", "rg",
+    "sed", "awk", "sort", "uniq", "cut", "tr", "diff",
+    # 身份与时间：看
+    "whoami", "hostname", "date", "which",
+    # 查找
+    "find",
 )
+
+#: ⚠️ **故意不放 `env` / `printenv`**（虽然 `policy.py` 的只读清单里有它们，很容易被当成漏项补上）：
+#: 它们会把容器环境变量原样吐出来，里面有 LLM 供应商的 API Key —— 等于把密钥写进对话与日志。
+#: 「读命令一律放行」这条原则，在"读环境变量"上要停一下。
 
 #: 单次执行可回传的输出上限。
 MAX_OUTPUT_BYTES = 32 * 1024
