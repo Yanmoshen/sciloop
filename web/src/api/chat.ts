@@ -201,7 +201,11 @@ export interface SystemRow {
    * `search` = 联网检索的结构化结果行（节点侧）。
    * 它随会话落盘，界面据此画折叠面板 —— 与批准卡同一套思路：**行即卡片**，刷新后还在。
    */
-  kind: 'system' | 'tool' | 'search'
+  /**
+   * `reasoning` = 一轮结束后的思考段（2026-09-24 起后端把每轮思考也落成行，
+   * 这样它就能和过程行**按顺序交叉展示**，而不是全部堆在一轮的最上方）。
+   */
+  kind: 'system' | 'tool' | 'search' | 'reasoning'
   /** 分类标签（节点过程行有；工具行由后端给的 text 自带工具名） */
   label?: string
   text: string

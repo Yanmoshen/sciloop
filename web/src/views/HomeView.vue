@@ -19,6 +19,7 @@
  * 中断/出错时**保留已生成部分**并在尾部如实标注，不假装完成。
  */
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import { ElMessage } from 'element-plus'
 import { humanError, writeDenied } from '@/utils/messages'
 import { useRoute, useRouter } from 'vue-router'
 
@@ -37,6 +38,7 @@ import { ApiError } from '@/api/client'
 import { getConversation } from '@/api/conversations'
 import MarkdownText from '@/components/MarkdownText.vue'
 import SearchReport from '@/components/SearchReport.vue'
+import AccessModeDialog from '@/components/home/AccessModeDialog.vue'
 import ConfirmDialog from '@/components/home/ConfirmDialog.vue'
 import ResearchFlowDrawer from '@/components/home/ResearchFlowDrawer.vue'
 import ProjectCreateDialog from '@/components/ProjectCreateDialog.vue'
@@ -174,6 +176,79 @@ function durationText(turn: Turn): string {
   if (turn.status === 'waiting') return '等待研究者批准'
   if (turn.durationMs) return `已完成 ${fmtDuration(turn.durationMs)}`
   return ''
+}
+
+/**
+ * 工具调用折叠（研究者 2026-09-25 口径）。
+ *
+ * 分组：**按思考段切** —— 组号 = 这行前面有几条「思考行」（`kind === 'reasoning'`）。
+ * 这样每段思考后面的那串工具调用各自成组，和"思考与过程行交叉展示"的口径一致。
+ *
+ * 哪些**永远不折**（安全线）：流程节点 / 系统行（`kind !== 'tool'`）、失败与被拒、等待批准。
+ * 把"被拦下了"折进抽屉里，审计上说不通。
+ *
+ * 状态：`openToolGroups` 只在内存里（默认全收起），刷新后回到收起 ——
+ * 与「思考过程」「已思考」那两块的展开态同一套做法。
+ */
+const openToolGroups = ref<Set<string>>(new Set())
+
+function isToolGroupOpen(key: string): boolean {
+  return openToolGroups.value.has(key)
+}
+
+function toggleToolGroup(key: string): void {
+  const next = new Set(openToolGroups.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  openToolGroups.value = next
+}
+
+/** 组号 = 前面有几条思考行 */
+function toolGroupOf(rows: TurnRow[], index: number): number {
+  let group = 0
+  for (let i = 0; i < index; i++) {
+    if (rows[i]?.kind === 'reasoning') group += 1
+  }
+  return group
+}
+
+/** 行内唯一键：轮下标-组号（同一轮里可能有好几组工具调用） */
+function toolKey(turnIndex: number, rows: TurnRow[], index: number): string {
+  return `${turnIndex}-${toolGroupOf(rows, index)}`
+}
+
+/** 这一行能不能折进抽屉：只有工具行能折；失败/被拒/等待批准一律留外面 */
+function rowCollapsible(row: TurnRow): boolean {
+  if (row.kind !== 'tool') return false
+  const text = String(row.text ?? '')
+  if (/未完成|失败|拒绝|不在允许/.test(text)) return false
+  if (/等待研究者批准|需要你确认/.test(text)) return false
+  return true
+}
+
+/** 表头只画在"这一组的第一条可折叠行"之前，且这一组确实有可折叠行 */
+function showsToolHead(rows: TurnRow[], index: number): boolean {
+  const row = rows[index]
+  if (!row || !rowCollapsible(row)) return false
+  const prev = index > 0 ? rows[index - 1] : undefined
+  return !prev || !rowCollapsible(prev) || toolGroupOf(rows, index) !== toolGroupOf(rows, index - 1)
+}
+
+/** 这一组里还有没有在跑的行（表头挂三点动效用） */
+function toolGroupRunning(rows: TurnRow[], index: number): boolean {
+  const group = toolGroupOf(rows, index)
+  for (let i = 0; i < rows.length; i++) {
+    if (toolGroupOf(rows, i) !== group) continue
+    if (rowMotion(rows, i) === 'mo-dots') return true
+  }
+  return false
+}
+
+/** 这一行此刻该不该显示（可折叠的行在抽屉收起时隐藏；其余永远显示） */
+function rowVisible(rows: TurnRow[], index: number, turnIndex: number): boolean {
+  const row = rows[index]
+  if (!row || !rowCollapsible(row)) return true
+  return isToolGroupOpen(toolKey(turnIndex, rows, index))
 }
 
 /**
@@ -844,10 +919,49 @@ const accessNote = ref('')
 /** 本地暂存过、但还没落到任何会话上的开关值（新建会话后补写） */
 let pendingFullAccess: boolean | null = null
 
+/**
+ * 说明弹窗（2026-09-25 研究者口径）：**开启前先讲清楚，确认后才真的开**。
+ * 关掉不弹 —— 收紧权限不需要再确认一次。开关上原来的 `title` 提示已去掉。
+ */
+const accessModalOpen = ref(false)
+const accessBusy = ref(false)
+const accessError = ref('')
+
 function toggleFullAccess(): void {
   fullAccess.value = !fullAccess.value
   localStorage.setItem(FULL_ACCESS_KEY, fullAccess.value ? '1' : '0')
   void syncFullAccess()
+}
+
+/** 开关点击：只在「要开启」时先弹窗；已经在开着的状态点它就是关闭，直接收紧 */
+function onFullAccessClick(): void {
+  if (fullAccess.value) {
+    toggleFullAccess()
+    return
+  }
+  accessError.value = ''
+  accessModalOpen.value = true
+}
+
+/** 弹窗里确认开启：**开通成功才关弹窗**，后端没记上就留在弹窗里如实说 */
+async function confirmFullAccess(): Promise<void> {
+  accessBusy.value = true
+  accessError.value = ''
+  fullAccess.value = true
+  localStorage.setItem(FULL_ACCESS_KEY, '1')
+  try {
+    const ok = await syncFullAccess()
+    if (!ok) {
+      // 后端没认下来 → **把本地也退回去**，不能让界面显示成"已开启"（说不上就是没开）
+      fullAccess.value = false
+      localStorage.setItem(FULL_ACCESS_KEY, '0')
+      accessError.value = accessNote.value || '开关没改成'
+      return
+    }
+    accessModalOpen.value = false
+  } finally {
+    accessBusy.value = false
+  }
 }
 
 /**
@@ -856,24 +970,30 @@ function toggleFullAccess(): void {
  * 还没有会话时先记在 `pendingFullAccess` 里 —— 用户是在"开始对话之前"拨的开关，
  * 等第一轮对话拿到会话 id 再补写，不能因此丢了他的选择。
  */
-async function syncFullAccess(): Promise<void> {
+async function syncFullAccess(): Promise<boolean> {
   const id = conversationId.value
   if (!id) {
     pendingFullAccess = fullAccess.value
-    return
+    return true
   }
   if (!session.isOwner) {
+    // 提示通道：原来靠开关上的 title 显示，现在 title 去掉了 → 改成一条瞬时提示，
+    // 否则"点了一点反应都没有"，用户只会以为开关坏了（弹窗里也会显示这条）。
     accessNote.value = '切到研究者身份后才能改这个开关'
-    return
+    ElMessage.error(accessNote.value)
+    return false
   }
   try {
     const state = await setAccessMode(id, fullAccess.value)
     accessNote.value = state.note
     pendingFullAccess = null
+    return true
   } catch (error) {
     // 如实说：本地拨了但后端没记上，别让界面显示成"已开"
     accessNote.value =
       error instanceof ApiError ? `开关没改成：${error.message}` : '开关没改成（网络异常）'
+    ElMessage.error(accessNote.value)
+    return false
   }
 }
 
@@ -1136,6 +1256,12 @@ onUnmounted(() => {
         <symbol id="sl-x" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
           <path d="M4.2 4.2 11.8 11.8M11.8 4.2 4.2 11.8" />
         </symbol>
+        <symbol id="sl-tool" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round">
+          <path d="M2.4 4.4h11.2M2.4 8h11.2M2.4 11.6h11.2" />
+          <circle cx="5.9" cy="4.4" r="1.45" fill="currentColor" stroke="none" />
+          <circle cx="10.2" cy="8" r="1.45" fill="currentColor" stroke="none" />
+          <circle cx="5.4" cy="11.6" r="1.45" fill="currentColor" stroke="none" />
+        </symbol>
       </defs>
     </svg>
 
@@ -1274,9 +1400,45 @@ onUnmounted(() => {
             <template v-for="(row, rowIndex) in turn.rows" :key="rowIndex">
               <!-- 批准卡**不在正文里显示**：它贴在输入框上方（见 .approval-bar）；
                    批准/拒绝的过程也不在正文留痕（研究者 2026-09-22 定的）。 -->
+              <!-- 工具调用折叠（研究者 2026-09-25 口径）：**按思考段分组、默认一律收起**，
+                   表头只有「工具图标 + 调用工具」；失败与被拒 / 等待批准 / 流程节点行永远露在外面。
+                   用 v-show 而不是把行塞进 .fold：折叠时**必须保持行的原始顺序**（露在外面的行
+                   要留在它原本的位置上），.fold 那种"整块包起来"会把顺序打乱。 -->
+              <button
+                v-if="showsToolHead(turn.rows ?? [], rowIndex)"
+                class="toolgroup"
+                type="button"
+                :aria-expanded="isToolGroupOpen(toolKey(index, turn.rows ?? [], rowIndex))"
+                @click="toggleToolGroup(toolKey(index, turn.rows ?? [], rowIndex))"
+              >
+                <svg
+                  class="reason__caret"
+                  :class="{
+                    'reason__caret--open': isToolGroupOpen(
+                      toolKey(index, turn.rows ?? [], rowIndex),
+                    ),
+                  }"
+                  width="10"
+                  height="10"
+                  viewBox="0 0 10 10"
+                  aria-hidden="true"
+                >
+                  <path d="M3 1.5 6.5 5 3 8.5" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+                <span class="reason__ico" aria-hidden="true">
+                  <svg width="14" height="14"><use href="#sl-tool" /></svg>
+                </span>
+                <span>调用工具</span>
+                <span
+                  v-if="toolGroupRunning(turn.rows ?? [], rowIndex)"
+                  class="mo-dots"
+                  aria-hidden="true"
+                ><i /><i /><i /></span>
+              </button>
               <!-- 联网检索：折叠面板取代原来那句文字摘要（来源 · 搜索词 · 结果标题与链接） -->
               <SearchReport
                 v-if="!isApprovalCard(row) && searchReportFor(row)"
+                v-show="rowVisible(turn.rows ?? [], rowIndex, index)"
                 :report="searchReportFor(row)!"
               />
               <!-- 一轮结束后的思考：按顺序落在它之后的过程行**之前**，与过程行交叉展示 -->
@@ -1308,6 +1470,7 @@ onUnmounted(() => {
               </div>
               <div
                 v-else-if="!isApprovalCard(row) && !isSettledApprovalRow(row)"
+                v-show="rowVisible(turn.rows ?? [], rowIndex, index)"
                 class="row"
                 :class="`row--${row.tone ?? 'idle'}`"
               >
@@ -1489,13 +1652,8 @@ onUnmounted(() => {
             type="button"
             role="switch"
             :aria-checked="fullAccess ? 'true' : 'false'"
-            :title="
-              accessNote ||
-              (fullAccess
-                ? '完全访问模式：已开启。普通操作直接执行，高危操作仍会先问你'
-                : '完全访问模式：关闭中。动手前都会先问你，点一下开启')
-            "
-            @click="toggleFullAccess"
+            aria-haspopup="dialog"
+            @click="onFullAccessClick"
           >
             <span class="autorun__dot" />
             {{ fullAccess ? '完全访问模式' : '逐步确认' }}
@@ -1615,6 +1773,13 @@ onUnmounted(() => {
       @confirm="confirmEditRestart"
     />
   </section>
+
+  <AccessModeDialog
+    v-model="accessModalOpen"
+    :busy="accessBusy"
+    :error="accessError"
+    @confirm="confirmFullAccess"
+  />
 
   <!-- 研究流程：右侧控制台抽屉（固定定位挂在 .chat 之外，避免被 .chat 的 overflow/animation 裁剪） -->
   <ResearchFlowDrawer :conversation-id="conversationId" />
@@ -1871,6 +2036,25 @@ onUnmounted(() => {
   width: 14px;
   height: 14px;
   display: block;
+}
+
+/* 工具调用折叠表头：与「思考过程」那一行同一套视觉（同样的缩进、同样的次色） */
+.toolgroup {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 0;
+  padding: 2px 0;
+  border: 0;
+  background: transparent;
+  color: var(--h-fg-subtle);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+}
+
+.toolgroup:hover {
+  color: var(--h-fg-muted);
 }
 
 .reason--inline {

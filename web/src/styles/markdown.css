@@ -10,28 +10,34 @@
  */
 @import 'katex/dist/katex.min.css';
 
+/**
+ * 代码高亮（全站黑白化）：原来是 6 种彩色的 One Dark 风格，
+ * 现在改成**一组灰度 + 字重**的方案 —— 关键字最亮最粗、注释最暗且斜体、
+ * 字符串/数字/函数名用中间几档区分。黑白主题下仍然一眼能读，且不再有任何色相。
+ * ⚠️ 若你更想保留"代码里的语法颜色"，说一声即可回退（这是唯一一处主动放弃彩色的地方）。
+ */
 :root {
-  --code-kw: #a626a4; /* 关键字 */
-  --code-str: #50a14f; /* 字符串 */
-  --code-num: #986801; /* 数字 / 常量 */
-  --code-fn: #4078f2; /* 函数名 */
-  --code-var: #e45649; /* 变量 / 标签 */
-  --code-cmt: #a0a1a7; /* 注释 */
-  --code-surface: #f6f7f9;
-  --code-line: #e6e8ec;
-  --code-fg: #383a42;
+  --code-kw: #0a0a0a; /* 关键字：最重 */
+  --code-str: #3d3d3d; /* 字符串 */
+  --code-num: #5a5a5a; /* 数字 / 常量 */
+  --code-fn: #1f1f1f; /* 函数名 */
+  --code-var: #6f6f6f; /* 变量 / 标签 */
+  --code-cmt: #9a9a9a; /* 注释：最轻 */
+  --code-surface: #f5f5f5;
+  --code-line: #e6e6e6;
+  --code-fg: #1f1f1f;
 }
 
 :root[data-theme='dark'] {
-  --code-kw: #c678dd;
-  --code-str: #98c379;
-  --code-num: #d19a66;
-  --code-fn: #61afef;
-  --code-var: #e06c75;
-  --code-cmt: #7f848e;
-  --code-surface: #191c22;
-  --code-line: #2b3038;
-  --code-fg: #d7dae0;
+  --code-kw: #ffffff;
+  --code-str: #cfcfcf;
+  --code-num: #b4b4b4;
+  --code-fn: #e6e6e6;
+  --code-var: #9a9a9a;
+  --code-cmt: #767676;
+  --code-surface: #141414;
+  --code-line: #262626;
+  --code-fg: #dedede;
 }
 
 .md {

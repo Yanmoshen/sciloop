@@ -13,40 +13,44 @@
  * 色值全部取自 n8n 提取结果，禁止自造新 hex。
  */
 
-/* ---------- 浅色 ---------- */
+/* ---------- 浅色（黑白化：纯白底；橙 primary / 蓝 secondary 全部下线）---------- */
 .sl-home {
   --h-page-bg: #ffffff;
-  --h-surface: #f7f6fa;
-  --h-surface-raised: #fefefe;
-  --h-surface-input: #f7f6fa;
+  --h-surface: #f5f5f5;
+  --h-surface-raised: #ffffff;
+  --h-surface-input: #f5f5f5;
   --h-line: rgba(0, 0, 0, 0.12);
-  --h-line-strong: rgba(0, 0, 0, 0.24);
+  --h-line-strong: rgba(0, 0, 0, 0.26);
   --h-fg: #000000;
-  --h-fg-muted: #4b4b4b;
-  --h-fg-subtle: #6f6f6f;
-  --h-primary: #ee4f27;
-  --h-primary-fg: #000000;
-  --h-secondary: #077ac7;
-  --h-hover: rgba(0, 0, 0, 0.05);
-  --h-active: rgba(238, 79, 39, 0.12);
+  --h-fg-muted: #5a5a5a;
+  --h-fg-subtle: #8a8a8a;
+  /* primary ＝ 最重的灰（近黑），配白字；hover 用中灰承接 */
+  --h-primary: #0a0a0a;
+  --h-primary-fg: #ffffff;
+  --h-primary-hover: #333333;
+  --h-secondary: #5a5a5a;
+  --h-hover: rgba(0, 0, 0, 0.06);
+  --h-active: rgba(0, 0, 0, 0.12);
 }
 
-/* ---------- 深色（P0 默认） ---------- */
+/* ---------- 深色（黑白化：**纯黑底**，面板靠底色深浅浮起）---------- */
 :root[data-theme='dark'] .sl-home {
-  --h-page-bg: #0e0918;
-  --h-surface: #1b1728;
-  --h-surface-raised: #1f192a;
-  --h-surface-input: #1a1624;
-  --h-line: rgba(209, 206, 206, 0.14);
-  --h-line-strong: rgba(209, 206, 206, 0.28);
+  --h-page-bg: #000000;
+  --h-surface: #141414;
+  --h-surface-raised: #1b1b1b;
+  --h-surface-input: #161616;
+  --h-line: rgba(255, 255, 255, 0.10);
+  --h-line-strong: rgba(255, 255, 255, 0.22);
   --h-fg: #ffffff;
-  --h-fg-muted: #b6b5b9;
-  --h-fg-subtle: #9d9797;
-  --h-primary: #ee4f27;
+  --h-fg-muted: #b4b4b4;
+  --h-fg-subtle: #8f8f8f;
+  /* 纯黑底下 primary ＝ 纯白，配黑字 —— 它是最"重"的元素，正好替代原来的橙 */
+  --h-primary: #ffffff;
   --h-primary-fg: #000000;
-  --h-secondary: #077ac7;
-  --h-hover: rgba(209, 206, 206, 0.08);
-  --h-active: rgba(238, 79, 39, 0.16);
+  --h-primary-hover: #e0e0e0;
+  --h-secondary: #b4b4b4;
+  --h-hover: rgba(255, 255, 255, 0.08);
+  --h-active: rgba(255, 255, 255, 0.14);
 }
 
 /* ---------- 状态色：别名到 tokens.css 的语义色 ----------

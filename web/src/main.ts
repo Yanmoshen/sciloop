@@ -36,8 +36,7 @@ import '@/styles/scrollbar.css'
 import '@/styles/markdown.css'
 // 思考可视化动效（.mo-spin / .mo-shimmer / .mo-breathe / .mo-dots / .mo-bars）
 // 自带 prefers-reduced-motion 降级，排在 a11y.css 之后
-// ⚠️ 2026-09-24 事故：`styles/thinking-motion.css` 在批量删除中丢失且无副本，
-// 导入会让构建 ENOENT，故暂时摘掉；该文件重建后把这一行加回来即可。
+import '@/styles/thinking-motion.css'
 
 const app = createApp(App)
 

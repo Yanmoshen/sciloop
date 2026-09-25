@@ -26,6 +26,8 @@ web/dist/
 web/.vite/
 *.local
 .vite/
+# vite 配置热重载自己落的临时文件（形如 vite.config.ts.timestamp-1790211066971-04516a304ec57.mjs）
+web/vite.config.ts.timestamp-*
 
 # ===== 运行产物 =====
 *.log

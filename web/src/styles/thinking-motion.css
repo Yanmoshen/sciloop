@@ -1,0 +1,150 @@
+/**
+ * 思考可视化动效（2026-09-23 从示例页搬进源码；示例见 preview/thinking-motion/）。
+ *
+ * 全局类，前缀 `mo-`（motion），避免与组件内类名撞车。
+ * 用在哪：对话过程行（HomeView 的 `.row`）与「已思考 Ns」那一行 —— 见 HomeView.vue。
+ *
+ * 规则：**颜色一律 currentColor**，动效只改 transform / opacity / background-position，
+ * 不改布局（不触发 reflow）；`prefers-reduced-motion` 下全部停掉，且流光必须退化成
+ * **纯次色文字** —— 否则 `background-clip:text` 配上 `animation:none` 会让文字直接变透明消失。
+ */
+
+/* ① 自转（原子/轨道类图标） */
+.mo-spin {
+  animation: mo-spin 4.2s linear infinite;
+  transform-origin: 50% 50%;
+}
+@keyframes mo-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ② 呼吸脉冲（等待研究者确认） */
+.mo-breathe {
+  animation: mo-breathe 2.1s ease-in-out infinite;
+}
+@keyframes mo-breathe {
+  0%,
+  100% {
+    opacity: 0.5;
+    transform: scale(0.9);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.06);
+  }
+}
+
+/* ③ 文字流光：一道高光从右往左扫过（灰字 + 亮扫） */
+.mo-shimmer {
+  background-image: linear-gradient(
+    90deg,
+    currentColor 0%,
+    currentColor 36%,
+    var(--h-fg, currentColor) 50%,
+    currentColor 64%,
+    currentColor 100%
+  );
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: mo-shimmer 1.9s linear infinite;
+}
+@keyframes mo-shimmer {
+  from {
+    background-position: 130% 0;
+  }
+  to {
+    background-position: -70% 0;
+  }
+}
+
+/* ④ 三点跳动（经典"在跑"） */
+.mo-dots {
+  display: inline-flex;
+  gap: 3px;
+  align-items: center;
+  margin-left: 2px;
+  vertical-align: 1px;
+}
+.mo-dots i {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+  display: block;
+  animation: mo-bounce 1.05s infinite;
+}
+.mo-dots i:nth-child(2) {
+  animation-delay: 0.13s;
+}
+.mo-dots i:nth-child(3) {
+  animation-delay: 0.26s;
+}
+@keyframes mo-bounce {
+  0%,
+  62%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  31% {
+    transform: translateY(-3px);
+    opacity: 1;
+  }
+}
+
+/* ⑤ 方块进度（等化器式，用于"写入中"这类） */
+.mo-bars {
+  display: inline-flex;
+  gap: 2px;
+  align-items: flex-end;
+  height: 13px;
+}
+.mo-bars i {
+  width: 3px;
+  height: 13px;
+  border-radius: 1px;
+  background: currentColor;
+  display: block;
+  transform-origin: 50% 100%;
+  animation: mo-eq 0.95s ease-in-out infinite;
+}
+.mo-bars i:nth-child(2) {
+  animation-delay: 0.12s;
+}
+.mo-bars i:nth-child(3) {
+  animation-delay: 0.24s;
+}
+.mo-bars i:nth-child(4) {
+  animation-delay: 0.36s;
+}
+@keyframes mo-eq {
+  0%,
+  100% {
+    transform: scaleY(0.3);
+    opacity: 0.45;
+  }
+  50% {
+    transform: scaleY(1);
+    opacity: 1;
+  }
+}
+
+/* 降级：关动效，并把流光还原成能看见的文字（这一条不能省） */
+@media (prefers-reduced-motion: reduce) {
+  .mo-spin,
+  .mo-breathe,
+  .mo-shimmer,
+  .mo-dots i,
+  .mo-bars i {
+    animation: none !important;
+  }
+  .mo-shimmer {
+    background: none;
+    color: inherit;
+    -webkit-text-fill-color: currentColor;
+  }
+}

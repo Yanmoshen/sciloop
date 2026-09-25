@@ -31,6 +31,8 @@ import { setConversationArchived, type ConversationBrief } from '@/api/conversat
 import type { CreatedProject } from '@/api/projects'
 import { setProjectArchived } from '@/api/projects'
 import ConfirmDialog from '@/components/home/ConfirmDialog.vue'
+import GlobalSearch from '@/components/home/GlobalSearch.vue'
+import SciLoopMark from '@/components/SciLoopMark.vue'
 import ConversationRenameDialog from '@/components/ConversationRenameDialog.vue'
 import MoveConversationDialog from '@/components/home/MoveConversationDialog.vue'
 import ProjectNameDialog from '@/components/home/ProjectNameDialog.vue'
@@ -88,7 +90,6 @@ const MODULE_NAV = [
   { key: 'workbench', label: '流水线工作台', path: '/workbench/demo' },
 ]
 
-const keyword = ref('')
 
 /**
  * 左栏折叠。
@@ -270,12 +271,6 @@ function toggleLiterature(): void {
   literatureOpen.value = !literatureOpen.value
 }
 
-function search(): void {
-  const q = keyword.value.trim()
-  if (!q) return
-  void router.push({ path: '/papers/feed', query: { q } })
-}
-
 function openSettings(): void {
   void router.push({ path: '/settings' })
 }
@@ -375,6 +370,30 @@ const railScrollEl = ref<HTMLElement | null>(null)
 
 function isExpanded(projectId: number): boolean {
   return expandedProjects.value.includes(projectId)
+}
+
+/**
+ * 全局搜索选中「项目」时的定位动作：**展开左栏 → 展开该项目 → 滚到可见 → 闪一下**。
+ * 为什么不是直接跳转：研究者在搜索结果里选项目，意图是"去左栏看它的对话"，
+ * 而不是离开当前正在看的对话（2026-09-25 定稿）。
+ */
+const flashProjectId = ref<number | null>(null)
+let flashTimer: number | null = null
+
+function revealProject(projectId: number): void {
+  railCollapsed.value = false
+  localStorage.setItem(RAIL_COLLAPSED_KEY, '0')
+  if (!isExpanded(projectId)) expandedProjects.value = [...expandedProjects.value, projectId]
+  void nextTick(() => {
+    const el = document.querySelector(`[data-project-id="${projectId}"]`)
+    if (el) el.scrollIntoView({ block: 'center', behavior: 'smooth' })
+    flashProjectId.value = projectId
+    if (flashTimer !== null) window.clearTimeout(flashTimer)
+    flashTimer = window.setTimeout(() => {
+      flashProjectId.value = null
+      flashTimer = null
+    }, 1600)
+  })
 }
 
 function toggleProject(projectId: number): void {
@@ -637,8 +656,7 @@ onUnmounted(() => {
       :inert="railCollapsed || undefined"
     >
       <div class="brand">
-        <!-- ⚠️ 2026-09-24 事故：`components/SciLoopMark.vue` 丢失且无副本，
-             暂时不渲染品牌标（`.brand__mark` 样式保留）；文件重建后把组件放回这里。 -->
+        <SciLoopMark class="brand__mark" />
         <div class="brand__name">SciLoop</div>
         <button
           class="rail-toggle"
@@ -1000,7 +1018,11 @@ onUnmounted(() => {
             {{ session.projectsError || '暂无项目' }}
           </p>
           <template v-for="p in displayProjects" :key="p.id">
-            <div class="crow crow--project" :class="{ 'crow--open': moreOpen === p.id }">
+            <div
+              class="crow crow--project"
+              :data-project-id="p.id"
+              :class="{ 'crow--open': moreOpen === p.id, 'crow--flash': flashProjectId === p.id }"
+            >
               <button
                 class="crow__item crow__item--project"
                 type="button"
@@ -1391,19 +1413,11 @@ onUnmounted(() => {
           </svg>
         </button>
 
-        <div class="search">
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <circle cx="7" cy="7" r="4.6" stroke="currentColor" stroke-width="1.4" />
-            <path d="M10.6 10.6 14 14" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
-          </svg>
-          <input
-            v-model="keyword"
-            type="search"
-            placeholder="搜索论文标题 / 摘要"
-            aria-label="搜索论文（标题或摘要）"
-            @keyup.enter="search"
-          />
-        </div>
+        <!-- 顶栏全局搜索：**只搜项目与对话**（论文搜索已下线，2026-09-25 研究者口径） -->
+        <GlobalSearch
+          @open-conversation="openConversation"
+          @reveal-project="revealProject"
+        />
 
         <div class="topbar__spacer" />
 
@@ -1576,7 +1590,6 @@ onUnmounted(() => {
 .sl-home,
 .rail,
 .topbar,
-.search,
 .theme-toggle,
 .avatar,
 .menu,
@@ -1882,6 +1895,22 @@ onUnmounted(() => {
   gap: 0;
 }
 
+/* 全局搜索定位到某个项目时闪一下（不改变选中态，只是"看向这里"） */
+@keyframes crow-flash {
+  0%,
+  100% {
+    background: transparent;
+  }
+  30% {
+    background: var(--h-active);
+  }
+}
+
+.crow--flash {
+  animation: crow-flash 1.5s ease-out 1;
+  border-radius: 8px;
+}
+
 .group__chev {
   width: 12px;
   height: 18px;
@@ -2180,34 +2209,6 @@ onUnmounted(() => {
   /* 研究流程抽屉滑出时，右侧按钮组跟着左移 —— 否则主题/任务/入口会被抽屉盖住点不到 */
   padding-right: calc(32px + var(--rfd-shift, 0px));
   transition: padding-right 340ms var(--motion-ease-out);
-}
-.search {
-  flex: 1;
-  max-width: 560px;
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  height: 40px;
-  padding: 0 16px;
-  background: var(--h-surface-input);
-  border: 1px solid var(--h-line);
-  border-radius: 12px;
-  color: var(--h-fg-subtle);
-}
-.search:focus-within {
-  border-color: var(--h-line-strong);
-}
-.search input {
-  flex: 1;
-  min-width: 0;
-  border: 0;
-  background: transparent;
-  color: var(--h-fg);
-  font: inherit;
-  outline: none;
-}
-.search input::placeholder {
-  color: var(--h-fg-subtle);
 }
 .topbar__spacer {
   flex: 1;
