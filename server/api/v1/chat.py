@@ -238,12 +238,46 @@ class HomeChatResponse(BaseModel):
 def _thinking_provider(model_ref: str) -> bool:
     """是不是"思考型"供应商 —— 带 `tool_calls` 的 assistant 消息**必须回传**
     `reasoning_content` 的那种（实测 deepseek 系列缺了直接 400）。
-
-    ⚠️ 这里必须比"有没有思考文本"更宽：模型可能这一轮**没吐思考**，字段仍要存在（空串也算）。
-    2026-09-25 实测：只在一个回合带了字段，于是工具链第二跳再被 400 打断。
     """
 
     return "deepseek" in (model_ref or "").lower()
+
+
+#: 思考型供应商要求 `reasoning_content` **非空**：实测带空串仍被
+#: `bad_request: The reasoning_content in the thinking mode must be passed back`
+#: （2026-09-25 19:16 复现）—— 所以拿不到真实思考时用一个**占位**。
+REASONING_PLACEHOLDER = "（本轮没有输出思考文本）"
+
+
+def reasoning_echo(reasoning: str, model_ref: str) -> str | None:
+    """要回传的 `reasoning_content`；``None`` = 这个供应商不要求这个字段。
+
+    真实思考优先；拿不到时，思考型供应商给**非空占位**（空串不算回传）。
+    """
+
+    if reasoning:
+        return reasoning
+    return REASONING_PLACEHOLDER if _thinking_provider(model_ref) else None
+
+
+def repair_reasoning_echo(messages: list[dict[str, Any]], model_ref: str) -> int:
+    """给「带 `tool_calls` 却缺（或为空）`reasoning_content`」的 assistant 消息补上占位。
+
+    返回补了几条。**发送前先修**，比"等 400 再重发"更直接：
+    请求永远不会以不合规的形状发出去，也就不会再把对话打断。
+    """
+
+    if not _thinking_provider(model_ref):
+        return 0
+    fixed = 0
+    for message in messages or []:
+        if str(message.get("role") or "") != "assistant" or not message.get("tool_calls"):
+            continue
+        if str(message.get("reasoning_content") or "").strip():
+            continue
+        message["reasoning_content"] = REASONING_PLACEHOLDER
+        fixed += 1
+    return fixed
 
 
 def _error(status_code: int, code: str, message: str, detail: Any = None) -> HTTPException:
@@ -372,6 +406,12 @@ async def _agent_loop(
                     logger.warning(
                         "上下文超预算但无可压缩内容（工具结果与早期轮次都没有可动的），继续执行"
                     )
+        # 发送前先把消息修好（用户口径 2026-09-25：400 修法 A+C）：
+        # 带 tool_calls 却缺 reasoning_content 的 assistant 消息补上非空占位 ——
+        # 这样就不会再因协议字段被供应商拒收而**打断"让模型重新决定"**。
+        repaired = repair_reasoning_echo(messages_now, ref)
+        if repaired:
+            logger.info("补了 %d 条 assistant 消息的 reasoning_content 占位后继续", repaired)
         estimate_before = meter.estimate(messages_now, tools=tool_defs)
         round_result: Any = None
         #: 这一轮的思考过程从 `state["reasoning"]` 的哪个下标开始 —— 用于把**本轮**的
@@ -435,9 +475,10 @@ async def _agent_loop(
         assistant_call = agent_tools.assistant_tool_message(
             getattr(round_result, "content", "") or "", calls
         )
-        # 思考型供应商要求该字段**存在**（空串也算回传），否则下一跳 400。
-        if round_reasoning or _thinking_provider(ref):
-            assistant_call["reasoning_content"] = round_reasoning
+        # 思考型供应商要求该字段**非空**（空串不算回传，实测仍 400）。
+        reasoning_value = reasoning_echo(round_reasoning, ref)
+        if reasoning_value is not None:
+            assistant_call["reasoning_content"] = reasoning_value
         messages_now.append(assistant_call)
 
         # **这一轮的思考也落成一行**（2026-09-24 研究者要求）：
@@ -1202,7 +1243,8 @@ async def _approval_stream(
                 grant_row = {
                     "kind": "tool",
                     "tone": "ok",
-                    "text": f"已允许在本对话内直接执行「{label}」（高危操作仍会先问你）",
+                    # 用户 2026-09-25：过程行不再带括号说明（界面上只留一句结论）
+                    "text": f"已允许在本对话内直接执行「{label}」",
                 }
                 rows.append(grant_row)
                 yield _sse("row", {"row": grant_row})
@@ -1213,7 +1255,7 @@ async def _approval_stream(
                 grant_row = {
                     "kind": "tool",
                     "tone": "ok",
-                    "text": f"已允许在本对话内直接执行（{agent_approvals.grants_summary(record)['note']}）",
+                    "text": "已允许在本对话内直接执行",
                 }
                 rows.append(grant_row)
                 yield _sse("row", {"row": grant_row})
@@ -1256,8 +1298,9 @@ async def _approval_stream(
             # 它就在这一轮记录里（`turn["reasoning"]`），没理由不带。
             assistant_call_msg = agent_tools.assistant_tool_message("", calls)
             reasoning_before = str(((record.get("turns") or [])[turn_index] or {}).get("reasoning") or "")
-            if reasoning_before or _thinking_provider(ref):
-                assistant_call_msg["reasoning_content"] = reasoning_before
+            reasoning_value = reasoning_echo(reasoning_before, ref)
+            if reasoning_value is not None:
+                assistant_call_msg["reasoning_content"] = reasoning_value
             compactions_out: list[dict[str, Any]] = []
             messages_now: list[dict[str, Any]] = [
                 {"role": "system", "content": REPLY_SYSTEM + skills_system_block()},

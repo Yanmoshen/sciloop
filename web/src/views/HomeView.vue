@@ -1438,7 +1438,7 @@ onUnmounted(() => {
         :disabled="phase === 'thinking' || !session.isOwner"
         @click="decideApprovalCard(pendingApprovalBar.card, 'approve_conversation')"
       >
-        本对话默认允许（含高危）
+        本对话默认允许
       </button>
       <button
         class="approval-bar__action"
