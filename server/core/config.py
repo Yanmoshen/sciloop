@@ -116,6 +116,10 @@ class Settings(BaseSettings):
     llm_fallback_model: str = ""
     llm_replay: bool = False
     llm_json_retry: int = 2
+    #: 单次请求的**上下文预算**（token）。超过它就按"先压工具结果、再摘要早期轮次"压缩。
+    #: 用户口径 2026-09-25：**固定 200k 的配置项**（不按模型窗口推导）。
+    #: 估算口径见 `services/context_meter.py`（照搬 Cherry Studio 的字符÷4 启发式）。
+    llm_context_limit_tokens: int = 200_000
 
     # ===== 流水线 =====
     pipeline_max_iterations: int = 3
