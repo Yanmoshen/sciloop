@@ -36,7 +36,10 @@ from services.skills import runner as runner_mod
 
 #: 单轮对话里最多允许的「模型要求调工具」轮数。上限存在的意义是**防死循环**：
 #: 模型可能反复要求调同一个工具，没有上限就会一直烧 token。
-MAX_TOOL_ROUNDS = 3
+#: 单次回答里的**模型调用**次数上限（用户口径 2026-09-25：600）。
+MAX_MODEL_CALLS_PER_TURN = 600
+#: 单次回答里的**工具调用**次数上限（用户口径 2026-09-25：500）。
+MAX_TOOL_CALLS_PER_TURN = 500
 
 #: 摆给模型**自主**调用的工具白名单（**只读**）。写/执行类不在这里，见 APPROVABLE_TOOLS。
 #: 摆给模型**自主**调用的工具白名单（**只读**）。写/执行类不在这里，见 APPROVABLE_TOOLS。

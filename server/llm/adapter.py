@@ -1113,9 +1113,14 @@ def _normalize_messages(messages: list[Message] | str) -> list[Message]:
             # deepseek 系列在 `assistant.tool_calls` 回合会直接 400 ——
             # `The reasoning_content in the thinking mode must be passed back to the API`。
             # 它跟 tool_calls 一样属于"协议字段"，白名单式归一化必须放行。
-            for key in ("tool_calls", "tool_call_id", "reasoning_content"):
+            for key in ("tool_calls", "tool_call_id"):
                 if message.get(key):
                     item[key] = message[key]
+            # ⚠️ `reasoning_content` 按**"字段存在"**放行，不能按真值判断：思考型供应商
+            # 要求它**存在**（空串也算回传）。用 `message.get(key)` 会把空串洗掉
+            # → 下一跳仍然 400（2026-09-25 实测：工具链第二轮必断，补丁此前只补了一半）。
+            if "reasoning_content" in message:
+                item["reasoning_content"] = message["reasoning_content"]
             if item.get("tool_calls") and "content" not in message:
                 # 要求调工具时 content 本就该缺省；硬塞空串会被部分兼容端判参数错
                 item.pop("content", None)

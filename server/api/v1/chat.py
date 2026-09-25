@@ -61,13 +61,25 @@ REASONING_MAX_CHARS: int | None = None
 #: 那个症状的根因就是**给了预算上限**；不设限之后 reasoning 与正文各得其所。
 TITLE_MAX_TOKENS: int | None = None
 
+#: 触顶后的**收尾提示**：不摆工具，只要它把「完成了什么 / 还差什么」说清楚（用户口径 2026-09-25）。
+WRAP_UP_PROMPT = (
+    "本次回答已经达到执行上限，你现在**不能再调用任何工具**。"
+    "请只根据上面已经拿到的事实，按三段如实交代："
+    "**已完成**（确实做过的步骤与得到的结论）、**未完成**（哪些还没做、卡在哪一步）、"
+    "**建议下一步**（研究者接下来该让你做什么）。"
+    "不要编造没做过的步骤，也不要再请求调用工具。"
+)
+
 #: 标题调用的 user 提示（约束在 `conversations.TITLE_SYSTEM` 里，两边都留着更稳）
 TITLE_PROMPT = "为下面这段研究需求拟一个标题。\n\n研究需求：\n{text}"
 
 REPLY_SYSTEM = (
-    "你是 SciLoop 的科研助手，帮助研究者把模糊的研究需求整理成可执行的研究方案。\n"
-    "信息不足时**最多集中提出 3 个问题**，且每个问题都要给出一个可用的默认值；"
-    "如果研究者说「随便」「你帮我定」，就按默认值继续推进，并在回答里标明你用的是什么假设。\n"
+    "你是 SciLoop 的科研助手，帮助研究者从海量论文中提取信息，生成灵感，"
+    "并且整理成一套以论文成稿为目的的自动化研究方案。\n"
+    "当你认为需求不明确时，可以向最多集中提出 5 个问题，以 1. 2. 3. 4. 5. 排列，"
+    "放在回复的最下面；每个问题都要给出一个默认值，每个问题下面提供 a b c 三个选项，"
+    "并提示研究者可以按「编号+字母」（例如 1b、3a）来确认需求。\n"
+    "研究者未回答这些问题时，就按你给出的默认值继续推进，并在回答里标明你用的是什么假设。\n"
     "**不要输出你的思考过程、推理草稿或自我对话**（例如「我们需要回答用户……」「让我想想……」），"
     "只输出给研究者看的最终答复。\n"
     "不要编造文献、数据或结论；没有实际查过本地数据就不要声称查过。\n\n" + OUTPUT_STYLE
@@ -215,6 +227,17 @@ class HomeChatResponse(BaseModel):
     usage: dict[str, Any] = Field(default_factory=dict)
 
 
+def _thinking_provider(model_ref: str) -> bool:
+    """是不是"思考型"供应商 —— 带 `tool_calls` 的 assistant 消息**必须回传**
+    `reasoning_content` 的那种（实测 deepseek 系列缺了直接 400）。
+
+    ⚠️ 这里必须比"有没有思考文本"更宽：模型可能这一轮**没吐思考**，字段仍要存在（空串也算）。
+    2026-09-25 实测：只在一个回合带了字段，于是工具链第二跳再被 400 打断。
+    """
+
+    return "deepseek" in (model_ref or "").lower()
+
+
 def _error(status_code: int, code: str, message: str, detail: Any = None) -> HTTPException:
     return HTTPException(
         status_code=status_code,
@@ -255,7 +278,15 @@ async def _agent_loop(
 
     from services.agent import mcp_tools as agent_tools
 
-    for round_index in range(agent_tools.MAX_TOOL_ROUNDS + 1):
+    # 两个**独立**计数器（用户口径 2026-09-25）：模型调用 600 次、工具调用 500 次。
+    # 之前只按「轮」算（3 轮），复杂任务会在第 4 轮被静默截断。
+    model_calls = 0
+    tool_calls_done = 0
+    #: 非空 = 因触顶而停（值说明哪一边触的顶），用于触发收尾交代
+    stopped_by: str | None = None
+
+    while model_calls < agent_tools.MAX_MODEL_CALLS_PER_TURN:
+        model_calls += 1
         round_result: Any = None
         #: 这一轮的思考过程从 `state["reasoning"]` 的哪个下标开始 —— 用于把**本轮**的
         #: reasoning_content 跟着 assistant.tool_calls 一起回喂（见下面 append 处）。
@@ -272,7 +303,7 @@ async def _agent_loop(
             # 批准后的续答同理：它**不是**用户的第一句，`allow_fallback_first=False`
             # 才能把真因如实报出来（实测这里真因是"assistant 的 tool_calls 没带
             # reasoning_content"，被降级链掩盖成了一句无关的 auth 错误）。
-            allow_fallback=allow_fallback_first and round_index == 0,
+            allow_fallback=allow_fallback_first and model_calls == 1,
             tools=tool_defs or None,
         ):
             if update.kind == "delta":
@@ -290,7 +321,10 @@ async def _agent_loop(
         if round_result is not None:
             state["result"] = round_result
         calls = agent_tools.normalize_tool_calls(getattr(round_result, "tool_calls", None) or [])
-        if not calls or round_index >= agent_tools.MAX_TOOL_ROUNDS:
+        if not calls:
+            break  # 模型不再要工具 = 这一轮答完了
+        if tool_calls_done >= agent_tools.MAX_TOOL_CALLS_PER_TURN:
+            stopped_by = "tool_calls"
             break
 
         # 模型要求调工具：先把这一轮如实记进消息（含它已说的话），再逐个处理。
@@ -309,7 +343,8 @@ async def _agent_loop(
         assistant_call = agent_tools.assistant_tool_message(
             getattr(round_result, "content", "") or "", calls
         )
-        if round_reasoning:
+        # 思考型供应商要求该字段**存在**（空串也算回传），否则下一跳 400。
+        if round_reasoning or _thinking_provider(ref):
             assistant_call["reasoning_content"] = round_reasoning
         messages_now.append(assistant_call)
 
@@ -325,6 +360,7 @@ async def _agent_loop(
 
         stopped_for_approval = False
         for call in calls:
+            tool_calls_done += 1
             tool_name = str((call.get("function") or {}).get("name") or "")
             # 逐次裁决（不是按工具名一刀切）：同一句删除命令，删研究数据是"待批准"，
             # 删 SciLoop 自己的代码是"直接拒绝"，读文件则根本不用打扰研究者。
@@ -408,6 +444,41 @@ async def _agent_loop(
         if stopped_for_approval:
             # 等研究者裁决：这一轮到此为止，绝不"先跑了再补批准"
             break
+    else:
+        stopped_by = "model_calls"
+
+    if stopped_by is not None:
+        # 触顶**不静默**（用户口径 2026-09-25）：先落一行过程行如实告知（随会话落盘），
+        # 再给模型**最后一次收尾机会** —— 这次调用不计入上限、且不摆工具，
+        # 让它产出「已完成 / 未完成 / 建议下一步」。
+        limit_row = {
+            "kind": "system",
+            "tone": "warn",
+            "text": (
+                "已达本次回答的执行上限"
+                f"（模型调用 {model_calls} 次 / 工具调用 {tool_calls_done} 次）"
+                "，正在汇总已完成与未完成的工作。"
+            ),
+        }
+        rows.append(limit_row)
+        yield _sse("row", {"row": limit_row})
+        messages_now.append({"role": "user", "content": WRAP_UP_PROMPT})
+        async for update in adapter.chat_stream(
+            messages_now,
+            model_ref=ref,
+            purpose="home_wrap_up",
+            max_tokens=REPLY_MAX_TOKENS,
+            allow_fallback=False,
+            tools=None,  # 收尾不再动手，只要它把话说清楚
+        ):
+            if update.kind == "delta":
+                state["text"].append(update.text)
+                yield _sse("delta", {"text": update.text})
+            elif update.kind == "reasoning":
+                state["reasoning"].append(update.text)
+                yield _sse("reasoning", {"text": update.text})
+            elif update.kind == "done":
+                state["result"] = update.result
 
 
 def _streaming(source: AsyncIterator[str]) -> StreamingResponse:
@@ -1058,7 +1129,7 @@ async def _approval_stream(
             # 它就在这一轮记录里（`turn["reasoning"]`），没理由不带。
             assistant_call_msg = agent_tools.assistant_tool_message("", calls)
             reasoning_before = str(((record.get("turns") or [])[turn_index] or {}).get("reasoning") or "")
-            if reasoning_before:
+            if reasoning_before or _thinking_provider(ref):
                 assistant_call_msg["reasoning_content"] = reasoning_before
             messages_now: list[dict[str, Any]] = [
                 {"role": "system", "content": REPLY_SYSTEM + skills_system_block()},
