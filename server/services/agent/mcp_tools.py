@@ -344,16 +344,10 @@ async def _build_tool_schemas() -> tuple[list[dict[str, Any]], bool]:
     for schema in _SKILL_TOOL_SCHEMAS:
         schemas.append(_json.loads(_json.dumps(schema)))
 
-    # 把"你在这台电脑上的默认工作目录"写进工具描述：模型据此决定要不要显式指定目录，
-    # 也免得它去猜容器里的路径（容器路径在宿主上根本不存在）。
-    default_dir = await host_runner.default_cwd()
-    if default_dir:
-        for item in schemas:
-            function = item["function"]
-            function["description"] = (
-                f"{function['description']} 你在这台电脑上的默认工作目录是 {default_dir}。"
-            )
-
+    # ⚠️ 这里原先会把「你在这台电脑上的默认工作目录是 <绝对路径>」拼进**每个**工具的描述
+    # （本意是免得模型去猜容器里的路径）。2026-09-25 用户要求删掉：这条提示会随工具描述
+    # 一起发给供应商，而且模型常把它**复述进回答**里 —— 界面上就是一句带 `D:\…` 的括号提示。
+    # 代价如实说明：模型不再被告知落脚点，可能自己问或先探一下目录（可接受）。
     from mcp_server.client import list_tools
 
     wanted = set(AUTONOMOUS_TOOLS) | set(APPROVABLE_TOOLS)
