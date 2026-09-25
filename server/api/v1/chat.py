@@ -285,8 +285,50 @@ async def _agent_loop(
     #: 非空 = 因触顶而停（值说明哪一边触的顶），用于触发收尾交代
     stopped_by: str | None = None
 
+    from services import context_compaction as compaction_mod
+    from services import context_meter
+
+    meter = context_meter.get_meter()
+    compactions: list[dict[str, Any]] = state.setdefault("compactions", [])
+
     while model_calls < agent_tools.MAX_MODEL_CALLS_PER_TURN:
         model_calls += 1
+        # ---------------------------------------------------------------- #
+        # 预算判定（用户口径 2026-09-25）：调模型**前**看一眼，超了**先压工具结果**。
+        # 压的是"历史里较早的结果"，与新结果回喂时"不截断"是两件事（见模块文档）。
+        # 压缩只影响**这次请求的模型视图**，会话文件里的原始轮次一字不动。
+        # 压不动了（已无可压的工具结果）也不停：如实记一条日志，继续往下走。
+        # ---------------------------------------------------------------- #
+        projected = meter.project(messages_now, tools=tool_defs)
+        if projected > meter.limit_tokens:
+            outcome = compaction_mod.compress_tool_results(messages_now)
+            if outcome.changed:
+                budget_row = {
+                    "kind": "system",
+                    "tone": "warn",
+                    "text": (
+                        f"上下文已达 {projected:,} / {meter.limit_tokens:,} token："
+                        f"已压缩 {outcome.count} 条较早的工具结果"
+                        f"（释放约 {outcome.freed_chars:,} 字符）后继续。"
+                    ),
+                }
+                rows.append(budget_row)
+                yield _sse("row", {"row": budget_row})
+                compactions.append(outcome.as_record())
+                logger.info(
+                    "上下文压缩 conversation=%s count=%d freed_chars=%d projected=%d",
+                    conversation_id,
+                    outcome.count,
+                    outcome.freed_chars,
+                    projected,
+                )
+            else:
+                logger.warning(
+                    "上下文 %d 已超预算 %d，但没有可压缩的工具结果，继续执行",
+                    projected,
+                    meter.limit_tokens,
+                )
+        estimate_before = meter.estimate(messages_now, tools=tool_defs)
         round_result: Any = None
         #: 这一轮的思考过程从 `state["reasoning"]` 的哪个下标开始 —— 用于把**本轮**的
         #: reasoning_content 跟着 assistant.tool_calls 一起回喂（见下面 append 处）。
@@ -320,6 +362,12 @@ async def _agent_loop(
 
         if round_result is not None:
             state["result"] = round_result
+            # 真实 prompt_tokens 是**唯一可信**的用量：拿它校正估算比例
+            # （Cherry 用事件溯源做"真实基准 + 估算增量"，我们用比例校正达到同样效果）。
+            usage = getattr(round_result, "usage", None)
+            prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+            if prompt_tokens:
+                meter.calibrate(prompt_tokens=prompt_tokens, estimated=estimate_before)
         calls = agent_tools.normalize_tool_calls(getattr(round_result, "tool_calls", None) or [])
         if not calls:
             break  # 模型不再要工具 = 这一轮答完了
@@ -777,6 +825,8 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
         # 工具调用过程行也要**落盘**：只发 SSE 不落盘的话，刷新后这段过程凭空消失，
         # 而库里只剩一句结论 —— 正是「显示与落盘必须一致」要防的那种不一致。
         tool_rows: list[dict[str, Any]] = []
+        #: 本轮发生的上下文压缩记录（会话级 `compactions[]`，与过程行一起落盘）
+        compactions_out: list[dict[str, Any]] = []
         #: 本轮里模型的**写盘/执行请求**（尚未执行）。与正文同源落进这一轮，
         #: 这样刷新后卡片还能按原状态重建，而不是"界面上一张卡、库里什么都没有"。
         approval_requests: list[dict[str, Any]] = []
@@ -815,6 +865,8 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
                 "reasoning": reasoning_buffer,
                 "result": None,
                 "pending": None,
+                #: 本轮发生的上下文压缩（会话级落盘，刷新后研究者仍能看到"压过什么"）
+                "compactions": compactions_out,
             }
             async for frame in _agent_loop(
                 messages_now,
@@ -866,6 +918,13 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
             # 编辑重开时**无条件落盘**：用户改过的正文必须留痕，否则刷新后改动就凭空消失了。
             # 等批准时也**无条件落盘**：卡片本身就是这一轮的产出（哪怕一个字都没有），
             # 不落盘就会出现"界面上有一张待批的卡、刷新后它不见了、而工具也永远没跑"。
+            if compactions_out:
+                # 会话级 `compactions[]`（用户口径 2026-09-25：**新字段存摘要、原始轮次一字不改**）。
+                # 先挂到记录上再 `append_turns`，这样"压缩 + 本轮"**一次写入**，不留半成品状态。
+                conversation["compactions"] = [
+                    *(conversation.get("compactions") or []),
+                    *compactions_out,
+                ]
             if generated or error_info is None or is_edit or pending_approval is not None:
                 conversations.append_turns(
                     conversation,
@@ -1155,6 +1214,7 @@ async def _approval_stream(
             reasoning_before = str(((record.get("turns") or [])[turn_index] or {}).get("reasoning") or "")
             if reasoning_before or _thinking_provider(ref):
                 assistant_call_msg["reasoning_content"] = reasoning_before
+            compactions_out: list[dict[str, Any]] = []
             messages_now: list[dict[str, Any]] = [
                 {"role": "system", "content": REPLY_SYSTEM + skills_system_block()},
                 *conversations.context_messages(record),
@@ -1179,6 +1239,8 @@ async def _approval_stream(
                 "reasoning": reasoning_buffer,
                 "result": None,
                 "pending": None,
+                #: 本轮发生的上下文压缩（会话级落盘，刷新后研究者仍能看到"压过什么"）
+                "compactions": compactions_out,
             }
             async for frame in _agent_loop(
                 messages_now,

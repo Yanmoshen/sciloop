@@ -207,6 +207,12 @@ class TokenMeter:
     def limit_tokens(self) -> int:
         return self._limit
 
+    @limit_tokens.setter
+    def limit_tokens(self, value: int) -> None:
+        """允许改预算（测试用固定小预算；将来也可做"按对话设预算"）。"""
+
+        self._limit = max(1, int(value))
+
     # ------------------------------------------------------------------ #
     # 估算与投影
     # ------------------------------------------------------------------ #
