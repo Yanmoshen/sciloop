@@ -11,7 +11,7 @@
 ```bash
 cp .env.example .env          # 至少填 OPENALEX_MAILTO；禁止提交 .env
 docker compose up -d --build   # db → backend（启动时自动 alembic upgrade head）→ frontend
-docker compose ps              # 三个服务都应为 healthy
+docker compose ps              # 五个服务都应为 healthy（db / backend / frontend / searxng / executor）
 curl http://localhost:8000/api/v1/health
 ```
 
@@ -30,17 +30,23 @@ docker compose exec backend alembic upgrade head       # 建 / 升级到最新
 docker compose exec backend alembic downgrade base     # 回滚
 ```
 
-迁移链：`0001_initial_schema` → `0002_passport_immutable_guard` → `0003_reader_library`。
+迁移链：`0001_initial_schema` → `0002_passport_immutable_guard` → `0003_reader_library` →
+`0004_reader_version_kind_history` → `0005_app_settings` → `0006_model_config_type` →
+`0007_project_archived` → `0008_research_nodes` → **`0009_chain_by_conversation`（当前链头）**。
+
+> 链头以 `ls server/migrations/versions | sort | tail -1` 为准。空库迁移验证脚本
+> `scripts/verify/empty_db_migration.sh` 内置期望表清单（当前 **37 张**）—— 加表必须同步改那条断言。
 
 ## 目录
 
 | 目录 | 职责 |
 |---|---|
-| `server/` | FastAPI + SQLAlchemy 2.x + Alembic。顶层按层分目录：`api/`（路由）、`services/`（领域服务：ingest / parsing / aggregation / ideation / feasibility / experiment / writing / review / translate / reader / export / research）、`db/`（会话与 ORM 模型）、`schemas/`（Pydantic DTO）、`core/`（配置与安全）、`llm/`（OpenAI 兼容适配与按环节路由）、`executor/`（进程内受限执行器）、`tasks/`（后台作业）、`migrations/`（迁移链） |
+| `server/` | FastAPI + SQLAlchemy 2.x + Alembic。顶层按层分目录：`api/`（路由）、`services/`（领域服务：`paper_source` 取数 / `ingest` 导入 / `fulltext` 全文 / `parsing` 解析 / `aggregation` 聚合 / `ideation` 构思 / `feasibility` 可行性 / `pipeline` 流水线 / `research` 研究编排 / `experiment` 实验 / `writing` 写作 / `review` 评审 / `evidence` 证据链 / `translate` 翻译 / `reader` 阅读器 / `export` 导出 / `agent` 动作裁决与批准 / `skills` 技能库 / `cost` 成本 / `settings` 设置）、`db/`（会话与 ORM 模型）、`schemas/`（Pydantic DTO）、`core/`（配置与安全）、`llm/`（OpenAI 兼容适配与按环节路由）、`executor/`（进程内受限执行器）、`tasks/`（后台作业）、`mcp_server/`（自建 MCP server 与工具门）、`exec_service/`（容器执行环境）、`migrations/`（迁移链） |
 | `web/` | Vue 3 + Vite + TypeScript + Pinia + Element Plus + ECharts（`api/` `views/` `components/` `stores/` `router/` `layouts/` `styles/` `utils/`） |
 | `prompts/` | 研究工作流长文档提示词（程序侧契约在 `server/services/research/`） |
-| `config/` | 非机密静态配置（`app.yaml`、`venue_whitelist.json`） |
-| `docker-compose.yml` | 三服务编排：`db`（PostgreSQL 16）/ `backend`（server/ 镜像）/ `frontend`（web/ 镜像，nginx） |
+| `config/` | 非机密静态配置（`app.yaml`、`venue_whitelist.json`、`searxng/`） |
+| `tools/` | `host-runner/`：可选的真机执行器（装在研究者电脑上后，后端会自动优先用它跑命令） |
+| `docker-compose.yml` | **五服务**编排：`db`（PostgreSQL 16）/ `backend`（server/ 镜像，8000）/ `frontend`（web/ 镜像，nginx，8080）/ `searxng`（自建元搜索，8888）/ `executor`（受限执行环境，仅 compose 内网可达，不发布端口） |
 
 ## 环境变量
 
