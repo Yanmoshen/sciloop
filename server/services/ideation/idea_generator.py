@@ -39,7 +39,7 @@ from typing import Any
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import Idea
+from db.models import Feasibility, Idea
 from services.aggregation.aggregation_service import load_gaps
 from services.cost import check_cost
 from services.ideation.evidence_binder import (
@@ -131,6 +131,8 @@ SYSTEM_PROMPT = (
     "   combination＝技术融合型（与其他领域的前沿技术交叉融合，交叉创新）；\n"
     "   paradigm＝范式拓展型（向上提出新的研究框架或技术体系，范式创新）；\n"
     "2) 请求里点名的**每个方向都要有产出**，且不同方向的 idea 不得内容重叠；\n"
+    "   若请求里给出了「该方向已有的方案」，新方案必须与它们**实质不同**（只换措辞不算），"
+    "并力争在可行性或创新性上**强于**已有方案；\n"
     "3) 每条 idea 必须针对明确的 Gap（用 gap_index 指明）；\n"
     "4) evidence_ref_ids 只能从材料中给出的编号引用表里选，**禁止编造编号**；\n"
     "5) 不得虚构数据、指标、数据集或引用；材料里没有的信息写「材料未提供」；\n"
@@ -148,10 +150,50 @@ class IdeaGenerationError(Exception):
         self.detail = detail
 
 
+async def _prior_ideas(
+    session: AsyncSession,
+    aggregation_id: int,
+    directions: Sequence[str],
+    *,
+    per_direction: int = 3,
+) -> dict[str, list[dict[str, Any]]]:
+    """取每个方向**已有的方案**（标题 + 可行性总分）。
+
+    用途：研究者点「再生成一批」时，把这批方案摆到模型面前，要求它**别重复、并力争更好**
+    （2026-09-26 研究者口径："生成的 idea 评分应该越来越高"）。
+    """
+    if not directions:
+        return {}
+    stmt = (
+        select(Idea.id, Idea.mechanism, Idea.title, Feasibility.total_score)
+        .outerjoin(Feasibility, Feasibility.idea_id == Idea.id)
+        .where(
+            Idea.aggregation_id == int(aggregation_id),
+            Idea.mechanism.in_(list(directions)),
+        )
+        .order_by(Idea.id.desc())
+    )
+    rows = (await session.execute(stmt)).all()
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for _idea_id, mechanism, title, score in rows:
+        key = str(mechanism)
+        bucket = grouped.setdefault(key, [])
+        if len(bucket) >= per_direction:
+            continue
+        bucket.append(
+            {
+                "title": str(title or "")[:140],
+                "score": float(score) if score is not None else None,
+            }
+        )
+    return grouped
+
+
 def build_prompt(
     gaps: Sequence[Mapping[str, Any]],
     count: int = 1,
     directions: Sequence[str] | None = None,
+    prior: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
 ) -> tuple[str, dict[str, dict[str, Any]]]:
     """构造 prompt 与「编号引用表 → 候选证据」映射（纯函数，便于离线核对）。
 
@@ -169,7 +211,33 @@ def build_prompt(
             f"- {MECHANISM_LABELS[key]}（mechanism={key}）：{MECHANISM_BRIEFS[key]}"
             for key in targets
         ]
-        head += ["", "不同方向的 idea 不得在内容上重叠。", "", "## 研究空白（Gap）"]
+        head += ["", "不同方向的 idea 不得在内容上重叠。"]
+        # 已有方案（研究者点「再生成一批」时才有）：要求不重复、且更强
+        # —— 对应"生成的 idea 评分应该越来越高"这条口径（2026-09-26）。
+        prior_lines: list[str] = []
+        for key in targets:
+            items = list((prior or {}).get(key) or [])
+            if not items:
+                continue
+            prior_lines.append(f"- {MECHANISM_LABELS[key]}：")
+            for item in items:
+                raw_score = item.get("score")
+                tag = (
+                    f"（可行性总分 {float(raw_score):.0f}）"
+                    if raw_score is not None
+                    else "（未评分）"
+                )
+                prior_lines.append(f"    · {item.get('title')}{tag}")
+        if prior_lines:
+            head += [
+                "",
+                "## 该方向**已有**的方案（必须先读一遍）",
+                *prior_lines,
+                "",
+                "**新方案必须与上面每一条实质不同**（只换措辞不算），"
+                "并力争在可行性或创新性上**优于**其中已评分最高的那条。",
+            ]
+        head += ["", "## 研究空白（Gap）"]
     else:
         head = [f"请产出 {count} 条研究 idea，覆盖下列空白（可跨条组合）。", "", "## 研究空白（Gap）"]
     lines: list[str] = list(head)
@@ -275,6 +343,7 @@ async def _llm_ideas(
     count: int,
     *,
     directions: Sequence[str] | None = None,
+    prior: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
     model_ref: str | None,
     project_id: int | None,
     temperature: float,
@@ -283,7 +352,7 @@ async def _llm_ideas(
     """调用 WP02 ``chat`` 生成 idea；返回 ``(ideas, llm_meta)``。"""
     from llm.adapter import chat  # 局部导入：避免无 LLM 场景下引入导入期依赖
 
-    prompt, refs = build_prompt(gaps, count, directions)
+    prompt, refs = build_prompt(gaps, count, directions, prior)
     if not refs:
         raise IdeaGenerationError(
             "no_evidence_available",
@@ -409,6 +478,9 @@ async def generate_ideas(
             {"aggregation_id": int(aggregation_id)},
         )
 
+    # 该聚合**该方向已有**的方案：用来让「再生成一批」不重复、且更强
+    prior = await _prior_ideas(session, int(aggregation_id), list(targets)) if targets else {}
+
     llm_meta: dict[str, Any] | None = None
     llm_error: dict[str, Any] | None = None
     generation_mode = MODE_TEMPLATE
@@ -421,13 +493,14 @@ async def generate_ideas(
                 gaps,
                 int(count),
                 directions=targets,
+                prior=prior,
                 model_ref=model_ref,
                 project_id=project_id,
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
             generation_mode = MODE_LLM
-            _, refs = build_prompt(gaps, int(count), targets)
+            _, refs = build_prompt(gaps, int(count), targets, prior)
         except Exception as exc:  # noqa: BLE001 - 需要区分「未配 LLM」与「真失败」
             detail = getattr(exc, "detail", None)
             llm_error = {

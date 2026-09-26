@@ -74,6 +74,15 @@ const analysisStartedAt = ref(0)
 const elapsedSeconds = ref(0)
 let elapsedTimer: ReturnType<typeof setInterval> | null = null
 
+/**
+ * 正在生成的方向（``''`` / ``'all'`` / 某个方向 key）。
+ *
+ * ⚠️ **必须与 ``busy`` 分开**：``busy`` 会被可行性分析的 ``finally`` 清空，
+ * 两者共用一个变量时，"再生成一批"的进行态会被分析结束顺手抹掉 ——
+ * 表现就是**点了按钮看着像没反应**（2026-09-26 研究者实测反馈）。
+ */
+const generating = ref('')
+
 const DIRECTIONS = IDEA_DIRECTIONS.map((key, index) => ({
   key,
   idx: '①②③④'[index],
@@ -229,7 +238,7 @@ async function refreshIdeas(): Promise<void> {
 // ---- 生成 ----
 async function runGenerate(directions: IdeaMechanism[]): Promise<void> {
   if (aggregationId.value === null) return
-  busy.value = directions.length === 1 ? `regen-${directions[0]}` : 'generate'
+  generating.value = directions.length === 1 ? directions[0] : 'all'
   notice.value = ''
   try {
     const result = await generateIdeas({
@@ -249,7 +258,7 @@ async function runGenerate(directions: IdeaMechanism[]): Promise<void> {
   } catch (error) {
     notice.value = ownerHint(error)
   } finally {
-    busy.value = ''
+    generating.value = ''
   }
 }
 
@@ -362,15 +371,24 @@ watch(aggregationId, () => {
       <button
         class="btn btn--primary"
         type="button"
-        :disabled="busy === 'generate' || aggregationId === null"
+        :disabled="generating === 'all' || aggregationId === null"
         @click="runGenerate([...IDEA_DIRECTIONS])"
       >
-        {{ busy === 'generate' ? '生成中…' : '生成 4 个方向' }}
+        {{ generating === 'all' ? '生成中…' : '生成 4 个方向' }}
       </button>
     </header>
 
+    <!-- 生成中：真实模型要读完素材再写，二三十秒；缺了这句就像"点了没反应" -->
+    <p v-if="generating" class="progress">
+      <span class="progress__dot" />
+      {{
+        generating === 'all'
+          ? '正在生成四个方向的新方案'
+          : `正在为「${activeMeta.idx} ${activeMeta.label}」生成新方案`
+      }}…通常 20–30 秒
+    </p>
     <!-- 分析进行中：说清"在算什么、算了多久"（原来只有一句"正在分析…"，看不出有没有在动） -->
-    <p v-if="analysisProgressText" class="progress">
+    <p v-else-if="analysisProgressText" class="progress">
       <span class="progress__dot" />
       {{ analysisProgressText }} · 已用 {{ elapsedSeconds }} 秒
     </p>
@@ -424,10 +442,10 @@ watch(aggregationId, () => {
         <button
           class="link-btn"
           type="button"
-          :disabled="busy === `regen-${activeDirection}`"
+          :disabled="generating === activeDirection"
           @click="runGenerate([activeDirection])"
         >
-          {{ busy === `regen-${activeDirection}` ? '生成中…' : '再生成一批' }}
+          {{ generating === activeDirection ? '生成中…' : '再生成一批' }}
         </button>
       </header>
 
