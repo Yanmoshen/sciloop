@@ -45,7 +45,7 @@ from llm.types import slugify_provider
 from services import conversations
 from services.agent import approvals as agent_approvals
 from services.output_style import OUTPUT_STYLE
-from services.research import dialog, messages
+from services.research import dialog, phrasing
 from services.research import intent as intent_mod
 
 logger = logging.getLogger("sciloop.chat")
@@ -1206,7 +1206,7 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
         except Exception as exc:  # noqa: BLE001 - 兜底：未预期异常也不该"甩个码就断"
             # 用户口径 2026-09-26：不允许把整轮变成强制中断。分两种情况处理最诚实：
             #   · 已经有字上屏 → 确实答了一半，如实标中断（不假装答完）；
-            #   · 一个字都没说出去 → 落成一句说完的话（见 finally 里的 MODEL_FAILED_TEXT）。
+            #   · 一个字都没说出去 → 交给模型写一句收尾（见 finally 里的 phrasing.say）；写不出来就留空 + 一条过程行。
             logger.exception("首页流式出现未预期异常 conversation=%s", conversation_id)
             if buffer:
                 aborted = True
@@ -1233,17 +1233,41 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
             if REASONING_MAX_CHARS is not None and len(reasoning_text) > REASONING_MAX_CHARS:
                 reasoning_text = reasoning_text[:REASONING_MAX_CHARS] + "\n…（思考过程过长，已截断）"
             if not generated and soft_failure and error_info is None:
-                # 模型这一跳彻底失败（自动重试也没成）：**不甩错误码**，落成一句说完的话
-                # （用户口径 2026-09-26）。它是系统在说话 → 标 `note_only`，
-                # 不进下一轮上下文，也不冒充模型的答复。
-                generated = messages.MODEL_FAILED_TEXT.format(reason=soft_failure[:220])
-                note_only = True
+                # 模型这一跳失败 → **再要一次收尾话**（走降级链，可能是另一家供应商）。
+                # 口径 2026-09-26：对话正文一律**模型写**，程序不代它说话。
+                generated = await phrasing.say(
+                    facts=(
+                        "刚才那一次回答没能生成出来。"
+                        "请用研究者看得懂的话说明：这一轮没有拿到答复；"
+                        "已经跑过的步骤都在上面的过程里、没有丢；他可以直接再发一次，或换个说法。"
+                        "两三句话，不要提任何内部术语，也不必反复道歉。\n"
+                        f"（技术原文，仅供你判断严重程度，不要照抄）{soft_failure[:220]}"
+                    ),
+                    model_ref=ref,
+                    purpose="chat_soft_failure_note",
+                )
             if not generated and reasoning_text and error_info is None:
-                # 模型只给了思考过程：如实说明，**不拿思考过程冒充答复**
-                generated = messages.NODE_ONLY_REASONING_TEXT
-                # 这句是"系统在说话"，不是模型说的话 —— 标记出来，别让它以 assistant 的身份
-                # 进下一轮的上下文（模型会以为那是自己说过的话）。
-                note_only = True
+                # 模型只给了思考过程、没给正文 → 让**它自己**把结论整理成答复。
+                # 不做"程序如实说明它没说话"那种系统文案：那还是程序在代替模型说话。
+                generated = await phrasing.say(
+                    facts=(
+                        "你刚才只输出了思考过程，没有给出给研究者看的答复。"
+                        "请把结论整理成一段正常的中文答复（不要复述思考过程本身）。\n"
+                        f"你的思考过程（只作素材）：\n{reasoning_text[:4000]}"
+                    ),
+                    model_ref=ref,
+                    purpose="chat_reasoning_to_answer",
+                )
+            if not generated and error_info is None:
+                # 两条路都没拿到模型的话 → **正文留空**，只留一条过程行如实说明。
+                # 绝不拿程序话术冒充对话正文（口径 2026-09-26）。
+                blank_note = {
+                    "kind": "system",
+                    "tone": "warn",
+                    "text": "这一轮没有生成出可显示的答复；已经跑过的步骤与工具结果都在上面的过程行里，没有丢。",
+                }
+                tool_rows.append(blank_note)
+                yield _sse("row", {"row": blank_note})
             # 有正文 → 追加本轮；无正文且无错误 → 模型真的返回空，也要如实记一条。
             # 编辑重开时**无条件落盘**：用户改过的正文必须留痕，否则刷新后改动就凭空消失了。
             # 等批准时也**无条件落盘**：卡片本身就是这一轮的产出（哪怕一个字都没有），
@@ -1395,7 +1419,6 @@ _APPROVAL_CLOSED_REASONS = {
 }
 
 #: 拒绝后的确定性答复。**不花一次模型调用**：这句话不是模型的观点，是系统在陈述事实。
-APPROVAL_DENIED_REPLY = "已记录你的拒绝，本次不执行「{label}」。需要换个做法的话，直接告诉我要怎么做。"
 
 
 def _replace_approval_card(record: dict[str, Any], turn_index: int, card: dict[str, Any]) -> None:
@@ -1481,9 +1504,20 @@ async def _approval_stream(
             rows.append(decision_row)
             yield _sse("row", {"row": decision_row})
             yield _sse("approval", card)
-            text = APPROVAL_DENIED_REPLY.format(label=label)
-            buffer.append(text)
-            yield _sse("delta", {"text": text})
+            # 拒绝的确认话由**模型**说（口径 2026-09-26：对话正文一律模型生成）。
+            text = await phrasing.say(
+                facts=(
+                    f"研究者拒绝了这次要执行的动作：「{label}」。"
+                    + (f"他给的说明：{payload.note}" if payload.note else "")
+                    + "\n请用你自己的话告诉他：这次不执行了；想换个做法的话直接说一句要怎么做就行。"
+                    "两三句话，不要提任何内部术语。"
+                ),
+                model_ref=ref,
+                purpose="approval_denied_reply",
+            )
+            if text:
+                buffer.append(text)
+                yield _sse("delta", {"text": text})
         else:
             # ① 先签发**一次性**令牌并存指纹：会话文件里永远不会出现可用凭据
             token = agent_approvals.issue_token(request_id)
@@ -1643,10 +1677,17 @@ async def _approval_stream(
         if not answer and result is not None:
             answer = str(getattr(result, "content", "") or "")
         if not answer and soft_failure and error_info is None:
-            # 续答这一跳彻底失败（自动重试也没成）：**不甩错误码**，落成一句说完的话
-            # （用户口径 2026-09-26）。系统在说话 → `note_only`，不冒充模型的答复。
-            answer = messages.MODEL_FAILED_TEXT.format(reason=soft_failure[:220])
-            note_only = True
+            # 续答这一跳失败 → 再要一次收尾话，**由模型说**（口径 2026-09-26）。
+            answer = await phrasing.say(
+                facts=(
+                    "刚才那一次回答没能生成出来。请用研究者看得懂的话说明："
+                    "这一轮没有拿到答复；已经跑过的步骤都在上面的过程里、没有丢；"
+                    "他可以直接再发一次。两三句话，不要提内部术语。\n"
+                    f"（技术原文，不要照抄）{soft_failure[:220]}"
+                ),
+                model_ref=ref,
+                purpose="approval_soft_failure_note",
+            )
         reasoning_text = "".join(reasoning_buffer)
         if not reasoning_text and result is not None:
             reasoning_text = str((getattr(result, "raw", None) or {}).get("reasoning") or "")

@@ -32,7 +32,7 @@ from typing import Any
 
 from services import conversations as conversations_service
 from services.research import intent as intent_mod
-from services.research import lookup, messages, orchestrator
+from services.research import lookup, messages, orchestrator, phrasing
 
 logger = logging.getLogger("sciloop.research.dialog")
 
@@ -278,12 +278,39 @@ async def stream_plain_chat(
             "routing": {"kind": "plain_chat", "mode": "plain"},
         },
     )
-    yield _sse("delta", {"text": messages.PLAIN_CHAT_TEXT})
+    # 正文由**模型**写（用户口径 2026-09-26：对话正文一律模型生成）。程序只给事实：
+    # 已经把这个对话记成普通对话、不会再问研究流程、以及**怎么切回研究模式**。
+    text = await phrasing.say(
+        facts=(
+            "研究者刚刚选择：把这个对话当作普通对话，不启动研究流程。"
+            "这件事已经记下了，以后不会再问他要不要开始研究流程。\n"
+            "请用你自己的话跟他确认一句，并明确告诉他："
+            "想切回研究模式时，直接说一句「开始文献调研」就可以。"
+            "控制在两三句话，不要用编号，也不要出现任何内部术语。"
+        ),
+        model_ref=str((scope.get("conversation") or {}).get("model_ref") or "") or None,
+        purpose="plain_chat_intro",
+    )
+    if not text:
+        # 模型没写出来 → **留空 + 一条过程行**，绝不拿程序话术冒充正文
+        note = messages.system_row(
+            "notice", "这个对话已记成普通对话；想切回研究模式时说一句「开始文献调研」即可。", tone="idle"
+        )
+        yield _sse("row", {"row": note})
+        persisted_plain = [note]
+    else:
+        persisted_plain = []
+        yield _sse("delta", {"text": text})
     conversations_service.append_turns(
         scope["conversation"],
         [
             {"role": "user", "content": scope["text"]},
-            {"role": "assistant", "content": messages.PLAIN_CHAT_TEXT, "routing": "plain_chat"},
+            {
+                "role": "assistant",
+                "content": text,
+                "routing": "plain_chat",
+                "rows": persisted_plain,
+            },
         ],
     )
     yield _sse("done", {"conversation_id": conversation_id, "routing": "plain_chat"})
@@ -307,8 +334,26 @@ async def stream_guide(
             "routing": {"kind": "guide", "reason": scope.get("reason", "")},
         },
     )
-    yield _sse("delta", {"text": messages.GUIDE_TEXT})
-    yield _sse("blocks", {"blocks": messages.guide_blocks()})
+    blocks = messages.guide_blocks()
+    options = []
+    for block in blocks:
+        for item in block.get("options") or []:
+            options.append(f"- {item.get('label')}：直接说「{item.get('send')}」")
+    # 正文由**模型**写；可点按钮（blocks）是界面结构，不属于"正文"，照旧发。
+    text = await phrasing.say(
+        facts=(
+            "研究者说的是一句想启动研究流程的话，但方向还不明确：" f"「{str(scope.get('text') or '')}」\n"
+            "本对话还没有开始研究流程。界面上会同时出现三个可点按钮，你要用自然的话把它们讲清楚：\n"
+            + "\n".join(options)
+            + "\n\n请用你自己的话说明这次可以怎么选，并明确告诉他直接说哪一句就能开始。"
+            "不要用 Markdown 小标题，也不要出现任何内部术语。"
+        ),
+        model_ref=str((scope.get("conversation") or {}).get("model_ref") or "") or None,
+        purpose="research_guide_intro",
+    )
+    if text:
+        yield _sse("delta", {"text": text})
+    yield _sse("blocks", {"blocks": blocks})
 
     conversations_service.append_turns(
         scope["conversation"],
@@ -316,8 +361,8 @@ async def stream_guide(
             {"role": "user", "content": scope["text"]},
             {
                 "role": "assistant",
-                "content": messages.GUIDE_TEXT,
-                "blocks": messages.guide_blocks(),
+                "content": text,
+                "blocks": blocks,
                 "routing": "guide",
                 "duration_ms": 0,
             },
@@ -458,6 +503,122 @@ async def stream_node(
             "next_node": next_node,
             "next_implemented": bool(next_node) and _implemented(next_node),
         },
+    )
+
+
+def _system_row_for(event: str, data: dict[str, Any]) -> dict[str, Any] | None:
+    """把节点事件转成一条紧凑系统行（面向研究者，不含内部字段名）。"""
+
+    if event == "node":
+        return messages.system_row(
+            "entered", f"{data.get('node_label')}（第 {data.get('entry_index')} 次进入）", tone="info"
+        )
+    if event == "attempt":
+        hits = data.get("library_hits")
+        return messages.system_row(
+            "attempt",
+            f"第 {data.get('attempt')}/{data.get('max_attempts')} 次尝试"
+            + (f"，命中论文 {hits} 篇" if hits is not None else ""),
+            tone="idle",
+        )
+    if event == "validation":
+        items = data.get("items") or []
+        detail = "；".join(str(item.get("message", "")) for item in items[:3])
+        return messages.system_row(
+            "validation",
+            f"第 {data.get('attempt')}/{data.get('max_attempts')} 次被驳回：{detail}",
+            tone="err",
+        )
+    if event == "notice":
+        return messages.system_row("notice", str(data.get("message") or ""), tone="warn")
+    if event == "revert":
+        return messages.system_row(
+            "revert",
+            f"{data.get('from_label')} → {data.get('to_label')}：{str(data.get('reason') or '')[:160]}",
+            tone="info",
+        )
+    if event == "migrated":
+        return messages.system_row(
+            "migrated", f"{data.get('from_label')} → {data.get('to_label')}", tone="ok"
+        )
+    if event == "waiting_human":
+        return messages.system_row(
+            "waiting_human", str(data.get("message") or "已转入人工介入"), tone="warn"
+        )
+    if event == "error":
+        return messages.system_row(
+            "stopped", str(data.get("message") or "执行失败"), tone="err"
+        )
+    return None
+
+
+def _facts_for_conclusion(
+    *,
+    label: str,
+    status: str,
+    events: list[tuple[str, dict[str, Any]]],
+    refs: dict[str, Any],
+    next_node: str | None,
+    next_unimplemented: bool,
+) -> str:
+    """把这一步的**事实**整理成给模型看的载荷（**不含任何面向用户的话术**）。
+
+    用户口径 2026-09-26：对话里的正文一律由模型写。所以这里只报事实 ——
+    状态、试了几次、为什么没过、产出了什么、下一步是什么，措辞一个字都不代它写。
+    """
+
+    done = next((d for e, d in events if e == "done"), {})
+    lines: list[str] = [
+        f"这一步是：{label}",
+        f"结果状态：{status}",
+        f"这一步尝试修复的次数：{int(done.get('llm_call_count') or 0) and ''}"
+        f"{len([1 for e, _ in events if e == 'validation'])}",
+    ]
+
+    # 未通过的具体原因（程序已经算出来的事实，照抄给模型，不加工）
+    reasons = [str(d.get("message") or "") for e, d in events if e in ("validation", "error")]
+    reasons = [item for item in reasons if item.strip()]
+    if reasons:
+        lines.append("未通过的原因（逐条）：")
+        lines.extend(f"- {item[:400]}" for item in reasons[-3:])
+
+    waiting = next((d for e, d in reversed(events) if e == "waiting_human"), None)
+    if waiting is not None:
+        lines.append(f"需要人介入的说明（程序记录的原文）：{str(waiting.get('message') or '')[:400]}")
+
+    produced: list[str] = []
+    if refs.get("evidence_ids"):
+        produced.append(f"证据 {len(refs['evidence_ids'])} 条")
+    if refs.get("idea_id"):
+        produced.append(f"候选假设一条（编号 {refs['idea_id']}）")
+    if refs.get("feasibility_id"):
+        produced.append(f"可行性报告一份（编号 {refs['feasibility_id']}）")
+    if refs.get("taskbook_id"):
+        produced.append(f"任务书一份（编号 {refs['taskbook_id']}，已锁定）")
+    if refs.get("taskbook_skipped"):
+        produced.append("任务书没落库（本对话没挂项目，任务书要归属到项目下）")
+    lines.append("这一步的产出：" + ("、".join(produced) if produced else "没有产出"))
+
+    if next_node and next_node != "end":
+        tail = f"下一步本来可以走：{_label_of(next_node)}"
+        if next_unimplemented:
+            tail += "（但这一步还**没有实装**：不会做校验、也不会真的执行实验）"
+        lines.append(tail)
+    return "\n".join(lines)
+
+
+async def _write_conclusion(*, facts: str, model_ref: str | None) -> str:
+    """让**模型**写节点收尾那段话；写不出来就返回空串。
+
+    为什么不兜一句程序文案：用户口径 2026-09-26「对话里所有正文都必须是模型输出」。
+    失败时**宁可留空**（再补一条过程行如实说明），也不拿程序话术冒充正文。
+    """
+
+    return await phrasing.say(
+        facts=messages.NODE_CONCLUSION_TEMPLATE.format(facts=facts),
+        model_ref=model_ref,
+        purpose="research_node_conclusion",
+        system=messages.NODE_CONCLUSION_SYSTEM,
     )
 
 
