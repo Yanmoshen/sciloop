@@ -224,14 +224,15 @@ export const routes: RouteRecordRaw[] = [
         path: 'ideas',
         name: 'ideas',
         component: () => import('@/views/IdeasHomeView.vue'),
-        meta: { title: '研究构思', module: 'ideas' },
+        // homeNav 必须标：研究构思已移入左栏主序列，不标的话点进来左栏那行不会亮
+        meta: { title: '研究构思', module: 'ideas', homeNav: 'ideas' },
       },
       {
         // 某个研究任务的工作区（四个方向 + 可行性分析）
         path: 'ideas/:aggregationId',
         name: 'idea-workspace',
         component: () => import('@/views/IdeaView.vue'),
-        meta: { title: '研究构思', module: 'ideas' },
+        meta: { title: '研究构思', module: 'ideas', homeNav: 'ideas' },
       },
       {
         // 流水线工作台整页已下线（研究者 2026-09-26：界面删掉、后端先留着）。

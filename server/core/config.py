@@ -129,6 +129,11 @@ class Settings(BaseSettings):
     pipeline_max_llm_cost_usd: float = 8.0
     pipeline_demo_cost_quota_usd: float = 3.0
     pipeline_max_stage_minutes: int = 20
+    #: **成本护栏熔断总开关**（2026-09-26 研究者要求：**默认关闭**）。
+    #: 关闭时：仍然照旧累计与展示真实花费、仍然算阈值、仍然写进返回值，
+    #: 但**不再据此拦下调用**（原来超线会直接拒绝调用，表现就是"生成失败"或悄悄降级成模板）。
+    #: 置 1/true/yes 可重新打开。见 ``services/cost/accumulator.check_cost``。
+    pipeline_cost_guard_enabled: bool = False
 
     # ===== 风险策略 =====
     risk_auto_max: float = 30.0

@@ -360,7 +360,13 @@ async def check_cost(
     """
     summary = await accumulate(project_id, store=store, limit_usd=limit_usd, quota_usd=quota_usd)
     projected = _round(summary.used_usd + max(0.0, float(estimated_usd)))
-    ok = projected <= summary.limit_usd
+    # 熔断总开关（2026-09-26 研究者要求**默认关闭**）：关掉时只如实记账、不再拦调用；
+    # 阈值照样算出来放进返回值，界面上该展示的用量一个都不少。
+    from core.config import get_settings
+
+    guard_on = bool(getattr(get_settings(), "pipeline_cost_guard_enabled", False))
+    limit_exceeded = projected > summary.limit_usd
+    ok = (not limit_exceeded) or (not guard_on)
     check = CostCheck(
         ok=ok,
         used_usd=summary.used_usd,
@@ -382,6 +388,12 @@ async def check_cost(
         check.reason = (
             f"成本护栏熔断：真实累计 {summary.used_usd} + 预估 {check.estimated_usd} "
             f"= {projected} USD 超过护栏值 {summary.limit_usd} USD"
+        )
+    elif limit_exceeded and not guard_on:
+        check.reason = (
+            f"成本护栏开关已关闭（PIPELINE_COST_GUARD_ENABLED=0）："
+            f"真实累计 {summary.used_usd} + 预估 {check.estimated_usd} = {projected} USD "
+            f"已超过阈值 {summary.limit_usd} USD，按研究者口径**不熔断**，仅如实记账。"
         )
     elif check.quota_exceeded:
         check.reason = (
