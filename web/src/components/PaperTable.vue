@@ -215,7 +215,7 @@ async function openReader(row: PaperSearchItem): Promise<void> {
       await router.push({ path: `/papers/reader/${doc.id}` })
       return
     }
-    notice.value = '登记成功但没有返回文档号，请到「全文阅读」里刷新看看。'
+    notice.value = '打开全文失败：服务端没有返回文档号，请稍后重试。'
   } catch (error) {
     notice.value =
       (error as { status?: number })?.status === 403

@@ -964,8 +964,6 @@ let savedTimer: number | null = null
 const KIND_OPTIONS: ReadonlyArray<{ value: ReadingKind; label: string }> = [
   { value: 'original', label: '原文' },
   { value: 'chinese', label: '中文' },
-  { value: 'simple', label: '简化英语' },
-  { value: 'bilingual', label: '双语' },
 ]
 
 const MISSING_OPTIONS: ReadonlyArray<{ value: MissingVersionAction; label: string }> = [

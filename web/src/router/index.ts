@@ -211,11 +211,12 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('@/views/TranslateView.vue'),
         meta: { title: '论文翻译', module: 'translate' },
       },
+      // 「全文阅读」列表页已下线（2026-09-26 研究者口径）：进阅读页只有一条路 —— 论文库点标题。
+      // 旧地址保留为重定向，免得旧书签 / 演示脚本里的 /papers/reader 直接 404。
       {
         path: 'papers/reader',
         name: 'reader',
-        component: () => import('@/views/ReaderView.vue'),
-        meta: { title: '全文阅读', module: 'reader' },
+        redirect: '/papers/feed',
       },
       {
         path: 'papers/reader/:documentId',

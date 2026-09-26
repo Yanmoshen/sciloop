@@ -7,12 +7,30 @@
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * 全文阅读（核心模块 ③）：**原文 PDF 与译文 PDF 左右并排，原汁原味地读**。
+ * 全文阅读（核心模块 ③）：**原文 PDF 与中文译文 PDF 并排，原汁原味地读**。
  *
- * 需求确认（2026-09-19，用户明确）：
- * - 左栏原文 PDF / 右栏译文 PDF，两栏各自滚动
- * - 批注**直接高亮在 PDF 页面上**（按后端给的 page + bbox 叠矩形），点高亮可看/改/删
- * - 「阅读就是阅读」：**不放**结构大纲、已理解标记、字号、逐块对照文本等辅助面板
+ * 界面口径（2026-09-26 研究者逐条确认）
+ * --------------------------------------
+ * - 只保留两个动作：**「翻译该论文」**（跳「论文翻译」页去跑，把这篇带过去）与
+ *   **「双语对照模式」**（显示开关）；
+ * - 「双语对照模式」**关** = 整屏一栏原文 PDF；**开** = 左英文原文 / 右中文译文，
+ *   两栏**各自独立滚动**（刻意不做滚动同步对齐）；
+ * - **不再有**「译文版本」下拉，也没有「登记中文译本 / 通俗简化 / 双语对照」按钮 ——
+ *   一个文档只可能有原文与中文译本两类版本（译本类型已在 2026-09-26 收敛）；
+ * - 进阅读页的唯一入口是**论文库点标题**（左栏导航的「全文阅读」入口与列表页已下线）。
+ *
+ * 译文怎么进阅读器（关键）
+ * ------------------------
+ * 登记按钮下掉后，译文靠 `autoAttachTranslation()` **自动接入**：打开阅读页时若该文档
+ * 还没有中文译本，就去翻译任务列表里找**这篇论文最新一份已完成**的产物并登记。
+ * 没有产物 / 只读模式 / 产物缺失 → 静默保持"还没有中文译本"，右栏照常给出下一步提示。
+ * 这样「只保留两个按钮」才不会漏掉"登记"这一步。
+ *
+ * 批注（保留）
+ * ------------
+ * 选区新建 / 点击高亮查看编辑，批注**直接高亮在 PDF 页面上**（按后端给的 page + bbox 叠矩形）。
+ * 只有原文栏的选区用于新建批注（译文栏的选区不是证据锚点）。
+ * 「阅读就是阅读」：不放结构大纲、已理解标记、字号、逐块对照文本等辅助面板。
  *
  * 渲染由 `components/PdfPane.vue` 用 PDF.js 完成；批注读写走既有 `/reader/...` 接口。
  */
@@ -25,25 +43,19 @@ import {
   deleteReaderAnnotation,
   fetchReaderDocument,
   listReaderAnnotations,
-  listReaderDocuments,
   listReaderVersions,
-  registerReaderDocument,
-  registerReaderVersion,
   readerVersionPdfUrl,
+  registerReaderVersion,
   updateReaderAnnotation,
   type ReaderAnnotation,
   type ReaderDocumentSummary,
   type ReaderVersion,
 } from '@/api/reader'
+import { listTranslateJobs } from '@/api/translate'
 import PdfPane from '@/components/PdfPane.vue'
 
 const route = useRoute()
 const router = useRouter()
-
-// ---- 文档列表态 ----
-const documents = ref<ReaderDocumentSummary[]>([])
-const documentsTotal = ref(0)
-const registerPaperId = ref<number | null>(null)
 
 // ---- 阅读态 ----
 const detail = ref<ReaderDocumentSummary | null>(null)
@@ -51,6 +63,9 @@ const versions = ref<ReaderVersion[]>([])
 const sourceVersionId = ref<number | null>(null)
 const targetVersionId = ref<number | null>(null)
 const annotations = ref<ReaderAnnotation[]>([])
+
+/** 「双语对照模式」开关：默认关（整屏一栏原文）。 */
+const pairMode = ref(false)
 
 const loading = ref(false)
 const busy = ref('')
@@ -69,18 +84,14 @@ const documentId = computed(() => {
   const parsed = Number(value)
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null
 })
-const inReading = computed(() => documentId.value !== null)
 
-/**
- * 译文版本：同一 kind 可以登记多份（历史追加，见迁移 0004），
- * 因此按 version_no **倒序**排 —— 最新版在最前，也就是默认阅读的那一份。
- */
-const translationVersions = computed(() =>
-  versions.value
-    .filter((item) => item.kind !== 'original')
-    .slice()
-    .sort((left, right) => right.version_no - left.version_no),
-)
+/** 中文译本：同一 kind 可保留历史（迁移 0004），取 version_no 最大的那份当"当前译文"。 */
+const translationVersion = computed(() => {
+  const items = versions.value.filter((item) => item.kind !== 'original')
+  return items.length
+    ? items.slice().sort((left, right) => right.version_no - left.version_no)[0]
+    : null
+})
 
 const sourcePdfUrl = computed(() =>
   documentId.value && sourceVersionId.value
@@ -100,20 +111,8 @@ const targetAnnotations = computed(() =>
   annotations.value.filter((item) => item.version_id === targetVersionId.value),
 )
 
-function versionLabel(kind: string | undefined): string {
-  switch (kind) {
-    case 'original':
-      return '原文'
-    case 'chinese':
-      return '中文译本'
-    case 'simple':
-      return '通俗简化'
-    case 'bilingual':
-      return '双语对照'
-    default:
-      return kind ?? '—'
-  }
-}
+/** 该论文在库内的 id —— 「翻译该论文」要把它带给翻译页。 */
+const paperId = computed(() => detail.value?.paper_id ?? null)
 
 function ownerHint(error: unknown): string {
   const status = (error as { status?: number })?.status
@@ -133,13 +132,31 @@ function placeBubble(rect: DOMRect): void {
 }
 
 // ---- 数据加载 ----
-async function loadDocuments(): Promise<void> {
+/**
+ * 自动接入中文译本：该文档还没有译本时，取**这篇论文最新一份已完成**的翻译产物登记。
+ *
+ * 幂等：已有译本直接返回（不重复登记，也不会因重复而 409）；
+ * 失败一律**静默**——没翻译过 / 只读模式 / 产物已被清掉都属正常情况，
+ * 右栏会自己显示「还没有中文译本」并给出下一步，不在这里报错吓人。
+ */
+async function autoAttachTranslation(id: number): Promise<void> {
+  const targetPaperId = paperId.value
+  if (!targetPaperId || translationVersion.value) return
   try {
-    const result = await listReaderDocuments(1, 50)
-    documents.value = result.items ?? []
-    documentsTotal.value = result.total ?? 0
-  } catch (error) {
-    notice.value = error instanceof Error ? error.message : String(error)
+    const page = await listTranslateJobs(50)
+    const latest = (page.items ?? [])
+      .filter((job) => job.paper_id === targetPaperId && job.status === 'completed' && job.task_id)
+      .sort((left, right) =>
+        String(right.created_at ?? '').localeCompare(String(left.created_at ?? '')),
+      )[0]
+    if (!latest?.task_id) return
+    const created = await registerReaderVersion(id, 'chinese', latest.task_id)
+    if (created?.id) {
+      versions.value = [...versions.value, created]
+      targetVersionId.value = created.id
+    }
+  } catch {
+    /* 没翻译过 / 无权限 / 产物缺失 —— 保持"还没有中文译本"即可 */
   }
 }
 
@@ -166,8 +183,9 @@ async function loadReading(id: number): Promise<void> {
 
     const original = versions.value.find((item) => item.kind === 'original')
     sourceVersionId.value = original?.id ?? null
-    // 默认右栏放「最新的译文版本」（translationVersions 已按 version_no 倒序；没有就留空，由用户点登记）
-    targetVersionId.value = translationVersions.value[0]?.id ?? null
+    targetVersionId.value = translationVersion.value?.id ?? null
+
+    await autoAttachTranslation(id)
   } catch (error) {
     notice.value = error instanceof Error ? error.message : String(error)
   } finally {
@@ -184,35 +202,10 @@ async function loadAnnotations(id: number): Promise<void> {
   }
 }
 
-async function registerDocument(): Promise<void> {
-  if (!registerPaperId.value || busy.value) return
-  busy.value = 'register'
-  notice.value = ''
-  try {
-    const doc = await registerReaderDocument(registerPaperId.value)
-    await loadDocuments()
-    if (doc?.id) await router.push({ path: `/papers/reader/${doc.id}` })
-  } catch (error) {
-    notice.value = ownerHint(error)
-  } finally {
-    busy.value = ''
-  }
-}
-
-/** 登记翻译版本（把翻译产物变成可阅读的 PDF） */
-async function registerTranslation(kind: 'chinese' | 'simple' | 'bilingual'): Promise<void> {
-  if (!documentId.value || busy.value) return
-  busy.value = `version-${kind}`
-  notice.value = ''
-  try {
-    const created = await registerReaderVersion(documentId.value, kind)
-    await loadReading(documentId.value)
-    if (created?.id) targetVersionId.value = created.id
-  } catch (error) {
-    notice.value = ownerHint(error)
-  } finally {
-    busy.value = ''
-  }
+/** 「翻译该论文」：带上这篇论文去翻译页（翻译页已支持 `?paper_id=` 自动预填）。 */
+function goTranslate(): void {
+  if (!paperId.value) return
+  void router.push({ path: '/papers/translate', query: { paper_id: String(paperId.value) } })
 }
 
 // ---- 批注 ----
@@ -288,7 +281,6 @@ watch(
       detail.value = null
       versions.value = []
       annotations.value = []
-      void loadDocuments()
       return
     }
     void loadReading(id)
@@ -303,137 +295,63 @@ onUnmounted(() => {
 
 <template>
   <section class="reader">
-    <!-- 列表态：挑文档 / 登记文档 -->
-    <template v-if="!inReading">
-      <header class="reader__head">
-        <h1>全文阅读</h1>
-        <span class="spacer" />
-        <span class="chip">共 {{ documentsTotal }} 篇</span>
-      </header>
+    <header class="reader__head">
+      <button class="btn btn--ghost" type="button" @click="router.push('/papers/feed')">
+        返回论文库
+      </button>
+      <h1 class="reader__title">{{ detail?.title ?? `文档 #${documentId}` }}</h1>
+      <span v-if="detail?.page_count" class="chip">{{ detail.page_count }} 页</span>
+      <span class="spacer" />
+      <button class="btn" type="button" :disabled="!paperId" @click="goTranslate">
+        翻译该论文
+      </button>
+      <button
+        class="btn"
+        :class="{ 'btn--primary': pairMode }"
+        type="button"
+        :aria-pressed="pairMode"
+        @click="pairMode = !pairMode"
+      >
+        双语对照模式
+      </button>
+    </header>
 
-      <p v-if="notice" class="notice">{{ notice }}</p>
+    <p v-if="notice" class="notice">{{ notice }}</p>
 
-      <article class="panel">
-        <div class="panel__head">
-          <h2>登记阅读文档</h2>
-        </div>
-        <div class="creator">
-          <input
-            v-model.number="registerPaperId"
-            class="field__input"
-            type="number"
-            min="1"
-            placeholder="论文 ID"
-          />
-          <button
-            class="btn btn--primary"
-            type="button"
-            :disabled="!registerPaperId || busy === 'register'"
-            @click="registerDocument"
-          >
-            {{ busy === 'register' ? '解析中…' : '解析原文并登记' }}
-          </button>
-        </div>
-      </article>
+    <div class="pdf-grid" :class="{ 'pdf-grid--pair': pairMode }">
+      <section class="pane">
+        <header class="pane__head">
+          <span class="pane__title">原文</span>
+          <span class="spacer" />
+          <a v-if="sourcePdfUrl" class="link-btn" :href="sourcePdfUrl" target="_blank" rel="noopener">打开原始 PDF</a>
+        </header>
+        <PdfPane
+          :src="sourcePdfUrl"
+          :annotations="sourceAnnotations"
+          side="source"
+          @select-text="onSelectText"
+          @click-annotation="onClickAnnotation"
+        />
+      </section>
 
-      <article class="panel">
-        <table class="table">
-          <thead>
-            <tr>
-              <th>标题</th>
-              <th>页数</th>
-              <th>解析状态</th>
-              <th>操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-if="documents.length === 0">
-              <td colspan="4" class="empty">还没有阅读文档：填论文 ID 登记一篇</td>
-            </tr>
-            <tr v-for="doc in documents" :key="doc.id" class="row" @click="router.push(`/papers/reader/${doc.id}`)">
-              <td class="ellipsis">{{ doc.title ?? `文档 #${doc.id}` }}</td>
-              <td class="mono">{{ doc.page_count ?? '—' }}</td>
-              <td>
-                <span class="tag" :class="doc.parse_status === 'ok' ? 'tag--ok' : 'tag--warn'">
-                  {{ doc.parse_status === 'ok' ? '解析完成' : (doc.parse_status ?? '未知') }}
-                </span>
-              </td>
-              <td>
-                <button class="link-btn" type="button" @click.stop="router.push(`/papers/reader/${doc.id}`)">
-                  打开阅读
-                </button>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </article>
-    </template>
-
-    <!-- 阅读态：原文 PDF ｜ 译文 PDF -->
-    <template v-else>
-      <header class="reader__head">
-        <button class="btn btn--ghost" type="button" @click="router.push('/papers/reader')">返回文档列表</button>
-        <h1 class="reader__title">{{ detail?.title ?? `文档 #${documentId}` }}</h1>
-        <span v-if="detail?.page_count" class="chip">{{ detail.page_count }} 页</span>
-        <span class="spacer" />
-        <span class="side-label">译文版本</span>
-        <select v-model.number="targetVersionId" class="field__input field__input--sm">
-          <option :value="null">未选择</option>
-          <option v-for="item in translationVersions" :key="item.id" :value="item.id">
-            {{ versionLabel(item.kind) }} · v{{ item.version_no }}
-          </option>
-        </select>
-        <div class="register-group">
-          <button
-            v-for="kind in (['chinese', 'simple', 'bilingual'] as const)"
-            :key="kind"
-            class="link-btn"
-            type="button"
-            :disabled="busy === `version-${kind}`"
-            @click="registerTranslation(kind)"
-          >
-            登记{{ versionLabel(kind) }}
-          </button>
-        </div>
-      </header>
-
-      <p v-if="notice" class="notice">{{ notice }}</p>
-
-      <div class="pdf-grid">
-        <section class="pane">
-          <header class="pane__head">
-            <span class="pane__title">原文</span>
-            <span class="spacer" />
-            <a v-if="sourcePdfUrl" class="link-btn" :href="sourcePdfUrl" target="_blank" rel="noopener">打开原始 PDF</a>
-          </header>
-          <PdfPane
-            :src="sourcePdfUrl"
-            :annotations="sourceAnnotations"
-            side="source"
-            @select-text="onSelectText"
-            @click-annotation="onClickAnnotation"
-          />
-        </section>
-
-        <section class="pane">
-          <header class="pane__head">
-            <span class="pane__title">译文</span>
-            <span class="spacer" />
-            <a v-if="targetPdfUrl" class="link-btn" :href="targetPdfUrl" target="_blank" rel="noopener">
-              打开原始 PDF
-            </a>
-          </header>
-          <PdfPane
-            v-if="targetPdfUrl"
-            :src="targetPdfUrl"
-            :annotations="targetAnnotations"
-            side="target"
-            @click-annotation="onClickAnnotation"
-          />
-          <p v-else class="pane__empty">该文档还没有译文版本，请在右上角登记一个</p>
-        </section>
-      </div>
-    </template>
+      <section v-if="pairMode" class="pane">
+        <header class="pane__head">
+          <span class="pane__title">译文</span>
+          <span class="spacer" />
+          <a v-if="targetPdfUrl" class="link-btn" :href="targetPdfUrl" target="_blank" rel="noopener">
+            打开原始 PDF
+          </a>
+        </header>
+        <PdfPane
+          v-if="targetPdfUrl"
+          :src="targetPdfUrl"
+          :annotations="targetAnnotations"
+          side="target"
+          @click-annotation="onClickAnnotation"
+        />
+        <p v-else class="pane__empty">这篇还没有中文译本，点上方「翻译该论文」开始翻译。</p>
+      </section>
+    </div>
 
     <!-- 批注气泡：选区新建 / 点击高亮查看编辑 -->
     <Teleport to="body">
@@ -499,92 +417,17 @@ onUnmounted(() => {
 .spacer {
   flex: 1;
 }
-.side-label {
-  color: var(--color-text-secondary);
-  font-size: var(--font-size-xs);
-}
-.register-group {
-  display: flex;
-  gap: var(--space-2);
-}
-.panel {
-  padding: var(--space-4);
-  background: var(--color-card-bg);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-lg);
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-}
-.panel__head h2 {
-  margin: 0;
-  font-size: var(--font-size-lg);
-}
-.creator {
-  display: flex;
-  gap: var(--space-2);
-}
-.field__input {
-  height: 34px;
-  padding: 0 12px;
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-md);
-  background: var(--color-bg-subtle);
-  color: var(--color-text-primary);
-  font: inherit;
-  font-size: var(--font-size-sm);
-}
-.field__input--sm {
-  height: 30px;
-  font-size: var(--font-size-xs);
-}
-.field__input:focus {
-  outline: none;
-  border-color: var(--color-brand);
-}
-.table {
-  width: 100%;
-  border-collapse: collapse;
-}
-.table th,
-.table td {
-  padding: 9px 12px;
-  text-align: left;
-  border-bottom: 1px solid var(--color-border);
-  font-size: var(--font-size-sm);
-}
-.table th {
-  background: var(--color-bg-subtle);
-  color: var(--color-text-secondary);
-  font-size: var(--font-size-xs);
-  font-weight: 500;
-}
-.row {
-  cursor: pointer;
-  transition: background-color 160ms;
-}
-.row:hover {
-  background: var(--color-bg-subtle);
-}
-.ellipsis {
-  max-width: 620px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.empty {
-  color: var(--color-text-secondary);
-  text-align: center;
-  font-size: var(--font-size-sm);
-}
 
-/* 双栏：原文 ｜ 译文，各自滚动，填满可用高度 */
+/* 单栏 = 整屏原文；开对照模式才分左右两栏（各自滚动，不做滚动同步） */
 .pdf-grid {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr;
   gap: var(--space-3);
+}
+.pdf-grid--pair {
+  grid-template-columns: 1fr 1fr;
 }
 .pane {
   min-width: 0;
@@ -616,7 +459,7 @@ onUnmounted(() => {
   font-size: var(--font-size-sm);
 }
 @media (max-width: 1100px) {
-  .pdf-grid {
+  .pdf-grid--pair {
     grid-template-columns: 1fr;
   }
 }

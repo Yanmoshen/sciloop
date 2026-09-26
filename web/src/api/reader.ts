@@ -10,7 +10,7 @@
  *
  * 关键语义（照后端实现，不自造）：
  * - 文档登记（`POST /reader/documents`）会解析原文并**自动登记 original 版本**（immutable）
- * - 翻译产物通过 `POST .../versions {kind: chinese|simple|bilingual, task_id}` 登记为**不可变版本**
+ * - 翻译产物通过 `POST .../versions {kind: chinese, task_id}` 登记为**不可变版本**（阅读页会自动接入）
  * - 版本 PDF 与文本索引分别走 `.../versions/{id}/pdf` 与 `.../versions/{id}/text`
  * - 批注锚点是 `block_id` + `quote_sha256`（内容寻址）；更新必须带 `revision`，冲突返回 409
  */
@@ -170,10 +170,10 @@ export function listReaderVersions(documentId: number): Promise<ReaderVersionLis
   return get<ReaderVersionList>(`/reader/documents/${documentId}/versions`)
 }
 
-/** 把翻译产物登记为不可变版本（kind: chinese | simple | bilingual） */
+/** 把翻译产物登记为不可变版本（kind: chinese，中文译本） */
 export function registerReaderVersion(
   documentId: number,
-  kind: 'chinese' | 'simple' | 'bilingual',
+  kind: 'chinese',
   taskId?: string,
 ): Promise<ReaderVersion> {
   return post<ReaderVersion>(`/reader/documents/${documentId}/versions`, {

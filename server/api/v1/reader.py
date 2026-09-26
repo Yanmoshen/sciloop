@@ -36,7 +36,7 @@
   ``annotation_conflict`` / ``version_already_registered`` / ``reader_version_immutable``）。
 - **禁止把不确定说成成功**：``align`` 只在全部目标版本精确命中时才返回 ``success``，
   部分匹配/未覆盖一律 ``partial``，一个都没中或有且仅有单一版本 → ``pending``。
-- ``kind`` 只允许 ``chinese`` / ``simple`` / ``bilingual``；``original`` 由创建文档时
+- ``kind`` 只允许 ``chinese``（中文译本）；``original`` 由创建文档时
   自动登记，**不能**通过登记接口提交。
 
 本轮**不做**（明确留给下一轮）
@@ -61,6 +61,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.security import require_owner
+from db.models.reader import VERSION_KINDS
 from db.session import AsyncSessionLocal
 from services.reader import annotations as annotations_service
 from services.reader import archive as archive_service
@@ -77,7 +78,7 @@ router = APIRouter(tags=["reader"])
 MAX_PAGE_SIZE = 100
 DEFAULT_PAGE_SIZE = 20
 MAX_ANNOTATION_PAGE_SIZE = 200
-VersionKind = Literal["chinese", "simple", "bilingual"]
+VersionKind = Literal["chinese"]
 
 
 # --------------------------------------------------------------------------- #
@@ -141,7 +142,7 @@ class RegisterVersionRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    kind: VersionKind = Field(..., description="chinese | simple | bilingual")
+    kind: VersionKind = Field(..., description="chinese（中文译本）")
     task_id: str | None = Field(
         default=None,
         description="翻译任务 id（读取 .cache/artifacts/<task_id>/manifest.json）；缺失 → 422",
@@ -155,7 +156,7 @@ class StatePatchRequest(BaseModel):
 
     current_block: str | None = Field(default=None, description="稳定 block id；null 表示清空")
     offset: int | None = Field(default=None, ge=0)
-    mode: str | None = Field(default=None, description="original|chinese|simple|bilingual")
+    mode: str | None = Field(default=None, description="original|chinese")
     font_size: int | None = Field(default=None, ge=8, le=48)
     understood_blocks: list[str] | None = None
     favorite_terms: list[str] | None = None
@@ -257,7 +258,7 @@ async def list_versions(document_id: int, session: DbSession) -> dict[str, Any]:
             "document_id": document.id,
             "items": [versions_service.to_api_dict(row) for row in rows],
             "total": len(rows),
-            "kinds": ["original", "chinese", "simple", "bilingual"],
+            "kinds": list(VERSION_KINDS),
             "note": (
                 "版本创建后不可修改（ORM before_update + 数据库触发器双保险，"
                 "报错信息含 reader_version_immutable）"
@@ -267,7 +268,7 @@ async def list_versions(document_id: int, session: DbSession) -> dict[str, Any]:
 
 @router.post(
     "/reader/documents/{document_id}/versions",
-    summary="登记不可变版本（chinese | simple | bilingual，来自翻译 manifest）",
+    summary="登记不可变版本（chinese，来自翻译 manifest）",
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_owner)],
 )

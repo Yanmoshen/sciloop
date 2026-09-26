@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from db.models.settings import AppSetting
 
 #: 允许的阅读版本（与 reader_versions.kind 对齐）
-READING_KINDS: tuple[str, ...] = ("original", "chinese", "simple", "bilingual")
+READING_KINDS: tuple[str, ...] = ("original", "chinese")
 #: 版本缺失时的行为
 MISSING_ACTIONS: tuple[str, ...] = ("fallback_original", "prompt_generate")
 #: 行距档位（与「阅读设置」界面的三档一致）

@@ -10,9 +10,7 @@
 --------
 ===========  ===========================================================
 ``original``  创建阅读文档时自动登记（原文 PDF，证据源，**永不被译文替代**）
-``chinese``   取自翻译 manifest 的 ``files.mono``（+ 记录 ``dual`` 是否可用）
-``simple``    取自 ``files.mono``
-``bilingual`` 取自 ``files.dual``（manifest 未产出 ``dual.pdf`` → 拒绝登记，不降级）
+``chinese``   中文译本，取自翻译 manifest 的 ``files.mono``（原位译写回原文 PDF）
 ===========  ===========================================================
 
 不可变性（硬约束）
@@ -73,8 +71,6 @@ TASK_ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,64}$")
 #: ``files`` 中 kind → 需要的产物键
 REQUIRED_FILE_KEY: dict[str, str] = {
     "chinese": "mono",
-    "simple": "mono",
-    "bilingual": "dual",
 }
 
 
@@ -499,7 +495,7 @@ async def register_from_manifest(
     kind: str,
     task_id: str,
 ) -> ReaderVersion:
-    """从翻译 manifest 登记不可变版本（``chinese`` / ``simple`` / ``bilingual``）。
+    """从翻译 manifest 登记不可变版本（``chinese``，中文译本）。
 
     同一 ``kind`` 可以登记**多份不同** ``task_id`` 的产物（追加为更高 ``version_no``）；
     同一 ``(kind, task_id)`` 重复登记 → 409。

@@ -22,7 +22,7 @@
 import { get, put } from './client'
 
 /** 打开论文时的默认版本（与 `reader_versions.kind` 对齐） */
-export type ReadingKind = 'original' | 'chinese' | 'simple' | 'bilingual'
+export type ReadingKind = 'original' | 'chinese'
 
 /** 目标版本缺失时的行为 */
 export type MissingVersionAction = 'fallback_original' | 'prompt_generate'

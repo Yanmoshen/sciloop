@@ -10,7 +10,7 @@
 
 ==========================  ====================================================
 ``reader_documents``        阅读文档：PyMuPDF 解析结果（pages/sections/blocks）
-``reader_versions``         **不可变**版本：original / chinese / simple / bilingual
+``reader_versions``         **不可变**版本：original / chinese
 ``reader_states``           阅读状态：当前 block / 偏移 / 模式 / 字号 / 已理解 / 术语
 ``reader_annotations``      批注：原文锚点 + 跨版本投影 + ``revision`` 乐观锁
 ==========================  ====================================================
@@ -59,9 +59,9 @@ from db.base import Base
 BIGINT = BigInteger
 
 #: 版本种类：``original`` 由创建阅读文档时自动生成，**不允许**通过登记接口提交
-VERSION_KINDS: tuple[str, ...] = ("original", "chinese", "simple", "bilingual")
-#: 只允许经 ``POST /reader/documents/{id}/versions`` 登记的三种（翻译产物）
-REGISTRABLE_KINDS: tuple[str, ...] = ("chinese", "simple", "bilingual")
+VERSION_KINDS: tuple[str, ...] = ("original", "chinese")
+#: 只允许经 ``POST /reader/documents/{id}/versions`` 登记的一种（中文译本，取自翻译产物）
+REGISTRABLE_KINDS: tuple[str, ...] = ("chinese",)
 #: 解析状态（与 EasyPaper §4.3 的 warnings 语义一致：无文本层不得伪装成 ok）
 PARSE_STATUSES: tuple[str, ...] = ("ok", "partial", "unavailable")
 #: 批注对齐状态；``partial`` / ``pending`` 必须保留，禁止把不确定匹配伪装成 success
@@ -120,7 +120,7 @@ class ReaderDocument(Base):
 
 
 class ReaderVersion(Base):
-    """不可变阅读版本（原文 / 中文 / 简单英语 / 双语）。
+    """不可变阅读版本（原文 / 中文译本）。
 
     保存 PDF 文件路径、文本索引、页面对应关系、内容指纹与**原样**保存的翻译
     ``manifest`` 审计字段（``sha256`` / ``layout_warnings`` / ``highlight_summary``）。

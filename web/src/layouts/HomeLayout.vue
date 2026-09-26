@@ -77,7 +77,6 @@ const HOME_NAV: HomeNavItem[] = [
       { key: 'papers', label: '文献总览', path: '/papers' },
       { key: 'feed', label: '论文库', path: '/papers/feed' },
       { key: 'translate', label: '论文翻译', path: '/papers/translate' },
-      { key: 'reader', label: '全文阅读', path: '/papers/reader' },
       { key: 'parse', label: '论文解析', path: '/papers/parse' },
       // 「聚合对比」2026-09-24 从界面下掉（用户口径）：后端能力与数据保留，界面不再提供入口
       { key: 'export', label: '多格式导出', path: '/papers/export' },
