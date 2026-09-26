@@ -43,7 +43,7 @@ from db.models import Feasibility, Idea
 from services.aggregation.cards import load_cards
 from services.cost import accumulate
 from services.evidence import bind_evidence_detailed
-from services.feasibility import mve_planner, risk_analyzer, scorer
+from services.feasibility import dimension_review, mve_planner, risk_analyzer, scorer
 
 logger = logging.getLogger("sciloop.wp08.feasibility_service")
 
@@ -240,21 +240,80 @@ async def create_feasibility(
     )
     risk = risk_analyzer.analyze(dimensions, bundle=bundle, mve_plan=mve)
 
+    # 七维评审（2026-09-26 研究者口径）：**一次模型调用**给出七个维度的分与约 50 字分析。
+    # 对外展示的分以评审为准；规则分原样保留在 ``rule_score``（可复算的审计基线）。
+    review: dict[str, Any] | None = None
+    if use_llm:
+        review = await dimension_review.review_dimensions(
+            idea=idea,
+            rule_dimensions=dimensions,
+            evidence_digest=_evidence_digest(cards),
+            model_ref=model_ref,
+            project_id=effective_project,
+        )
+
+    # 旧的「逐维建议分」复核只在**七维评审拿不到**时兜底跑一次（否则白花一次模型调用）
     llm_suggestions: dict[str, dict[str, Any]] = {}
     llm_errors: list[dict[str, Any]] = []
-    if use_llm:
+    if use_llm and review is None:
         llm_suggestions, llm_errors = await _llm_review(
             dimensions, model_ref=model_ref, project_id=effective_project
         )
+    review_by_key: dict[str, dict[str, Any]] = {
+        str(item["key"]): dict(item) for item in ((review or {}).get("dimensions") or [])
+    }
 
+    review_labels = dict(scorer.REVIEW_DIMENSIONS)
     dim_payloads: dict[str, dict[str, Any]] = {}
     for dim in dimensions:
         payload = _strip_internal(dim)
         payload["evidence"] = []
         payload["evidence_count"] = 0
+        #: 规则分与依据**永远保留**（审计基线，可复算）；评审分只覆盖对外展示的 score
+        payload["rule_score"] = payload.get("score")
+        payload["rule_rationale"] = payload.get("rationale")
         if dim["key"] in llm_suggestions:
             payload["llm_suggestion"] = llm_suggestions[dim["key"]]
+        reviewed = review_by_key.get(str(dim["key"]))
+        if reviewed:
+            payload["score"] = reviewed["score"]
+            payload["analysis"] = reviewed["analysis"]
+            payload["label"] = reviewed["label"]
+            payload["score_source"] = "model_review"
+        else:
+            payload["analysis"] = payload.get("rationale") or ""
+            payload["score_source"] = "rule"
+            # 降级时也统一成**界面口径**的维度名：七个维度的名字必须一致，
+            # 否则界面会出现「方法成熟度」与「技术成熟度」混在一起。
+            payload["label"] = review_labels.get(str(dim["key"]), payload.get("label"))
         dim_payloads[dim["key"]] = payload
+
+    # 规则层没有信号的三个维度：评审给分则落分数；没评到就**留空**（留空 ≠ 0 分）
+    for key in scorer.LLM_ONLY_DIMENSIONS:
+        reviewed = review_by_key.get(key)
+        dim_payloads[key] = {
+            "key": key,
+            "label": review_labels[key],
+            "score": reviewed["score"] if reviewed else None,
+            "analysis": reviewed["analysis"] if reviewed else "",
+            "score_source": "model_review" if reviewed else "not_evaluated",
+            "evidence": [],
+            "evidence_count": 0,
+            "evidence_note": (
+                "该维度由模型评审给出：规则层没有可用于复算的信号"
+                if reviewed
+                else "本次未做模型评审，该维度没有分数（留空，而不是 0 分）"
+            ),
+        }
+
+    # 总分：评审成功＝**七维平均**（界面口径）；否则退回规则层四维加权和，并如实标注来源
+    if review:
+        reviewed_scores = [int(item["score"]) for item in review["dimensions"]]
+        total_score = round(sum(reviewed_scores) / len(reviewed_scores), 2)
+        total_source = "seven_dimension_average"
+    else:
+        total_score = float(scoring["total_score"])
+        total_source = "rule_weighted"
 
     row = Feasibility(
         idea_id=int(idea_id),
@@ -262,7 +321,10 @@ async def create_feasibility(
         compute_cost=dim_payloads["compute_cost"],
         method_maturity=dim_payloads["method_maturity"],
         novelty_gap=dim_payloads["novelty_gap"],
-        total_score=Decimal(str(scoring["total_score"])),
+        landing_risk=dim_payloads["landing_risk"],
+        application_value=dim_payloads["application_value"],
+        ethics_compliance=dim_payloads["ethics_compliance"],
+        total_score=Decimal(str(total_score)),
         risk_list=risk["risk_list"],
         mve_plan=mve,
     )
@@ -306,6 +368,9 @@ async def create_feasibility(
     row.compute_cost = dim_payloads["compute_cost"]
     row.method_maturity = dim_payloads["method_maturity"]
     row.novelty_gap = dim_payloads["novelty_gap"]
+    row.landing_risk = dim_payloads["landing_risk"]
+    row.application_value = dim_payloads["application_value"]
+    row.ethics_compliance = dim_payloads["ethics_compliance"]
     await session.commit()
 
     logger.info(
@@ -324,8 +389,11 @@ async def create_feasibility(
         "project_id": effective_project,
         "aggregation_id": effective_aggregation,
         "paper_ids": ids,
-        "dimensions": [dim_payloads[key] for key in (d["key"] for d in scoring["dimensions"])],
-        "total_score": scoring["total_score"],
+        "dimensions": [dim_payloads[key] for key, _ in scorer.REVIEW_DIMENSIONS],
+        "total_score": total_score,
+        #: 总分怎么来的（七维平均 / 规则加权），**如实标注**，便于事后核对
+        "total_score_source": total_source,
+        "dimension_review": review,
         "scoring": scoring["scoring"],
         "risk_list": risk["risk_list"],
         "risk_summary": {
@@ -343,7 +411,7 @@ async def create_feasibility(
         "all_dimensions_have_evidence": not dims_without_evidence,
         "llm_suggestions": llm_suggestions,
         "llm_errors": llm_errors,
-        "llm_used_in_total": False,
+        "llm_used_in_total": bool(review),
         "created_at": datetime.datetime.now(datetime.UTC).isoformat(),
         "compliance_note": "本内容由 AI 辅助生成，需研究者自行核验",
     }
@@ -353,6 +421,30 @@ def _dim_payload(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, Mapping) else {}
 
 
+def _evidence_digest(cards: Sequence[Mapping[str, Any]], limit: int = 6) -> str:
+    """把论文卡片压成模型评审可读的证据摘要。
+
+    只摘卡片里**已有**的字段：卡片没提供的（占位值）一律跳过 ——
+    不让「未提及」这类占位词被当成真实材料喂给模型。
+    """
+    lines: list[str] = []
+    for card in list(cards)[:limit]:
+        parts: list[str] = []
+        for field in (
+            "core_method",
+            "experimental_setup",
+            "technical_route",
+            "limitations",
+            "datasets",
+        ):
+            value = card.get(field)
+            if value and str(value).strip() not in scorer.PLACEHOLDERS:
+                parts.append(f"{field}={str(value)[:160]}")
+        if parts:
+            lines.append(f"- 论文 {card.get('paper_id')}：" + "；".join(parts))
+    return "\n".join(lines)
+
+
 async def get_feasibility(session: AsyncSession, feasibility_id: int) -> dict[str, Any] | None:
     """读回可行性报告（四维分 + 风险 + MVE）。"""
     row = (
@@ -360,12 +452,8 @@ async def get_feasibility(session: AsyncSession, feasibility_id: int) -> dict[st
     ).scalars().first()
     if row is None:
         return None
-    dims = [
-        _dim_payload(row.data_availability),
-        _dim_payload(row.compute_cost),
-        _dim_payload(row.method_maturity),
-        _dim_payload(row.novelty_gap),
-    ]
+    # 按**界面口径的七维顺序**读回（前四维＝规则列，后三维＝评审列）
+    dims = [_dim_payload(getattr(row, key, None)) for key, _ in scorer.REVIEW_DIMENSIONS]
     without = [str(dim.get("key")) for dim in dims if not dim.get("evidence")]
     return {
         "id": int(row.id),

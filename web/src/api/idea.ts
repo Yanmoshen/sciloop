@@ -220,7 +220,11 @@ export interface Aggregation {
   compliance_note?: string
 }
 
-export type IdeaMechanism = 'combination' | 'transfer' | 'refinement'
+/** 四个创新方向（与后端 `services/ideation/idea_generator.py` 的 MECHANISMS 同口径） */
+export type IdeaMechanism = 'refinement' | 'transfer' | 'combination' | 'paradigm'
+
+/** 界面上四个方向的**固定展示顺序**（方法迭代 → 场景迁移 → 技术融合 → 范式拓展） */
+export const IDEA_DIRECTIONS = ['refinement', 'transfer', 'combination', 'paradigm'] as const
 export type IdeaMode = 'auto' | 'llm' | 'template'
 
 export interface Idea {
@@ -264,7 +268,15 @@ export interface IdeaGenerationResult {
 export interface FeasibilityDimension {
   key: string
   label: string
-  score: number
+  /** 界面展示的分：模型评审分或规则分；**未评为 null**（null ≠ 0 分） */
+  score: number | null
+  /** 模型生成的约 50 字分析（界面只读，研究者不能改） */
+  analysis?: string
+  /** 这个分是谁给的：model_review / rule / not_evaluated */
+  score_source?: string
+  /** 规则层的分与依据（审计基线，可复算） */
+  rule_score?: number | null
+  rule_rationale?: string | null
   rationale: string
   evidence: EvidenceDetail[]
   evidence_count: number
@@ -345,8 +357,10 @@ export interface Feasibility {
   project_id?: number | null
   paper_ids?: number[]
   dimensions: FeasibilityDimension[]
-  dimension_scores?: Record<string, number>
+  dimension_scores?: Record<string, number | null>
   total_score: number
+  /** 总分怎么来的：seven_dimension_average（七维平均）/ rule_weighted（规则加权） */
+  total_score_source?: string
   scoring?: {
     weights: Record<string, number>
     contributions: Array<{
@@ -461,7 +475,10 @@ export function deleteAggregation(id: number | string, signal?: AbortSignal) {
 export function generateIdeas(
   body: {
     aggregation_id: number
+    /** 总条数（不传 directions 时）/ 每个方向各几条（传 directions 时） */
     count?: number
+    /** 四个方向固定口径：要产出的方向；只给一个＝对该方向再来一批备选 */
+    directions?: IdeaMechanism[]
     project_id?: number | null
     mode?: IdeaMode
     model_ref?: string | null
@@ -636,11 +653,40 @@ export function lockTaskbook(id: number | string, signal?: AbortSignal) {
 /* --------------------------------------------------------------------- */
 /* 展示辅助（仅格式化，不做任何数据编造）                                  */
 /* --------------------------------------------------------------------- */
+/** 四个创新方向的中文名（研究构想界面按此展示，与后端 description 同口径） */
 export const MECHANISM_LABELS: Record<string, string> = {
-  combination: '组合',
-  transfer: '迁移',
-  refinement: '细化',
+  refinement: '方法迭代型',
+  transfer: '场景迁移型',
+  combination: '技术融合型',
+  paradigm: '范式拓展型',
 }
+
+/** 方向的创新层级（卡片上的一行说明） */
+export const MECHANISM_LAYERS: Record<string, string> = {
+  refinement: '增量创新',
+  transfer: '拓展创新',
+  combination: '交叉创新',
+  paradigm: '范式创新',
+}
+
+/** 方向的难度评分（0–100，越高越难）—— 界面用数值，不用星级 */
+export const MECHANISM_DIFFICULTY: Record<string, number> = {
+  refinement: 40,
+  transfer: 60,
+  combination: 80,
+  paradigm: 100,
+}
+
+/** 七个可行性维度的固定展示顺序（与后端 scorer.REVIEW_DIMENSIONS 一致） */
+export const REVIEW_DIMENSIONS = [
+  'method_maturity',
+  'data_availability',
+  'compute_cost',
+  'novelty_gap',
+  'landing_risk',
+  'application_value',
+  'ethics_compliance',
+] as const
 
 export const RISK_LEVEL_LABELS: Record<string, string> = {
   low: '低',

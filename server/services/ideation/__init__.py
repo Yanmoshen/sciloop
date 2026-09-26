@@ -39,6 +39,8 @@ from services.ideation.evidence_binder import (
 )
 from services.ideation.idea_generator import (
     MAX_IDEAS,
+    MECHANISM_BRIEFS,
+    MECHANISM_LABELS,
     MECHANISMS,
     MODE_AUTO,
     MODE_LLM,
@@ -63,6 +65,8 @@ from services.ideation.idea_service import (
 __all__ = [
     # 生成（T4）
     "MAX_IDEAS",
+    "MECHANISM_BRIEFS",
+    "MECHANISM_LABELS",
     "MECHANISMS",
     "MODE_AUTO",
     "MODE_LLM",

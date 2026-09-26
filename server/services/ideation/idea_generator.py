@@ -50,7 +50,27 @@ from services.ideation.evidence_binder import (
 
 logger = logging.getLogger("sciloop.wp08.idea_generator")
 
-MECHANISMS: tuple[str, ...] = ("combination", "transfer", "refinement")
+#: 四个创新方向（2026-09-26 研究者口径：**固定四个方向**，每个方向产出 idea）
+#: ⚠️ ``combination`` / ``transfer`` / ``refinement`` 是 2026-09-26 之前就有的值，
+#: 存量数据仍在用 → **只能新增、不能改名**；``paradigm`` 是本次新增的第四个方向。
+MECHANISMS: tuple[str, ...] = ("refinement", "transfer", "combination", "paradigm")
+
+#: mechanism → 方向中文名（提示词与界面共用同一份口径，避免两处漂移）
+MECHANISM_LABELS: dict[str, str] = {
+    "refinement": "方法迭代型",
+    "transfer": "场景迁移型",
+    "combination": "技术融合型",
+    "paradigm": "范式拓展型",
+}
+
+#: 每个方向的定位（写进提示词，让模型知道这个方向该产出什么层次的创新）
+MECHANISM_BRIEFS: dict[str, str] = {
+    "refinement": "针对原论文的明确缺陷、瓶颈或局限性做定向改进（增量创新）",
+    "transfer": "把原论文的核心方法迁移到未覆盖的任务、领域或模态（拓展创新）",
+    "combination": "与其他领域的前沿技术交叉融合（交叉创新）",
+    "paradigm": "基于方法内核向上拓展，提出新的研究框架或技术体系（范式创新）",
+}
+
 ORIGIN_AI = "ai_generated"
 ORIGIN_USER = "user_input"
 
@@ -104,12 +124,17 @@ _IDEA_SCHEMA: dict[str, Any] = {
 
 SYSTEM_PROMPT = (
     "你是严谨的科研选题助手。给定若干条**有原文证据支撑**的研究空白（Gap），"
-    "产出可执行的研究 idea。硬性要求：\n"
-    "1) 每条 idea 必须针对明确的 Gap，并说明机制属于 combination（组合）/ "
-    "transfer（迁移）/ refinement（细化）；\n"
-    "2) evidence_ref_ids 只能从材料中给出的编号引用表里选，**禁止编造编号**；\n"
-    "3) 不得虚构数据、指标、数据集或引用；材料里没有的信息写「材料未提供」；\n"
-    "4) 只输出 JSON，符合给定 schema。"
+    "按**四个固定创新方向**产出可执行的研究 idea。硬性要求：\n"
+    "1) mechanism 只能取下列四个之一，且必须与该方向的定位一致：\n"
+    "   refinement＝方法迭代型（针对原论文的缺陷做定向改进，增量创新）；\n"
+    "   transfer＝场景迁移型（把核心方法迁到未覆盖的任务/领域/模态，拓展创新）；\n"
+    "   combination＝技术融合型（与其他领域的前沿技术交叉融合，交叉创新）；\n"
+    "   paradigm＝范式拓展型（向上提出新的研究框架或技术体系，范式创新）；\n"
+    "2) 请求里点名的**每个方向都要有产出**，且不同方向的 idea 不得内容重叠；\n"
+    "3) 每条 idea 必须针对明确的 Gap（用 gap_index 指明）；\n"
+    "4) evidence_ref_ids 只能从材料中给出的编号引用表里选，**禁止编造编号**；\n"
+    "5) 不得虚构数据、指标、数据集或引用；材料里没有的信息写「材料未提供」；\n"
+    "6) 只输出 JSON，符合给定 schema。"
 )
 
 
@@ -123,10 +148,31 @@ class IdeaGenerationError(Exception):
         self.detail = detail
 
 
-def build_prompt(gaps: Sequence[Mapping[str, Any]], count: int) -> tuple[str, dict[str, dict[str, Any]]]:
-    """构造 prompt 与「编号引用表 → 候选证据」映射（纯函数，便于离线核对）。"""
+def build_prompt(
+    gaps: Sequence[Mapping[str, Any]],
+    count: int = 1,
+    directions: Sequence[str] | None = None,
+) -> tuple[str, dict[str, dict[str, Any]]]:
+    """构造 prompt 与「编号引用表 → 候选证据」映射（纯函数，便于离线核对）。
+
+    ``directions`` 给定时按「**每个方向各 ``count`` 条**」产出（四方向固定口径）；
+    不给定则沿用旧口径：总共 ``count`` 条、方向不限。
+    """
     refs: dict[str, dict[str, Any]] = {}
-    lines: list[str] = [f"请产出 {count} 条研究 idea，覆盖下列空白（可跨条组合）。", "", "## 研究空白（Gap）"]
+    targets = [key for key in (directions or ()) if key in MECHANISMS]
+    if targets:
+        head: list[str] = [
+            f"请针对下列 {len(targets)} 个创新方向，**每个方向各产出 {count} 条** idea：",
+            "",
+        ]
+        head += [
+            f"- {MECHANISM_LABELS[key]}（mechanism={key}）：{MECHANISM_BRIEFS[key]}"
+            for key in targets
+        ]
+        head += ["", "不同方向的 idea 不得在内容上重叠。", "", "## 研究空白（Gap）"]
+    else:
+        head = [f"请产出 {count} 条研究 idea，覆盖下列空白（可跨条组合）。", "", "## 研究空白（Gap）"]
+    lines: list[str] = list(head)
     ref_seq = 0
     for index, gap in enumerate(gaps):
         lines.append(f"[Gap {index}] （提出者论文 {gap.get('raised_by_paper_ids')}）{gap.get('gap_text')}")
@@ -175,20 +221,24 @@ def build_prompt(gaps: Sequence[Mapping[str, Any]], count: int) -> tuple[str, di
 
 
 def _template_ideas(
-    gaps: Sequence[Mapping[str, Any]], count: int
+    gaps: Sequence[Mapping[str, Any]],
+    count: int = 1,
+    directions: Sequence[str] | None = None,
 ) -> list[dict[str, Any]]:
     """规则合成：不调用 LLM，用 Gap 原文实词 + 机制模板拼装（如实标注模式）。
 
-    ``(gap, mechanism)`` 组合唯一：Gap 数少于 ``count`` 时会在同一 Gap 上用不同机制
-    再生成一条（组合不同即视为不同 idea），重复组合直接跳过。
+    ``(gap, mechanism)`` 组合唯一：同一方向在 Gap 之间轮转取素材，组合用尽即停。
+    ``directions`` 给定时只出这些方向、每个方向 ``count`` 条；不给定时沿用旧口径（共 ``count`` 条）。
     """
+    targets = [key for key in (directions or ()) if key in MECHANISMS] or list(MECHANISMS)
+    want = len(targets) * int(count) if directions else int(count)
     ideas: list[dict[str, Any]] = []
     used: set[tuple[int, str]] = set()
-    for index in range(max(1, len(gaps)) * len(MECHANISMS)):
-        if len(ideas) >= count:
+    for slot in range(max(1, len(gaps)) * len(targets)):
+        if len(ideas) >= want:
             break
-        gap_index = index % len(gaps)
-        mechanism = MECHANISMS[index % len(MECHANISMS)]
+        mechanism = targets[slot % len(targets)]
+        gap_index = (slot // len(targets)) % max(1, len(gaps))
         if (gap_index, mechanism) in used:
             continue
         used.add((gap_index, mechanism))
@@ -199,11 +249,13 @@ def _template_ideas(
             plan = "把该空白与相邻问题的已有做法组合：取其可用组件，补齐空白所缺的一环，先做最小对照实验。"
         elif mechanism == "transfer":
             plan = "把其他任务上已成熟的机制迁移过来，替换掉当前受限于该空白的默认做法，并设计迁移前后对照。"
+        elif mechanism == "paradigm":
+            plan = "不满足于替换组件：把该空白当成更大的框架缺口，先写清分层接口与评价口径，再做最小可验证原型。"
         else:
             plan = "不更换整体框架，只针对该空白做细粒度改进，控制变量以隔离改进来源。"
         ideas.append(
             {
-                "title": f"[模板] 针对论文 {papers} 提出空白的{mechanism}式方案",
+                "title": f"[模板] 针对论文 {papers} 提出空白的{MECHANISM_LABELS[mechanism]}方案",
                 "content": f"问题（来自原文证据）：{gap_text}\n做法：{plan}\n"
                 f"验证：以提出者论文的实验设置为基线，先跑最小可行实验，再逐步放大。",
                 "mechanism": mechanism,
@@ -222,6 +274,7 @@ async def _llm_ideas(
     gaps: Sequence[Mapping[str, Any]],
     count: int,
     *,
+    directions: Sequence[str] | None = None,
     model_ref: str | None,
     project_id: int | None,
     temperature: float,
@@ -230,7 +283,7 @@ async def _llm_ideas(
     """调用 WP02 ``chat`` 生成 idea；返回 ``(ideas, llm_meta)``。"""
     from llm.adapter import chat  # 局部导入：避免无 LLM 场景下引入导入期依赖
 
-    prompt, refs = build_prompt(gaps, count)
+    prompt, refs = build_prompt(gaps, count, directions)
     if not refs:
         raise IdeaGenerationError(
             "no_evidence_available",
@@ -310,6 +363,7 @@ async def generate_ideas(
     *,
     aggregation_id: int,
     count: int = 5,
+    directions: Sequence[str] | None = None,
     project_id: int | None = None,
     mode: str = MODE_AUTO,
     model_ref: str | None = None,
@@ -317,14 +371,34 @@ async def generate_ideas(
     # 不设输出上限（原先 2000；推理类模型的推理与正文共用同一份预算，限死会让正文被截断）
     max_tokens: int | None = None,
 ) -> dict[str, Any]:
-    """生成 idea → 绑定证据 → **丢弃无证据条目** → 落库。"""
+    """生成 idea → 绑定证据 → **丢弃无证据条目** → 落库。
+
+    2026-09-26 起支持**四方向固定口径**：``directions`` 给出要产出的方向（不传＝沿用
+    「共 count 条、方向不限」的旧口径）；给出时 ``count`` 的含义变为此前**每个方向各几条**
+    ——「对某个方向不满意、再来一批备选」就是只传那一个方向。
+    """
     if mode not in (MODE_LLM, MODE_TEMPLATE, MODE_AUTO):
         raise IdeaGenerationError(
             "invalid_mode", f"mode='{mode}' 不在 {MODE_LLM}/{MODE_TEMPLATE}/{MODE_AUTO} 内"
         )
-    if not 1 <= int(count) <= MAX_IDEAS:
+    targets = tuple(dict.fromkeys(str(item) for item in directions)) if directions else None
+    if targets:
+        unknown = [key for key in targets if key not in MECHANISMS]
+        if unknown:
+            raise IdeaGenerationError(
+                "invalid_direction",
+                f"未知的创新方向：{', '.join(unknown)}",
+                {"allowed": list(MECHANISMS), "labels": MECHANISM_LABELS},
+            )
+        total = len(targets) * int(count)
+    else:
+        total = int(count)
+    if not 1 <= int(count) <= MAX_IDEAS or not 1 <= total <= MAX_IDEAS:
         raise IdeaGenerationError(
-            "invalid_count", f"count 必须在 1–{MAX_IDEAS} 之间", {"count": count}
+            "invalid_count",
+            f"count 必须在 1–{MAX_IDEAS} 之间"
+            f"（四方向模式下 count 是「每个方向几条」，总数不得超过 {MAX_IDEAS}）",
+            {"count": count, "total": total},
         )
 
     gaps = await load_gaps(session, int(aggregation_id))
@@ -346,13 +420,14 @@ async def generate_ideas(
             raw_ideas, llm_meta = await _llm_ideas(
                 gaps,
                 int(count),
+                directions=targets,
                 model_ref=model_ref,
                 project_id=project_id,
                 temperature=temperature,
                 max_tokens=max_tokens,
             )
             generation_mode = MODE_LLM
-            _, refs = build_prompt(gaps, int(count))
+            _, refs = build_prompt(gaps, int(count), targets)
         except Exception as exc:  # noqa: BLE001 - 需要区分「未配 LLM」与「真失败」
             detail = getattr(exc, "detail", None)
             llm_error = {
@@ -370,12 +445,12 @@ async def generate_ideas(
                 ) from exc
 
     if generation_mode == MODE_TEMPLATE:
-        raw_ideas = _template_ideas(gaps, int(count))
+        raw_ideas = _template_ideas(gaps, int(count), targets)
 
     created_ids: list[int] = []
     ref_audit: list[dict[str, Any]] = []
     for created, raw in enumerate(raw_ideas):
-        if created >= int(count):
+        if created >= total:
             break
         candidate_idea = dict(raw)
         candidates, invalid_refs = candidates_for_idea(candidate_idea, gaps, refs)
@@ -442,7 +517,9 @@ async def generate_ideas(
     return {
         "aggregation_id": int(aggregation_id),
         "project_id": project_id,
-        "requested_count": int(count),
+        "requested_count": total,
+        #: 本次要求产出的方向（null＝旧口径「方向不限」）
+        "requested_directions": list(targets) if targets else None,
         "generated_count": len(items),
         "created_count": len(created_ids),
         "discarded_count": len(dropped_ids),
@@ -483,6 +560,8 @@ __all__ = [
     "LLM_STAGE",
     "MAX_IDEAS",
     "MAX_REFS",
+    "MECHANISM_BRIEFS",
+    "MECHANISM_LABELS",
     "MECHANISMS",
     "MODE_AUTO",
     "MODE_LLM",

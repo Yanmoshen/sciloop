@@ -96,6 +96,14 @@ class GenerateRequest(BaseModel):
 
     aggregation_id: int = Field(..., description="聚合 id（其空白清单是 idea 的素材与证据来源）")
     count: int = Field(default=5, ge=1, le=MAX_IDEAS, description=f"期望条数 1–{MAX_IDEAS}")
+    directions: list[str] | None = Field(
+        default=None,
+        description=(
+            "**四个创新方向固定口径**：给出时要产出的方向（可只给其中一个＝对该方向再来一批备选），"
+            f"此时 ``count`` 含义变为「每个方向各几条」；不传＝沿用旧口径（共 count 条、方向不限）。"
+            f"可选值：{' / '.join(MECHANISMS)}"
+        ),
+    )
     project_id: int | None = Field(default=None, description="可选：关联项目（用于成本护栏口径）")
     mode: str = Field(default=MODE_AUTO, description=MODE_HELP)
     model_ref: str | None = Field(
@@ -149,6 +157,7 @@ async def post_generate(body: GenerateRequest, session: DbSession) -> dict[str, 
             session,
             aggregation_id=body.aggregation_id,
             count=body.count,
+            directions=body.directions,
             project_id=body.project_id,
             mode=body.mode,
             model_ref=body.model_ref,

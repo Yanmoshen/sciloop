@@ -41,13 +41,15 @@ from services.ideation.evidence_binder import (
     enforce_manual_idea,
 )
 
+#: 四个创新方向 —— **单一来源**在 idea_generator（提示词/生成/校验共用同一份），
+#: 这里只再导出，防止两处漂移（idea_generator 不在模块顶层反向导入本模块，故无循环）。
+from services.ideation.idea_generator import MECHANISM_LABELS, MECHANISMS
+
 logger = logging.getLogger("sciloop.wp08.idea_service")
 
 ORIGIN_AI = "ai_generated"
 ORIGIN_USER = "user_input"
 ORIGINS = (ORIGIN_AI, ORIGIN_USER)
-
-MECHANISMS = ("combination", "transfer", "refinement")
 
 
 class IdeaError(Exception):
@@ -299,6 +301,7 @@ async def idea_evidences(session: AsyncSession, idea_id: int) -> dict[str, Any]:
 
 
 __all__ = [
+    "MECHANISM_LABELS",
     "MECHANISMS",
     "ORIGINS",
     "ORIGIN_AI",

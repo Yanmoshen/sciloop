@@ -54,6 +54,31 @@ DIMENSIONS: tuple[tuple[str, str], ...] = (
     ("novelty_gap", "与已有工作差异度"),
 )
 
+#: **界面口径的七个维度**（2026-09-26 研究者定稿，技能「论文创新Idea生成与专业可行性分析」）。
+#:
+#: - 前四维与 :data:`DIMENSIONS` 同键，分数**由规则层给**（可复算、可审计）；
+#: - 后三维规则层没有信号 → **由模型评审给分**（见 :data:`LLM_ONLY_DIMENSIONS`）；
+#: - 七个维度的**分析文字**统一由模型生成（``services.feasibility.dimension_review``），
+#:   界面只读、不允许研究者修改。
+#:
+#: ⚠️ 分数含义统一为「**越高越好**」：``landing_risk`` 的高分＝**风险可控**（不是风险高）。
+REVIEW_DIMENSIONS: tuple[tuple[str, str], ...] = (
+    ("method_maturity", "技术成熟度"),
+    ("data_availability", "数据可行性"),
+    ("compute_cost", "算力与工程成本"),
+    ("novelty_gap", "创新增量"),
+    ("landing_risk", "落地风险"),
+    ("application_value", "应用价值"),
+    ("ethics_compliance", "伦理与合规"),
+)
+
+#: 规则层算不出分、只能由模型评审的维度
+LLM_ONLY_DIMENSIONS: tuple[str, ...] = (
+    "landing_risk",
+    "application_value",
+    "ethics_compliance",
+)
+
 #: total_score 权重（写入 scoring.weights，可手算复核）
 WEIGHTS: dict[str, float] = {
     "data_availability": 0.30,
@@ -649,8 +674,10 @@ __all__ = [
     "DEFAULT_MAX_LLM_COST_USD",
     "DIMENSIONS",
     "DIMENSION_CARD_FIELD",
+    "LLM_ONLY_DIMENSIONS",
     "MIN_DATASET_SPAN_WORDS",
     "PLACEHOLDERS",
+    "REVIEW_DIMENSIONS",
     "WEIGHTS",
     "build_scoring_payload",
     "build_signal_bundle",

@@ -17,6 +17,7 @@ from sqlalchemy import (
     String,
     Text,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -39,6 +40,17 @@ class Feasibility(Base):
     compute_cost: Mapped[Any] = mapped_column(JSONB, nullable=False)
     method_maturity: Mapped[Any] = mapped_column(JSONB, nullable=False)
     novelty_gap: Mapped[Any] = mapped_column(JSONB, nullable=False)
+    #: 2026-09-26 新增：规则层**没有信号**的三个维度，由模型评审给分
+    #: （``services.feasibility.dimension_review``；分数口径同前四维：越高越好）
+    landing_risk: Mapped[Any] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    application_value: Mapped[Any] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    ethics_compliance: Mapped[Any] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
     total_score: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)
     risk_list: Mapped[Any] = mapped_column(JSONB, nullable=False)
     mve_plan: Mapped[Any] = mapped_column(JSONB, nullable=False)

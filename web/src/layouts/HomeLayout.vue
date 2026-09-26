@@ -82,12 +82,14 @@ const HOME_NAV: HomeNavItem[] = [
       { key: 'export', label: '多格式导出', path: '/papers/export' },
     ],
   },
+  // 2026-09-26 研究者口径：「研究构想」从底部二级入口移到主序列，
+  // 位置在「文献调研」与「知识库」之间。
+  { key: 'ideas', label: '研究构想', path: '/ideas' },
   { key: 'knowledge', label: '知识库', path: '/knowledge' },
 ]
 
 /** 左栏二级入口（不在分组里的功能页）；设置由右上角头像的悬浮菜单进入 */
 const MODULE_NAV = [
-  { key: 'ideas', label: '研究构想', path: '/ideas' },
   { key: 'workbench', label: '流水线工作台', path: '/workbench/demo' },
 ]
 
