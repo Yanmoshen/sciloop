@@ -441,7 +441,41 @@ async def resolve_paper_source(session: Any, paper_id: int) -> tuple[dict[str, A
         if not payload:
             continue
         return {"filename": path.name, "bytes": payload, "via": str(path)}, ""
-    return None, "no_source_document"
+
+    # 本地候选（上传残留 / upload:// 记录）都没命中 → **委派给阅读模块**。
+    #
+    # 为什么必须委派而不是自己再写一份（2026-09-26 用户实测反馈）：
+    # 论文库里**抓取入库**的论文（arXiv / S2 / OpenAlex）本地从来没有落文件，
+    # 阅读模块为此做了"按 papers.pdf_url 现拉一份并缓存"的兜底，翻译模块却没有 ——
+    # 于是同一篇论文，阅读页能正常渲染，点「翻译该论文」却回 409「没有可用的本地原文」。
+    # 用户看到的就是"这个不是原文是啥？"。
+    #
+    # 委派之后，「找到原文」只有**一份**实现：缓存命中也好、现拉也好、以后加新来源也好，
+    # 两边自动一致（也顺手满足了"没有本地 PDF 就联网取"的口径）。
+    from services.reader import documents as reader_documents
+
+    try:
+        resolved = await reader_documents.resolve_paper_source(session, paper_id)
+    except Exception as exc:  # noqa: BLE001 - 按异常类型映射成翻译模块的 code
+        name = type(exc).__name__
+        if name == "PaperNotFoundError":
+            return None, "paper_not_found"
+        if name == "SourceTooLargeError":
+            return None, "source_too_large"
+        logger.warning("阅读模块也没能拿到原文 paper=%s：%s", paper_id, exc)
+        return None, "no_source_document"
+
+    payload = resolved.get("bytes") or b""
+    if not payload:
+        return None, "no_source_document"
+    if len(payload) > artifacts.MAX_FILE_BYTES:
+        return None, "source_too_large"
+    return {
+        "filename": str(resolved.get("filename") or f"paper-{paper_id}.pdf"),
+        "bytes": payload,
+        # 记清来源，便于排查"这份原文到底哪来的"
+        "via": f"reader.{resolved.get('via') or 'source'}",
+    }, ""
 
 
 # --------------------------------------------------------------------------- #
