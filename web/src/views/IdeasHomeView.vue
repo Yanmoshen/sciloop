@@ -35,6 +35,8 @@ const titleById = ref<Record<number, string>>({})
 const ideaCounts = ref<Record<number, number>>({})
 const directionCounts = ref<Record<number, number>>({})
 const loading = ref(false)
+/** 统计每个任务的 idea 数要跑好几条请求，这段时间不能让行里显示"还没有生成"（那是假话） */
+const statsLoading = ref(false)
 const busy = ref(false)
 const notice = ref('')
 
@@ -83,6 +85,8 @@ function createdAtText(item: Aggregation): string {
 }
 
 function directionSummary(id: number): string {
+  // 统计还没回来时如实说"正在统计" —— 不能显示"还没有生成 idea"（那是假话，会让人以为白干了）
+  if (statsLoading.value || ideaCounts.value[id] === undefined) return '正在统计…'
   const total = ideaCounts.value[id] ?? 0
   if (!total) return '还没有生成 idea'
   const directions = directionCounts.value[id] ?? 0
@@ -105,6 +109,7 @@ async function loadList(): Promise<void> {
       papers.value = papersPage.items ?? []
     }
     // 只给最近 STAT_LIMIT 个任务统计 idea（免得为整段历史逐个查库）
+    statsLoading.value = true
     await Promise.all(
       aggregations.value.slice(0, STAT_LIMIT).map(async (item) => {
         try {
@@ -123,6 +128,7 @@ async function loadList(): Promise<void> {
   } catch (error) {
     notice.value = error instanceof Error ? error.message : String(error)
   } finally {
+    statsLoading.value = false
     loading.value = false
   }
 }
@@ -185,7 +191,7 @@ onMounted(loadList)
         <span class="muted">{{ aggregations.length }} 个</span>
       </header>
 
-      <p v-if="loading" class="empty">正在加载…</p>
+      <p v-if="loading" class="empty">正在加载任务列表…</p>
       <p v-else-if="aggregations.length === 0" class="empty">
         还没有研究任务。点右上角「新建研究任务」，选一篇或多篇论文开始。
       </p>
