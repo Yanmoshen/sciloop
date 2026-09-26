@@ -9,17 +9,17 @@
  *
  * 新建研究项目弹窗（**总览壳层样式**：居中 + 背景模糊，用 `.sl-home` 的 --h-* 令牌）。
  *
- * 字段：项目名（必填）/ 备注 / 研究方向（多选，可自定义并保存、可删除）。
- * 研究方向交互：默认平铺前 9 个，**第 10 个起收进下拉框**；行尾「＋」进入编辑模式，
- * 在编辑模式里新增或删除方向，编辑结果持久化在浏览器本地。
+ * 字段：项目名（必填）/ 工作目录（**按钮选择**）/ 备注。
+ * 左栏「项目」的 ＋ 与首页「新建研究项目」卡片**共用这一个弹窗**（2026-09-26 统一）。
  *
- * 口径说明：自定义研究方向目前**存在浏览器 localStorage**（跨设备/清缓存会丢）；
- * 后端暂无「方向字典」接口，若需要入库需另加接口与迁移。
+ * 工作目录为什么走执行环境：网页拿不到本地路径、也调不起系统弹框（浏览器安全边界）；
+ * 点按钮 → 后端 → 执行环境弹出**系统自带**的文件夹选择框 → 真实绝对路径回填。
+ *
  */
 import { computed, ref, watch } from 'vue'
 import { writeDenied } from '@/utils/messages'
 
-import { createProject, isOwnerRequired, RESEARCH_FIELDS, type CreatedProject } from '@/api/projects'
+import { createProject, isOwnerRequired, pickFolder, type CreatedProject } from '@/api/projects'
 
 const props = defineProps<{ modelValue: boolean; prefill?: string }>()
 const emit = defineEmits<{
@@ -27,64 +27,22 @@ const emit = defineEmits<{
   (e: 'created', project: CreatedProject): void
 }>()
 
-/** 内置研究方向（单一来源：api/projects.ts 的 RESEARCH_FIELDS） */
-const BUILTIN_FIELDS: FieldOption[] = RESEARCH_FIELDS
-
-interface FieldOption {
-  value: string
-  label: string
-}
-
-/** 内置研究方向由 api/projects.ts 提供（前 9 个平铺、其余进下拉） */
-const VISIBLE_FIELDS = 9
-const CUSTOM_FIELD_KEY = 'sciloop.custom_research_fields'
-
 const name = ref('')
 const note = ref('')
-const workspaceDir = ref('')
-const selected = ref<string[]>(['cs.CL'])
 const notice = ref('')
 const busy = ref(false)
 
-const editing = ref(false)
-const newFieldName = ref('')
+type PickResult = { ok: boolean; available: boolean; canceled: boolean; path: string; message: string }
 
-const customFields = ref<FieldOption[]>(readCustomFields())
+/** 研究者用系统选择框选的绝对路径（选完就定，不提供重选） */
+const workspaceDir = ref('')
 
-function readCustomFields(): FieldOption[] {
-  try {
-    const raw = localStorage.getItem(CUSTOM_FIELD_KEY)
-    if (!raw) return []
-    const parsed = JSON.parse(raw) as FieldOption[]
-    return Array.isArray(parsed)
-      ? parsed.filter((item) => item && typeof item.value === 'string' && item.value.trim())
-      : []
-  } catch {
-    return []
-  }
-}
+/** 选文件夹：这个执行环境弹不弹得出系统框 / 正在等选 / 弹不出时给人看的说明 */
+const pickAvailable = ref(true)
+const pickBusy = ref(false)
+const pickMessage = ref('')
 
-function persistCustomFields(): void {
-  try {
-    localStorage.setItem(CUSTOM_FIELD_KEY, JSON.stringify(customFields.value))
-  } catch {
-    /* 存储不可用时忽略：仅影响自定义方向的持久化 */
-  }
-}
-
-const allFields = computed<FieldOption[]>(() => [...BUILTIN_FIELDS, ...customFields.value])
-/** 平铺展示的前 9 个 */
-const headFields = computed(() => allFields.value.slice(0, VISIBLE_FIELDS))
-/** 第 10 个起：下拉框选择 */
-const tailFields = computed(() => allFields.value.slice(VISIBLE_FIELDS))
-/** 已选但不在平铺区的方向（下拉或自定义来的），要单独显示出来 */
-const extraSelected = computed(() =>
-  selected.value
-    .filter((value) => !headFields.value.some((item) => item.value === value))
-    .map((value) => allFields.value.find((item) => item.value === value) ?? { value, label: value }),
-)
-
-const canSubmit = computed(() => name.value.trim().length > 0 && selected.value.length > 0)
+const canSubmit = computed(() => name.value.trim().length > 0)
 
 watch(
   () => props.modelValue,
@@ -93,8 +51,9 @@ watch(
     notice.value = ''
     busy.value = false
     workspaceDir.value = ''
-    editing.value = false
-    newFieldName.value = ''
+    pickBusy.value = false
+    pickMessage.value = ''
+    pickAvailable.value = true
     const seed = (props.prefill ?? '').trim()
     if (seed) {
       note.value = seed
@@ -107,41 +66,32 @@ function close(): void {
   emit('update:modelValue', false)
 }
 
-function toggleField(value: string): void {
-  selected.value = selected.value.includes(value)
-    ? selected.value.filter((item) => item !== value)
-    : [...selected.value, value]
-}
-
-function pickFromSelect(event: Event): void {
-  const el = event.target as HTMLSelectElement
-  const value = el.value
-  el.value = ''
-  if (!value) return
-  if (!selected.value.includes(value)) selected.value = [...selected.value, value]
-}
-
-function saveNewField(): void {
-  const raw = newFieldName.value.trim()
-  if (!raw) {
-    notice.value = '研究方向名称不能为空'
-    return
-  }
-  if (allFields.value.some((item) => item.value === raw || item.label === raw)) {
-    notice.value = '该研究方向已存在'
-    return
-  }
-  customFields.value = [...customFields.value, { value: raw, label: raw }]
-  persistCustomFields()
-  selected.value = [...selected.value, raw]
-  newFieldName.value = ''
+/**
+ * 点「选择文件夹…」：请**执行环境**在研究者屏幕上弹出系统自带的文件夹选择框。
+ *
+ * 为什么不自己做界面：网页拿不到本地路径、也调不起系统弹框（浏览器安全边界）；
+ * 而"资源管理器那种选择"正是研究者要的（2026-09-26）。容器执行环境没有屏幕 → 由它如实回"弹不出来"。
+ */
+async function chooseFolder(): Promise<void> {
+  if (pickBusy.value || !pickAvailable.value) return
+  pickBusy.value = true
   notice.value = ''
-}
-
-function removeField(value: string): void {
-  customFields.value = customFields.value.filter((item) => item.value !== value)
-  persistCustomFields()
-  selected.value = selected.value.filter((item) => item !== value)
+  pickMessage.value = ''
+  try {
+    const result = (await pickFolder()) as PickResult
+    if (!result.ok && !result.available) {
+      pickAvailable.value = false
+      pickMessage.value = result.message || '当前执行环境弹不出系统选择框'
+      return
+    }
+    if (result.ok && result.path) workspaceDir.value = result.path
+    else if (result.ok) notice.value = '没有选择文件夹（保持默认）'
+    else notice.value = result.message || '没能打开系统选择框'
+  } catch (error) {
+    notice.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    pickBusy.value = false
+  }
 }
 
 async function submit(): Promise<void> {
@@ -152,7 +102,6 @@ async function submit(): Promise<void> {
     const project = await createProject({
       name: name.value,
       note: note.value,
-      fields: selected.value,
       workspace_dir: workspaceDir.value,
     })
     emit('created', project)
@@ -182,94 +131,31 @@ async function submit(): Promise<void> {
         <input v-model="name" type="text" placeholder="例如：长上下文问答评测方案" />
       </label>
 
-      <label class="field">
+      <div class="field">
         <span class="field__label">工作目录</span>
-        <input
-          v-model="workspaceDir"
-          type="text"
-          placeholder="留空即可：会在项目的 research-workspaces 下自动建一个"
-        />
-      </label>
+        <div class="pickrow">
+          <button
+            class="btn"
+            type="button"
+            :disabled="pickBusy || !pickAvailable"
+            :title="pickAvailable ? '' : pickMessage"
+            @click="chooseFolder"
+          >
+            {{ pickBusy ? '等待你在系统窗口里选择…' : '选择文件夹…' }}
+          </button>
+          <span v-if="workspaceDir" class="pickrow__path">{{ workspaceDir }}</span>
+        </div>
+        <p v-if="workspaceDir" class="field__hint">已选择：项目就在这个目录里干活</p>
+        <p v-else-if="pickMessage && !pickAvailable" class="field__hint">{{ pickMessage }}</p>
+        <p v-else class="field__hint">
+          未选择：将在 SciLoop 目录下的 research-workspaces/&lt;项目名&gt; 建一个
+        </p>
+      </div>
 
       <label class="field">
         <span class="field__label">备注</span>
         <textarea v-model="note" rows="3" placeholder="例如：本周先验证 tokenizer 公平性，样本 20–50 条" />
       </label>
-
-      <div class="field">
-        <div class="field__row">
-          <span class="field__label">研究方向（可多选）</span>
-          <button class="link-btn" type="button" @click="editing = !editing">
-            {{ editing ? '完成编辑' : '编辑方向' }}
-          </button>
-        </div>
-
-        <!-- 前 9 个平铺 + 已选中的额外方向 -->
-        <div class="chips">
-          <button
-            v-for="item in headFields"
-            :key="item.value"
-            type="button"
-            class="chip"
-            :class="{ 'chip--on': selected.includes(item.value) }"
-            @click="toggleField(item.value)"
-          >
-            {{ item.label }}
-          </button>
-          <button
-            v-for="item in extraSelected"
-            :key="`extra-${item.value}`"
-            type="button"
-            class="chip chip--on"
-            :title="`移除 ${item.label}`"
-            @click="toggleField(item.value)"
-          >
-            {{ item.label }} ×
-          </button>
-        </div>
-
-        <!-- 第 10 个起：下拉框选择；行尾「＋」进入编辑模式 -->
-        <div class="picker">
-          <select class="select" :disabled="tailFields.length === 0" @change="pickFromSelect">
-            <option value="">更多方向</option>
-            <option v-for="item in tailFields" :key="item.value" :value="item.value">
-              {{ item.label }}
-            </option>
-          </select>
-          <button
-            class="icon-btn"
-            type="button"
-            :class="{ 'icon-btn--on': editing }"
-            title="编辑研究方向"
-            aria-label="编辑研究方向"
-            @click="editing = !editing"
-          >
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-            </svg>
-          </button>
-        </div>
-
-        <!-- 编辑模式：新增 / 删除自定义方向 -->
-        <div v-if="editing" class="editor">
-          <div v-if="customFields.length > 0" class="editor__list">
-            <span v-for="item in customFields" :key="item.value" class="editor__item">
-              {{ item.label }}
-              <button type="button" :aria-label="`删除 ${item.label}`" @click="removeField(item.value)">×</button>
-            </span>
-          </div>
-          <div class="editor__row">
-            <input
-              v-model="newFieldName"
-              type="text"
-              maxlength="40"
-              placeholder="输入新的研究方向名称"
-              @keyup.enter="saveNewField"
-            />
-            <button class="btn" type="button" @click="saveNewField">保存方向</button>
-          </div>
-        </div>
-      </div>
 
       <p v-if="notice" class="notice">{{ notice }}</p>
 
@@ -284,6 +170,28 @@ async function submit(): Promise<void> {
 </template>
 
 <style scoped>
+/* 选文件夹：按钮 + 已选路径 + 未选提示（2026-09-26） */
+.pickrow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.pickrow__path {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  color: var(--h-fg-muted);
+  overflow-wrap: anywhere;
+}
+
+.field__hint {
+  margin: 8px 0 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--h-fg-muted);
+}
+
 .overlay {
   position: fixed;
   inset: 0;
@@ -350,13 +258,6 @@ async function submit(): Promise<void> {
   gap: 8px;
 }
 
-.field__row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
 .field__label {
   font-size: var(--font-size-sm);
   color: var(--h-fg-subtle);
@@ -364,170 +265,13 @@ async function submit(): Promise<void> {
 
 .field input,
 .field textarea,
-.select {
-  width: 100%;
-  padding: 10px 12px;
-  background: var(--h-surface-input);
-  border: 1px solid var(--h-line);
-  border-radius: 12px;
-  color: var(--h-fg);
-  font: inherit;
-  font-size: var(--font-size-md);
-  outline: none;
-}
-
 .field textarea {
   resize: none;
 }
 
 .field input:focus,
 .field textarea:focus,
-.select:focus {
-  border-color: var(--h-primary);
-}
-
-.chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.chip {
-  padding: 6px 12px;
-  border: 1px solid var(--h-line);
-  border-radius: 40px;
-  background: transparent;
-  color: var(--h-fg-muted);
-  font: inherit;
-  font-size: var(--font-size-sm);
-  cursor: pointer;
-  transition:
-    background-color 180ms cubic-bezier(0.4, 0, 0.2, 1),
-    border-color 180ms cubic-bezier(0.4, 0, 0.2, 1),
-    color 180ms cubic-bezier(0.4, 0, 0.2, 1);
-}
-
-.chip--on {
-  background: var(--h-active);
-  border-color: var(--h-primary);
-  color: var(--h-fg);
-}
-
-.picker {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.link-btn {
-  border: 0;
-  background: transparent;
-  color: var(--h-primary);
-  font: inherit;
-  font-size: var(--font-size-sm);
-  cursor: pointer;
-  transition:
-    color 180ms cubic-bezier(0.4, 0, 0.2, 1),
-    filter 180ms cubic-bezier(0.4, 0, 0.2, 1);
-}
-.link-btn:hover {
-  filter: brightness(1.2);
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
-.link-btn:active {
-  filter: brightness(0.95);
-}
 /* 方向 chip：悬停给描边 + 淡底，不用位移（避免整排跳动） */
-.chip:hover {
-  border-color: var(--h-primary);
-  color: var(--h-fg);
-  background: var(--h-hover);
-}
-
-.icon-btn {
-  width: 32px;
-  height: 32px;
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid var(--h-line);
-  border-radius: 10px;
-  background: transparent;
-  color: var(--h-fg-muted);
-  cursor: pointer;
-}
-
-.icon-btn:hover,
-.icon-btn--on {
-  border-color: var(--h-primary);
-  color: var(--h-primary);
-}
-
-.editor {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 12px;
-  border: 1px solid var(--h-line);
-  border-radius: 12px;
-  background: var(--h-surface-input);
-}
-
-.editor__list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-
-.editor__item {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 10px;
-  border: 1px solid var(--h-line);
-  border-radius: 40px;
-  font-size: var(--font-size-sm);
-  color: var(--h-fg-muted);
-}
-
-.editor__item button {
-  border: 0;
-  background: transparent;
-  color: var(--h-fg-subtle);
-  font: inherit;
-  font-size: var(--font-size-md);
-  line-height: 1;
-  cursor: pointer;
-}
-
-.editor__item button:hover {
-  color: var(--h-primary);
-}
-
-.editor__row {
-  display: flex;
-  gap: 8px;
-}
-
-.editor__row input {
-  flex: 1;
-  min-width: 0;
-  padding: 8px 12px;
-  background: var(--h-surface-raised);
-  border: 1px solid var(--h-line);
-  border-radius: 10px;
-  color: var(--h-fg);
-  font: inherit;
-  font-size: var(--font-size-md);
-  outline: none;
-}
-
-.editor__row input:focus {
-  border-color: var(--h-primary);
-}
-
 .notice {
   margin: 0;
   padding: 10px 12px;

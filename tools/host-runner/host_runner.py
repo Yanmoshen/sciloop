@@ -195,6 +195,52 @@ def run_command(
     }
 
 
+def pick_folder(*, title: str = "选择文件夹", initial: str = "", timeout_s: int = 600) -> dict[str, Any]:
+    """弹出**系统自带**的文件夹选择框，返回研究者选中的绝对路径。
+
+    - Windows：`System.Windows.Forms.FolderBrowserDialog`（就是资源管理器那种选择框）；
+    - macOS：`osascript` 的 `choose folder`；
+    - Linux：`zenity`（没装就如实说"这台机器弹不出来"）。
+
+    ⚠️ 弹框会**一直等人**（人去点），所以超时给得很长；取消就返回 `canceled=True`。
+    ⚠️ 这个函数会阻塞所在线程 —— 服务是 `ThreadingHTTPServer`，不会把整个服务卡住。
+    """
+
+    if sys.platform.startswith("win"):
+        script = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
+            f"$d.Description = {json.dumps(title, ensure_ascii=False)}; "
+            "$d.ShowNewFolderButton = $true; "
+            + (f"$d.SelectedPath = {json.dumps(initial, ensure_ascii=False)}; " if initial else "")
+            + "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
+            "{ Write-Output $d.SelectedPath }"
+        )
+        argv = ["powershell", "-NoProfile", "-STA", "-Command", script]
+    elif sys.platform == "darwin":
+        script = f'POSIX path of (choose folder with prompt "{title}")'
+        argv = ["osascript", "-e", script]
+    else:
+        argv = ["zenity", "--file-selection", "--directory", "--title", title]
+
+    try:
+        proc = subprocess.run(argv, capture_output=True, timeout=timeout_s, check=False)
+    except FileNotFoundError:
+        return {
+            "ok": False,
+            "error": "这台机器上没有可用的系统选择框（Windows 之外需要 osascript / zenity）。",
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"等了 {timeout_s} 秒还没选 —— 以为你不选了，已放弃。"}
+
+    picked = (proc.stdout or b"").decode("utf-8", "replace").strip()
+    if not picked:
+        # 取消：不是错误，如实说"你取消了"
+        return {"ok": True, "path": "", "canceled": True}
+    return {"ok": True, "path": picked, "canceled": False}
+
+
+
 def fs_action(*, action: str, path: str, to: str | None, content: str | None,
               encoding: str | None, recursive: bool) -> dict[str, Any]:
     """文件操作。删除**只在这里具备能力**，是否允许由后端按用户定的三层边界裁决。"""
@@ -391,7 +437,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.rstrip("/")
-        if path not in ("/exec", "/fs"):
+        if path not in ("/exec", "/fs", "/pick-folder"):
             self._send(404, {"ok": False, "error": "没有这个接口"})
             return
         if not self._authorized():
@@ -399,7 +445,13 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         body = self._body()
-        if path == "/exec":
+        if path == "/pick-folder":
+            result = pick_folder(
+                title=str(body.get("title") or "选择文件夹"),
+                initial=str(body.get("initial") or ""),
+                timeout_s=int(body.get("timeout_s") or 600),
+            )
+        elif path == "/exec":
             argv = body.get("argv")
             result = run_command(
                 argv=[str(x) for x in argv] if isinstance(argv, list) else None,

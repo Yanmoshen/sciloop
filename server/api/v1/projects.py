@@ -329,6 +329,39 @@ async def create_project(
     return result
 
 
+@router.post("/pick-folder", summary="弹出系统文件夹选择框，返回研究者选的路径（Owner）")
+async def pick_project_folder(
+    _owner: OwnerDep, payload: Annotated[dict[str, Any] | None, Body()] = None
+) -> dict[str, Any]:
+    """让**执行环境**在研究者屏幕上弹出系统自带的文件夹选择框，返回真实绝对路径。
+
+    ⚠️ 这条路由必须排在 `/{project_id}` 这类参数路由**之前**（字面路径优先）。
+    ⚠️ 网页自己拿不到本地路径、也调不起系统弹框 —— 所以由执行环境弹（容器执行环境会如实回"弹不出来"）。
+    """
+
+    from services.agent import host_runner
+
+    title = str((payload or {}).get("title") or "选择一个文件夹作为工作目录")
+    initial = str((payload or {}).get("initial") or "")
+    result = await host_runner.pick_folder(title=title, initial=initial)
+    if not result.get("ok"):
+        supported = result.get("supported")
+        return {
+            "ok": False,
+            "available": supported is None and not result.get("auth_failed", False),
+            "canceled": False,
+            "path": "",
+            "message": str(result.get("error") or "弹不出系统选择框"),
+        }
+    return {
+        "ok": True,
+        "available": True,
+        "canceled": bool(result.get("canceled")),
+        "path": str(result.get("path") or ""),
+        "message": "" if result.get("path") else "没有选择文件夹",
+    }
+
+
 @router.patch("/{project_id}", summary="重命名 / 归档项目（Owner）")
 async def rename_project(
     project_id: int,

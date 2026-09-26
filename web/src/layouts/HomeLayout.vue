@@ -35,7 +35,9 @@ import GlobalSearch from '@/components/home/GlobalSearch.vue'
 import SciLoopMark from '@/components/SciLoopMark.vue'
 import ConversationRenameDialog from '@/components/ConversationRenameDialog.vue'
 import MoveConversationDialog from '@/components/home/MoveConversationDialog.vue'
-import ProjectNameDialog from '@/components/home/ProjectNameDialog.vue'
+// 2026-09-26：左栏「项目」的 ＋ 与首页「新建研究项目」统一成**同一个**弹窗。
+// 旧的 ProjectNameDialog（只手填项目名）退役：文件保留在仓库里，不再被引用。
+import ProjectCreateDialog from '@/components/ProjectCreateDialog.vue'
 import ProjectRenameDialog from '@/components/ProjectRenameDialog.vue'
 import TaskHistoryDialog from '@/components/TaskHistoryDialog.vue'
 import TaskMonitorDialog from '@/components/TaskMonitorDialog.vue'
@@ -1535,7 +1537,7 @@ onUnmounted(() => {
       :conversation-title="convRenameTarget?.title ?? ''"
       @renamed="onConversationRenamed"
     />
-    <ProjectNameDialog v-model="createProjectOpen" @created="onProjectCreated" />
+    <ProjectCreateDialog v-model="createProjectOpen" @created="onProjectCreated" />
     <MoveConversationDialog
       v-model="moveOpen"
       :conversation-id="moveTarget?.id ?? null"

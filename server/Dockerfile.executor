@@ -20,9 +20,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends curl fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
-COPY exec_service ./exec_service
-
 # 服务本身的依赖 + **科学基础包**（研究者 2026-09-24 确认：预装，开箱能跑出图与 PPT）
+# ⚠️ 【顺序很重要】先装依赖、**最后**再拷代码 —— 否则改一行执行器代码就会让这层缓存失效，
+#    每次重建都要重装一遍几百 MB 的科学包（实测 3 分钟起步）。
 RUN pip install --no-cache-dir "fastapi>=0.115,<1.0" "uvicorn[standard]>=0.30,<1.0" \
     && pip install --no-cache-dir \
         "numpy>=1.26" \
@@ -44,6 +44,9 @@ RUN pip install --no-cache-dir "fastapi>=0.115,<1.0" "uvicorn[standard]>=0.30,<1
         "beautifulsoup4>=4.12" \
         "lxml>=5.1" \
         "markdown>=3.5"
+
+# 代码放最后（见上面的说明：这样改代码不会打掉依赖缓存）
+COPY exec_service ./exec_service
 
 EXPOSE 8765
 

@@ -16,7 +16,8 @@ export interface CreateProjectInput {
   name: string
   /** 备注（原「一句话研究问题」，落库在 settings.note） */
   note: string
-  fields: string[]
+  /** @deprecated 2026-09-26 起「研究方向」不再使用（新建弹窗已删掉该功能，接口层不再收） */
+  fields?: string[]
   mode?: 'manual' | 'auto'
   /**
    * 这个项目在研究者电脑上的工作目录（可选）。
@@ -74,28 +75,6 @@ export interface CreatedProject {
   is_demo?: boolean
 }
 
-/**
- * 可选研究领域（内置前 9 个平铺展示；更多方向在弹窗里用下拉选择）。
- * 与后端抓取用的 arXiv 分类同口径（后端只做 JSONB 落库，不校验取值）。
- */
-export const RESEARCH_FIELDS: Array<{ value: string; label: string }> = [
-  { value: 'cs.AI', label: 'cs.AI · 人工智能' },
-  { value: 'cs.CL', label: 'cs.CL · 计算语言学' },
-  { value: 'cs.CV', label: 'cs.CV · 计算机视觉' },
-  { value: 'cs.LG', label: 'cs.LG · 机器学习' },
-  { value: 'cs.IR', label: 'cs.IR · 信息检索' },
-  { value: 'cs.SE', label: 'cs.SE · 软件工程' },
-  { value: 'cs.DB', label: 'cs.DB · 数据库' },
-  { value: 'cs.HC', label: 'cs.HC · 人机交互' },
-  { value: 'cs.MA', label: 'cs.MA · 多智能体' },
-  { value: 'cs.NE', label: 'cs.NE · 神经与进化计算' },
-  { value: 'cs.RO', label: 'cs.RO · 机器人学' },
-  { value: 'cs.CR', label: 'cs.CR · 密码学与安全' },
-  { value: 'stat.ML', label: 'stat.ML · 统计机器学习' },
-  { value: 'eess.AS', label: 'eess.AS · 语音与音频' },
-  { value: 'q-bio.BM', label: 'q-bio.BM · 生物分子' },
-  { value: 'econ.EM', label: 'econ.EM · 计量经济' },
-]
 
 /**
  * 创建项目：`POST /projects`（Owner 写操作）。
@@ -126,4 +105,21 @@ export async function createProject(input: CreateProjectInput): Promise<CreatedP
 export function isOwnerRequired(error: unknown): boolean {
   const status = (error as ApiError | undefined)?.status
   return status === 403
+}
+
+
+/**
+ * 请执行环境在研究者屏幕上弹出**系统自带**的文件夹选择框，返回选中的绝对路径。
+ *
+ * 网页自己拿不到本地路径、也调不起系统弹框（浏览器安全边界），所以只能由执行环境弹；
+ * 容器执行环境没有屏幕 → 会回 `available: false` + `message`（界面据此把按钮置灰并说明原因）。
+ */
+export function pickFolder(title?: string): Promise<{
+  ok: boolean
+  available: boolean
+  canceled: boolean
+  path: string
+  message: string
+}> {
+  return post('/projects/pick-folder', { body: { title } })
 }

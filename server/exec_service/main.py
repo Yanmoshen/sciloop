@@ -208,6 +208,22 @@ async def exec_command(request: Request, token: str | None = Header(default=None
     }
 
 
+@app.post("/pick-folder")
+async def pick_folder(token: str | None = Header(default=None, alias=TOKEN_HEADER)) -> Any:
+    """容器执行环境**弹不出系统选择框**（没有屏幕）—— 如实说清，别装能弹。
+
+    前端据此把"选择文件夹"按钮置灰并说明原因（装了本机执行环境才可用）。
+    """
+
+    if not _authorised(token):
+        raise HTTPException(status_code=401, detail={"error": "执行环境不认识这串密钥"})
+    return {
+        "ok": False,
+        "supported": False,
+        "error": "容器执行环境没有屏幕，弹不出系统文件夹选择框；装了本机执行环境（开机自启）才可用。",
+    }
+
+
 @app.post("/fs")
 async def fs_action(request: Request, token: str | None = Header(default=None, alias=TOKEN_HEADER)) -> Any:
     """读写文件（read / write / list / mkdir / move / delete / exists）。

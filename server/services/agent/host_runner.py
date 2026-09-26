@@ -175,7 +175,12 @@ async def _post(
                 "auth_failed": True,
             }
         data = response.json()
-        return data if isinstance(data, dict) else {"ok": False, "error": "执行器返回了看不懂的内容"}
+        if not isinstance(data, dict):
+            return {"ok": False, "error": "执行器返回了看不懂的内容"}
+        if "ok" not in data:
+            # 执行环境不认识这条接口（老版本）→ 如实说，别让调用方以为"成功但没结果"
+            return {"ok": False, "error": f"执行环境不认识这个接口（HTTP {response.status_code}）：{path}", "unknown_route": True}
+        return data
     except httpx.HTTPError as exc:
         return _unreachable(f"连不上执行器：{str(exc)[:160]}")
     finally:
@@ -273,3 +278,18 @@ async def call_fs(
     if recursive:
         payload["recursive"] = True
     return await _post("/fs", payload, timeout_s=DEFAULT_TIMEOUT_S, client=client)
+
+
+async def pick_folder(*, title: str = "选择文件夹", initial: str = "", timeout_s: int = 600) -> dict[str, Any]:
+    """请执行环境**弹出系统自带的文件夹选择框**，返回研究者选中的绝对路径。
+
+    ⚠️ 网页拿不到本地路径、也调不起系统弹框（浏览器安全边界），所以这条路只能由执行环境走；
+    ⚠️ 人在点、要等 —— 超时给得长（默认 600 秒）；容器执行环境会如实回"弹不出来"。
+    """
+
+    return await _post(
+        "/pick-folder",
+        {"title": title, "initial": initial, "timeout_s": timeout_s},
+        timeout_s=timeout_s + 20,
+        client=None,
+    )
