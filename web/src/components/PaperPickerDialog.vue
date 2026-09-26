@@ -24,11 +24,21 @@ import { computed, ref } from 'vue'
 
 import PaperTable from '@/components/PaperTable.vue'
 
-const props = defineProps<{ open: boolean }>()
+/**
+ * 选完之后那个动作是什么（2026-09-26 加）：
+ * - `parse`（默认）：提交解析任务（原行为，论文解析首屏在用）；
+ * - `translate`：**只把选中的论文交回调用方**，由调用方去建翻译任务
+ *   —— 翻译页要"用论文搜索选择模块挑论文"，而不是让人手填论文编号（用户口径）。
+ */
+const props = withDefaults(defineProps<{ open: boolean; action?: 'parse' | 'translate' }>(), {
+  action: 'parse',
+})
 const emit = defineEmits<{
   (e: 'update:open', value: boolean): void
   /** 已提交解析任务：复用方据此立刻刷新列表并开始轮询（否则要等一轮才发现） */
   (e: 'submitted'): void
+  /** `action='translate'`：把选中的论文交回调用方（翻译只需要一篇） */
+  (e: 'picked', papers: import('@/api/papers').PaperSearchItem[]): void
 }>()
 
 const table = ref<InstanceType<typeof PaperTable> | null>(null)
@@ -48,6 +58,14 @@ function close(): void {
 
 async function runSingle(): Promise<void> {
   if (!canSingle.value) return
+  if (props.action === 'translate') {
+    // 翻译这条路**不提交解析**，只把选中的论文交回去（翻译只需一篇，取第一篇）。
+    const picked = table.value?.selectedList ?? []
+    if (picked.length === 0) return
+    emit('picked', picked)
+    close()
+    return
+  }
   await table.value?.buildCardsForSelected()
   // 提交完就退出这个界面（用户口径）；进度看首屏「最近解析」的状态图标
   emit('submitted')
@@ -84,7 +102,7 @@ async function runSingle(): Promise<void> {
           <span class="picker__count">已选 {{ selectedCount }} 篇</span>
           <span class="picker__spacer" />
           <button class="pk-btn" type="button" :disabled="!canSingle" @click="runSingle">
-            {{ singleLabel }}
+            {{ props.action === 'translate' ? '翻译选中的论文' : singleLabel }}
           </button>
           <button class="pk-btn" type="button" @click="table?.openPicked()">查看已选</button>
           <button class="pk-btn" type="button" @click="close">关闭</button>

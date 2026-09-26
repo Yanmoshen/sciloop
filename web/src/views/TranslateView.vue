@@ -16,6 +16,8 @@
 import { computed, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
+import type { PaperSearchItem } from '@/api/papers'
+import PaperPickerDialog from '@/components/PaperPickerDialog.vue'
 import {
   cancelTranslateJob,
   createTranslateFromFile,
@@ -40,6 +42,16 @@ const paperId = ref<number | null>(
   route.query.paper_id ? Number(route.query.paper_id) : null,
 )
 const mode = ref<'translate' | 'simplify'>('translate')
+//: 论文选择器（复用论文库/论文解析那套搜索模块，不再手填编号）
+const pickerOpen = ref(false)
+//: 选中的论文标题（只为显示"选对了没"；真正提交用的是 paper_id）
+const pickedTitle = ref('')
+const pickedLabel = computed(() => {
+  if (!paperId.value) return ''
+  const title = pickedTitle.value.trim()
+  if (!title) return `论文 #${paperId.value}`
+  return title.length > 64 ? `${title.slice(0, 64)}…` : title
+})
 const detail = ref<TranslateJob | null>(null)
 const previewBlocks = ref<TranslatePreviewBlock[]>([])
 const previewLoading = ref(false)
@@ -107,6 +119,15 @@ async function loadJobs(): Promise<void> {
   } finally {
     loading.value = false
   }
+}
+
+/** 从论文选择器拿到论文 → 定为这次要翻的论文（顺带记住标题，便于核对选对了没）。 */
+function onPapersPicked(papers: PaperSearchItem[]): void {
+  const first = papers[0]
+  if (!first) return
+  paperId.value = Number(first.id)
+  pickedTitle.value = String(first.title || '')
+  notice.value = ''
 }
 
 async function createFromPaper(): Promise<void> {
@@ -189,6 +210,20 @@ async function action(kind: 'cancel' | 'retry', job: TranslateJob): Promise<void
   }
 }
 
+/**
+ * 「任务」那一列显示什么（用户口径 2026-09-26：显示**论文标题**，不是任务编号）。
+ * 顺序：论文标题 → 来源文件名 → 论文编号 → 任务编号。
+ * **最后一定要有东西**，不能出现空单元格；查不到标题时退回编号，绝不编一个假标题。
+ */
+function jobTitle(job: TranslateJob): string {
+  const title = String(job.paper_title ?? '').trim()
+  if (title) return title
+  const filename = String(job.source?.filename ?? '').trim()
+  if (filename) return filename
+  if (job.paper_id) return `论文 #${job.paper_id}`
+  return job.task_id
+}
+
 /** 状态文案（用户口径 2026-09-26：已完成 / 正在翻译 / 未完成）。 */
 function statusTag(status: string): { text: string; cls: string; running: boolean } {
   switch (status) {
@@ -269,9 +304,16 @@ onUnmounted(stopPolling)
         <h2>创建翻译任务</h2>
       </div>
       <div class="creator">
-        <label class="field">
-          <span class="field__label">论文 ID</span>
-          <input v-model.number="paperId" class="field__input" type="number" min="1" placeholder="例如 547" />
+        <!-- 选论文**不再手填编号**（用户口径 2026-09-26）：复用论文库那套搜索选择模块，
+             与「论文解析」用的是同一个（关键词/领域/来源/解析状态筛选 + 分页 + 跨页选择）。 -->
+        <label class="field field--wide">
+          <span class="field__label">论文</span>
+          <button class="pick-btn" type="button" @click="pickerOpen = true">
+            <span class="pick-btn__text" :class="{ 'pick-btn__text--empty': !pickedLabel }">
+              {{ pickedLabel || '点击选择论文（可按关键词、领域、来源筛选）' }}
+            </span>
+            <span class="pick-btn__hint">选择</span>
+          </button>
         </label>
         <label class="field">
           <span class="field__label">模式</span>
@@ -317,7 +359,9 @@ onUnmounted(stopPolling)
             <td colspan="7" class="empty">还没有翻译任务</td>
           </tr>
           <tr v-for="job in jobs" :key="job.task_id">
-            <td class="mono">{{ job.task_id }}</td>
+            <!-- 「任务」这一列显示**论文标题**（用户口径 2026-09-26：不要显示任务编号）。
+                 标题过长就截断，鼠标悬停看全名；任务编号挪到「详情」里。 -->
+            <td class="ellipsis" :title="jobTitle(job)">{{ jobTitle(job) }}</td>
             <td>
               <span class="tag" :class="statusTag(String(job.status)).cls">
                 <span v-if="statusTag(String(job.status)).running" class="spin" aria-hidden="true" />
@@ -437,6 +481,13 @@ onUnmounted(stopPolling)
         </div>
       </div>
     </Teleport>
+
+    <!-- 选论文：与「论文解析」共用同一个搜索选择模块（用户口径 2026-09-26） -->
+    <PaperPickerDialog
+      v-model:open="pickerOpen"
+      action="translate"
+      @picked="onPapersPicked"
+    />
   </section>
 </template>
 
@@ -500,6 +551,51 @@ onUnmounted(stopPolling)
   color: var(--color-text-primary);
   font: inherit;
   font-size: var(--font-size-sm);
+}
+/* 选论文的那个按钮（替代原来的"论文 ID"输入框）：长得像输入框，点开的是搜索选择器 */
+.field--wide {
+  min-width: 320px;
+  flex: 1;
+}
+.pick-btn {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-bg-subtle);
+  color: var(--color-text-primary);
+  font: inherit;
+  font-size: var(--font-size-sm);
+  text-align: left;
+  cursor: pointer;
+}
+.pick-btn:hover {
+  border-color: var(--color-border-hover, var(--color-border-strong));
+  background: var(--color-bg-hover, var(--color-bg-subtle));
+}
+.pick-btn:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 1px;
+}
+.pick-btn__text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+/* 还没选时用次要色，和"已选中"区分开（不写解释性小字） */
+.pick-btn__text--empty {
+  color: var(--color-text-tertiary);
+}
+.pick-btn__hint {
+  flex: none;
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-xs);
 }
 .field__input:focus {
   outline: none;

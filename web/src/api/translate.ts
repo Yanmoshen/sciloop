@@ -36,6 +36,8 @@ export interface TranslateJob {
   mode?: string | null
   highlight?: boolean
   paper_id?: number | null
+  /** 论文标题（列表首列显示它，不再显示任务编号；用户口径 2026-09-26） */
+  paper_title?: string | null
   source?: TranslateSource | null
   formats?: { mono?: TranslateFormatState; dual?: TranslateFormatState } | null
   layout_warnings?: string[] | null

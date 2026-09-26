@@ -435,9 +435,34 @@ async def create_translate_job_from_paper(request: Request, session: DbSession) 
 # --------------------------------------------------------------------------------------
 # GET 列表 / 详情
 # --------------------------------------------------------------------------------------
+async def _paper_titles(session: AsyncSession, paper_ids: set[int]) -> dict[int, str]:
+    """批量取论文标题（一次查询，避免 N+1）。取不到就返回空，由调用方退回其它标识。"""
+
+    if not paper_ids:
+        return {}
+    from sqlalchemy import select
+
+    from db.models.paper import Paper
+
+    rows = await session.execute(
+        select(Paper.id, Paper.title).where(Paper.id.in_(sorted(paper_ids)))
+    )
+    return {
+        int(row[0]): str(row[1] or "").strip() for row in rows.all() if str(row[1] or "").strip()
+    }
+
+
 @router.get("/translate/jobs", summary="翻译任务列表")
-async def list_translate_jobs() -> dict[str, Any]:
+async def list_translate_jobs(session: DbSession) -> dict[str, Any]:
     items = jobs.list_tasks()
+    # 「任务」那一列要显示**论文标题**（用户口径 2026-09-26：不要显示任务编号）。
+    # 界面据此渲染首列；查不到标题时前端会退回文件名，仍然不编。
+    titles = await _paper_titles(
+        session, {int(item["paper_id"]) for item in items if item.get("paper_id")}
+    )
+    for item in items:
+        paper_id = item.get("paper_id")
+        item["paper_title"] = titles.get(int(paper_id)) if paper_id else None
     return {
         "items": items,
         "total": len(items),

@@ -548,8 +548,15 @@ async def _execute(task: TranslateTask) -> None:
     task.translator_name = str(getattr(translator, "name", "unknown"))
     task.stub_used = bool(getattr(translator, "is_stub", False))
     if task.stub_used:
-        reason = str(getattr(translator, "reason", "") or "")
+        # ⚠️ **没有可用的翻译模型时，直接判失败**（用户口径 2026-09-26）。
+        # 改前会照跑，产出一份"原文 + 【本地桩·未翻译】"的 PDF 并且状态是 completed ——
+        # 用户实测反馈："没有完全翻译，还有很多本地桩"。那是**把没翻的东西当译文交付**，
+        # 比明确失败坏得多。界面会按口径显示「未完成」。
+        reason = str(getattr(translator, "reason", "") or "").strip()
+        message = "没有可用的翻译模型，任务未执行" + (f"（{reason[:160]}）" if reason else "")
+        _set_progress(task_id, status=STATUS_ERROR, stage=STATUS_ERROR, percent=0, message=message)
         task.layout_warnings.append(f"{engine.STUB_NOTE}（触发原因：{reason}）")
+        return
 
     _set_progress(
         task_id,
@@ -559,6 +566,8 @@ async def _execute(task: TranslateTask) -> None:
         message=f"逐块翻译（{len(blocks)} 块，mode={task.mode}）",
     )
     targets: list[str | None] = []
+    #: 重试用尽仍没翻成的块数（>0 则整任务判**未完成**，不谎报成功）
+    untranslated_blocks = 0
     for index, block in enumerate(blocks):
         _check_cancel(task)
         try:
@@ -566,31 +575,27 @@ async def _execute(task: TranslateTask) -> None:
                 await translator.translate(block.source_text, mode=task.mode, page=block.page)
             )
         except engine.TranslatorUnavailable as exc:
-            if isinstance(translator, engine.StubTranslator):
-                targets.append(None)
-                task.layout_warnings.append(
-                    f"page={block.page} 本地桩翻译失败：{type(exc).__name__}: {exc}"
-                )
-            else:
-                # 真实模型不可用 → **只降级一次**，并如实披露（绝不静默改写状态）
-                translator = engine.StubTranslator(
-                    reason=f"真实模型不可用：{exc}", mode_hint=task.mode
-                )
-                task.stub_used = True
-                task.translator_name = translator.name
-                task.layout_warnings.append(
-                    f"translate: 真实模型调用失败（{exc}），已如实降级为本地桩"
-                    f"（provider={engine.STUB_PROVIDER}）；本次产物不含真实模型译文"
-                )
+            # 真实模型这一块没翻成 → **重试几次**，仍不行就如实记失败：
+            # **绝不换成桩**（桩产出的是"原文 + 标记"，把它写进 PDF 等于伪造译文）。
+            text: str | None = None
+            last_error: Exception | None = exc
+            for wait_seconds in (1.0, 2.0):
+                _check_cancel(task)
+                await asyncio.sleep(wait_seconds)
                 try:
-                    targets.append(
-                        await translator.translate(block.source_text, mode=task.mode, page=block.page)
+                    text = await translator.translate(
+                        block.source_text, mode=task.mode, page=block.page
                     )
-                except Exception as inner:  # noqa: BLE001
-                    targets.append(None)
-                    task.layout_warnings.append(
-                        f"page={block.page} 降级后仍翻译失败：{type(inner).__name__}: {inner}"
-                    )
+                    break
+                except Exception as retry_exc:  # noqa: BLE001
+                    last_error = retry_exc
+            if text is None:
+                untranslated_blocks += 1
+                task.layout_warnings.append(
+                    f"page={block.page} 这一块没能翻译（重试后仍失败，已保留原文）："
+                    f"{type(last_error).__name__}: {str(last_error)[:120]}"
+                )
+            targets.append(text)
         except Exception as exc:  # noqa: BLE001 - 单块失败不阻断整篇
             targets.append(None)
             task.layout_warnings.append(
@@ -694,6 +699,21 @@ async def _execute(task: TranslateTask) -> None:
     message = f"完成：{written}/{translatable} 块已回写译文"
     if preserved:
         message += f"（另有 {preserved} 块竖排/水印/重叠/无译文，按原样保留、不计入）"
+    if untranslated_blocks:
+        # 有块没翻成 → **判未完成**（界面按口径显示「未完成」），并在消息里说清多少块。
+        # 产物仍然保留（已翻的块是真译文，未翻的块保留原文），但绝不谎报"已完成"。
+        _set_progress(
+            task_id,
+            status=STATUS_ERROR,
+            stage=STATUS_ERROR,
+            percent=100,
+            message=(
+                f"未完成：{untranslated_blocks}/{len(blocks)} 块没能翻译"
+                f"（模型调用重试后仍失败，这些块保留原文）；其余 {message}"
+            ),
+        )
+        return
+
     _set_progress(
         task_id,
         status=STATUS_COMPLETED,
