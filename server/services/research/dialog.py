@@ -381,16 +381,27 @@ async def stream_node(
                 persisted_rows.append(row)
                 yield _sse("row", {"row": row})
 
-    summary = _conclusion(label=label, status=status, events=events, refs=refs)
     next_node = next((d.get("next_node") for e, d in events if e == "done"), None)
+    # **不假装往下走**：后面几个节点首版未实装，自动连续跑必须在这里停住。
+    # 但"停住"这件事**由模型用自己的话告诉研究者**（用户口径 2026-09-26：
+    # 对话里的正文一律模型写），程序只把它作为一条**事实**交上去 + 留一条过程行。
+    next_unimplemented = bool(
+        status == "done" and next_node and next_node != "end" and not _implemented(next_node)
+    )
 
-    if status == "done" and next_node and next_node != "end" and not _implemented(next_node):
-        # **不假装往下走**：后面几个节点首版未实装，自动连续跑必须在这里停住并说明，
-        # 否则它们会依次「通过」，等于伪造「实验做完了、论文写好了」。
-        summary += (
-            f"\n\n下一节点是「{_label_of(next_node)}」，**首版尚未实装**："
-            "它既不会校验产出，也不会真的执行实验。我不会替你把它标记成完成。"
-        )
+    facts = _facts_for_conclusion(
+        label=label,
+        status=status,
+        events=events,
+        refs=refs,
+        next_node=next_node,
+        next_unimplemented=next_unimplemented,
+    )
+    summary = await _write_conclusion(
+        facts=facts, model_ref=str((scope.get("conversation") or {}).get("model_ref") or "") or None
+    )
+
+    if next_unimplemented:
         yield _sse(
             "row",
             {
@@ -406,6 +417,15 @@ async def stream_node(
                 "stopped", f"「{_label_of(next_node)}」尚未实装，已停止继续推进", tone="warn"
             )
         )
+
+    if not summary:
+        # 模型这一跳没写出收尾 → **留空 + 如实记一条过程行**，
+        # 绝不拿程序话术冒充对话正文（用户口径 2026-09-26）。
+        note = messages.system_row(
+            "stopped", "这一轮的收尾没能生成（模型没返回可用的文字），产出与过程都已落库。", tone="warn"
+        )
+        persisted_rows.append(note)
+        yield _sse("row", {"row": note})
 
     yield _sse("delta", {"text": summary})
 
@@ -487,29 +507,92 @@ def _system_row_for(event: str, data: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def _conclusion(
-    *, label: str, status: str, events: list[tuple[str, dict[str, Any]]], refs: dict[str, Any]
+def _facts_for_conclusion(
+    *,
+    label: str,
+    status: str,
+    events: list[tuple[str, dict[str, Any]]],
+    refs: dict[str, Any],
+    next_node: str | None,
+    next_unimplemented: bool,
 ) -> str:
-    """结论文本。优先级：**缺输入的说明** > 失败原因 > 常规确定性总结。
+    """把这一步的**事实**整理成给模型看的载荷（**不含任何面向用户的话术**）。
 
-    为什么把「缺输入」放第一位：这种情况下真正该告诉用户的是「我需要一个研究问题」，
-    而不是「多次修复仍未通过校验」——后者会把**输入缺失**说成**模型修不好**，属于误导。
+    用户口径 2026-09-26：对话里的正文一律由模型写。所以这里只报事实 ——
+    状态、试了几次、为什么没过、产出了什么、下一步是什么，措辞一个字都不代它写。
     """
 
-    for event, data in reversed(events):
-        if event == "waiting_human" and data.get("needs_input"):
-            return str(data.get("message") or "")
-    if status == "failed":
-        return _failure_summary(label, events)
-    return messages.node_summary(
-        node_label=label, status=status, events=events, refs=refs
-    )
+    done = next((d for e, d in events if e == "done"), {})
+    lines: list[str] = [
+        f"这一步是：{label}",
+        f"结果状态：{status}",
+        f"这一步尝试修复的次数：{int(done.get('llm_call_count') or 0) and ''}"
+        f"{len([1 for e, _ in events if e == 'validation'])}",
+    ]
+
+    # 未通过的具体原因（程序已经算出来的事实，照抄给模型，不加工）
+    reasons = [str(d.get("message") or "") for e, d in events if e in ("validation", "error")]
+    reasons = [item for item in reasons if item.strip()]
+    if reasons:
+        lines.append("未通过的原因（逐条）：")
+        lines.extend(f"- {item[:400]}" for item in reasons[-3:])
+
+    waiting = next((d for e, d in reversed(events) if e == "waiting_human"), None)
+    if waiting is not None:
+        lines.append(f"需要人介入的说明（程序记录的原文）：{str(waiting.get('message') or '')[:400]}")
+
+    produced: list[str] = []
+    if refs.get("evidence_ids"):
+        produced.append(f"证据 {len(refs['evidence_ids'])} 条")
+    if refs.get("idea_id"):
+        produced.append(f"候选假设一条（编号 {refs['idea_id']}）")
+    if refs.get("feasibility_id"):
+        produced.append(f"可行性报告一份（编号 {refs['feasibility_id']}）")
+    if refs.get("taskbook_id"):
+        produced.append(f"任务书一份（编号 {refs['taskbook_id']}，已锁定）")
+    if refs.get("taskbook_skipped"):
+        produced.append("任务书没落库（本对话没挂项目，任务书要归属到项目下）")
+    lines.append("这一步的产出：" + ("、".join(produced) if produced else "没有产出"))
+
+    if next_node and next_node != "end":
+        tail = f"下一步本来可以走：{_label_of(next_node)}"
+        if next_unimplemented:
+            tail += "（但这一步还**没有实装**：不会做校验、也不会真的执行实验）"
+        lines.append(tail)
+    return "\n".join(lines)
 
 
-def _failure_summary(label: str, events: list[tuple[str, dict[str, Any]]]) -> str:
-    error = next((d for e, d in reversed(events) if e == "error"), None)
-    reason = str((error or {}).get("message") or "未知原因")
-    return f"「{label}」执行失败：{reason}"
+async def _write_conclusion(
+    *,
+    facts: str,
+    model_ref: str | None,
+) -> str:
+    """让**模型**写节点收尾那段话；写不出来就返回空串。
+
+    为什么不兜一句程序文案：用户口径 2026-09-26「对话里所有正文都必须是模型输出」。
+    所以失败时**宁可留空**（再补一条过程行如实说明），也不拿程序话术冒充正文。
+    """
+
+    if not model_ref:
+        return ""
+    from llm import adapter
+
+    try:
+        result = await adapter.chat(
+            [
+                {"role": "system", "content": messages.NODE_CONCLUSION_SYSTEM},
+                {"role": "user", "content": messages.NODE_CONCLUSION_TEMPLATE.format(facts=facts)},
+            ],
+            model_ref=model_ref,
+            temperature=0.3,
+            purpose="research_node_conclusion",
+            allow_fallback=False,
+            strict_logging=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - 收尾失败不该把这一轮带崩
+        logger.warning("节点收尾（模型措辞）失败：%s", exc)
+        return ""
+    return str(getattr(result, "content", "") or "").strip()
 
 
 # --------------------------------------------------------------------------- #

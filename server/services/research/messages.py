@@ -22,7 +22,8 @@ __all__ = [
     "NODE_ONLY_REASONING_TEXT",
     "SYSTEM_ROW_LABELS",
     "guide_blocks",
-    "node_summary",
+    "NODE_CONCLUSION_SYSTEM",
+    "NODE_CONCLUSION_TEMPLATE",
     "system_row",
 ]
 
@@ -78,6 +79,35 @@ NODE_ONLY_REASONING_TEXT = (
     "思考过程已折叠在下面（它**不是结论**，不能当作回答使用）。"
 )
 
+#: 节点收尾的提示词 —— **措辞由模型来，程序只给事实**。
+#:
+#: 为什么不让程序拼这句话（用户口径 2026-09-26）：对话里的正文必须是人话，
+#: 而程序拼出来的必然是"状态机口吻"（「多次修复仍未通过校验」「已转入人工介入」这种），
+#: 研究者读到的是一句内部结论，而不是"现在怎么了、要我做啥"。
+#:
+#: ⚠️ 严禁出现内部术语（校验 / 重试 / 策略层 / 节点 id / 熔断 / 落库 等）——
+#: 说人话是硬要求，不是风格偏好。
+NODE_CONCLUSION_SYSTEM = (
+    "你是 SciLoop 的科研助手。刚刚跑完了研究流程里的一步，请你**用研究者看得懂的话**"
+    "把这一步交代清楚。\n"
+    "只说你拿得到事实的部分，不要编造未被记录的产出。\n"
+    "**严禁出现内部术语**：不要写「校验」「重试」「策略层」「节点」「流水线」「熔断」"
+    "「落库」「闸门」这类词，也不要用机器状态名（例如 waiting_human）。\n"
+    "按顺序说清四件事（自然分段，不要用「第一/第二」这种编号腔，也不要写小标题）：\n"
+    "1. 这一步现在是什么结果 —— 成了、还是没成、还是需要他来定；\n"
+    "2. 具体产出了什么（有就写清楚数量与名称；没有就直说没有）；\n"
+    "3. 如果没成或需要他定：卡在什么地方、**因为他能做的事**是什么；\n"
+    "4. 接下来可以怎么走，并明确告诉他可以直接回一句什么话来继续。\n"
+    "全程不要提系统、程序、调用了模型几次、花了多少钱。"
+    "不要用 Markdown 标题，就用正常段落。控制在 200 字以内。"
+)
+
+#: 收尾提示词的载荷模板（`{facts}` 由程序填**事实**）
+NODE_CONCLUSION_TEMPLATE = (
+    "【这一步的事实（照它说，不要自己加戏）】\n{facts}\n\n"
+    "请写一段给研究者看的话，交代清楚这一步的结果与接下来怎么办。"
+)
+
 #: 模型这一跳彻底失败（自动重试也没成）时的如实说明。
 #:
 #: 用户口径 2026-09-26：「不再允许所有的强制中断，必须完整回答之后才能结束」。
@@ -128,55 +158,6 @@ def result_card(result: Any) -> dict[str, Any]:
         "rows": list(getattr(result, "rows", []) or []),
         "total": int(getattr(result, "total", 0) or 0),
     }
-
-
-def node_summary(
-    *,
-    node_label: str,
-    status: str,
-    events: list[tuple[str, dict[str, Any]]],
-    refs: dict[str, Any],
-) -> str:
-    """节点执行完后的**确定性结论**（不再花一次模型调用去措辞）。
-
-    为什么不让模型写这段：结论必须与落库事实一致。「花了多少钱、产出了几条证据、
-    下一步是哪」这些都是程序已经知道的事实，交给模型复述只会引入不一致。
-    """
-
-    lines: list[str] = []
-    done = next((d for e, d in events if e == "done"), {})
-    if status == "done":
-        lines.append(f"「{node_label}」已通过校验。")
-    elif status == "waiting_human":
-        lines.append(f"「{node_label}」多次修复仍未通过校验，已转入人工介入。")
-    elif status == "failed":
-        lines.append(f"「{node_label}」执行失败。")
-    else:
-        lines.append(f"「{node_label}」本轮结束（{status}）。")
-
-    produced: list[str] = []
-    if refs.get("evidence_ids"):
-        produced.append(f"证据 {len(refs['evidence_ids'])} 条")
-    if refs.get("idea_id"):
-        produced.append(f"假设 #{refs['idea_id']}")
-    if refs.get("feasibility_id"):
-        produced.append(f"可行性报告 #{refs['feasibility_id']}")
-    if refs.get("taskbook_id"):
-        produced.append(f"任务书 #{refs['taskbook_id']}（已锁定）")
-    if refs.get("taskbook_skipped"):
-        produced.append("任务书未落库（本对话未挂项目，任务书需要项目归属）")
-    if produced:
-        lines.append("产出：" + "、".join(produced) + "。")
-
-    if done.get("llm_call_count"):
-        cost = done.get("cost_usd")
-        cost_text = f"${cost:.4f}" if isinstance(cost, (int, float)) else "未知"
-        lines.append(f"本次调用模型 {done['llm_call_count']} 次，费用 {cost_text}。")
-
-    next_node = done.get("next_node")
-    if next_node and next_node != "end" and status == "done":
-        lines.append(f"下一步可以执行「{_label_of(next_node)}」——说一句「继续」我就往下走。")
-    return "\n\n".join(lines)
 
 
 def _label_of(node: str) -> str:
