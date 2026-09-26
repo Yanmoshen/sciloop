@@ -174,9 +174,19 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
 .dual__pane {
   flex: 1 1 50%;
   min-width: 0;
+  /* ⚠️ **必须有 `min-height: 0`**（2026-09-26 实测：漏了它 = "滚动不了"）。
+     flex 子项默认 `min-height: auto`，不肯缩到内容高度以下 —— 于是里面的
+     `overflow-y: auto` 永远撑不成"固定高度 + 内部滚动"，内容被裁掉、且滚不动。
+     阅读页的 `.pane` 一直有这一行，这里照抄。 */
+  min-height: 0;
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+/* 让 PDF 栏吃掉剩余高度，把滚动交给它内部的 host（PdfPane 是子组件，需 :deep） */
+.dual__pane > :deep(.pdf-pane) {
+  flex: 1;
+  min-height: 0;
 }
 /* 两栏之间只靠一条分隔线，不额外画卡片边框（要"只剩原文和译文"） */
 .dual__pane + .dual__pane {
