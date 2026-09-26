@@ -179,76 +179,36 @@ function durationText(turn: Turn): string {
 }
 
 /**
- * 工具调用折叠（研究者 2026-09-25 口径）。
+ * 过程抽屉（研究者 2026-09-25 口径）：**整轮一行**。
  *
- * 分组：**按思考段切** —— 组号 = 这行前面有几条「思考行」（`kind === 'reasoning'`）。
- * 这样每段思考后面的那串工具调用各自成组，和"思考与过程行交叉展示"的口径一致。
+ * 演变：先是"按思考段分组、每段一组"，他说还是太占地方 → 现在整轮的思考与工具调用
+ * **合成一行「调用工具」**，点开才是按发生顺序的时间线。
+ * 连失败/被拒、等待批准、流程节点行也一起收进去（他选的"最省地方"那一档）——
+ * 代价是"被拦下了"默认看不见，需要点开才看得到；这是他的取舍，记录在此。
  *
- * 哪些**永远不折**（安全线）：流程节点 / 系统行（`kind !== 'tool'`）、失败与被拒、等待批准。
- * 把"被拦下了"折进抽屉里，审计上说不通。
- *
- * 状态：`openToolGroups` 只在内存里（默认全收起），刷新后回到收起 ——
- * 与「思考过程」「已思考」那两块的展开态同一套做法。
+ * 状态只在内存里（默认全收起），刷新回到收起 —— 与「思考过程」折叠同一套做法。
  */
-const openToolGroups = ref<Set<string>>(new Set())
+const openProcess = ref<Set<number>>(new Set())
 
-function isToolGroupOpen(key: string): boolean {
-  return openToolGroups.value.has(key)
+function isProcessOpen(turnIndex: number): boolean {
+  return openProcess.value.has(turnIndex)
 }
 
-function toggleToolGroup(key: string): void {
-  const next = new Set(openToolGroups.value)
-  if (next.has(key)) next.delete(key)
-  else next.add(key)
-  openToolGroups.value = next
+function toggleProcess(turnIndex: number): void {
+  const next = new Set(openProcess.value)
+  if (next.has(turnIndex)) next.delete(turnIndex)
+  else next.add(turnIndex)
+  openProcess.value = next
 }
 
-/** 组号 = 前面有几条思考行 */
-function toolGroupOf(rows: TurnRow[], index: number): number {
-  let group = 0
-  for (let i = 0; i < index; i++) {
-    if (rows[i]?.kind === 'reasoning') group += 1
-  }
-  return group
-}
-
-/** 行内唯一键：轮下标-组号（同一轮里可能有好几组工具调用） */
-function toolKey(turnIndex: number, rows: TurnRow[], index: number): string {
-  return `${turnIndex}-${toolGroupOf(rows, index)}`
-}
-
-/** 这一行能不能折进抽屉：只有工具行能折；失败/被拒/等待批准一律留外面 */
-function rowCollapsible(row: TurnRow): boolean {
-  if (row.kind !== 'tool') return false
-  const text = String(row.text ?? '')
-  if (/未完成|失败|拒绝|不在允许/.test(text)) return false
-  if (/等待研究者批准|需要你确认/.test(text)) return false
-  return true
-}
-
-/** 表头只画在"这一组的第一条可折叠行"之前，且这一组确实有可折叠行 */
-function showsToolHead(rows: TurnRow[], index: number): boolean {
-  const row = rows[index]
-  if (!row || !rowCollapsible(row)) return false
-  const prev = index > 0 ? rows[index - 1] : undefined
-  return !prev || !rowCollapsible(prev) || toolGroupOf(rows, index) !== toolGroupOf(rows, index - 1)
-}
-
-/** 这一组里还有没有在跑的行（表头挂三点动效用） */
-function toolGroupRunning(rows: TurnRow[], index: number): boolean {
-  const group = toolGroupOf(rows, index)
+/** 这一轮的过程是否还在跑（收起时表头挂三点，否则完全看不出它在干活） */
+function processRunning(turn: Turn): boolean {
+  if (turn.status === 'streaming') return true
+  const rows = turn.rows ?? []
   for (let i = 0; i < rows.length; i++) {
-    if (toolGroupOf(rows, i) !== group) continue
     if (rowMotion(rows, i) === 'mo-dots') return true
   }
   return false
-}
-
-/** 这一行此刻该不该显示（可折叠的行在抽屉收起时隐藏；其余永远显示） */
-function rowVisible(rows: TurnRow[], index: number, turnIndex: number): boolean {
-  const row = rows[index]
-  if (!row || !rowCollapsible(row)) return true
-  return isToolGroupOpen(toolKey(turnIndex, rows, index))
 }
 
 /**
@@ -1365,7 +1325,35 @@ onUnmounted(() => {
             <span class="meta__model">{{ turn.model }}</span>
             <span class="meta__time">{{ durationText(turn) }}</span>
           </div>
-          <!-- 思考过程：**只显示"还没落成过程行"的那一段**（正在想的那一轮）。
+          <!-- 过程（研究者 2026-09-25 口径）：整轮的**思考 + 工具调用合成一行**抽屉，默认收起 ——
+               连失败/被拒、等待批准、流程节点行也一起收进去（他明确选了"最省地方"这一档）。
+               点开是**按发生顺序的时间线**：思考段各自可折（.reason--inline），工具行平铺。 -->
+          <button
+            v-if="turn.rows?.length || liveReasoning(turn)"
+            class="toolgroup"
+            type="button"
+            :aria-expanded="isProcessOpen(index)"
+            @click="toggleProcess(index)"
+          >
+            <svg
+              class="reason__caret"
+              :class="{ 'reason__caret--open': isProcessOpen(index) }"
+              width="10"
+              height="10"
+              viewBox="0 0 10 10"
+              aria-hidden="true"
+            >
+              <path d="M3 1.5 6.5 5 3 8.5" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+            <span class="reason__ico" aria-hidden="true">
+              <svg width="14" height="14"><use href="#sl-tool" /></svg>
+            </span>
+            <span>调用工具</span>
+            <span v-if="processRunning(turn)" class="mo-dots" aria-hidden="true"><i /><i /><i /></span>
+          </button>
+
+          <div v-show="isProcessOpen(index)" class="process">
+            <!-- 思考过程：**只显示"还没落成过程行"的那一段**（正在想的那一轮）。
                已经结束的各轮思考会跟着过程行一起按顺序出现（见 row.kind === 'reasoning'），
                不再把所有思考都堆在这一轮的最上方。 -->
           <div v-if="liveReasoning(turn)" class="reason">
@@ -1400,45 +1388,9 @@ onUnmounted(() => {
             <template v-for="(row, rowIndex) in turn.rows" :key="rowIndex">
               <!-- 批准卡**不在正文里显示**：它贴在输入框上方（见 .approval-bar）；
                    批准/拒绝的过程也不在正文留痕（研究者 2026-09-22 定的）。 -->
-              <!-- 工具调用折叠（研究者 2026-09-25 口径）：**按思考段分组、默认一律收起**，
-                   表头只有「工具图标 + 调用工具」；失败与被拒 / 等待批准 / 流程节点行永远露在外面。
-                   用 v-show 而不是把行塞进 .fold：折叠时**必须保持行的原始顺序**（露在外面的行
-                   要留在它原本的位置上），.fold 那种"整块包起来"会把顺序打乱。 -->
-              <button
-                v-if="showsToolHead(turn.rows ?? [], rowIndex)"
-                class="toolgroup"
-                type="button"
-                :aria-expanded="isToolGroupOpen(toolKey(index, turn.rows ?? [], rowIndex))"
-                @click="toggleToolGroup(toolKey(index, turn.rows ?? [], rowIndex))"
-              >
-                <svg
-                  class="reason__caret"
-                  :class="{
-                    'reason__caret--open': isToolGroupOpen(
-                      toolKey(index, turn.rows ?? [], rowIndex),
-                    ),
-                  }"
-                  width="10"
-                  height="10"
-                  viewBox="0 0 10 10"
-                  aria-hidden="true"
-                >
-                  <path d="M3 1.5 6.5 5 3 8.5" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-                <span class="reason__ico" aria-hidden="true">
-                  <svg width="14" height="14"><use href="#sl-tool" /></svg>
-                </span>
-                <span>调用工具</span>
-                <span
-                  v-if="toolGroupRunning(turn.rows ?? [], rowIndex)"
-                  class="mo-dots"
-                  aria-hidden="true"
-                ><i /><i /><i /></span>
-              </button>
               <!-- 联网检索：折叠面板取代原来那句文字摘要（来源 · 搜索词 · 结果标题与链接） -->
               <SearchReport
                 v-if="!isApprovalCard(row) && searchReportFor(row)"
-                v-show="rowVisible(turn.rows ?? [], rowIndex, index)"
                 :report="searchReportFor(row)!"
               />
               <!-- 一轮结束后的思考：按顺序落在它之后的过程行**之前**，与过程行交叉展示 -->
@@ -1470,7 +1422,6 @@ onUnmounted(() => {
               </div>
               <div
                 v-else-if="!isApprovalCard(row) && !isSettledApprovalRow(row)"
-                v-show="rowVisible(turn.rows ?? [], rowIndex, index)"
                 class="row"
                 :class="`row--${row.tone ?? 'idle'}`"
               >
@@ -1494,6 +1445,7 @@ onUnmounted(() => {
                 ><i /><i /><i /></span>
               </div>
             </template>
+          </div>
           </div>
           <MarkdownText v-if="showContent(turn)" :content="turn.content" />
           <!-- 等批准时**不要转省略号**：它不是"正在生成"，是停着等人 -->
@@ -2038,7 +1990,12 @@ onUnmounted(() => {
   display: block;
 }
 
-/* 工具调用折叠表头：与「思考过程」那一行同一套视觉（同样的缩进、同样的次色） */
+/* 过程抽屉：点开后的时间线容器（思考段 + 工具行按原顺序铺开） */
+.process {
+  display: block;
+}
+
+/* 过程抽屉表头：与「思考过程」那一行同一套视觉（同样的缩进、同样的次色） */
 .toolgroup {
   display: flex;
   align-items: center;
