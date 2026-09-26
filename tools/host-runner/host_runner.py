@@ -95,6 +95,38 @@ def read_owner_token() -> str:
     return ""
 
 
+def read_configured_port() -> int | None:
+    """从 `.env` 的 `SCILOOP_HOST_RUNNER_URL` 里读端口 —— 让「就这一条命令」名副其实。
+
+    ⚠️ 为什么必须读它（2026-09-26 查到的真根因）：`.env` 指向 **8766**
+    （9-23 因为 8765 上有个半死旧进程才换过去），而本脚本的 `DEFAULT_PORT` 是 **8765**。
+    照文档跑那一句 `python tools/host-runner/host_runner.py`，执行器就起在 8765，
+    后端去 8766 找不到人 → 界面永远「还没连上这台电脑的执行器」，
+    只有手工加 `--port 8766` 才对得上。这就是这个坑反复出现的原因。
+    配置与行为必须同源：令牌已经是从 `.env` 读的（`read_owner_token`），端口也一样读。
+
+    解析口径与 `read_owner_token` 一致（**必须剥行内注释**，否则端口后面挂的说明会污染取值）。
+    """
+
+    try:
+        for raw in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            if key.strip() != "SCILOOP_HOST_RUNNER_URL":
+                continue
+            value = value.split("#", 1)[0].strip().strip('"').strip("'")
+            tail = value.rsplit(":", 1)[-1].split("/", 1)[0].strip()
+            if tail.isdigit():
+                candidate = int(tail)
+                if 1 <= candidate <= 65535:
+                    return candidate
+    except OSError:
+        return None
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # 状态：只有端口与版本（**不再存任何密钥**）
 # --------------------------------------------------------------------------- #
@@ -651,7 +683,12 @@ def _selftest() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="SciLoop 宿主执行器：让 SciLoop 能在你这台电脑上跑命令、读写文件")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"监听端口（默认 {DEFAULT_PORT}）")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help=f"监听端口（不传就按 .env 里 SCILOOP_HOST_RUNNER_URL 的端口，都没有才用 {DEFAULT_PORT}）",
+    )
     parser.add_argument("--selftest", action="store_true", help="自检本机能不能跑命令、读文件后退出")
     parser.add_argument(
         "--token",
@@ -664,6 +701,10 @@ def main(argv: list[str] | None = None) -> int:
         return _selftest()
 
     # 认证就用 Owner 那一枚密钥 —— 不再有"执行器自己的密钥"
+    # 端口与令牌**同源**：都从 `.env` 读。否则会出现"配置写 8766、脚本默认 8765"，
+    # 研究者怎么照文档做都连不上（见 read_configured_port 的说明）。
+    port = args.port or read_configured_port() or DEFAULT_PORT
+
     token = (args.token or "").strip() or read_owner_token()
     if not token:
         print("")
@@ -679,7 +720,7 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:  # pragma: no cover - 权限异常时只说一声，不让启动失败
         print(f"（提示：没能创建 {PROJECT_ROOT}：{exc}）")
 
-    load_or_create_state(args.port)
+    load_or_create_state(port)
 
     Handler.token = token
     Handler.started_at = time.time()
@@ -690,18 +731,18 @@ def main(argv: list[str] | None = None) -> int:
 
     # 绑定 127.0.0.1：局域网/外网都连不上，只有本机能调
     try:
-        server = Server(("127.0.0.1", args.port), Handler)
+        server = Server(("127.0.0.1", port), Handler)
     except OSError as exc:
         print("")
-        print(f"启动失败：端口 {args.port} 已经被占用了（{exc}）。")
+        print(f"启动失败：端口 {port} 已经被占用了（{exc}）。")
         print("通常说明已经有一个执行器在跑 —— 先关掉它，或者换一个端口：")
-        print(f"    python tools/host-runner/host_runner.py --port {args.port + 1}")
+        print(f"    python tools/host-runner/host_runner.py --port {port + 1}")
         print("")
         return 2
 
     _say("")
     _say("SciLoop 宿主执行器已启动（保持这个窗口开着）")
-    _say(f"  监听地址：http://127.0.0.1:{args.port}（只有本机能访问）")
+    _say(f"  监听地址：http://127.0.0.1:{port}（只有本机能访问）")
     _say("  认证：用项目 .env 里的 Owner 密钥（不显示明文）")
     _say("  停止：按 Ctrl+C")
     if not probe.get("ok"):
