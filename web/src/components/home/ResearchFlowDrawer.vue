@@ -185,8 +185,13 @@ onMounted(() => {
   document.addEventListener('mouseup', endDrag)
   refreshViewportMax()
   window.addEventListener('resize', refreshViewportMax)
+  // ⚠️ 这里**不能**加 `if (ui.open)`（2026-09-26 修）：
+  // 自动弹出靠 `chain.has_chain` 由假变真来触发（见文件末尾的 watch），
+  // 而抽屉收起时如果不刷新，就永远看不到"链刚建立"这个变化 →
+  // 表现就是**面板永远不自动弹开**，只有手动打开过一次、或换会话才会弹。
+  // 只要还有会话就刷新：代价是多一个每 4 秒的轻量读，换来"阶段一建立就滑出来"。
   timer = setInterval(() => {
-    if (ui.open) void loadChain()
+    if (props.conversationId) void loadChain()
   }, 4000)
 })
 

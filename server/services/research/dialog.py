@@ -38,7 +38,13 @@ logger = logging.getLogger("sciloop.research.dialog")
 
 __all__ = [
     "PLAIN_CHAT_TRIGGERS",
+    "CHAIN_DENY_WORDS",
+    "CHAIN_OFFER_CORE",
+    "CHAIN_OFFER_SENTENCE",
+    "chain_snapshot",
     "has_chain",
+    "is_chain_denial",
+    "mentions_chain_offer",
     "is_plain_chat_reply",
     "route",
     "stream_guide",
@@ -49,6 +55,91 @@ __all__ = [
 
 #: 选了「只是普通对话」时前端会发过来的原句
 PLAIN_CHAT_TRIGGERS: tuple[str, ...] = ("只是普通对话", "普通对话", "就聊聊", "随便聊聊")
+
+
+#: 未进研究链时，模型每轮回复**末尾**要原样带上的邀请句。
+#:
+#: ⚠️ 这句话**发不发**由提示词决定（用户口径 2026-09-26：「不要程序写死规则，用提示词来告知模型」）。
+#: 程序只借它做一件事实判断：**上一轮到底发出邀请没有** —— 只有发出过，
+#: 下一轮"没否定就算同意"才成立（否则用户随口一句就得被拉进研究链）。
+CHAIN_OFFER_CORE = "是否现在开始研究链"
+
+#: 邀请原句（提示词要原样要求；程序靠 `CHAIN_OFFER_CORE` 识别）
+CHAIN_OFFER_SENTENCE = "是否现在开始研究链？默认现在开始"
+
+#: 明确**不要**研究链的说法 —— 命中即声明为普通对话，本对话内永久不再问。
+CHAIN_DENY_WORDS: tuple[str, ...] = (
+    "不需要",
+    "不用了",
+    "不用",
+    "不要了",
+    "不要",
+    "先不",
+    "先别",
+    "别开始",
+    "不必",
+    "暂时不",
+)
+
+
+def mentions_chain_offer(text: str) -> bool:
+    """这条（助手）回复里有没有发出「是否现在开始研究链」的邀请。"""
+
+    return CHAIN_OFFER_CORE in (text or "")
+
+
+def is_chain_denial(text: str) -> bool:
+    """用户这句话是不是在**明确拒绝**研究链。"""
+
+    compact = (text or "").strip()
+    if not compact:
+        return False
+    return any(word in compact for word in CHAIN_DENY_WORDS)
+
+
+async def chain_snapshot(conversation_id: str) -> dict[str, Any]:
+    """本对话研究链的**事实快照**：有没有开链、当前在哪一站、第几步。
+
+    为什么要有它：对话通道（`api/v1/chat.py`）是**文件型**的、拿不到 DB session，
+    而模型现在必须在**回复开头**点明"现在处于哪个节点"、并据此决定要不要发邀请 ——
+    它需要真相，否则只能猜（实测就猜错过：把"还没挂链"当成"已经在跑"，
+    于是凭空做起了实验准备）。
+
+    与 `has_chain` 同一套做法：自己开会话去读，**读不到一律按"还没开链"处理，绝不阻塞对话**。
+    """
+
+    from services.research import graph
+
+    order = list(graph.NODE_ORDER)
+    empty: dict[str, Any] = {
+        "chained": False,
+        "node": None,
+        "label": None,
+        "index": 0,
+        "total": len(order),
+    }
+
+    from db.session import AsyncSessionLocal
+
+    if AsyncSessionLocal is None:  # pragma: no cover - 未配库时不影响对话
+        return empty
+    try:
+        async with AsyncSessionLocal() as session:
+            if await _node_run_count(session, conversation_id) <= 0:
+                return empty
+            node = await orchestrator.current_node(session, conversation_id=conversation_id)
+    except Exception as exc:  # noqa: BLE001 - 读不到就当"还没开链"，不影响这一轮对话
+        logger.warning("读研究链快照失败 conversation=%s：%s", conversation_id, exc)
+        return empty
+
+    index = order.index(node) + 1 if node in order else 0
+    return {
+        "chained": True,
+        "node": node,
+        "label": graph.NODE_LABELS.get(node or "", node),
+        "index": index,
+        "total": len(order),
+    }
 
 
 def is_plain_chat_reply(text: str) -> bool:

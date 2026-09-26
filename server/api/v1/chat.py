@@ -33,7 +33,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -46,6 +46,7 @@ from services import conversations
 from services.agent import approvals as agent_approvals
 from services.output_style import OUTPUT_STYLE
 from services.research import dialog, messages
+from services.research import intent as intent_mod
 
 logger = logging.getLogger("sciloop.chat")
 
@@ -95,6 +96,18 @@ REPLY_SYSTEM = (
     "反过来，研究者已经说清要做什么时就直接做，不要重复确认、也不要多问。\n"
     "**不要输出你的思考过程、推理草稿或自我对话**（例如「我们需要回答用户……」「让我想想……」），"
     "只输出给研究者看的最终答复。\n"
+    # 2026-09-26 用户口径（新用户首轮体验，逐条确认过）：说清「现在在哪一段」、
+    # 邀请进研究链、等批准时也必须说话、首轮只问三件事。
+    "**每一条回复的开头**先用一句话点明现在处于哪个阶段：还没开始研究链就直说"
+    "「现在还没开始研究链」；已经在链上就点明当前节点名。系统消息里给了你"
+    "**当前真实状态**，照它说，不要猜。\n"
+    "**还没开始研究链时**，每条回复的**最末尾**原样补上这一句（不要改写、不要省略）："
+    "「" + dialog.CHAIN_OFFER_SENTENCE + "」。研究者下一条只要没明确说不要，就算他同意 —— "
+    "你直接开始第 1 步（文献调研），不要再问第二遍；他要是明确说不需要，这件事就不要再提。\n"
+    "**需要研究者批准、或要等他给信息时，也必须先写一句话**说明你在做什么、需要他点头什么 —— "
+    "不允许只有动作、没有正文。\n"
+    "**刚开始对话、还没搞清他要做什么时，最多问三件事**：研究主题或方向、想要的产出、数据情况；"
+    "别的一律先别问。\n"
     "不要编造文献、数据或结论；没有实际查过本地数据就不要声称查过。\n\n" + OUTPUT_STYLE
 )
 
@@ -146,6 +159,56 @@ def skills_signature() -> str:
         logger.warning("技能目录指纹计算失败，本轮不做缓存：%s", exc)
         return ""
     return "|".join(parts)
+
+
+async def research_state_block(conversation_id: str, conversation: dict[str, Any]) -> str:
+    """把「研究链现在到哪了」如实告诉模型 —— **事实块，不是指令**。
+
+    为什么必须有它：模型要在回复开头点明阶段、并决定要不要发那道邀请，就得知道真相。
+    实测（2026-09-26）没有这块时它会**猜错**：把"还没挂链"当成"已经在跑"，
+    于是整轮都在做实验准备，而研究者看不到任何阶段分界。
+
+    口径：**程序只报事实**（有没有链、当前第几站、是否已声明普通对话）；
+    跑不跑、推不推进仍由模型决定。
+    """
+
+    if conversation.get("plain_chat"):
+        state = "研究者已声明本对话**不做研究链**（当普通对话用）。"
+    else:
+        snapshot = await dialog.chain_snapshot(conversation_id)
+        if snapshot["chained"]:
+            state = (
+                f"已经在研究链上，当前节点：**{snapshot['label']}**"
+                f"（第 {snapshot['index']}/{snapshot['total']} 步）。"
+            )
+        else:
+            state = "本对话**还没开始研究链**（还没有任何节点跑过）。"
+
+    return (
+        "\n\n【当前状态（系统实测，照它说，别猜）】\n"
+        f"- {state}\n"
+        "- 这是程序查出来的事实；要不要推进、推进到哪，仍由你决定。\n"
+    )
+
+
+async def _chained(conversation_id: str) -> bool:
+    """本对话是否已经在研究链上（读不到就按"没有"处理，不阻塞对话）。"""
+
+    return bool((await dialog.chain_snapshot(conversation_id))["chained"])
+
+
+def _last_assistant_text(conversation: dict[str, Any]) -> str:
+    """最近一条**助手说的话**（跳过"系统在说话"的那种轮次）。
+
+    用来判断上一轮到底发没发「是否现在开始研究链」那道邀请 ——
+    靠**读真实正文**判断，而不是另存一个可能过期的标志位。
+    """
+
+    for turn in reversed(conversation.get("turns") or []):
+        if str(turn.get("role") or "") != "assistant" or turn.get("note_only"):
+            continue
+        return str(turn.get("content") or "")
+    return ""
 
 
 def skills_system_block() -> str:
@@ -914,7 +977,7 @@ async def home_chat(payload: HomeChatRequest) -> HomeChatResponse:
     summary="首页对话（真流式 SSE：meta / delta / done / title / error，需 X-Owner-Token）",
     dependencies=[Depends(require_owner)],
 )
-async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
+async def home_chat_stream(payload: HomeChatRequest, request: Request) -> StreamingResponse:
     """首页对话的流式版本。
 
     事件序列：
@@ -968,6 +1031,39 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
     if dialog.is_plain_chat_reply(text):
         return _streaming(
             dialog.stream_plain_chat(conversation_id=conversation_id, scope=scope)
+        )
+
+    # ------------------------------------------------------------------ #
+    # 「是否现在开始研究链？默认现在开始」怎么落地（用户口径 2026-09-26）
+    #
+    # 分工写清楚，免得两边都当成"写死规则"：
+    #   · 邀请**发不发**由**提示词**决定（模型自己判断）—— 程序不代它说这句话；
+    #   · 程序只做**事实判断**：上一轮助手到底发出邀请没有（读它的正文，不存标志位）；
+    #   · 发过 + 这一条**没否定** ⇒ 算同意，直接按「开始文献调研」走（不再问第二遍）；
+    #   · 发过 + 明确说不要 ⇒ 走既有的「本对话声明为普通对话」（`plain_chat`，永久不再提）；
+    #   · 没发过邀请 ⇒ 什么都不做（免得研究者随口一句就被拉进研究链）。
+    # ------------------------------------------------------------------ #
+    offer_live = (
+        not conversation.get("plain_chat")
+        and dialog.mentions_chain_offer(_last_assistant_text(conversation))
+        and not await _chained(conversation_id)
+    )
+    if offer_live:
+        if dialog.is_chain_denial(text):
+            return _streaming(
+                dialog.stream_plain_chat(conversation_id=conversation_id, scope=scope)
+            )
+        return _streaming(
+            dialog.stream_node(
+                conversation_id=conversation_id,
+                text=text,
+                scope=scope,
+                routing=intent_mod.Intent(
+                    kind="node",
+                    node="literature_review",
+                    reason="研究者没有拒绝那道邀请，按同意处理",
+                ),
+            )
         )
 
     routing = await dialog.route(
@@ -1045,7 +1141,12 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
             from services.agent import mcp_tools as agent_tools
 
             messages_now: list[dict[str, Any]] = [
-                {"role": "system", "content": REPLY_SYSTEM + skills_system_block()},
+                {
+                    "role": "system",
+                    "content": REPLY_SYSTEM
+                    + await research_state_block(conversation_id, conversation)
+                    + skills_system_block(),
+                },
                 *history,
                 {"role": "user", "content": text},
             ]
@@ -1072,6 +1173,20 @@ async def home_chat_stream(payload: HomeChatRequest) -> StreamingResponse:
                 approvals_out=approval_requests,
                 state=state,
             ):
+                # 客户端断开（研究者按了「停止」、或关掉页面）→ **主动收尾**。
+                # ⚠️ 为什么不能只靠 asyncio.CancelledError：任务被取消之后，finally 里
+                # 落盘的 await 会被**二次取消**，于是"停止"的那一轮整个不落盘 ——
+                # 2026-09-26 实测：停止后刷新，那一轮在库里查不到（显示与落盘不一致）。
+                # 这里在 yield 之前轻量探一次连接，断开就走**正常收尾路径**（不触发取消）。
+                if await request.is_disconnected():
+                    aborted = True
+                    error_info = {
+                        "code": "client_disconnected",
+                        "message": "研究者停止了本轮生成",
+                        "kind": "ClientDisconnected",
+                    }
+                    logger.info("首页流式：客户端断开，按中断收尾 conversation=%s", conversation_id)
+                    break
                 yield frame
             result = state["result"]
             pending_approval = state["pending"]
@@ -1439,7 +1554,12 @@ async def _approval_stream(
                 assistant_call_msg["reasoning_content"] = reasoning_value
             compactions_out: list[dict[str, Any]] = []
             messages_now: list[dict[str, Any]] = [
-                {"role": "system", "content": REPLY_SYSTEM + skills_system_block()},
+                {
+                    "role": "system",
+                    "content": REPLY_SYSTEM
+                    + await research_state_block(conversation_id, record)
+                    + skills_system_block(),
+                },
                 *conversations.context_messages(record),
                 assistant_call_msg,
                 {
