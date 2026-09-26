@@ -667,8 +667,10 @@ def render_mono(
     skipped_rotated = 0
     skipped_unreadable = 0
     skipped_overlap = 0
-    #: 回写字号**低于可读下限**但成功放下的块数（2026-09-26：宁可小字号也要写进去）
+    #: 回写字号**低于可读下限**但成功放下的块数，以及其中用过的最小字号
+    #: （2026-09-26：宁可小字号也要写进去；但汇总里必须报**实际最小值**，不能说成都到了 4pt）
     below_readable = 0
+    below_readable_min = 0.0
     expanded_blocks = 0
     try:
         by_page: dict[int, list[int]] = {}
@@ -861,6 +863,8 @@ def render_mono(
                     expanded_blocks += 1
                 if used_size < _readable_floor(block.font_size) - 1e-9:
                     below_readable += 1
+                    if below_readable_min <= 0 or used_size < below_readable_min:
+                        below_readable_min = used_size
                 if used_size < block.font_size * SHRINK_WARN_RATIO:
                     warnings.append(
                         f"page={block.page} bbox={_fmt_bbox(block.bbox)} 译文回写字号由 "
@@ -872,9 +876,11 @@ def render_mono(
 
         if below_readable:
             warnings.append(
-                f"共 {below_readable} 块译文放不进可读下限（{MIN_READABLE_FONT_SIZE:g}pt），"
-                f"已缩到技术下限 {MIN_FONT_SIZE:g}pt 写入（在可缩放阅读器里可读，"
-                "但比原文字号小；这类块值得人工看一眼）"
+                f"共 {below_readable} 块译文放不进可读下限（不低于原字号 "
+                f"{READABILITY_FLOOR_RATIO:.0%} 且 {MIN_READABLE_FONT_SIZE:g}pt），"
+                f"已缩到下限以下写入，其中最小到 {below_readable_min:g}pt"
+                f"（技术下限 {MIN_FONT_SIZE:g}pt）—— 在可缩放阅读器里可读，"
+                "但确实比原文字号小，这类块值得人工抽查"
             )
         if skipped_rotated:
             warnings.append(
