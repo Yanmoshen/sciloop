@@ -28,6 +28,8 @@ export interface ProjectBrief {
   is_demo?: boolean
   /** 供「最近打开」按时间排序 */
   created_at?: string | null
+  /** 这个项目在研究者电脑上的真实工作目录（没定过就是 null/缺失） */
+  workspace_dir?: string | null
 }
 
 export interface HealthPayload {

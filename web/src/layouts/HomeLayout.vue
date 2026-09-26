@@ -543,6 +543,9 @@ async function onProjectCreated(project: CreatedProject): Promise<void> {
   // 不滚回去的话用户会以为"建了但没出现"。
   await nextTick()
   railScrollEl.value?.scrollTo({ top: 0, behavior: 'smooth' })
+  // 2026-09-26（研究者报）：建完项目应该**直接进这个项目并开一个新对话**，
+  // 而不是停在原地让人自己找。复用项目行 ＋ 那套（同一个口径，不另写一份）。
+  startConversationIn(project.id)
 }
 
 // --------------------------------------------------------------------------- //
@@ -1045,6 +1048,31 @@ onUnmounted(() => {
                 </span>
                 <span class="crow__label">{{ p.name }}</span>
               </button>
+              <span class="pcard" role="tooltip">
+                <span class="pcard__name">{{ p.name }}</span>
+                <span class="pcard__line">
+                  <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path
+                      d="M3 3.6h10v7.2H7.2L4.6 13v-2.2H3z"
+                      stroke="currentColor"
+                      stroke-width="1.3"
+                      stroke-linejoin="round"
+                    />
+                  </svg>
+                  {{ conversations.forProject(p.id).length }} 个对话
+                </span>
+                <span v-if="p.workspace_dir" class="pcard__line pcard__line--path">
+                  <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path
+                      d="M2.4 4.6h4l1.2 1.6h6v5.6a1 1 0 0 1-1 1h-10a1 1 0 0 1-1-1V4.6z"
+                      stroke="currentColor"
+                      stroke-width="1.3"
+                      stroke-linejoin="round"
+                    />
+                  </svg>
+                  {{ p.workspace_dir }}
+                </span>
+              </span>
               <span class="crow__acts">
                 <button
                   class="icon-btn"
@@ -1135,9 +1163,6 @@ onUnmounted(() => {
 
             <div class="fold" :class="{ 'fold--open': isExpanded(p.id) }">
               <div class="ckids">
-                <p v-if="conversations.forProject(p.id).length === 0" class="group__empty group__empty--child">
-                  该项目暂无对话
-                </p>
                 <div v-for="c in conversations.forProject(p.id)" :key="c.id" class="crow-block">
                   <div
                     class="crow crow--child"
@@ -1152,7 +1177,32 @@ onUnmounted(() => {
                   >
                     {{ c.title || '未命名对话' }}
                   </button>
-                  <span class="crow__acts">
+                  <span class="pcard" role="tooltip">
+                <span class="pcard__name">{{ p.name }}</span>
+                <span class="pcard__line">
+                  <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path
+                      d="M3 3.6h10v7.2H7.2L4.6 13v-2.2H3z"
+                      stroke="currentColor"
+                      stroke-width="1.3"
+                      stroke-linejoin="round"
+                    />
+                  </svg>
+                  {{ conversations.forProject(p.id).length }} 个对话
+                </span>
+                <span v-if="p.workspace_dir" class="pcard__line pcard__line--path">
+                  <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path
+                      d="M2.4 4.6h4l1.2 1.6h6v5.6a1 1 0 0 1-1 1h-10a1 1 0 0 1-1-1V4.6z"
+                      stroke="currentColor"
+                      stroke-width="1.3"
+                      stroke-linejoin="round"
+                    />
+                  </svg>
+                  {{ p.workspace_dir }}
+                </span>
+              </span>
+              <span class="crow__acts">
                     <!-- 已在项目里，所以行内只留「更多」（重命名 / 归档）；移入别的项目走「更多」之外不做，避免误操作 -->
                     <button
                       class="icon-btn"
@@ -1574,6 +1624,54 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+/* 项目行悬停卡片（2026-09-26）：项目名 + 几个对话 + 挂载的真实目录。
+   研究者明确要求：**不要小字注释**，所以这里只放数据，不放说明文字。 */
+.crow--project {
+  position: relative;
+}
+
+.pcard {
+  position: absolute;
+  left: 12px;
+  top: calc(100% - 4px);
+  z-index: 40;
+  display: none;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 200px;
+  max-width: 340px;
+  padding: 10px 12px;
+  border: 1px solid var(--h-line-strong);
+  border-radius: 10px;
+  background: var(--h-bg-elevated, var(--h-surface));
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18); /* ui-polish-allow: 浮层投影 */
+}
+
+.crow--project:hover .pcard,
+.crow--project:focus-within .pcard {
+  display: flex;
+}
+
+.pcard__name {
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  color: var(--h-fg);
+  overflow-wrap: anywhere;
+}
+
+.pcard__line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--font-size-sm);
+  color: var(--h-fg-muted);
+}
+
+.pcard__line--path {
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  overflow-wrap: anywhere;
+}
+
 /* 壳层：整页不滚动，只有中间内容区滚动（左栏与顶栏固定）
    —— `height`（而非 `min-height`）+ `overflow: hidden` 是必须的：
    只要留着 `min-height: 100vh`，内容变高时根容器会被撑高，整页就会出现第二条滚动条。 */

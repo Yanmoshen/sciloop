@@ -264,14 +264,45 @@ async function submit(): Promise<void> {
 }
 
 .field input,
-.field textarea,
 .field textarea {
-  resize: none;
+  /* 2026-09-26：这段规则体被上一轮"删死样式"误删过（只剩 resize）→ 输入框退回浏览器默认样式，
+     与研究者的整体风格断层 ✗。这里按 app 的扁平口径补回来（跟聊天输入框同一套令牌）。 */
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 12px;
+  border: 1px solid var(--h-line);
+  border-radius: 10px;
+  background: var(--h-surface);
+  color: var(--h-fg);
+  font: inherit;
+  font-size: var(--font-size-md);
+  line-height: 1.5;
+  resize: vertical;
+  transition: border-color 160ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.field input::placeholder,
+.field textarea::placeholder {
+  color: var(--h-fg-subtle);
+}
+
+.field input:hover,
+.field textarea:hover {
+  border-color: var(--h-line-strong);
 }
 
 .field input:focus,
-.field textarea:focus,
-/* 方向 chip：悬停给描边 + 淡底，不用位移（避免整排跳动） */
+.field textarea:focus {
+  outline: none;
+  border-color: var(--h-fg-muted);
+}
+
+.field input:focus-visible,
+.field textarea:focus-visible {
+  outline: 2px solid var(--h-fg-muted);
+  outline-offset: 1px;
+}
+
 .notice {
   margin: 0;
   padding: 10px 12px;
@@ -311,6 +342,15 @@ async function submit(): Promise<void> {
   border-color: var(--h-primary);
   color: var(--h-primary-fg);
   font-weight: 600;
+}
+
+/* 2026-09-26：通用 `.btn:hover{color:var(--h-fg)}` 会盖掉主按钮的字色 ✗
+   → 白底 + 主题浅字 = 悬停时看不清（研究者实报）。主按钮的 hover 固定用自己的字色。 */
+.btn--primary:hover {
+  background: var(--h-primary);
+  border-color: var(--h-primary);
+  color: var(--h-primary-fg);
+  opacity: 0.92;
 }
 
 .btn--primary:disabled {

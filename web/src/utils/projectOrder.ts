@@ -26,6 +26,8 @@ export interface RailProjectLike {
   name?: string
   is_demo?: boolean
   created_at?: string | null
+  /** 这个项目在研究者电脑上的真实工作目录（没定过就是 null/缺失） */
+  workspace_dir?: string | null
 }
 
 function demoRank(project: RailProjectLike): number {
