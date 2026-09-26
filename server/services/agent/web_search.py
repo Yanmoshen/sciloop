@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import xml.etree.ElementTree as ET
@@ -63,7 +64,10 @@ DEFAULT_URL = "http://searxng:8080"
 SEARXNG_URL_ENV = "SCILOOP_SEARXNG_URL"
 #: 可选代理。**默认为空 = 直连**（研究者明确要"直连为主"，代理只在需要时配）。
 PROXY_ENV = "SCILOOP_SEARXNG_PROXY"
-DEFAULT_TIMEOUT_S = 30.0
+#: 单个外部请求的超时。2026-09-26 从 30 秒压到 12 秒：节点检索已经改成**并发**发起，
+#: 慢源不该拖着整轮一起等它（实测一次文献调研的 178 秒里有 158 秒是在等检索，
+#: 而其中大半是「一个源不响应 → 后面所有源都在排队」）。
+DEFAULT_TIMEOUT_S = 12.0
 
 #: 默认要搜的分类。**这一项是 2026-09-22 那次"0 条"的一半原因**：
 #: arxiv / crossref 在 `science`、github 在 `it`，只搜 `general` 等于把它们全跳过。
@@ -411,6 +415,40 @@ async def _github(query: str, limit: int, http: httpx.AsyncClient) -> list[dict[
 _SOURCE_FETCHERS = {"arxiv": _arxiv, "crossref": _crossref, "github": _github}
 
 
+async def _fetch_one(
+    name: str, text: str, limit: int, http: httpx.AsyncClient
+) -> tuple[str, list[dict[str, Any]] | None, dict[str, str] | None]:
+    """并发单元：问**一个**来源，返回 ``(来源名, 命中列表, 失败描述)``。
+
+    异常全部在这里吃掉并转成结构化失败 —— 并发时一个源抛错不能影响其它源
+    （等价于原来 ``for`` 循环里的那几个 ``except ... continue``）。
+    """
+    fetcher = _SOURCE_FETCHERS.get(name)
+    if fetcher is None:
+        return name, None, None
+    label = SOURCE_LABELS.get(name, name)
+    try:
+        return name, await fetcher(text, limit, http), None
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        # 403/429 是被挡；**406 也要算被挡** —— arXiv 按 IP 限流时就是回 406
+        # （实测：同一请求几分钟前 200，连续探测后一律 406）
+        reason = REASON_BLOCKED if status in (403, 406, 429) else REASON_BAD_RESPONSE
+        return name, None, {"source": label, "reason": reason, "detail": f"HTTP {status}"}
+    except httpx.HTTPError as exc:
+        return name, None, {
+            "source": label,
+            "reason": REASON_NO_EGRESS,
+            "detail": type(exc).__name__,
+        }
+    except (ET.ParseError, ValueError, KeyError) as exc:
+        return name, None, {
+            "source": label,
+            "reason": REASON_BAD_RESPONSE,
+            "detail": str(exc)[:60],
+        }
+
+
 async def search_academic(
     query: str,
     *,
@@ -434,44 +472,24 @@ async def search_academic(
     used: list[str] = []
     seen: set[str] = set()
     try:
-        for name in sources:
-            fetcher = _SOURCE_FETCHERS.get(name)
-            if fetcher is None:
-                continue
-            try:
-                hits = await fetcher(text, limit, http)
-            except httpx.HTTPStatusError as exc:
-                status = exc.response.status_code
-                # 403/429 是被挡；**406 也要算被挡** —— arXiv 按 IP 限流时就是回 406
-                # （实测：同一请求几分钟前 200，连续探测后一律 406）
-                reason = REASON_BLOCKED if status in (403, 406, 429) else REASON_BAD_RESPONSE
-                failed.append({"source": SOURCE_LABELS.get(name, name), "reason": reason, "detail": f"HTTP {status}"})
-                continue
-            except httpx.HTTPError as exc:
-                failed.append(
-                    {
-                        "source": SOURCE_LABELS.get(name, name),
-                        "reason": REASON_NO_EGRESS,
-                        "detail": type(exc).__name__,
-                    }
-                )
-                continue
-            except (ET.ParseError, ValueError, KeyError) as exc:
-                failed.append(
-                    {
-                        "source": SOURCE_LABELS.get(name, name),
-                        "reason": REASON_BAD_RESPONSE,
-                        "detail": str(exc)[:60],
-                    }
-                )
-                continue
-            used.append(SOURCE_LABELS.get(name, name))
-            for hit in hits:
-                key = hit["url"].split("?")[0]
-                if key in seen:
+            # **并发**问所有来源（2026-09-26）：串行时"一个源不响应"会把整轮拖住 ——
+            # 实测一次文献调研 178 秒里 158 秒都在等检索，而这三个源彼此毫无依赖。
+            # 顺序仍按 sources 声明（gather 保序），去重规则不变。
+            for name, hits, failure in await asyncio.gather(
+                *(_fetch_one(name, text, limit, http) for name in sources)
+            ):
+                if failure is not None:
+                    failed.append(failure)
                     continue
-                seen.add(key)
-                results.append(hit)
+                if not hits:
+                    continue
+                used.append(SOURCE_LABELS.get(name, name))
+                for hit in hits:
+                    key = hit["url"].split("?")[0]
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    results.append(hit)
     finally:
         if owns:
             await http.aclose()

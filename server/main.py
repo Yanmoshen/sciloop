@@ -169,6 +169,26 @@ async def _warm_up_prompt_caches() -> None:
         logger.warning("提示词料预热失败（首次请求会照旧现算）：%s", exc)
 
 
+async def _reap_stale_node_runs() -> None:
+    """服务启动时把上一代进程留下的「运行中」节点**如实收尾**（2026-09-26）。
+
+    不做的话界面上会出现**假的「运行中」**：那些节点其实早就随进程消失了，
+    状态却一直停在 running（实测库里积了 4 条）。收尾失败只告警，绝不影响启动。
+    """
+    try:
+        from db.session import AsyncSessionLocal
+        from services.research import store as research_store
+
+        if AsyncSessionLocal is None:  # pragma: no cover - 驱动缺失
+            return
+        async with AsyncSessionLocal() as session:
+            reaped = await research_store.reap_stale_running_runs(session)
+        if reaped:
+            logger.info("已如实收尾 %d 条残留的「运行中」节点记录", reaped)
+    except Exception as exc:  # noqa: BLE001 - 收尾失败不该拦住启动
+        logger.warning("收尾残留节点失败：%s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期：启动探测数据库 + 按开关挂载批量任务调度器，关闭时释放资源。"""
@@ -177,6 +197,8 @@ async def lifespan(app: FastAPI):
         logger.info("数据库连接正常: %s (%s)", probe.get("database"), probe.get("server_version"))
     else:
         logger.warning("数据库不可用: %s", probe.get("detail"))
+    # 收尾上一代进程留下的「运行中」节点（否则界面上会有一条假的"运行中"）
+    await _reap_stale_node_runs()
     if settings.demo_seed_on_startup:
         logger.info("DEMO_SEED_ON_STARTUP=1：预置示例 Project 由 WP16 种子任务负责导入")
     # WP01-T6：调度器默认关闭（SCHEDULER_ENABLED=0），关闭时由 scheduler 打印「未启用」；

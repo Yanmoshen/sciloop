@@ -41,6 +41,7 @@ import os
 import secrets
 import subprocess
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -302,6 +303,99 @@ def run_command(
     }
 
 
+# ---------------------------------------------------------------------------------------
+# 常驻弹框助手（2026-09-26）
+#
+# 为什么要有它：研究者点「选择文件夹」时，走 PowerShell 要等 2.4–3.4 秒（起进程 + 现场
+# 编译 C#），走一次性子进程要 ~18 秒（每次重新预热 COM）—— 点一下等三秒以上不合理。
+# 常驻助手把预热做在前面，点击时只发一行 JSON，窗口几乎立刻出现；
+# **顺带**：助手是无控制台的子进程，所以不会再闪出 PowerShell 黑框。
+#
+# 失败一律回落：助手起不来 / 中途崩了 / 回话超时 → 返回 None，`pick_folder` 照旧走原路径 ✓
+# ---------------------------------------------------------------------------------------
+_PICK_ASSISTANT: dict[str, Any] = {"proc": None, "lock": threading.Lock()}
+
+
+def _start_pick_assistant() -> subprocess.Popen[bytes] | None:
+    """启动常驻助手（只在 Windows 且原生模块存在时）；失败返回 None。"""
+    if not sys.platform.startswith("win"):
+        return None
+    script = Path(__file__).with_name("pick_native.py")
+    if not script.is_file():
+        return None
+    try:
+        return subprocess.Popen(  # noqa: S603 - 弹系统对话框是本模块的本职
+            [sys.executable, str(script), "--serve"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+        )
+    except OSError:
+        return None
+
+
+def _discard_pick_assistant(proc: subprocess.Popen[bytes] | None) -> None:
+    """丢弃一个不正常的助手（杀掉 + 归零；下次请求会重新起一个）。返回值恒为 None。"""
+    if proc is not None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    return None
+
+
+def _readline_within(proc: subprocess.Popen[bytes], timeout_s: float) -> str | None:
+    """在独立线程里读一行；超时返回 None（`readline` 本身没法中断）。"""
+    box: dict[str, Any] = {"line": None}
+
+    def worker() -> None:
+        try:
+            raw = proc.stdout.readline() if proc.stdout is not None else b""
+        except Exception:  # noqa: BLE001 - 助手没了就是没结果
+            raw = b""
+        box["line"] = raw.decode("utf-8", errors="replace").strip() if isinstance(raw, bytes) else None
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(timeout_s)
+    if thread.is_alive():
+        return None
+    return box["line"] or None
+
+
+def pick_folder_via_assistant(*, title: str, timeout_s: int) -> dict[str, Any] | None:
+    """让常驻助手弹框；**任何异常/超时都返回 None**，由调用方回落原路径。"""
+    with _PICK_ASSISTANT["lock"]:
+        proc = _PICK_ASSISTANT.get("proc")
+        if proc is not None and proc.poll() is not None:
+            proc = None  # 助手已经退出（崩了 / 被关掉）
+        if proc is None:
+            proc = _start_pick_assistant()
+            _PICK_ASSISTANT["proc"] = proc
+        if proc is None or proc.stdin is None or proc.stdout is None:
+            return None
+        request = json.dumps(
+            {"cmd": "pick", "title": title, "timeout_s": int(timeout_s)}, ensure_ascii=False
+        )
+        try:
+            proc.stdin.write((request + "\n").encode("utf-8"))
+            proc.stdin.flush()
+        except (OSError, ValueError):
+            _PICK_ASSISTANT["proc"] = _discard_pick_assistant(proc)
+            return None
+        # 助手自己带对话框超时，这里再留 30 秒余量；仍读不到 → 助手不正常，丢弃回落
+        line = _readline_within(proc, float(timeout_s) + 30)
+        if line is None:
+            _PICK_ASSISTANT["proc"] = _discard_pick_assistant(proc)
+            return None
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+
 def pick_folder(*, title: str = "选择文件夹", initial: str = "", timeout_s: int = 600) -> dict[str, Any]:
     """弹出**系统自带**的文件夹选择框，返回研究者选中的绝对路径。
 
@@ -327,6 +421,10 @@ def pick_folder(*, title: str = "选择文件夹", initial: str = "", timeout_s:
 # 实测：子进程跑原生 COM 要 ~18 秒 ✗（比旧路径的 2.4–3.4 秒更差），这里不用它；
 # 原生模块 pick_native.py 留着，等以后做“常驻助手进程”时再用。
     if sys.platform.startswith("win"):
+        # 先试**常驻助手**（快 + 不会闪黑框）；拿不到就回落下面的 PowerShell 路径
+        assisted = pick_folder_via_assistant(title=title, timeout_s=timeout_s)
+        if assisted is not None:
+            return assisted
         script = (
             "Add-Type -AssemblyName System.Windows.Forms; "
             "Add-Type -AssemblyName System.Drawing; "
@@ -376,8 +474,17 @@ def pick_folder(*, title: str = "选择文件夹", initial: str = "", timeout_s:
     else:
         argv = ["zenity", "--file-selection", "--directory", "--title", title]
 
+    # Windows：**隐藏子进程自带的控制台窗口** —— 否则点「选择文件夹」会闪出一个
+    # PowerShell 黑框（对话框是它弹的，那个黑框只是它的控制台副作用，用户不该看到）。
+    # CREATE_NO_WINDOW 只掐掉控制台，不影响 WinForms 对话框本身的显示。
+    run_extra: dict[str, Any] = {}
+    if sys.platform.startswith("win"):
+        run_extra["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
     try:
-        proc = subprocess.run(argv, capture_output=True, timeout=timeout_s, check=False)
+        proc = subprocess.run(
+            argv, capture_output=True, timeout=timeout_s, check=False, **run_extra
+        )
     except FileNotFoundError:
         return {
             "ok": False,

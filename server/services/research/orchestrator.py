@@ -996,6 +996,9 @@ async def _run_node_events(
     advisories: list[str] = []
     #: 模型要求搜的结果累积在这里，下一轮作为事实塞进提示词
     search_notes: list[dict[str, Any]] = []
+    #: 连续多少轮检索都没命中（2026-09-26）：作为**事实**写进提示词交给模型判断，
+    #: 并在达到防呆线时交回研究者 —— 防的是"一圈一圈白跑"，不是替模型做决定。
+    zero_hit_streak = 0
     #: 模型要求跑的命令与真实输出（同样是"事实"，下一轮塞回去）
     command_notes: list[dict[str, Any]] = []
     while True:
@@ -1016,7 +1019,7 @@ async def _run_node_events(
             upstream=upstream,
             library=library,
             hits=hits or [],
-            budget={**budget, "retry_count": attempt},
+            budget={**budget, "retry_count": attempt, "zero_hit_streak": zero_hit_streak},
             repair=repair,
             search_results=search_notes,
             command_results=command_notes,
@@ -1305,14 +1308,62 @@ async def _run_node_events(
         academic_wanted = _query_list(candidate, "academic_queries")
         web_wanted = _query_list(candidate, "web_queries")
         if academic_wanted or web_wanted:
-            found: list[dict[str, Any]] = []
+            # 先报一句「正在检索」：检索可能等十几秒，缺了这句用户只会觉得"卡住了"
+            # （2026-09-26 实测：整轮 178 秒里，界面在这段完全没有增量反馈）。
+            all_wanted = [*academic_wanted, *web_wanted]
+            yield "notice", {
+                "node": target,
+                "code": "searching",
+                "message": (
+                    f"正在检索 {len(all_wanted)} 组关键词：{'、'.join(all_wanted[:4])}"
+                    f"{'…' if len(all_wanted) > 4 else ''}（学术与网页同时查）"
+                ),
+            }
+            # **学术与网页并发**：原来学术全跑完才开始跑网页，等于把两段等待串起来等。
+            tasks: list[Any] = []
             if academic_wanted:
-                found.extend(await _run_academic_queries(academic_wanted))
+                tasks.append(_run_academic_queries(academic_wanted))
             if web_wanted:
-                found.extend(await _run_web_queries(web_wanted))
+                tasks.append(_run_web_queries(web_wanted))
+            batches = await asyncio.gather(*tasks)
+            found: list[dict[str, Any]] = [item for batch in batches for item in batch]
             search_notes.extend(found)
 
             total = sum(len(block.get("results") or []) for block in found)
+
+            # ---- 连续空手就停下来交给研究者（2026-09-26 防呆）--------------------- #
+            # 提示词里已经把"连续 N 轮空手"如实告诉模型了（让它自己决定换词还是停），
+            # 这里兜的是"模型一直说 continue、于是一圈一圈白跑"的极端情况：
+            # 实测有一次跑到 7 轮 / 533 秒，每轮都把同样的源重搜一遍。
+            zero_hit_streak = zero_hit_streak + 1 if total == 0 else 0
+            if zero_hit_streak >= SEARCH_ZERO_HIT_LIMIT:
+                stop_text = (
+                    f"连续 {zero_hit_streak} 轮检索都没有命中任何材料，已停下来交给你："
+                    "继续用同样的词搜下去大概率还是空手。可以换一批更具体的论文、"
+                    "或把研究问题写得更明确，然后让我重跑这一步。"
+                )
+                yield "notice", {
+                    "node": target,
+                    "code": "search_zero_hits",
+                    "message": stop_text,
+                }
+                yield "waiting_human", {
+                    "node": target,
+                    "node_label": graph.NODE_LABELS.get(target, target),
+                    "retry_count": attempt,
+                    "items": advisories,
+                    "message": stop_text,
+                }
+                yield "done", {
+                    "node": target,
+                    "status": "waiting_human",
+                    "display_status": graph.display_status("waiting_human"),
+                    "content_notes": _content_notes(candidate),
+                    "cost_usd": round(total_cost, 6),
+                    "llm_call_count": llm_calls,
+                }
+                return
+
             # **结构化结果行**：随会话落盘，界面据此画折叠面板（行即卡片，刷新后还在）
             yield "row", {
                 "row": {
@@ -1900,32 +1951,42 @@ def _block(capability: str, query: str, result: dict[str, Any]) -> dict[str, Any
 
 
 async def _run_academic_queries(queries: list[str]) -> list[dict[str, Any]]:
-    """查学术（arXiv / Crossref / GitHub 官方接口）。**查不到也照实返回**。"""
+    """查学术（arXiv / Crossref / GitHub 官方接口）。**查不到也照实返回**。
+
+    2026-09-26：多组关键词**并发**查 —— 原来一组一组串行，实测一次文献调研的
+    178 秒里有 158 秒都耗在等检索。返回顺序仍按 ``queries``（gather 保序），
+    便于过程行与模型引用的编号一一对上。
+    """
 
     from services.agent import web_search
 
+    if not queries:
+        return []
+    fetched = await asyncio.gather(
+        *(web_search.search_academic(query, limit=SEARCH_RESULTS_PER_QUERY) for query in queries)
+    )
     return [
-        _block(
-            web_search.CAPABILITY_ACADEMIC,
-            query,
-            await web_search.search_academic(query, limit=SEARCH_RESULTS_PER_QUERY),
-        )
-        for query in queries
+        _block(web_search.CAPABILITY_ACADEMIC, query, result)
+        for query, result in zip(queries, fetched, strict=False)
     ]
 
 
 async def _run_web_queries(queries: list[str]) -> list[dict[str, Any]]:
-    """搜网页（自建 SearXNG）。**搜不到也照实返回**。"""
+    """搜网页（自建 SearXNG）。**搜不到也照实返回**。
+
+    2026-09-26：与学术检索同理，多组并发。
+    """
 
     from services.agent import web_search
 
+    if not queries:
+        return []
+    fetched = await asyncio.gather(
+        *(web_search.search_web(query, limit=SEARCH_RESULTS_PER_QUERY) for query in queries)
+    )
     return [
-        _block(
-            web_search.CAPABILITY_WEB,
-            query,
-            await web_search.search_web(query, limit=SEARCH_RESULTS_PER_QUERY),
-        )
-        for query in queries
+        _block(web_search.CAPABILITY_WEB, query, result)
+        for query, result in zip(queries, fetched, strict=False)
     ]
 
 
@@ -1939,6 +2000,12 @@ async def _run_searches(queries: list[str]) -> list[dict[str, Any]]:
 MAX_NODE_COMMANDS = 3
 #: 单条命令最长跑多久
 NODE_COMMAND_TIMEOUT_S = 300
+
+#: 连续多少轮检索都**没命中任何材料**就把这一步交回研究者（2026-09-26）。
+#: 口径注意：这**不是**"重试上限"—— 提示词里照样不给模型任何次数上限，
+#: 只是把"已经连续 N 轮空手"当**事实**告诉它；这条线兜的是"模型一直说 continue、
+#: 于是一圈一圈白跑"（实测一次跑到 7 轮 / 533 秒，每轮把同样的源重搜一遍）。
+SEARCH_ZERO_HIT_LIMIT = 3
 
 
 async def _run_node_commands(

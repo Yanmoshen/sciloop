@@ -56,6 +56,7 @@ __all__ = [
     "library_facts",
     "library_overview",
     "merge_project_settings",
+    "reap_stale_running_runs",
     "record_transition",
     "row_to_dict",
     "search_library",
@@ -177,6 +178,36 @@ async def list_orphan_node_runs(
     )
     rows = (await session.execute(stmt)).scalars().all()
     return [_row_to_dict(r) for r in rows]
+
+
+async def reap_stale_running_runs(session: AsyncSession) -> int:
+    """把**残留的「运行中」节点**如实收尾，返回处理条数（2026-09-26）。
+
+    为什么需要：进程重启或对话中断之后，那些"当时正在跑"的节点会永远停在 ``running``
+    —— 界面上就是一条**假的「运行中」**（实测库里积了 4 条，且 ``updated_at`` 等于
+    ``created_at``，说明它们启动后就再没动过）。跑它们的进程早就没了。
+
+    口径：
+    - 状态改成 ``failed``（内部六态里没有"中断"这一态，"没跑完就停了"最贴近它）；
+    - **原因写进 ``payload``**（``reaped_reason``），**不删除记录** —— 记录本身是历史，
+      删了就再也查不出"这一步曾经跑过、被中断了"；
+    - 只在**服务启动时**调用：此刻任何 ``running`` 必然是上一代进程留下的。
+    """
+
+    result = await session.execute(
+        text(
+            """
+            UPDATE research_node_runs
+               SET status = 'failed',
+                   payload = COALESCE(payload, '{}'::jsonb)
+                             || '{"reaped_reason": "服务重启：上一代进程没跑完，状态已如实收尾"}'::jsonb,
+                   updated_at = now()
+             WHERE status = 'running'
+            """
+        )
+    )
+    await session.commit()
+    return int(result.rowcount or 0)
 
 
 # --------------------------------------------------------------------------- #

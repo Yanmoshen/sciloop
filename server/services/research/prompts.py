@@ -315,6 +315,16 @@ def _format_budget(budget: dict[str, Any]) -> str:
         f"上限 {budget.get('max_total_reverts', graph.MAX_TOTAL_REVERTS)}",
         f"- 已发生费用：{budget.get('cost_usd', 0)}（只记账，不拦截）",
     ]
+    # 检索连续空手时**如实说清事实**（2026-09-26）：仍然不给"重试上限"这个伪规则，
+    # 但要把"同样的检索已经连续 N 轮没命中"摆到它面前，让它自己决定换关键词/换来源，
+    # 还是直接转人工说明缺什么。（极端情况下另有程序防呆线兜底，见 orchestrator。）
+    zero_hits = int(budget.get("zero_hit_streak") or 0)
+    if zero_hits > 0:
+        lines.append(
+            f"- **最近连续 {zero_hits} 轮检索都没有命中任何材料**："
+            "沿用同样的检索词大概率还是空手；请换关键词、换来源，"
+            "或直接转人工说明需要研究者补什么。"
+        )
     return "\n".join(lines)
 
 

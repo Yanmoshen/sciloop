@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import ctypes
+import sys
 import threading
 from ctypes import wintypes
 from typing import Any
@@ -161,6 +162,43 @@ def pick_folder_native(*, title: str = "选择文件夹", timeout_s: int = 600) 
         _release(dialog)
 
 
+def serve() -> int:
+    """**常驻模式**：逐行读 stdin 的请求 → 弹框 → 把结果写一行 JSON 到 stdout。
+
+    为什么要有常驻模式（2026-09-26）：每新起一个进程都要重新预热（实测单次约 18 秒 ✗），
+    而研究者点「选择文件夹」只该等"窗口弹出来"这点时间。常驻之后，每次弹框只剩
+    几十毫秒的开销 —— 点完窗口几乎立刻出现，而且**不会**再闪出 PowerShell 黑框。
+
+    协议：一行一个 JSON 请求 ``{"cmd":"pick","title":...,"timeout_s":...}``，
+    收到 ``{"cmd":"quit"}`` 或 stdin 关闭即退出；每个请求回一行 JSON 结果。
+    """
+    import json as _json
+
+    for raw in sys.stdin:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            request = _json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(request, dict):
+            continue
+        if str(request.get("cmd") or "pick") == "quit":
+            break
+        try:
+            timeout_s = int(request.get("timeout_s") or 600)
+        except (TypeError, ValueError):
+            timeout_s = 600
+        outcome = pick_folder_native(
+            title=str(request.get("title") or "选择文件夹"),
+            timeout_s=timeout_s,
+        )
+        sys.stdout.write(_json.dumps(outcome, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    return 0
+
+
 if __name__ == "__main__":
     # 独立子进程入口：执行器 spawn 它来弹框（卡也只卡它自己，超时直接杀 ✓）
     import argparse
@@ -169,7 +207,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="弹原生文件夹选择框，JSON 回话")
     parser.add_argument("--title", default="选择文件夹")
     parser.add_argument("--timeout", type=int, default=600)
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="常驻模式：从 stdin 逐行读请求、逐行回结果（供执行器长期持有，省掉每次预热）",
+    )
     args = parser.parse_args()
+
+    if args.serve:
+        raise SystemExit(serve())
 
     outcome = pick_folder_native(title=args.title, timeout_s=args.timeout)
     print(json.dumps(outcome, ensure_ascii=False))
