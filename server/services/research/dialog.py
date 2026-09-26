@@ -39,11 +39,13 @@ logger = logging.getLogger("sciloop.research.dialog")
 __all__ = [
     "PLAIN_CHAT_TRIGGERS",
     "CHAIN_DENY_WORDS",
+    "CONTINUE_WORDS",
     "CHAIN_OFFER_CORE",
     "CHAIN_OFFER_SENTENCE",
     "chain_snapshot",
     "has_chain",
     "is_chain_denial",
+    "is_continue_command",
     "mentions_chain_offer",
     "is_plain_chat_reply",
     "route",
@@ -67,6 +69,11 @@ CHAIN_OFFER_CORE = "是否现在开始研究链"
 #: 邀请原句（提示词要原样要求；程序靠 `CHAIN_OFFER_CORE` 识别）
 CHAIN_OFFER_SENTENCE = "是否现在开始研究链？默认现在开始"
 
+#: 「继续」类的说法 —— 已开链时表示**重入当前这一站**（再给它一次机会）。
+#: 为什么必须补：转人工时给的可点选项里就有「继续」，而动作词表里只有英文 `continue`，
+#: 实测点「继续」不会触发任何动作 —— 点了没反应的按钮比没有按钮更糟（2026-09-26）。
+CONTINUE_WORDS: tuple[str, ...] = ("继续", "下一步", "接着跑", "往下走", "接着做")
+
 #: 明确**不要**研究链的说法 —— 命中即声明为普通对话，本对话内永久不再问。
 CHAIN_DENY_WORDS: tuple[str, ...] = (
     "不需要",
@@ -86,6 +93,15 @@ def mentions_chain_offer(text: str) -> bool:
     """这条（助手）回复里有没有发出「是否现在开始研究链」的邀请。"""
 
     return CHAIN_OFFER_CORE in (text or "")
+
+
+def is_continue_command(text: str) -> bool:
+    """是不是「继续往下走」这类说法（允许少量修饰）。"""
+
+    compact = (text or "").strip()
+    if not compact or len(compact) > 12:
+        return False
+    return any(word in compact for word in CONTINUE_WORDS)
 
 
 def is_chain_denial(text: str) -> bool:
@@ -239,16 +255,35 @@ async def route(
     零延迟；规则拿不准、且这句话**看着像指令**时，再让模型判一次 —— 中英混排与口语说法
     只有这一层盖得住（词表是纯子串匹配，`start a literature review` 必掉进通用回答）。
     模型超时/失败/给不可信值都不影响结果：一律回落规则结论。
+
+    ⚠️ 但**只在规则判成 ``chat`` 时才让模型复判**：``guide`` 是"想开始但没说清"的分支，
+    它给的可点按钮就是入口，绝不能被模型降级成一句普通回答（2026-09-26 实测踩过）。
     """
 
     chained = await has_chain(conversation_id)
     result = intent_mod.resolve_intent(text, has_chain=chained)
-    if result.kind in ("chat", "guide") and intent_mod.looks_like_command(text):
+    # ⚠️ **只让模型"捞漏"，不让它把 guide 判掉**（2026-09-26 修）。
+    # 模型这一层的用途是兜住词表漏掉的口语 / 中英混排指令（把 chat **升级**成 node/query）；
+    # 反过来把 guide **降级**成 chat 就把入口弄没了 —— 实测「怎么开始」「帮我做研究」
+    # 都被判成 chat，于是那三个可点按钮永远不出现，研究者想开始却看不到任何入口。
+    if result.kind == "chat" and intent_mod.looks_like_command(text):
         judged = await intent_mod.classify_with_model(
             text, model_ref=model_ref, has_chain=chained
         )
         if judged is not None:
             result = judged
+    # 「继续 / 下一步」——已开链时**重入当前这一站**（再给它一次机会）。
+    # 放在 force_plain 之前：这是**明确的执行意图**，普通对话模式下也该生效。
+    if result.kind == "chat" and chained and is_continue_command(text):
+        snapshot = await chain_snapshot(conversation_id)
+        if snapshot["node"]:
+            return intent_mod.Intent(
+                kind="node",
+                node=str(snapshot["node"]),
+                keyword="继续",
+                reason="按「继续」重入当前这一站",
+            )
+
     if force_plain and result.kind != "node":
         return intent_mod.Intent(
             kind="chat",
@@ -463,6 +498,38 @@ async def stream_node(
             )
         )
 
+    # 转人工时给**可点选项**（用户口径 2026-09-26：停下但要说清 + 给选项）。
+    # ⚠️ 这些按钮发出去的每一句都**必须真的能路由到动作**（见 CONTINUE_WORDS 与
+    # 「重新跑一遍 X」都命中了动作词表 + 节点别名），否则点了没反应比没按钮更糟。
+    if status == "waiting_human":
+        blocks = [
+            {
+                "kind": "choice",
+                "prompt": "这一步停下来等你定，想怎么走？",
+                "options": [
+                    {
+                        "id": "continue",
+                        "label": "继续（按你的判断往下走）",
+                        "send": "继续",
+                        "tone": "primary",
+                    },
+                    {
+                        "id": "redo",
+                        "label": "换个做法重跑这一步",
+                        "send": f"重新跑一遍{label}，换个做法",
+                        "tone": "default",
+                    },
+                    {
+                        "id": "plain",
+                        "label": "先不跑流程，就当普通对话",
+                        "send": "只是普通对话",
+                        "tone": "quiet",
+                    },
+                ],
+            }
+        ]
+        yield _sse("blocks", {"blocks": blocks})
+
     if not summary:
         # 模型这一跳没写出收尾 → **留空 + 如实记一条过程行**，
         # 绝不拿程序话术冒充对话正文（用户口径 2026-09-26）。
@@ -484,6 +551,7 @@ async def stream_node(
                 "routing": "node",
                 "node": routing.node,
                 "node_status": status,
+                **({"blocks": blocks} if status == "waiting_human" else {}),
                 "cost_usd": total_cost,
                 "duration_ms": 0,
                 # 过程行也要落盘：否则刷新后节点过程整段消失，只剩一句结论
