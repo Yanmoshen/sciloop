@@ -112,6 +112,15 @@ export const routes: RouteRecordRaw[] = [
     component: () => import('@/views/KnowledgeReaderPage.vue'),
     meta: { title: '阅读' },
   },
+  // ---- 全屏双语阅读（同样不带壳层）----
+  // 用户口径 2026-09-26：「双语阅读应该是**全屏只剩下左边原文右边译文**」——
+  // 所以它必须是**顶层路由**，否则会被 HomeLayout 包住、左栏导航与头像都还在。
+  {
+    path: '/papers/dual/:documentId',
+    name: 'reader-dual',
+    component: () => import('@/views/DualReaderView.vue'),
+    meta: { title: '双语阅读', module: 'reader' },
+  },
   {
     path: '/',
     component: HomeLayout,

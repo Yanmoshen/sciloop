@@ -486,6 +486,45 @@ def _check_cancel(task: TranslateTask) -> None:
         raise engine.TranslationCancelled("任务已取消")
 
 
+async def _auto_register_reader_version(task_id: str, paper_id: int | None) -> None:
+    """把这次翻译登记成该论文的**中文译本版本**（阅读页据此自动更新到最新译文）。
+
+    为什么必须自动做（2026-09-26 用户实测）：登记入口只有一个 API，界面上那个
+    「登记中文译本」按钮早已下掉 —— 于是"翻译完成"与"阅读页看到新译文"之间**断了**，
+    阅读页一直显示上一版（用户看到的甚至是本地桩那一版）。
+
+    任何失败都**只记一笔**，绝不把已经跑完的翻译任务带崩（登记不是翻译的一部分）。
+    """
+
+    if not paper_id:
+        return
+    try:
+        from sqlalchemy import select
+
+        from db.models.reader import ReaderDocument
+        from db.session import AsyncSessionLocal
+        from services.reader import versions as reader_versions
+
+        async with AsyncSessionLocal() as session:
+            document = (
+                await session.execute(
+                    select(ReaderDocument)
+                    .where(ReaderDocument.paper_id == int(paper_id))
+                    .order_by(ReaderDocument.id.desc())
+                )
+            ).scalars().first()
+            if document is None:
+                logger.info("论文 %s 还没有阅读文档，翻译产物不登记为译本版本", paper_id)
+                return
+            await reader_versions.register_from_manifest(
+                session, document, kind="chinese", task_id=task_id
+            )
+            await session.commit()
+        logger.info("已把翻译 %s 登记为论文 %s 的中文译本版本", task_id, paper_id)
+    except Exception as exc:  # noqa: BLE001 - 登记失败不影响翻译结果
+        logger.warning("翻译 %s 登记为译本版本失败（不影响产物）：%s", task_id, exc)
+
+
 async def _run(task_id: str) -> None:
     """执行入口：占用并发额度 → 执行 → 落 manifest（无论如何都落）。"""
     task = _get_raw(task_id)
@@ -713,6 +752,10 @@ async def _execute(task: TranslateTask) -> None:
             ),
         )
         return
+
+    # 干净完成 → **自动登记为中文译本**，阅读页下次打开就是这一版（用户口径 2026-09-26）。
+    # 放在这里而不是"未完成"那一支：半成品不该顶掉读者手头那份。
+    await _auto_register_reader_version(task_id, task.paper_id)
 
     _set_progress(
         task_id,

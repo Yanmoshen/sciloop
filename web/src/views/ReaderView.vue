@@ -64,8 +64,9 @@ const sourceVersionId = ref<number | null>(null)
 const targetVersionId = ref<number | null>(null)
 const annotations = ref<ReaderAnnotation[]>([])
 
-/** 「双语对照模式」开关：默认关（整屏一栏原文）。 */
-const pairMode = ref(false)
+// 「双语对照模式」原先在这里是个显示开关（整屏原文 ↔ 左原文右译文）。
+// 2026-09-26 用户口径：双语阅读要**全屏、只剩左右两栏** —— 那必须脱开应用外壳，
+// 所以它改成了独立页面 `/papers/dual/:documentId`（见 `goDual`），本页只留原文一栏。
 
 const loading = ref(false)
 const busy = ref('')
@@ -141,7 +142,7 @@ function placeBubble(rect: DOMRect): void {
  */
 async function autoAttachTranslation(id: number): Promise<void> {
   const targetPaperId = paperId.value
-  if (!targetPaperId || translationVersion.value) return
+  if (!targetPaperId) return
   try {
     const page = await listTranslateJobs(50)
     const latest = (page.items ?? [])
@@ -150,9 +151,22 @@ async function autoAttachTranslation(id: number): Promise<void> {
         String(right.created_at ?? '').localeCompare(String(left.created_at ?? '')),
       )[0]
     if (!latest?.task_id) return
-    const created = await registerReaderVersion(id, 'chinese', latest.task_id)
+
+    // ⚠️ 幂等的判据是「**这一版还没登记过**」，**不是**「有没有译本」（2026-09-26 修）。
+    //
+    // 原来写的是 `if (translationVersion.value) return` —— 只要已经有过一版（哪怕是最早
+    // 本地桩跑出来的那一版），就**永远不再接入新译文**。于是用户看到的现象是：
+    // **翻译明明完成了，阅读页还停在旧译文上**。
+    const newest = String(latest.task_id)
+    const registered = new Set(
+      versions.value.map((item) => String(item.task_id ?? '')).filter(Boolean),
+    )
+    if (registered.has(newest)) return
+
+    const created = await registerReaderVersion(id, 'chinese', newest)
     if (created?.id) {
       versions.value = [...versions.value, created]
+      // 右栏立刻切到刚接入的这一版（`translationVersion` 取 version_no 最大者）
       targetVersionId.value = created.id
     }
   } catch {
@@ -202,10 +216,16 @@ async function loadAnnotations(id: number): Promise<void> {
   }
 }
 
-/** 「翻译该论文」：带上这篇论文去翻译页（翻译页已支持 `?paper_id=` 自动预填）。 */
+/** 「翻译该论文」：带上这篇论文去翻译页（翻译页会**自动开跑**，不用再点一次）。 */
 function goTranslate(): void {
   if (!paperId.value) return
   void router.push({ path: '/papers/translate', query: { paper_id: String(paperId.value) } })
+}
+
+/** 「双语对照模式」：打开**全屏双语页**（不带应用外壳的那一页）。 */
+function goDual(): void {
+  if (!documentId.value) return
+  void router.push(`/papers/dual/${documentId.value}`)
 }
 
 // ---- 批注 ----
@@ -305,20 +325,16 @@ onUnmounted(() => {
       <button class="btn" type="button" :disabled="!paperId" @click="goTranslate">
         翻译该论文
       </button>
-      <button
-        class="btn"
-        :class="{ 'btn--primary': pairMode }"
-        type="button"
-        :aria-pressed="pairMode"
-        @click="pairMode = !pairMode"
-      >
+      <!-- 「双语对照模式」不再是本页的显示开关，而是**打开全屏双语页**
+           （用户口径 2026-09-26：全屏只剩左原文/右译文，导航栏头像全去掉）。 -->
+      <button class="btn" type="button" :disabled="!documentId" @click="goDual">
         双语对照模式
       </button>
     </header>
 
     <p v-if="notice" class="notice">{{ notice }}</p>
 
-    <div class="pdf-grid" :class="{ 'pdf-grid--pair': pairMode }">
+    <div class="pdf-grid">
       <section class="pane">
         <header class="pane__head">
           <span class="pane__title">原文</span>
@@ -332,24 +348,6 @@ onUnmounted(() => {
           @select-text="onSelectText"
           @click-annotation="onClickAnnotation"
         />
-      </section>
-
-      <section v-if="pairMode" class="pane">
-        <header class="pane__head">
-          <span class="pane__title">译文</span>
-          <span class="spacer" />
-          <a v-if="targetPdfUrl" class="link-btn" :href="targetPdfUrl" target="_blank" rel="noopener">
-            打开原始 PDF
-          </a>
-        </header>
-        <PdfPane
-          v-if="targetPdfUrl"
-          :src="targetPdfUrl"
-          :annotations="targetAnnotations"
-          side="target"
-          @click-annotation="onClickAnnotation"
-        />
-        <p v-else class="pane__empty">这篇还没有中文译本，点上方「翻译该论文」开始翻译。</p>
       </section>
     </div>
 
