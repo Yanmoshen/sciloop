@@ -12,7 +12,7 @@
  *
  * 左栏分两块（2026-09-20 重构）：
  * - **固定区**：开始使用 / 文献调研 / 知识库（吸在左上角，永不滚动）
- * - 分块线之后是**独立滚动区**：研究构想 / 流水线工作台 / 未分组 / 项目 / 已归档
+ * - 分块线之后是**独立滚动区**：未分组 / 项目 / 已归档
  *   只有这一块自己滚，整页不滚（沿用 `.sl-home{height:100vh;overflow:hidden}` 的口径）。
  *
  * 「未分组 / 项目」取代了原来的「最近打开」：项目 ↔ 对话 = 1:N，对话可以未分组；
@@ -86,11 +86,6 @@ const HOME_NAV: HomeNavItem[] = [
   // 位置在「文献调研」与「知识库」之间。
   { key: 'ideas', label: '研究构想', path: '/ideas' },
   { key: 'knowledge', label: '知识库', path: '/knowledge' },
-]
-
-/** 左栏二级入口（不在分组里的功能页）；设置由右上角头像的悬浮菜单进入 */
-const MODULE_NAV = [
-  { key: 'workbench', label: '流水线工作台', path: '/workbench/demo' },
 ]
 
 
@@ -430,17 +425,6 @@ function openConversation(conversation: ConversationBrief): void {
 /** 当前正在看的那条对话（左栏据此高亮 —— 对话页顶栏标题已去掉，这里成了唯一的方位标识） */
 function isCurrentConversation(id: string): boolean {
   return route.name === 'conversation' && String(route.params.conversationId ?? '') === id
-}
-
-/**
- * 打开某项目的流水线工作台。
- * 原先是对话页顶部那个按钮（带项目参数直达），顶栏去掉后入口收到这里 ——
- * 否则「按项目直达看板」就没路径了，只能从左栏「流水线工作台」进再自己挑项目。
- */
-function openProjectWorkbench(projectId: number): void {
-  closeMore()
-  session.selectProject(projectId)
-  void router.push({ name: 'workbench', params: { projectId: String(projectId) } })
 }
 
 function openMove(conversation: ConversationBrief): void {
@@ -811,49 +795,6 @@ onUnmounted(() => {
       <div class="rail__divider" />
 
       <div ref="railScrollEl" class="rail__scroll">
-        <nav class="nav nav--modules" aria-label="模块导航">
-          <RouterLink
-            v-for="item in MODULE_NAV"
-            :key="item.key"
-            class="nav__item nav__item--solo"
-            :class="{ 'nav__item--on': activeModule === item.key }"
-            :to="item.path"
-          >
-            <span class="nav__icon">
-              <!-- 研究构想 -->
-              <svg
-                v-if="item.key === 'ideas'"
-                width="17"
-                height="17"
-                viewBox="0 0 16 16"
-                fill="none"
-                aria-hidden="true"
-              >
-                <path
-                  d="M8 2.4a4.2 4.2 0 0 0-2.4 7.6v1.4h4.8V10A4.2 4.2 0 0 0 8 2.4Z"
-                  stroke="currentColor"
-                  stroke-width="1.3"
-                  stroke-linejoin="round"
-                />
-                <path d="M6.4 13.4h3.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
-              </svg>
-              <!-- 流水线工作台 -->
-              <svg v-else width="17" height="17" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                <circle cx="3.6" cy="8" r="1.7" stroke="currentColor" stroke-width="1.3" />
-                <circle cx="12.4" cy="4.4" r="1.7" stroke="currentColor" stroke-width="1.3" />
-                <circle cx="12.4" cy="11.6" r="1.7" stroke="currentColor" stroke-width="1.3" />
-                <path
-                  d="M5.2 7.2 10.8 5M5.2 8.8l5.6 2.2"
-                  stroke="currentColor"
-                  stroke-width="1.3"
-                  stroke-linecap="round"
-                />
-              </svg>
-            </span>
-            {{ item.label }}
-          </RouterLink>
-        </nav>
-
         <!-- 未分组对话 -->
         <div class="group" :class="{ 'group--closed': !ungroupedOpen }">
           <div class="group__head group__head--foldable">
@@ -1032,7 +973,6 @@ onUnmounted(() => {
               <button
                 class="crow__item crow__item--project"
                 type="button"
-                :title="p.name"
                 :aria-expanded="isExpanded(p.id)"
                 @click="toggleProject(p.id)"
               >
@@ -1109,27 +1049,6 @@ onUnmounted(() => {
                  展开/收起同样走统一 .fold。 -->
             <div class="fold" :class="{ 'fold--open': moreOpen === p.id }">
               <ul class="pmenu" role="menu">
-                <li>
-                  <button
-                    class="pmenu__item"
-                    type="button"
-                    role="menuitem"
-                    @click="openProjectWorkbench(p.id)"
-                  >
-                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                      <circle cx="3.6" cy="8" r="1.7" stroke="currentColor" stroke-width="1.3" />
-                      <circle cx="12.4" cy="4.4" r="1.7" stroke="currentColor" stroke-width="1.3" />
-                      <circle cx="12.4" cy="11.6" r="1.7" stroke="currentColor" stroke-width="1.3" />
-                      <path
-                        d="M5.2 7.2 10.8 5M5.2 8.8l5.6 2.2"
-                        stroke="currentColor"
-                        stroke-width="1.3"
-                        stroke-linecap="round"
-                      />
-                    </svg>
-                    流水线工作台
-                  </button>
-                </li>
                 <li>
                   <button class="pmenu__item" type="button" role="menuitem" @click="closeMore(); openRename(p)">
                     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -1302,7 +1221,6 @@ onUnmounted(() => {
                 <button
                   class="crow__item"
                   type="button"
-                  :title="p.name"
                   :aria-expanded="isExpanded(p.id)"
                   @click="toggleProject(p.id)"
                 >
@@ -1887,9 +1805,6 @@ onUnmounted(() => {
   transition: color 300ms cubic-bezier(0.4, 0, 0.2, 1);
 }
 /* 二级入口（模块功能页）：直接是导航项本身，铺满整行 */
-.nav--modules {
-  padding-top: 2px;
-}
 /* 分组（文献调研）：父项是按钮，右侧带下角标 */
 .nav__block {
   display: flex;
@@ -1943,9 +1858,6 @@ onUnmounted(() => {
 .nav__item--child.nav__item--on .nav__dot {
   opacity: 1;
   transform: scale(1.2);
-}
-.nav__item--solo {
-  width: 100%;
 }
 .nav__item--on {
   background: var(--h-hover);

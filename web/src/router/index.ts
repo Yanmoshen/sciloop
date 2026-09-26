@@ -68,18 +68,6 @@ export const MODULE_GROUPS: ModuleGroup[] = [
     items: [{ key: 'ideas', label: '研究构思', path: '/ideas', hint: 'idea 生成与证据抽屉' }],
   },
   {
-    key: 'pipeline',
-    title: '流水线',
-    items: [
-      {
-        key: 'workbench',
-        label: '流水线工作台',
-        path: '/workbench/demo',
-        hint: '六环节看板 + 决策日志',
-      },
-    ],
-  },
-  {
     key: 'knowledge',
     title: '知识库',
     items: [{ key: 'knowledge', label: '知识库', path: '/knowledge', hint: '文件 / 摘录 / 技能 / 记忆' }],
@@ -238,10 +226,10 @@ export const routes: RouteRecordRaw[] = [
         meta: { title: '研究构思', module: 'ideas' },
       },
       {
+        // 流水线工作台整页已下线（研究者 2026-09-26：界面删掉、后端先留着）。
+        // 旧链接与书签仍可能指向它 → 送回首页，别留一屏白。
         path: 'workbench/:projectId',
-        name: 'workbench',
-        component: () => import('@/views/WorkbenchView.vue'),
-        meta: { title: '流水线工作台', module: 'workbench' },
+        redirect: '/',
       },
       {
         path: 'settings',

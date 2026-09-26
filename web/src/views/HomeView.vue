@@ -1200,7 +1200,8 @@ function openCreate(prefill: string): void {
 function onCreated(project: CreatedProject): void {
   void session.loadProjects()
   session.selectProject(project.id)
-  void router.push({ name: 'workbench', params: { projectId: String(project.id) } })
+  // 流水线工作台整页已下线（研究者 2026-09-26：界面删掉、后端先留）：
+  // 新建项目后**留在首页**，项目在左栏选中即可 —— 别再跳一个已经不存在的路由。
 }
 
 watch(
