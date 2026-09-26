@@ -52,6 +52,14 @@ htmlcov/
 # 不再丢失 offset 校验所需的全文（见 docker-compose.yml 的 backend.volumes）。
 .data/
 
+# ===== 研究产出目录（模型在研究者电脑上写出来的文件，禁止入库）=====
+# research-workspaces/ 是执行器给研究项目用的默认工作目录：脚本、下载物、
+# 中间数据、图表都会落在这里，属于**研究者自己的研究内容**，不是本项目的源码。
+# 之前它只靠"不 git add -A"的纪律挡着 —— 一旦有人宽暂存，研究文件就会进公开仓库。
+# （2026-09-26 实测：跑一次对话就让该目录多出一个文件并出现在 untracked 里。）
+# 根锚定：不锚定的 `research-workspaces/` 会连源码里同名子目录一起忽略。
+/research-workspaces/
+
 # ===== 编辑器 / 系统 =====
 .vscode/
 .idea/
