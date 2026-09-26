@@ -344,21 +344,26 @@ async def pick_project_folder(
     title = str((payload or {}).get("title") or "选择一个文件夹作为工作目录")
     initial = str((payload or {}).get("initial") or "")
     result = await host_runner.pick_folder(title=title, initial=initial)
+    shown = bool(result.get("shown"))
     if not result.get("ok"):
-        supported = result.get("supported")
+        # 三种情况要分开说：压根弹不出来 / 弹出来没人点（超时）/ 其它错误
         return {
             "ok": False,
-            "available": supported is None and not result.get("auth_failed", False),
+            "available": bool(result.get("supported")) and not result.get("auth_failed", False),
+            "shown": shown,
             "canceled": False,
+            "timed_out": bool(result.get("timed_out")),
             "path": "",
-            "message": str(result.get("error") or "弹不出系统选择框"),
+            "message": str(result.get("error") or "没能打开系统选择框"),
         }
     return {
         "ok": True,
         "available": True,
+        "shown": shown,
         "canceled": bool(result.get("canceled")),
+        "timed_out": bool(result.get("timed_out")),
         "path": str(result.get("path") or ""),
-        "message": "" if result.get("path") else "没有选择文件夹",
+        "message": "" if result.get("path") else "你在系统窗口里取消了选择（保持默认）",
     }
 
 

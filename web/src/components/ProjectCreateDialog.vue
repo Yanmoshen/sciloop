@@ -85,7 +85,7 @@ async function chooseFolder(): Promise<void> {
       return
     }
     if (result.ok && result.path) workspaceDir.value = result.path
-    else if (result.ok) notice.value = '没有选择文件夹（保持默认）'
+    else if (result.ok) notice.value = result.message || '你在系统窗口里取消了选择（保持默认）'
     else notice.value = result.message || '没能打开系统选择框'
   } catch (error) {
     notice.value = error instanceof Error ? error.message : String(error)

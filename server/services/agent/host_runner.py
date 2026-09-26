@@ -292,4 +292,4 @@ async def pick_folder(*, title: str = "选择文件夹", initial: str = "", time
         {"title": title, "initial": initial, "timeout_s": timeout_s},
         timeout_s=timeout_s + 20,
         client=None,
-    )
+    )  # 返回里带 shown / canceled / timed_out / elapsed_ms：调用方据此说人话，别把"没弹出来"报成"你没选"

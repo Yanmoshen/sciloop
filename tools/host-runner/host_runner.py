@@ -199,22 +199,61 @@ def pick_folder(*, title: str = "选择文件夹", initial: str = "", timeout_s:
     """弹出**系统自带**的文件夹选择框，返回研究者选中的绝对路径。
 
     - Windows：`System.Windows.Forms.FolderBrowserDialog`（就是资源管理器那种选择框）；
-    - macOS：`osascript` 的 `choose folder`；
-    - Linux：`zenity`（没装就如实说"这台机器弹不出来"）。
+    - macOS：`osascript` 的 `choose folder`；Linux：`zenity`（没装就如实说"这台机器弹不出来"）。
 
-    ⚠️ 弹框会**一直等人**（人去点），所以超时给得很长；取消就返回 `canceled=True`。
-    ⚠️ 这个函数会阻塞所在线程 —— 服务是 `ThreadingHTTPServer`，不会把整个服务卡住。
+    2026-09-26 修的三件事（都是真机踩出来的）：
+    1. **强制置顶**：没有 owner 的对话框常被浏览器盖住，研究者看不到 → 用不可见置顶窗体当 owner，
+       弹完再抢一次前台；否则"点了没反应"（实测有一次 0.3 秒就返回 Cancel ✗）。
+    2. **超时自动关**：用 WinForms 计时器到点关闭，**不留孤儿窗口**
+       （`subprocess.run(timeout=)` 只杀直接子进程，窗口会残留 ✗）。
+    3. **如实区分**：`canceled`（弹出来了、人取消）/ `timed_out`（弹出来了、人没点）/
+       `shown=False`（**压根没弹出来**）—— 原来第三种被报成"没有选择文件夹"，是假消息。
     """
+
+    timeout_s = max(5, min(int(timeout_s or 600), 3600))
 
     if sys.platform.startswith("win"):
         script = (
             "Add-Type -AssemblyName System.Windows.Forms; "
+            "Add-Type -AssemblyName System.Drawing; "
+            # 抢前台的助手（ShowDialog 会阻塞，只能在消息循环里抢）
+            "Add-Type @'\n"
+            "using System;\n"
+            "using System.Runtime.InteropServices;\n"
+            "public class FG {\n"
+            "  [DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr h);\n"
+            "  [DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr h, int c);\n"
+            "}\n"
+            "'@; "
+            # owner：**不可见但已显示**的置顶窗体（最小化的给不了前台 ✗，2026-09-26 实测）
+            "$owner = New-Object System.Windows.Forms.Form; "
+            "$owner.ShowInTaskbar = $false; $owner.FormBorderStyle = 'None'; "
+            "$owner.Opacity = 0; $owner.TopMost = $true; $owner.Size = New-Object System.Drawing.Size(1,1); "
+            "$owner.StartPosition = 'CenterScreen'; $owner.Show(); $owner.Activate(); "
             "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
             f"$d.Description = {json.dumps(title, ensure_ascii=False)}; "
             "$d.ShowNewFolderButton = $true; "
+            "$d.StartPosition = 'CenterScreen'; "
             + (f"$d.SelectedPath = {json.dumps(initial, ensure_ascii=False)}; " if initial else "")
-            + "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) "
-            "{ Write-Output $d.SelectedPath }"
+            + "$hits = 0; "
+            # 到点自动关（不留孤儿窗口）
+            "$timer = New-Object System.Windows.Forms.Timer; "
+            f"$timer.Interval = {timeout_s * 1000}; "
+            "$timer.Add_Tick({ $script:hits = 1; $d.Dispose(); $owner.Close() }); "
+            "$timer.Start(); "
+            # 200ms 后主动把对话框抢到前台（抢不到也不算失败，只是可能被盖住）
+            "$fg = New-Object System.Windows.Forms.Timer; "
+            "$fg.Interval = 200; "
+            "$fg.Add_Tick({ try { [void][FG]::ShowWindow($d.Handle, 5); [void][FG]::SetForegroundWindow($d.Handle) } catch {} $fg.Stop() }); "
+            "$fg.Start(); "
+            "$sw = [System.Diagnostics.Stopwatch]::StartNew(); "
+            "$r = $d.ShowDialog($owner); "
+            "$sw.Stop(); $timer.Stop(); $fg.Stop(); "
+            "$owner.Close(); "
+            "Write-Output ('result=' + $r); "
+            "Write-Output ('elapsed_ms=' + $sw.ElapsedMilliseconds); "
+            "Write-Output ('picked=' + $d.SelectedPath); "
+            "if ($hits -eq 1) { Write-Output 'timed_out=1' } else { Write-Output 'timed_out=0' }"
         )
         argv = ["powershell", "-NoProfile", "-STA", "-Command", script]
     elif sys.platform == "darwin":
@@ -228,17 +267,56 @@ def pick_folder(*, title: str = "选择文件夹", initial: str = "", timeout_s:
     except FileNotFoundError:
         return {
             "ok": False,
+            "supported": False,
+            "shown": False,
             "error": "这台机器上没有可用的系统选择框（Windows 之外需要 osascript / zenity）。",
         }
     except subprocess.TimeoutExpired:
-        return {"ok": False, "error": f"等了 {timeout_s} 秒还没选 —— 以为你不选了，已放弃。"}
+        return {
+            "ok": False,
+            "supported": True,
+            "shown": True,
+            "timed_out": True,
+            "error": f"等了 {timeout_s} 秒还没选，已关闭选择框。",
+        }
 
-    picked = (proc.stdout or b"").decode("utf-8", "replace").strip()
+    out = _decode(proc.stdout or b"")
+    fields: dict[str, str] = {}
+    for line in out.splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            fields[key.strip()] = value.strip()
+
+    elapsed_ms = int(fields["elapsed_ms"]) if fields.get("elapsed_ms", "").isdigit() else None
+    timed_out = fields.get("timed_out") == "1"
+    result = fields.get("result", "")
+
+    if elapsed_ms is not None and elapsed_ms < 1000 and not fields.get("picked"):
+        # 人不可能在一秒内点完：只能解释为"窗口没弹出来"（抢不到前台/无桌面会话）
+        return {
+            "ok": False,
+            "supported": True,
+            "shown": False,
+            "elapsed_ms": elapsed_ms,
+            "error": "系统选择框没能显示出来（这次连一秒都没到就返回了）—— 请把当前界面告诉我，我从执行器的桌面会话查。",
+        }
+
+    if timed_out:
+        return {"ok": False, "supported": True, "shown": True, "timed_out": True, "elapsed_ms": elapsed_ms,
+                "error": f"等了 {timeout_s} 秒还没选，已关闭选择框。"}
+
+    picked = (fields.get("picked") or "").strip()
     if not picked:
-        # 取消：不是错误，如实说"你取消了"
-        return {"ok": True, "path": "", "canceled": True}
-    return {"ok": True, "path": picked, "canceled": False}
-
+        # 弹出来过（耗时正常）+ 没选 = 研究者取消了
+        return {"ok": True, "supported": True, "shown": True, "path": "", "canceled": True, "elapsed_ms": elapsed_ms}
+    return {
+        "ok": True,
+        "supported": True,
+        "shown": True,
+        "path": picked,
+        "canceled": False if result else True,
+        "elapsed_ms": elapsed_ms,
+    }
 
 
 def fs_action(*, action: str, path: str, to: str | None, content: str | None,
