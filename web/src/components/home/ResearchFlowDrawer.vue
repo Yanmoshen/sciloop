@@ -225,47 +225,11 @@ onBeforeUnmount(() => {
       <p class="rfd__meta">{{ headline }}</p>
     </header>
 
-    <div class="rfd__tools">
-      <button
-        class="rfd__btn"
-        type="button"
-        :disabled="!conversationId"
-        @click="run"
-      >
-        {{ busy ? '中止' : '执行节点' }}
-      </button>
-      <span class="rfd__spacer" />
-      <div class="rfd__more">
-        <button
-          class="rfd__icon"
-          type="button"
-          title="更多"
-          aria-label="更多"
-          aria-haspopup="menu"
-          :aria-expanded="menuOpen ? 'true' : 'false'"
-          @click="menuOpen = !menuOpen"
-        >
-          <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <circle cx="3.4" cy="8" r="1.3" fill="currentColor" />
-            <circle cx="8" cy="8" r="1.3" fill="currentColor" />
-            <circle cx="12.6" cy="8" r="1.3" fill="currentColor" />
-          </svg>
-        </button>
-        <div v-if="menuOpen" class="rfd__menu" role="menu">
-          <button class="rfd__menuitem" type="button" role="menuitem" @click="toggleMode">
-            改为{{ modeLabel === '免确认' ? '每次确认' : '免确认' }}
-          </button>
-          <button
-            class="rfd__menuitem"
-            type="button"
-            role="menuitem"
-            @click="showDetail = !showDetail; menuOpen = false"
-          >
-            {{ showDetail ? '收起详情' : '展开详情' }}
-          </button>
-        </div>
-      </div>
-    </div>
+    <!--
+      工具条已下线（研究者 2026-09-26）：删掉「执行节点」按钮与右侧三点菜单。
+      后端能力**保留**（`POST /research/projects/{id}/run` 等照旧可用），只是界面上不再提供入口
+      —— 研究链的推进由对话里的模型自己决定，不该由面板上按一个按钮来推。
+    -->
 
     <div class="rfd__body scroll-y">
       <p v-if="!conversationId" class="rfd__empty">{{ RESEARCH_TEXT.needProject }}</p>

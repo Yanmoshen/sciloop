@@ -1562,7 +1562,10 @@ onUnmounted(() => {
               </div>
             </template>
           </div>
-          <div v-if="turn.status === 'interrupted'" class="cut">已中断 / 出错</div>
+          <div v-if="turn.status === 'interrupted'" class="cut">
+            连接中断（服务端重启或网络波动，不是研究链自己停的）—— 已产出的内容都保留着，
+            再发一条消息就能接着往下走
+          </div>
           <div v-if="turn.content && isLastOfRound(index) && turn.status !== 'streaming'" class="acts">
             <button
               class="icon-btn"

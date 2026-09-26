@@ -188,7 +188,10 @@ async def reap_stale_running_runs(session: AsyncSession) -> int:
     ``created_at``，说明它们启动后就再没动过）。跑它们的进程早就没了。
 
     口径：
-    - 状态改成 ``failed``（内部六态里没有"中断"这一态，"没跑完就停了"最贴近它）；
+    - 状态改成 ``pending``（＝"回到未开始"，**不是 ``failed``**）。2026-09-26 研究者实测反馈：
+      收尾成 ``failed`` 会让右栏那个节点一直是**红的**、顶上一直写「需人工介入」，
+      重启完也散不掉 —— 但它其实只是"上一代进程没跑完"，重新跑一次就好，不是失败。
+      （前端把 ``failed``/``blocked``/``waiting_human`` 都画成红色，``pending`` 才是灰的。）
     - **原因写进 ``payload``**（``reaped_reason``），**不删除记录** —— 记录本身是历史，
       删了就再也查不出"这一步曾经跑过、被中断了"；
     - 只在**服务启动时**调用：此刻任何 ``running`` 必然是上一代进程留下的。
@@ -198,9 +201,9 @@ async def reap_stale_running_runs(session: AsyncSession) -> int:
         text(
             """
             UPDATE research_node_runs
-               SET status = 'failed',
+               SET status = 'pending',
                    payload = COALESCE(payload, '{}'::jsonb)
-                             || '{"reaped_reason": "服务重启：上一代进程没跑完，状态已如实收尾"}'::jsonb,
+                             || '{"reaped_reason": "服务重启：上一代进程没跑完，本节点回到未开始，重新跑即可"}'::jsonb,
                    updated_at = now()
              WHERE status = 'running'
             """

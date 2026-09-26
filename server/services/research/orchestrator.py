@@ -149,8 +149,10 @@ def _interrupted_if_stale(
 
     为什么要读侧也兜一道：节点行一旦卡在 ``running``（客户端断连、进程被替换），
     控制台的流光会**一直转**、像还在跑（实测有卡了 15 小时的行）。
-    这里**不改库**，只在读取时按 ``updated_at`` 超时判定，并把原因写成一条校验缺项，
-    让界面显示红点「已中断」而不是永远进行中；重试入口照旧可用。
+    这里**不改库**，只在读取时按 ``updated_at`` 超时判定，并把原因写成一条校验缺项。
+    2026-09-26 起状态报 **``pending``（未开始、可重跑）而不是 ``failed``**：
+    报成失败会让那个节点一直红着、顶上一直写「需人工介入」，重启完也散不掉 ——
+    但它并不是"失败"，只是上一代进程没跑完。
     """
 
     if str(row.get("status")) != "running":
@@ -165,7 +167,7 @@ def _interrupted_if_stale(
         return row
 
     stale = dict(row)
-    stale["status"] = "failed"
+    stale["status"] = "pending"
     stale["interrupted"] = True
     stale["validation"] = {
         "ok": False,
@@ -785,7 +787,10 @@ async def _settle_interrupted(
     node: str,
     entry_index: int,
 ) -> None:
-    """把被中断的那行 ``running`` 落成 ``failed`` 并留痕（尽力而为）。
+    """把被中断的那行 ``running`` 落成 ``pending``（未开始、可重跑）并留痕（尽力而为）。
+
+    2026-09-26 改：原来落成 ``failed`` —— "连接断开"这种非失败情形会让节点永久变红，
+    重启后也散不掉（研究者实测反馈）。断开只是"这一轮没跑完"，重新跑即可。
 
     用 ``asyncio.shield``：调用方此刻多半已经处于**取消**状态，不 shield 的话
     收尾的第一次 ``await`` 会立刻再抛 ``CancelledError``，这行就还是收不了尾。
@@ -804,7 +809,9 @@ async def _settle_interrupted(
                 project_id=project_id,
                 node=node,
                 entry_index=entry_index,
-                status="failed",
+                # 2026-09-26：**断开 ≠ 失败** —— 落成 `pending`（回到未开始、可重跑），
+                # 否则右栏那个节点会一直红着、顶上一直写「需人工介入」，重启也散不掉。
+                status="pending",
                 validation={
                     "ok": False,
                     "level": "L1",
