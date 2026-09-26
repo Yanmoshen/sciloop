@@ -1302,9 +1302,10 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
                             "model_id": getattr(result, "model_id", payload.model_id)
                             if result is not None
                             else payload.model_id,
-                            "duration_ms": getattr(result, "duration_ms", duration_ms)
-                            if result is not None
-                            else duration_ms,
+                            # ⚠️ 这里必须是**整轮耗时**（`started` 是请求进来时打的表），
+                            # 不能拿 `result.duration_ms` —— 那是**最后一次模型调用**的耗时：
+                            # 多轮工具调用时它只有整轮的零头，研究者会看到"跑了半天显示 10s"。
+                            "duration_ms": duration_ms,
                             "reasoning": reasoning_text or None,
                             "rows": tool_rows,
                             # 批准请求随轮次落盘：裁决端点要凭它认账（一次性、带有效期）
@@ -1340,7 +1341,8 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
             {
                 "conversation_id": conversation_id,
                 "content": getattr(result, "content", "") if result is not None else "",
-                "duration_ms": getattr(result, "duration_ms", 0) if result is not None else 0,
+                # 同上：整轮耗时（前端在 done 里会用它覆盖那一轮的显示）
+                "duration_ms": duration_ms,
                 "model_id": getattr(result, "model_id", payload.model_id),
                 "model_ref": getattr(result, "model_ref", ref),
                 "provider": getattr(result, "provider", ""),
@@ -1703,9 +1705,8 @@ async def _approval_stream(
                         "role": "assistant",
                         "content": answer,
                         "model_id": getattr(result, "model_id", "") if result is not None else "",
-                        "duration_ms": getattr(result, "duration_ms", duration_ms)
-                        if result is not None
-                        else duration_ms,
+                        # 同上：整轮耗时
+                        "duration_ms": duration_ms,
                         "reasoning": reasoning_text or None,
                         "rows": rows,
                         # 续答里模型又提出的请求，随**这一轮**落盘（可能要再批一次）
@@ -1731,7 +1732,7 @@ async def _approval_stream(
         {
             "conversation_id": conversation_id,
             "content": "".join(buffer) or (getattr(result, "content", "") if result is not None else ""),
-            "duration_ms": getattr(result, "duration_ms", 0) if result is not None else 0,
+            "duration_ms": duration_ms,
             "model_id": getattr(result, "model_id", "") if result is not None else "",
             "model_ref": getattr(result, "model_ref", ref) if result is not None else ref,
             "provider": getattr(result, "provider", "") if result is not None else "",

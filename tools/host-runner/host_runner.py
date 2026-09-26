@@ -39,7 +39,6 @@ import json
 import locale
 import os
 import secrets
-import shlex
 import subprocess
 import sys
 import time
@@ -47,7 +46,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-VERSION = "0.2.0"
+VERSION = "0.2.2"
 DEFAULT_PORT = 8765
 DEFAULT_TIMEOUT_S = 120
 MAX_OUTPUT_CHARS = 200_000
@@ -93,6 +92,60 @@ def read_owner_token() -> str:
     except OSError:
         return ""
     return ""
+
+
+#: 研究者的**科研解释器**：跑命令时把它的目录提到 PATH 最前。
+HOST_PYTHON_ENV = "SCILOOP_HOST_PYTHON"
+
+
+def read_env_value(key: str) -> str:
+    """按项目 `.env` 的写法取值（**必须剥行内注释** —— 与 `read_owner_token` 同口径）。"""
+
+    try:
+        for raw in ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, _, value = line.partition("=")
+            if name.strip() != key:
+                continue
+            return value.split("#", 1)[0].strip().strip('"').strip("'")
+    except OSError:
+        return ""
+    return ""
+
+
+def host_python() -> str:
+    r"""研究者电脑上「跑命令时该用哪个 Python」：环境变量 → 项目 `.env` → 空（空＝不改 PATH）。
+
+    为什么要有它（2026-09-26 研究者报的「结论二」真根因之一）：
+    执行器是**恰好被哪个 Python 拉起就用哪个** —— 实测它被工具链自带的托管解释器拉起
+    （`…\workbuddy\binaries\python\…`），那里面**没有 numpy / scipy / torch**，
+    于是模型一问「本机有没有这些库」必然得到「没有」，把**明明能做的预试验判成做不了**。
+    让研究者指定一个，模型探到的才是他真实的科研环境。
+
+    ⚠️ 只影响**子进程的 PATH**（等价于"先激活这个环境"），不改执行器自己的解释器，
+    也不动全局配置 —— 不想要就把 `.env` 里那行删掉，行为立刻回到原样。
+    """
+
+    raw = (os.environ.get(HOST_PYTHON_ENV) or "").strip() or read_env_value(HOST_PYTHON_ENV)
+    path = raw.strip().strip('"').strip("'")
+    return path if path and Path(path).is_file() else ""
+
+
+def python_path_prefix() -> list[str]:
+    """解释器所在目录 + conda 的 `Library\bin` / `Scripts` / `DLLs`（有才加）。"""
+
+    exe = host_python()
+    if not exe:
+        return []
+    home = Path(exe).parent
+    dirs = [str(home)]
+    for extra in ("Library/bin", "Library/usr/bin", "Scripts", "DLLs"):
+        candidate = home / extra
+        if candidate.is_dir():
+            dirs.append(str(candidate))
+    return dirs
 
 
 def read_configured_port() -> int | None:
@@ -142,6 +195,7 @@ def load_or_create_state(port: int) -> dict[str, Any]:
     state.pop("token", None)
     state["port"] = port
     state["version"] = VERSION
+    state["python_env"] = host_python() or "(未指定，沿用环境默认)"
     state["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
     try:
         STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -164,11 +218,25 @@ def run_command(
 ) -> dict[str, Any]:
     """执行一条命令，返回真实退出码与输出（**不美化、不伪造**）。"""
 
+    use_shell = False
     if argv:
         args = list(argv)
     elif command:
-        # Windows 上 posix=False 才不会被反斜杠吃掉；两侧都试一次更稳
-        args = shlex.split(command, posix=(os.name != "nt"))
+        # ⚠️ 2026-09-26 修：原来 Windows 上是 `shlex.split(command, posix=False)` ——
+        # **引号会被原样保留**，`python -c "print(1)"` 到程序手里成了**带引号的字符串**
+        # （Python 把它当字符串字面量求值：不报错、不打印、退出码 0），
+        # 而且 `&&` / 管道 / 重定向这些 shell 语义**全部失效**（不是 shell 在跑）。
+        # 后果实测：模型连续几次拿到"退出码 0 + 输出为空"，于是写下
+        # 「本机 numpy / scipy / torch / transformers 全部不可用」这种**错误硬结论**，
+        # 把能做的事判成做不了。命令字符串本来就该交给**平台 shell** 解析 ——
+        # 研究者与模型写的都是 shell 语法，不是 argv 数组。
+        # ⚠️ 必须走 `shell=True` 而不是手工拼 ["cmd", "/c", command]：
+        # Windows 上 subprocess 会把 list 形式的参数交给 list2cmdline 再转义一次，
+        # 内层引号会变成 \"（cmd 不认），于是 `python -c "print(1)"` **依然是空输出** ✗
+        # （2026-09-26 实测：拼 cmd 只修好了 `&&`，带引号的仍然丢输出）。
+        # 直接把命令**字符串**交给平台 shell，引号与元字符才按原样生效。
+        use_shell = True
+        args = command
     else:
         return {"ok": False, "error": "既没有 argv 也没有 command"}
 
@@ -177,6 +245,12 @@ def run_command(
         return {"ok": False, "error": f"工作目录不存在：{workdir}"}
 
     env = dict(os.environ)
+    # 让子进程的 `python` 指向研究者的科研环境（等价于"先激活环境"）：
+    # 不这么做，模型探到的是"恰好拉起执行器的那个解释器"，结论会离谱（见 host_python 注释）。
+    prefix = python_path_prefix()
+    if prefix:
+        env["PATH"] = os.pathsep.join([*prefix, env.get("PATH", "")])
+        env[HOST_PYTHON_ENV] = host_python()
     if env_extra:
         env.update({str(k): str(v) for k, v in env_extra.items()})
 
@@ -193,6 +267,7 @@ def run_command(
     try:
         proc = subprocess.run(  # noqa: S603 - 这是执行器的本职
             args,
+            shell=use_shell,
             cwd=workdir,
             env=env,
             capture_output=True,
