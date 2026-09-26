@@ -650,12 +650,22 @@ async def _execute(task: TranslateTask) -> None:
     )
 
     written = sum(1 for item in outcomes if item.written)
+    #: "按原样保留"的块（竖排/水印/重叠/无译文）**不进分母** —— 见 engine.PRESERVED_REASONS。
+    preserved = sum(
+        1
+        for item in outcomes
+        if not item.written and (item.reason is None or item.reason in engine.PRESERVED_REASONS)
+    )
+    translatable = len(outcomes) - preserved
+    message = f"完成：{written}/{translatable} 块已回写译文"
+    if preserved:
+        message += f"（另有 {preserved} 块竖排/水印/重叠/无译文，按原样保留、不计入）"
     _set_progress(
         task_id,
         status=STATUS_COMPLETED,
         stage=STATUS_COMPLETED,
         percent=100,
-        message=f"完成：{written}/{len(outcomes)} 块已回写译文",
+        message=message,
     )
 
 

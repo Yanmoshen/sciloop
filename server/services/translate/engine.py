@@ -60,6 +60,22 @@ CJK_REGISTERED_FONTNAME = "sciloopcjk"
 #: ASCII 相对字宽（内置 CJK 字体的 ASCII 度量接近全角，注册 TTF 后为比例宽度）
 ASCII_WIDTH_BUILTIN = 1.0
 ASCII_WIDTH_REGISTERED = 0.52
+#: **按原样保留**的原因码 —— 这些不是"该翻没翻"，不进回写率的分母。
+#:
+#: 为什么必须分开算（2026-09-26 实测）：一篇 15 页论文的 496 个块里，有 **222 个是
+#: arXiv 侧栏印章**（竖排，按原方向保留才是对的）。把它们算进分母，回写率永远上不去，
+#: 而"提高"它的唯一办法竟是去翻水印 —— 既荒谬又浪费。分母必须回答的是
+#: 「**该有译文的块，有多少真的写进去了**」。
+PRESERVED_REASONS: frozenset[str] = frozenset(
+    {
+        "rotated_block_skipped",  # 竖排 / 水印 / 侧栏
+        "overlaps_neighbour_block_skipped",  # 与邻块重叠，原位回写会叠印
+        "block_bbox_too_small",  # 框太小，放不下任何字
+        "target_equals_source",  # 译文与原文相同（无需改写）
+        "empty_target",  # 没有译文可写
+    }
+)
+
 #: 回写字号的**绝对**技术下限（低于此值 PyMuPDF 已无法正常排字）
 MIN_FONT_SIZE = 4.0
 #: 回写字号的**可读性**下限（pt）：低于此值不再缩小，改为扩容或保留原文
@@ -219,6 +235,36 @@ def _text_width(text: str, size: float, ascii_ratio: float) -> float:
     for char in text:
         width += size if _CJK_RE.match(char) else size * ascii_ratio
     return width
+
+
+#: 判"这段是不是一整句自然语言"的粗口径：够长、且至少 4 个词。
+#: 只用来区分「作者名/邮箱/编号」与「真的没翻的一句话」，不参与翻译决策。
+_SENTENCE_MIN_CHARS = 40
+_SENTENCE_MIN_WORDS = 4
+
+
+#: 常见英文虚词 —— 真句子基本都会命中；作者名 / 会议名 / 邮箱不会。
+_SENTENCE_STOPWORDS = frozenset(
+    {"the", "of", "is", "are", "was", "were", "and", "to", "in", "on", "we", "this",
+     "that", "for", "with", "by", "as", "be", "it", "our", "which", "when", "but"}
+)
+
+
+def _looks_like_sentence(text: str) -> bool:
+    """这段文本像不像"一整句要被翻译的话"（而不是作者名 / 邮箱 / 会议名）。
+
+    为什么要收紧：只按"长度 + 词数"判，`Jakob Uszkoreit ∗ Google Research usz@google.com`
+    会被当成一句话，于是把**本来就无需改写**的作者行记成"没翻"，
+    白白拉低回写率、还误导人。加一层虚词要求即可把这类误判挡掉。
+    """
+
+    raw = " ".join(str(text or "").split())
+    if len(raw) < _SENTENCE_MIN_CHARS:
+        return False
+    words = [item.strip(".,;:()[]").lower() for item in raw.replace("/", " ").split(" ")]
+    if len([item for item in words if item.isalpha()]) < _SENTENCE_MIN_WORDS:
+        return False
+    return sum(1 for item in words if item in _SENTENCE_STOPWORDS) >= 2
 
 
 def _readable_floor(base: float) -> float:
@@ -621,6 +667,8 @@ def render_mono(
     skipped_rotated = 0
     skipped_unreadable = 0
     skipped_overlap = 0
+    #: 回写字号**低于可读下限**但成功放下的块数（2026-09-26：宁可小字号也要写进去）
+    below_readable = 0
     expanded_blocks = 0
     try:
         by_page: dict[int, list[int]] = {}
@@ -644,6 +692,18 @@ def render_mono(
                 block = blocks[index]
                 target = targets[index] if index < len(targets) else None
                 if not target or target == block.source_text:
+                    # 「译文与原文相同」要分两种，别混在一起（2026-09-26）：
+                    #   · 作者名 / 邮箱 / 编号 / 短标签 → 本来就无需改写，**不计入分母**；
+                    #   · 原文明明是**一整句话**却一字未改 → 那就是**没翻**，必须计入分母，
+                    #     否则回写率会被这条口径"刷"上去，而右边看到的还是英文。
+                    if target and _looks_like_sentence(block.source_text):
+                        reason = "untranslated_sentence"
+                        warnings.append(
+                            f"page={block.page} bbox={_fmt_bbox(block.bbox)} 这一句没有译文"
+                            "（模型原样返回了英文，判为未翻译，计入回写率）"
+                        )
+                    else:
+                        reason = "target_equals_source" if target else "empty_target"
                     outcomes.append(
                         BlockOutcome(
                             page=block.page,
@@ -651,7 +711,7 @@ def render_mono(
                             source_text=block.source_text,
                             target_text=target if target else block.source_text,
                             written=False,
-                            reason=None if not target else "target_equals_source",
+                            reason=reason,
                         )
                     )
                     continue
@@ -690,6 +750,14 @@ def render_mono(
                 floor = _readable_floor(block.font_size)
                 write_rect = rect
                 size = _required_font_size(rect, target, block.font_size, ascii_ratio, floor)
+                if size is None:
+                    # 可读下限放不下 → 先试**技术下限**（字号会小于可读下限，但在可缩放的
+                    # PDF 阅读器里，比"这块留英文"有用得多；用户口径 2026-09-26：回写率 ≥98%）。
+                    size = _required_font_size(
+                        rect, target, block.font_size, ascii_ratio, MIN_FONT_SIZE
+                    )
+                    if size is not None:
+                        floor = MIN_FONT_SIZE
                 grew = False
                 if size is None:
                     grown = _expand_rect(pymupdf, rect, obstacles, page_bottom)
@@ -697,6 +765,12 @@ def render_mono(
                         grown_size = _required_font_size(
                             grown, target, block.font_size, ascii_ratio, floor
                         )
+                        if grown_size is None:
+                            grown_size = _required_font_size(
+                                grown, target, block.font_size, ascii_ratio, MIN_FONT_SIZE
+                            )
+                            if grown_size is not None:
+                                floor = MIN_FONT_SIZE
                         if grown_size is not None:
                             size, write_rect, grew = grown_size, grown, True
                 if size is None:
@@ -735,7 +809,20 @@ def render_mono(
             for index, rect, write_rect, target, size, color, grew in pending:
                 block = blocks[index]
                 written, used_size, failure = _insert_block(
-                    page, write_rect, target, size, color, font_file, floor=_readable_floor(block.font_size)
+                    # ⚠️ 下限必须与**估算阶段**用的一致（`floor`：走过技术下限就是 MIN_FONT_SIZE）。
+                    # 一度写成 `min(可读下限, size)` → 估算说 11pt 能放下、写入器却卡在 9pt 上，
+                    # 于是"框高比行高还小"的那类块（Abstract、单行小字）永远写不进去。
+                    page,
+                    write_rect,
+                    target,
+                    size,
+                    color,
+                    font_file,
+                    # 起点是估算字号（已经先试过可读下限），下限放到**技术下限**：
+                    # 估算的行高系数（1.22）比真实字体（≈1.36）乐观，
+                    # 不让写入器继续往下搜，就会出现"估算说放得下、实测塞不进"的死结。
+                    # 宁可小字号写进去（并在汇总里报出块数），也不要整块留英文。
+                    floor=MIN_FONT_SIZE,
                 )
                 if not written:
                     # 回写失败 → 立即把**原文**写回该块，避免「清了原文什么都没写」的内容丢失
@@ -748,6 +835,19 @@ def render_mono(
                         font_file,
                         floor=_readable_floor(block.font_size),
                     )
+                    if not restored:
+                        # 原文都写不回去 → 再用**技术下限**兜一次。
+                        # 原设计在这里会留下一块**空白**（原文已 redact、什么都没写回）——
+                        # 那是真的丢内容，比字小严重得多。
+                        restored, _restore_size, restore_failure = _insert_block(
+                            page,
+                            rect,
+                            block.source_text,
+                            block.font_size,
+                            color,
+                            font_file,
+                            floor=MIN_FONT_SIZE,
+                        )
                     reason = failure or "insert_failed"
                     warnings.append(
                         f"page={block.page} bbox={_fmt_bbox(block.bbox)} 译文未回写（{reason}），"
@@ -759,6 +859,8 @@ def render_mono(
                     continue
                 if grew:
                     expanded_blocks += 1
+                if used_size < _readable_floor(block.font_size) - 1e-9:
+                    below_readable += 1
                 if used_size < block.font_size * SHRINK_WARN_RATIO:
                     warnings.append(
                         f"page={block.page} bbox={_fmt_bbox(block.bbox)} 译文回写字号由 "
@@ -768,6 +870,12 @@ def render_mono(
                     BlockOutcome(block.page, block.bbox, block.source_text, target, True, None)
                 )
 
+        if below_readable:
+            warnings.append(
+                f"共 {below_readable} 块译文放不进可读下限（{MIN_READABLE_FONT_SIZE:g}pt），"
+                f"已缩到技术下限 {MIN_FONT_SIZE:g}pt 写入（在可缩放阅读器里可读，"
+                "但比原文字号小；这类块值得人工看一眼）"
+            )
         if skipped_rotated:
             warnings.append(
                 f"共 {skipped_rotated} 块旋转文本（侧栏/水印/竖排）未回写，PDF 中按原方向保留"
@@ -929,6 +1037,7 @@ __all__ = [
     "MAX_BLOCKS_TOTAL",
     "MIN_FONT_SIZE",
     "MIN_READABLE_FONT_SIZE",
+    "PRESERVED_REASONS",
     "READABILITY_FLOOR_RATIO",
     "SHRINK_WARN_RATIO",
     "STUB_MARK",
