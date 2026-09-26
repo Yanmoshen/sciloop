@@ -213,15 +213,23 @@ export const routes: RouteRecordRaw[] = [
         meta: { title: '全文阅读', module: 'reader' },
       },
       {
+        // 多格式导出整页已下线（研究者 2026-09-26：界面删掉、后端保留）。
+        // 旧链接与书签 → 送回文献总览，别留一屏白。
         path: 'papers/export',
-        name: 'export',
-        component: () => import('@/views/ExportView.vue'),
-        meta: { title: '多格式导出', module: 'export' },
+        redirect: '/papers',
       },
       // ---- 其余工作页（从左栏「最近打开」、卡片或头像菜单进入；左栏保持常驻）----
       {
+        // 研究构想：**先看任务列表**（2026-09-26 研究者口径），选一个任务才进工作区
         path: 'ideas',
         name: 'ideas',
+        component: () => import('@/views/IdeasHomeView.vue'),
+        meta: { title: '研究构思', module: 'ideas' },
+      },
+      {
+        // 某个研究任务的工作区（四个方向 + 可行性分析）
+        path: 'ideas/:aggregationId',
+        name: 'idea-workspace',
         component: () => import('@/views/IdeaView.vue'),
         meta: { title: '研究构思', module: 'ideas' },
       },

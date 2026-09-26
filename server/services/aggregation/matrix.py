@@ -37,7 +37,10 @@ from services.aggregation.span_locator import locate_in_spans
 
 logger = logging.getLogger("sciloop.wp08.matrix")
 
-MIN_PAPERS = 2
+#: 参与聚合的论文数下限。2026-09-26 由 2 放开到 **1**：研究构想要支持「单篇精读发散」
+#: （研究者口径：选 1 篇＝单篇精读，选 ≥2 篇＝多篇交叉聚合）。单篇在对比矩阵里就是
+#: "只有一列"，本身是合法形状，不是异常 —— 原来是 2 时选单篇会直接 422。
+MIN_PAPERS = 1
 MAX_PAPERS = 20
 
 #: 对比维度（``sub_key`` 用于 ``experimental_setup`` 这类嵌套结构）
