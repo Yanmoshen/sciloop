@@ -47,8 +47,19 @@ const engine = ref('')
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
-const RUNNING = ['accepted', 'running', 'queued', 'pending']
-const hasRunning = computed(() => jobs.value.some((job) => RUNNING.includes(String(job.status))))
+/**
+ * ⚠️ 终态要按**后端真实的状态名**列（2026-09-26 修）。
+ *
+ * 改前写的是 `['accepted','running','queued','pending']` —— 其中前三个后端**根本没有**，
+ * 而真实的运行态 `parsing / rewriting / rendering / highlighting` 一个都没认。
+ * 结果：`hasRunning` 在真跑的时候恒为假 → **轮询从不启动** → 状态一动不动
+ * （用户报的"状态不实时更新"就是它）。
+ *
+ * 口径改成"**不是终态就是在跑**"，这样后端以后加新的中间态也不会漏。
+ */
+const TERMINAL_STATUSES = ['completed', 'error', 'failed', 'cancelled']
+const isRunning = (status: unknown): boolean => !TERMINAL_STATUSES.includes(String(status))
+const hasRunning = computed(() => jobs.value.some((job) => isRunning(job.status)))
 
 function stopPolling(): void {
   if (pollTimer !== null) {
@@ -76,7 +87,13 @@ function ownerHint(error: unknown): string {
   if (status === 403) {
     return '只读浏览模式下没法创建翻译任务：到「设置」里切换成研究者身份后重试。'
   }
-  return error instanceof Error ? error.message : String(error)
+  const message = error instanceof Error ? error.message : String(error)
+  // 论文库里没有这篇的本地原文（很常见：题录是抓来的，没有落盘 PDF）→ 光说"没有原文"没用，
+  // 得给出可执行的出路（用户口径：界面不写解释性小字，但**错误必须有下一步**）。
+  if (status === 409 && message.includes('原文')) {
+    return `${message}  出路：用下面的「上传 PDF 翻译」直接传这篇的 PDF；或先把原文 PDF 导进论文库再点翻译。`
+  }
+  return message
 }
 
 async function loadJobs(): Promise<void> {
@@ -172,20 +189,19 @@ async function action(kind: 'cancel' | 'retry', job: TranslateJob): Promise<void
   }
 }
 
-function statusTag(status: string): { text: string; cls: string } {
+/** 状态文案（用户口径 2026-09-26：已完成 / 正在翻译 / 未完成）。 */
+function statusTag(status: string): { text: string; cls: string; running: boolean } {
   switch (status) {
     case 'completed':
-      return { text: '已完成', cls: 'tag--ok' }
-    case 'running':
-    case 'accepted':
-    case 'queued':
-      return { text: '进行中', cls: 'tag--warn' }
+      return { text: '已完成', cls: 'tag--ok', running: false }
+    case 'error':
     case 'failed':
-      return { text: '失败', cls: 'tag--fail' }
+      return { text: '未完成', cls: 'tag--fail', running: false }
     case 'cancelled':
-      return { text: '已取消', cls: 'tag--mute' }
+      return { text: '已取消', cls: 'tag--mute', running: false }
     default:
-      return { text: status, cls: 'tag--mute' }
+      // 其余全是中间态（pending / parsing / rewriting / rendering / highlighting …）
+      return { text: '正在翻译', cls: 'tag--warn', running: true }
   }
 }
 
@@ -201,7 +217,38 @@ function download(taskId: string, format: 'mono' | 'dual'): void {
 
 const detailWarnings = computed(() => detail.value?.layout_warnings ?? [])
 
-void loadJobs().then(ensurePolling)
+/**
+ * 带着 `?paper_id=` 进来（从阅读页点「翻译该论文」）→ **直接开跑**，不让研究者再点一次。
+ *
+ * 用户口径 2026-09-26：「跳转到论文翻译界面后，应该直接新建一个翻译任务，
+ * 直接翻译刚刚那篇论文，不需要我手动再去选择」。
+ *
+ * 两条保护：
+ *  · 只在**这次进入**触发一次（`autoStarted`），页面内不会重复建；
+ *  · 同一条论文**已经有任务在跑**时不重复建（重复建 = 白烧一次整篇翻译）。
+ * `createFromPaper()` 成功后会清掉 query，所以刷新页面也不会再建一条。
+ */
+const autoStarted = ref(false)
+
+async function autoStartFromQuery(): Promise<void> {
+  if (autoStarted.value || !paperId.value) return
+  autoStarted.value = true
+  const running = jobs.value.find(
+    (job) => job.paper_id === paperId.value && isRunning(job.status),
+  )
+  if (running) {
+    notice.value = '这篇的翻译已经在跑了，进度见下面的列表。'
+    await openDetail(running.task_id)
+    void router.replace({ query: {} })
+    return
+  }
+  await createFromPaper()
+}
+
+void loadJobs().then(() => {
+  ensurePolling()
+  void autoStartFromQuery()
+})
 onUnmounted(stopPolling)
 </script>
 
@@ -271,7 +318,12 @@ onUnmounted(stopPolling)
           </tr>
           <tr v-for="job in jobs" :key="job.task_id">
             <td class="mono">{{ job.task_id }}</td>
-            <td><span class="tag" :class="statusTag(String(job.status)).cls">{{ statusTag(String(job.status)).text }}</span></td>
+            <td>
+              <span class="tag" :class="statusTag(String(job.status)).cls">
+                <span v-if="statusTag(String(job.status)).running" class="spin" aria-hidden="true" />
+                {{ statusTag(String(job.status)).text }}
+              </span>
+            </td>
             <td class="progress-cell">
               <span class="progress"><span class="progress__bar" :style="{ width: `${Math.min(100, job.percent ?? 0)}%` }" /></span>
               <span class="mono pct">{{ job.percent ?? 0 }}%</span>
@@ -298,7 +350,7 @@ onUnmounted(stopPolling)
                 双语 PDF
               </button>
               <button
-                v-if="RUNNING.includes(String(job.status))"
+                v-if="isRunning(job.status)"
                 class="link-btn link-btn--mute"
                 type="button"
                 @click="action('cancel', job)"
@@ -324,7 +376,10 @@ onUnmounted(stopPolling)
         <div class="dialog" role="dialog" aria-modal="true" aria-label="翻译任务详情">
           <header class="dialog__head">
             <h2>翻译任务 {{ detail.task_id }}</h2>
-            <span class="tag" :class="statusTag(String(detail.status)).cls">{{ statusTag(String(detail.status)).text }}</span>
+            <span class="tag" :class="statusTag(String(detail.status)).cls">
+              <span v-if="statusTag(String(detail.status)).running" class="spin" aria-hidden="true" />
+              {{ statusTag(String(detail.status)).text }}
+            </span>
             <span class="spacer" />
             <button class="icon-btn" type="button" title="关闭" aria-label="关闭" @click="detail = null">
               <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
@@ -632,5 +687,32 @@ onUnmounted(stopPolling)
   gap: var(--space-2);
   padding-top: var(--space-3);
   border-top: 1px solid var(--color-border);
+}
+
+/* 「正在翻译」旁边的转圈（用户口径 2026-09-26：正在翻译要有个转圈的图案）。
+   纯 CSS：一圈 currentColor 的环 + 顶上开口，转起来就是转圈，不引任何图标资源。 */
+.spin {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  margin-right: 4px;
+  vertical-align: -1px;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: translate-spin 0.8s linear infinite;
+}
+
+@keyframes translate-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 偏好「减少动态」时不要闪个不停，放慢即可（还要能看出它在跑） */
+@media (prefers-reduced-motion: reduce) {
+  .spin {
+    animation-duration: 2.4s;
+  }
 }
 </style>
