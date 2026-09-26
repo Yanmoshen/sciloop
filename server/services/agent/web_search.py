@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import xml.etree.ElementTree as ET
 from typing import Any
 from urllib.parse import quote
@@ -415,6 +416,23 @@ async def _github(query: str, limit: int, http: httpx.AsyncClient) -> list[dict[
 _SOURCE_FETCHERS = {"arxiv": _arxiv, "crossref": _crossref, "github": _github}
 
 
+#: 来源失败后的冷却秒数：被挡 / 连不上的来源短期内**不再重复试** ——
+#: 每次白等一个超时没有意义（arXiv 按 IP 限流时会连续回 406）。
+#: 研究者 2026-09-26 口径："不再强制要求 arxiv 请求尝试"。
+_SOURCE_COOLDOWN_S = 600.0
+_SOURCE_READY_AT: dict[str, float] = {}
+
+
+def _source_ready(name: str) -> bool:
+    return time.time() >= _SOURCE_READY_AT.get(name, 0.0)
+
+
+def _mark_source_failed(name: str, reason: str) -> None:
+    """只有"被挡 / 连不上"才进冷却；解析类失败是数据问题，不进（下次还值得试）。"""
+    if reason in (REASON_BLOCKED, REASON_NO_EGRESS):
+        _SOURCE_READY_AT[name] = time.time() + _SOURCE_COOLDOWN_S
+
+
 async def _fetch_one(
     name: str, text: str, limit: int, http: httpx.AsyncClient
 ) -> tuple[str, list[dict[str, Any]] | None, dict[str, str] | None]:
@@ -427,6 +445,12 @@ async def _fetch_one(
     if fetcher is None:
         return name, None, None
     label = SOURCE_LABELS.get(name, name)
+    if not _source_ready(name):
+        return name, None, {
+            "source": label,
+            "reason": "cooling_down",
+            "detail": "该来源刚失败过，本次跳过（如实记录，不是没查）",
+        }
     try:
         return name, await fetcher(text, limit, http), None
     except httpx.HTTPStatusError as exc:
@@ -434,8 +458,10 @@ async def _fetch_one(
         # 403/429 是被挡；**406 也要算被挡** —— arXiv 按 IP 限流时就是回 406
         # （实测：同一请求几分钟前 200，连续探测后一律 406）
         reason = REASON_BLOCKED if status in (403, 406, 429) else REASON_BAD_RESPONSE
+        _mark_source_failed(name, reason)
         return name, None, {"source": label, "reason": reason, "detail": f"HTTP {status}"}
     except httpx.HTTPError as exc:
+        _mark_source_failed(name, REASON_NO_EGRESS)
         return name, None, {
             "source": label,
             "reason": REASON_NO_EGRESS,

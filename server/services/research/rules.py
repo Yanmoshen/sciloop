@@ -48,8 +48,11 @@ __all__ = [
     "validate_node_output",
 ]
 
-#: 「证据充分」阈值：≥3 条且均带可定位来源，其中至少 1 条是最接近工作
-MIN_EVIDENCE_COUNT = 3
+#: 「证据充分」阈值（**2026-09-26 起为 0 ＝ 不再有数量门槛**）。
+#: 研究者口径："不要有那么多程序硬性限制" —— 程序只报**事实**（本轮拿到几条证据），
+#: 够不够、要不要继续找由模型自己判断，不由程序划一条线。
+#: 保留常量是为了不破坏 `min_evidence_count()` 的接口与既有引用。
+MIN_EVIDENCE_COUNT = 0
 
 #: 解析卡片的 8 个字段名（`card_field` 只允许取这些值）
 CARD_FIELDS: tuple[str, ...] = (
@@ -184,12 +187,14 @@ def _check_literature(
     if _blank(out.research_question):
         hits.append(RuleHit("R1", "L1", "研究问题为空，无法界定调研范围", "research_question"))
 
-    if len(out.evidence) < MIN_EVIDENCE_COUNT:
+    # 只报**事实**：本轮拿到几条证据。"够不够"由模型判断 ——
+    # 这里不再写"至少需要 N 条"（那是程序替模型定的标准，2026-09-26 研究者要求去掉）。
+    if not out.evidence:
         hits.append(
             RuleHit(
                 "R2",
                 "L2",
-                f"证据只有 {len(out.evidence)} 条，至少需要 {MIN_EVIDENCE_COUNT} 条",
+                "本轮没有任何证据（0 条）：可以继续找，也可以如实说明材料不足",
                 "evidence",
             )
         )
@@ -212,7 +217,15 @@ def _check_literature(
     hits.extend(_check_locators_real(out.evidence, facts))
 
     if not out.closest_work:
-        hits.append(RuleHit("R3", "L2", "未给出最接近的工作，无法判断差异与空白", "closest_work"))
+        # 2026-09-26 放宽：不再要求"至少 1 条最接近的工作"，只如实报"这一轮没给"
+        hits.append(
+            RuleHit(
+                "R3",
+                "L2",
+                "本轮没有给出「最接近的工作」（不强制；若确有相关前作，补上更容易看清差异）",
+                "closest_work",
+            )
+        )
     else:
         bad = [
             f"论文 {c.paper_id}"
@@ -574,8 +587,8 @@ def rule_catalog(node: str) -> list[dict[str, str]]:
     catalog = {
         "literature_review": [
             ("R1", "格式", "研究问题不能为空"),
-            ("R2", "质量", f"证据至少 {MIN_EVIDENCE_COUNT} 条，且每条都要带解析卡片字段或原文片段"),
-            ("R3", "质量", "至少 1 条最接近的工作，且同时说明重合点与仍存差异"),
+            ("R2", "质量", "本轮证据条数（只报事实，不设数量门槛）；每条都要带解析卡片字段或原文片段"),
+            ("R3", "质量", "若给出了最接近的工作，要说清重合点与仍存差异（没给出也不强制）"),
             ("R4", "质量", "证据不能全部标为「推断」"),
             ("R5", "质量", "提到研究空白时必须说明检索覆盖范围与盲区"),
             ("R6", "格式", "引用的论文必须真实存在于论文库，不得编造编号"),
