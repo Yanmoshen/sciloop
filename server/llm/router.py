@@ -253,6 +253,10 @@ class ModelRouter:
 
         resolved = await self._resolve_from_registry(stage, project_id)
         if resolved is None:
+            # 环节没配路由 → **回落设置页里的默认模型**（用户口径 2026-09-26：
+            # 翻译这类环节不该因为"没人给它单独配路由"就静默降级成本地桩）。
+            resolved = await self._resolve_default_config()
+        if resolved is None:
             resolved = self._env_model_from_settings(source="env_default")
         if resolved is None:
             return None
@@ -281,6 +285,40 @@ class ModelRouter:
             # 库里的 ``stage_model_routing.max_tokens`` 列保留作历史记录，但不再生效。
             max_tokens=None,
             source="project" if routing.project_id is not None else "global",
+        )
+
+    async def _resolve_default_config(self) -> ResolvedModel | None:
+        """回落到「设置页里那个默认模型」（`model_configs.is_default`）。
+
+        ⚠️ 为什么必须有这一层（2026-09-26 实测）：`stage_model_routing` 里**只有 `parse` 一行**，
+        所以 `translate` 这类环节一路回落到 `.env` 的 `LLM_DEFAULT_API_KEY`（**是空的**），
+        翻译于是**静默**换成本地桩 —— 产出"原文 + 【本地桩·未翻译】"，
+        表面上任务"完成 100%"，实际一个字的翻译都没有。
+        **凭据只有一个来源**：用户在设置页配好的那套。某个环节没人单独配路由，
+        不应该等于"这个功能没接模型"。
+        """
+
+        try:
+            configs = await self.registry.list_configs()
+        except Exception as exc:  # noqa: BLE001 - 读不到就继续走 env 兜底
+            logger.warning("读取模型配置失败，继续走环境变量兜底：%s", exc)
+            return None
+        if not configs:
+            return None
+
+        config = next((item for item in configs if item.is_default), configs[0])
+        models = list(config.models or [])
+        if not models:
+            return None
+        model_id = str(models[0].get("model_id") or "")
+        if not model_id:
+            return None
+        return self._build_from_config(
+            config=config,
+            model_id=model_id,
+            temperature=None,
+            max_tokens=None,
+            source="default_config",
         )
 
     def _build_from_config(
