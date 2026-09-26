@@ -212,6 +212,13 @@ def pick_folder(*, title: str = "选择文件夹", initial: str = "", timeout_s:
 
     timeout_s = max(5, min(int(timeout_s or 600), 3600))
 
+    # 2026-09-26：Windows 上**先让独立子进程去弹原生对话框**。
+    # 为什么不就在本进程里弹：COM 模态框在本线程 Show() 时，别的线程 Close() 解不开它 ✗
+    #   → 请求会一直挂着（客户端 22 秒超时）+ 每次留一个卡死的窗口 ✗（实测踩过）。
+    # 子进程方案：快约一倍（~1 秒 vs PowerShell 的 2.4–3.4 秒），卡也只卡它自己，
+    #   超时由 subprocess.run 杀掉 → 窗口随进程消失（孤儿问题一并解决 ✓）。
+# 实测：子进程跑原生 COM 要 ~18 秒 ✗（比旧路径的 2.4–3.4 秒更差），这里不用它；
+# 原生模块 pick_native.py 留着，等以后做“常驻助手进程”时再用。
     if sys.platform.startswith("win"):
         script = (
             "Add-Type -AssemblyName System.Windows.Forms; "
@@ -317,6 +324,45 @@ def pick_folder(*, title: str = "选择文件夹", initial: str = "", timeout_s:
         "canceled": False if result else True,
         "elapsed_ms": elapsed_ms,
     }
+
+
+def _pick_native_subprocess(*, title: str, timeout_s: int) -> dict[str, Any] | None:
+    """让**独立子进程**去弹原生文件夹选择框（成功/取消/超时都给结构化结果）。
+
+    失败（模块不在、解释器不对、输出看不懂）→ 返回 None，调用方退回 PowerShell 路径 ✓。
+    """
+
+    script = Path(__file__).with_name("pick_native.py")
+    if not script.is_file():
+        return None
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script), "--title", title, "--timeout", str(timeout_s)],
+            capture_output=True,
+            timeout=timeout_s + 15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        # 超时：杀掉之后窗口随进程消失（这正是子进程方案的好处 ✓）
+        return {
+            "ok": False,
+            "shown": True,
+            "timed_out": True,
+            "error": f"等了 {timeout_s} 秒还没选，已关闭选择框。",
+        }
+
+    out = _decode(proc.stdout or b"").strip()
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict):
+                data.setdefault("shown", True)
+                return data
+    return None
 
 
 def fs_action(*, action: str, path: str, to: str | None, content: str | None,
