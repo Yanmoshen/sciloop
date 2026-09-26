@@ -571,8 +571,7 @@ def _facts_for_conclusion(
     lines: list[str] = [
         f"这一步是：{label}",
         f"结果状态：{status}",
-        f"这一步尝试修复的次数：{int(done.get('llm_call_count') or 0) and ''}"
-        f"{len([1 for e, _ in events if e == 'validation'])}",
+        f"这一步尝试修复的次数：{len([1 for e, _ in events if e == 'validation'])}",
     ]
 
     # 未通过的具体原因（程序已经算出来的事实，照抄给模型，不加工）
@@ -604,6 +603,20 @@ def _facts_for_conclusion(
         if next_unimplemented:
             tail += "（但这一步还**没有实装**：不会做校验、也不会真的执行实验）"
         lines.append(tail)
+
+    # 节点自己写在产出里的文字（coverage_note / gaps / limits / closest_work …）。
+    # ⚠️ 少了这一段，收尾就只能写出"没有任何产出" —— 哪怕模型在产出里已经写了自己的判断。
+    notes = done.get("content_notes") or {}
+    if notes:
+        lines.append(
+            "这一步**自己写在产出里的内容**（用你自己的话转述给研究者，"
+            "**不要把字段名念出来**，也不要照抄 JSON）："
+        )
+        for key, value in notes.items():
+            if isinstance(value, list):
+                lines.append(f"- {key}：" + "；".join(str(item) for item in value))
+            else:
+                lines.append(f"- {key}：{value}")
     return "\n".join(lines)
 
 
@@ -620,140 +633,6 @@ async def _write_conclusion(*, facts: str, model_ref: str | None) -> str:
         purpose="research_node_conclusion",
         system=messages.NODE_CONCLUSION_SYSTEM,
     )
-
-
-def _system_row_for(event: str, data: dict[str, Any]) -> dict[str, Any] | None:
-    """把节点事件转成一条紧凑系统行（面向研究者，不含内部字段名）。"""
-
-    if event == "node":
-        return messages.system_row(
-            "entered", f"{data.get('node_label')}（第 {data.get('entry_index')} 次进入）", tone="info"
-        )
-    if event == "attempt":
-        hits = data.get("library_hits")
-        return messages.system_row(
-            "attempt",
-            f"第 {data.get('attempt')}/{data.get('max_attempts')} 次尝试"
-            + (f"，命中论文 {hits} 篇" if hits is not None else ""),
-            tone="idle",
-        )
-    if event == "validation":
-        items = data.get("items") or []
-        detail = "；".join(str(item.get("message", "")) for item in items[:3])
-        return messages.system_row(
-            "validation",
-            f"第 {data.get('attempt')}/{data.get('max_attempts')} 次被驳回：{detail}",
-            tone="err",
-        )
-    if event == "notice":
-        return messages.system_row("notice", str(data.get("message") or ""), tone="warn")
-    if event == "revert":
-        return messages.system_row(
-            "revert",
-            f"{data.get('from_label')} → {data.get('to_label')}：{str(data.get('reason') or '')[:160]}",
-            tone="info",
-        )
-    if event == "migrated":
-        return messages.system_row(
-            "migrated", f"{data.get('from_label')} → {data.get('to_label')}", tone="ok"
-        )
-    if event == "waiting_human":
-        return messages.system_row(
-            "waiting_human", str(data.get("message") or "已转入人工介入"), tone="warn"
-        )
-    if event == "error":
-        return messages.system_row(
-            "stopped", str(data.get("message") or "执行失败"), tone="err"
-        )
-    return None
-
-
-def _facts_for_conclusion(
-    *,
-    label: str,
-    status: str,
-    events: list[tuple[str, dict[str, Any]]],
-    refs: dict[str, Any],
-    next_node: str | None,
-    next_unimplemented: bool,
-) -> str:
-    """把这一步的**事实**整理成给模型看的载荷（**不含任何面向用户的话术**）。
-
-    用户口径 2026-09-26：对话里的正文一律由模型写。所以这里只报事实 ——
-    状态、试了几次、为什么没过、产出了什么、下一步是什么，措辞一个字都不代它写。
-    """
-
-    done = next((d for e, d in events if e == "done"), {})
-    lines: list[str] = [
-        f"这一步是：{label}",
-        f"结果状态：{status}",
-        f"这一步尝试修复的次数：{int(done.get('llm_call_count') or 0) and ''}"
-        f"{len([1 for e, _ in events if e == 'validation'])}",
-    ]
-
-    # 未通过的具体原因（程序已经算出来的事实，照抄给模型，不加工）
-    reasons = [str(d.get("message") or "") for e, d in events if e in ("validation", "error")]
-    reasons = [item for item in reasons if item.strip()]
-    if reasons:
-        lines.append("未通过的原因（逐条）：")
-        lines.extend(f"- {item[:400]}" for item in reasons[-3:])
-
-    waiting = next((d for e, d in reversed(events) if e == "waiting_human"), None)
-    if waiting is not None:
-        lines.append(f"需要人介入的说明（程序记录的原文）：{str(waiting.get('message') or '')[:400]}")
-
-    produced: list[str] = []
-    if refs.get("evidence_ids"):
-        produced.append(f"证据 {len(refs['evidence_ids'])} 条")
-    if refs.get("idea_id"):
-        produced.append(f"候选假设一条（编号 {refs['idea_id']}）")
-    if refs.get("feasibility_id"):
-        produced.append(f"可行性报告一份（编号 {refs['feasibility_id']}）")
-    if refs.get("taskbook_id"):
-        produced.append(f"任务书一份（编号 {refs['taskbook_id']}，已锁定）")
-    if refs.get("taskbook_skipped"):
-        produced.append("任务书没落库（本对话没挂项目，任务书要归属到项目下）")
-    lines.append("这一步的产出：" + ("、".join(produced) if produced else "没有产出"))
-
-    if next_node and next_node != "end":
-        tail = f"下一步本来可以走：{_label_of(next_node)}"
-        if next_unimplemented:
-            tail += "（但这一步还**没有实装**：不会做校验、也不会真的执行实验）"
-        lines.append(tail)
-    return "\n".join(lines)
-
-
-async def _write_conclusion(
-    *,
-    facts: str,
-    model_ref: str | None,
-) -> str:
-    """让**模型**写节点收尾那段话；写不出来就返回空串。
-
-    为什么不兜一句程序文案：用户口径 2026-09-26「对话里所有正文都必须是模型输出」。
-    所以失败时**宁可留空**（再补一条过程行如实说明），也不拿程序话术冒充正文。
-    """
-
-    if not model_ref:
-        return ""
-    from llm import adapter
-
-    try:
-        result = await adapter.chat(
-            [
-                {"role": "system", "content": messages.NODE_CONCLUSION_SYSTEM},
-                {"role": "user", "content": messages.NODE_CONCLUSION_TEMPLATE.format(facts=facts)},
-            ],
-            model_ref=model_ref,
-            temperature=0.3,
-            purpose="research_node_conclusion",
-            allow_fallback=False,
-            strict_logging=False,
-        )
-    except Exception as exc:  # noqa: BLE001 - 收尾失败不该把这一轮带崩
-        logger.warning("节点收尾（模型措辞）失败：%s", exc)
-        return ""
-    return str(getattr(result, "content", "") or "").strip()
 
 
 # --------------------------------------------------------------------------- #

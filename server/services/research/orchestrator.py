@@ -977,6 +977,9 @@ async def _run_node_events(
     llm_calls = 0
     last_raw = ""
     last_validation: ValidationResult | None = None
+    #: 契约反复产不出可落库产出时，**通牒只发一次**（用户口径 2026-09-26：
+    #: 决定权在模型；程序只在通牒之后仍无解时兜底）。
+    ultimatum_sent = False
     repair: str | None = None
     # 循环的出口只有两个：模型说完成（break）或模型要人介入（return）。
     # 不再有"重试用尽"这个由程序判定出来的出口。
@@ -1229,11 +1232,28 @@ async def _run_node_events(
                 "code": "contract_miss",
                 "message": f"这一版产出还不能落库（{why}），已经把要补齐的地方回给你了。",
             }
+            if contract_misses >= CONTRACT_MISS_LIMIT and not ultimatum_sent:
+                # 2026-09-26 用户口径：**该不该停下由模型决定**，程序不抢着宣判。
+                # 先给它一次明确的通牒（两条出路写清楚），下一轮看它怎么选。
+                ultimatum_sent = True
+                yield "notice", {
+                    "node": target,
+                    "code": "contract_ultimatum",
+                    "message": (
+                        f"已经连续 {CONTRACT_MISS_LIMIT} 次给不出可落库的产出（{why}）。"
+                        "这是最后一次明确：要么立刻给出符合结构的产出，"
+                        "要么把 state 写成 need_human、并用 state_reason 说清需要研究者做什么。"
+                    ),
+                }
+                attempt += 1
+                continue
+
             if contract_misses >= CONTRACT_MISS_LIMIT:
-                # 防挂死：连续多次给不出可落库的产出，如实停下等人 ——
-                # 这不是"研究质量判定"，而是"这台机器现在产不出可用的东西"。
+                # 通牒发过、仍然产不出合法产出 → 程序兜底停下（防挂死底线）。
+                # ⚠️ 这里**如实写清是程序兜的底**，不要假装是模型的决定。
                 reason = (
-                    f"连续 {CONTRACT_MISS_LIMIT} 次未能给出可落库的产出（{why}），已停下等你处理"
+                    f"已发出最后一次明确要求，仍未能给出可落库的产出（{why}），"
+                    "程序在此兜底停下等你处理"
                 )
                 await _hand_off_to_human(
                     session_factory,
@@ -1423,6 +1443,7 @@ async def _run_node_events(
                 "node": target,
                 "status": "waiting_human",
                 "display_status": graph.display_status("waiting_human"),
+                "content_notes": _content_notes(candidate),
                 "cost_usd": round(total_cost, 6),
                 "llm_call_count": llm_calls,
             }
@@ -1635,6 +1656,8 @@ async def _run_node_events(
             "entry_index": entry_index,
             "next_node": next_target,
             "refs": refs,
+            # 产出里的**文字内容**（截断后）—— 收尾措辞要靠它才能说出"这一步到底说了什么"
+            "content_notes": _content_notes(payload),
             "cost_usd": round(total_cost, 6),
             "llm_call_count": llm_calls,
         }
@@ -1643,6 +1666,50 @@ async def _run_node_events(
 # --------------------------------------------------------------------------- #
 # 节点循环的三个辅助（2026-09-22：程序从"判定者"退成"报事实的人"）
 # --------------------------------------------------------------------------- #
+#: 交给"收尾措辞"用的文字字段（节点产出里**给人看**的那几项）。
+#: 为什么只挑这几项：收尾要的是"这一步说了什么"，不是把整份产物（含一堆内部字段）搬过去 ——
+#: 搬多了既贵又会让模型复述字段名。
+_TEXT_NOTE_FIELDS = ("research_question", "coverage_note", "state_reason", "summary", "notes")
+_LIST_NOTE_FIELDS = ("limits", "recommended_queries", "pending")
+_DICT_NOTE_FIELDS = ("gaps", "closest_work")
+
+
+def _content_notes(payload: Any) -> dict[str, Any]:
+    """从节点产出里挑出**给研究者看有用**的文字，截断后返回（供收尾措辞引用）。"""
+
+    if not isinstance(payload, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for key in _TEXT_NOTE_FIELDS:
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            out[key] = value.strip()[:900]
+    for key in _LIST_NOTE_FIELDS:
+        value = payload.get(key)
+        if not isinstance(value, list):
+            continue
+        items = [str(item).strip()[:220] for item in value if str(item).strip()]
+        if items:
+            out[key] = items[:12]
+    for key in _DICT_NOTE_FIELDS:
+        value = payload.get(key)
+        if not isinstance(value, list):
+            continue
+        picked: list[str] = []
+        for item in value[:8]:
+            if not isinstance(item, dict):
+                continue
+            picked.append(
+                json.dumps(
+                    {k: (str(v)[:220] if isinstance(v, str) else v) for k, v in item.items()},
+                    ensure_ascii=False,
+                )
+            )
+        if picked:
+            out[key] = picked
+    return out
+
+
 #: 契约连续失败多少次就如实停下等人。**这不是研究质量的上限**，
 #: 而是"这台机器已经产不出可落库的东西了"的防挂死阈值 —— 没有它，
 #: 一个无论如何都产不出合法 JSON 的模型会让循环永远烧下去。
