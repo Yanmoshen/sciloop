@@ -28,6 +28,7 @@ import { searchReportOf } from '@/api/chat'
 import type {
   ApprovalCard,
   ApprovalDecision,
+  ApprovalStatus,
   ChatBlock,
   SearchReport as SearchReportData,
   StreamDone,
@@ -65,6 +66,11 @@ interface Turn {
   reasoning?: string
   /** 本轮的判定结果（执行 / 引导 / 查询 / 普通对话），用于角标 */
   routing?: string
+  /**
+   * 这一轮**裁决过**（批准/拒绝/过期都算）—— 研究者 2026-09-26 口径：
+   * 裁决过的那一轮**不再写任何状态文案**（只显示模型名）。刷新前后都靠这个标记保持一致。
+   */
+  settled?: boolean
   /** 待研究者裁决的批准请求（非空 = 界面要停在这里等人） */
   awaiting?: ApprovalCard | null
   /** 正文是**系统说明**而不是模型说的话（`note_only`）→ 有卡时就不重复渲染 */
@@ -173,7 +179,12 @@ function durationText(turn: Turn): string {
   if (turn.role !== 'assistant') return ''
   if (turn.status === 'streaming') return `${Math.floor(elapsedMs.value / 1000)}s`
   // 停在批准上**不能说"已完成"**：这一轮其实还没答完，人没裁决之前它不会往前走
+  // 裁决过的那一轮不写状态（研究者 2026-09-26 口径）：只留模型名，刷新前后一致
+  if (turn.settled) return ''
   if (turn.status === 'waiting') return '等待研究者批准'
+  // ⚠️ 中断/停止**不能说"已完成"**：原来这条落到下面那行，会拿 durationMs 显示成「已完成 Xs」——
+  // 明明是被停下的（或出错了），却报完成，属于"显示与事实不一致"。
+  if (turn.status === 'interrupted') return '已停止'
   if (turn.durationMs) return `已完成 ${fmtDuration(turn.durationMs)}`
   return ''
 }
@@ -451,6 +462,10 @@ async function loadConversation(id: string): Promise<void> {
       const pending = (rows ?? []).find(
         (row) => isApprovalCard(row) && row.status === 'pending',
       ) as ApprovalCard | undefined
+      // 裁决过的卡（非 pending）＝这一轮已经收过尾 —— 刷新后不要又冒出状态文案
+      const settledCard = (rows ?? []).some(
+        (row) => isApprovalCard(row) && row.status !== 'pending',
+      )
       const status: TurnStatus = pending
         ? 'waiting'
         : (turn as { interrupted?: boolean }).interrupted
@@ -467,6 +482,7 @@ async function loadConversation(id: string): Promise<void> {
         reasoning: (turn as { reasoning?: string }).reasoning ?? undefined,
         routing: (turn as { routing?: string }).routing,
         awaiting: pending ?? null,
+        settled: settledCard && !pending,
         noteOnly: (turn as { note_only?: boolean }).note_only === true,
       }
     })
@@ -513,6 +529,19 @@ function pickedModel(): PickedModel | null {
 }
 
 /** 同一 request_id 只留一张卡：后端在裁决后会把**同一张卡**以新状态再发一次。 */
+/**
+ * 卡片进终态（批准/拒绝/过期）后，**把它所属那一轮的状态一起收尾**。
+ *
+ * ⚠️ 2026-09-26 实测 bug：原来只把 `awaiting` 清掉、换了卡片状态，**没动 turn.status**，
+ * 于是那一轮永远显示「等待研究者批准」—— 而对话其实早就继续走下去了（刷新后反而是对的，
+ * 因为加载时是「按卡片状态推导」的）。两处口径必须一致，所以收尾统一走这个函数。
+ */
+function settleApprovalTurn(turn: Turn, status: ApprovalStatus): void {
+  turn.awaiting = null
+  turn.settled = true
+  if (turn.status === 'waiting') turn.status = status === 'denied' ? 'interrupted' : 'done'
+}
+
 function upsertApprovalRow(rows: TurnRow[], card: ApprovalCard): TurnRow[] {  const index = rows.findIndex((row) => isApprovalCard(row) && row.request_id === card.request_id)
   if (index < 0) return [...rows, card]
   const next = [...rows]
@@ -569,6 +598,8 @@ function streamHandlers(assistantIndex: number, approvalIndex = assistantIndex):
       owner.rows = upsertApprovalRow(owner.rows ?? [], card)
       // 只有 pending 才停在等人；批准/拒绝后同一张卡换成终态，不再拦着界面
       owner.awaiting = card.status === 'pending' ? card : null
+      // 进终态就要**连这一轮的状态一起收尾**（否则会一直挂着「等待研究者批准」）
+      if (card.status !== 'pending') settleApprovalTurn(owner, card.status)
       void scrollToBottom()
     },
     onBlocks: (blocks) => {
@@ -602,6 +633,11 @@ function streamHandlers(assistantIndex: number, approvalIndex = assistantIndex):
     onError: (streamError) => {
       const current = target()
       if (current) current.status = 'interrupted'
+      // 研究者自己按的停止不是故障：本轮照旧标「已停止」，但不弹错误
+      if (stoppedByUser) {
+        void conversations.load()
+        return
+      }
       errorText.value = humanError(streamError)
       void conversations.load()
     },
@@ -614,12 +650,32 @@ function streamHandlers(assistantIndex: number, approvalIndex = assistantIndex):
  * `assistantIndex` = 本地那条等待中的 assistant 轮下标；`replaceFrom` 非空表示编辑重开
  * （后端会先丢弃该条及其后的轮次，再以 `text` 作为新的该条重问）。
  */
+/**
+ * 正在跑的那条流的中断句柄（研究者 2026-09-26 口径：生成中把发送按钮换成停止）。
+ *
+ * 停止 = **断开连接**：后端随之中止本轮并以 `interrupted` 落盘（不新增取消接口，
+ * 用它现有的中断机制）；已产出的内容保留，这一轮标「已停止」。
+ */
+let streamAbort: AbortController | null = null
+/** 是不是研究者自己按的停止：是的话**不要弹错误提示**（那不是故障） */
+let stoppedByUser = false
+
+function stopStream(): void {
+  if (!streamAbort) return
+  stoppedByUser = true
+  streamAbort.abort()
+  streamAbort = null
+}
+
 async function runStream(
   text: string,
   model: PickedModel,
   assistantIndex: number,
   replaceFrom?: number,
 ): Promise<void> {
+  stoppedByUser = false
+  const controller = new AbortController()
+  streamAbort = controller
   try {
     await streamChatHome(
       {
@@ -631,9 +687,16 @@ async function runStream(
         replace_from: replaceFrom,
       },
       streamHandlers(assistantIndex),
+      controller.signal,
     )
   } catch (error) {
     const target = turns.value[assistantIndex]
+    // 自己按的停止：**保留已产出的内容**、本轮标「已停止」，不回滚输入框、不报错（2026-09-26 口径）
+    if (stoppedByUser) {
+      if (target) target.status = 'interrupted'
+      stoppedByUser = false
+      return
+    }
     if (target) {
       target.status = 'interrupted'
       // 一个字都没生成：普通发送撤掉这条空回答并把原文放回输入框；
@@ -650,6 +713,7 @@ async function runStream(
         ? error.message
         : String(error)
   } finally {
+    streamAbort = null
     stopTicker()
     phase.value = 'idle'
   }
@@ -756,6 +820,9 @@ async function decideApprovalCard(card: ApprovalCard, decision: ApprovalDecision
   await scrollToBottom()
 
   try {
+    stoppedByUser = false
+    const decideController = new AbortController()
+    streamAbort = decideController
     await streamApprovalDecision(
       {
         conversation_id: id,
@@ -765,6 +832,7 @@ async function decideApprovalCard(card: ApprovalCard, decision: ApprovalDecision
         model_id: model?.modelId,
       },
       streamHandlers(assistantIndex, cardIndex >= 0 ? cardIndex : assistantIndex),
+      decideController.signal,
     )
   } catch (error) {
     const target = turns.value[assistantIndex]
@@ -787,7 +855,7 @@ async function decideApprovalCard(card: ApprovalCard, decision: ApprovalDecision
       )
       if (owner) {
         owner.rows = upsertApprovalRow(owner.rows ?? [], closed)
-        owner.awaiting = null
+        settleApprovalTurn(owner, closed.status)
       }
     }
     errorText.value = withCode?.message
@@ -796,6 +864,7 @@ async function decideApprovalCard(card: ApprovalCard, decision: ApprovalDecision
         ? error.message
         : String(error)
   } finally {
+    streamAbort = null
     stopTicker()
     phase.value = 'idle'
   }
@@ -1653,15 +1722,26 @@ onUnmounted(() => {
               </li>
             </ul>
           </div>
+          <!-- agent 在跑时这里变**停止**（实心方块、无悬停提示）——研究者 2026-09-26 口径：
+               点了立刻停；停止=断开连接，后端随之收尾，已产出的内容保留。 -->
           <button
             class="send press"
+            :class="{ 'send--stop': phase === 'thinking' }"
             type="button"
-            :disabled="!canSend || phase === 'thinking'"
-            :title="phase === 'thinking' ? '正在生成' : '发送'"
-            aria-label="发送"
-            @click="send"
+            :disabled="phase === 'thinking' ? false : !canSend"
+            :aria-label="phase === 'thinking' ? '停止生成' : '发送'"
+            @click="phase === 'thinking' ? stopStream() : send()"
           >
-            <svg width="16" height="16" viewBox="0 0 18 18" fill="none" aria-hidden="true">
+            <svg
+              v-if="phase === 'thinking'"
+              width="16"
+              height="16"
+              viewBox="0 0 18 18"
+              aria-hidden="true"
+            >
+              <rect x="5" y="5" width="8" height="8" rx="1.6" fill="currentColor" />
+            </svg>
+            <svg v-else width="16" height="16" viewBox="0 0 18 18" fill="none" aria-hidden="true">
               <path
                 d="M9 15V4M9 4 4.5 8.5M9 4l4.5 4.5"
                 stroke="currentColor"
@@ -2557,6 +2637,11 @@ onUnmounted(() => {
 .icon-btn:hover {
   background: var(--h-hover);
   color: var(--h-fg);
+}
+
+/* 停止态：同一个按钮、同一个尺寸，只把图标换成实心方块（形状本身就是语义，不再加文字） */
+.send--stop {
+  cursor: pointer;
 }
 
 .send {

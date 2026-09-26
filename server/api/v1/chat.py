@@ -1173,11 +1173,10 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
                 approvals_out=approval_requests,
                 state=state,
             ):
-                # 客户端断开（研究者按了「停止」、或关掉页面）→ **主动收尾**。
-                # ⚠️ 为什么不能只靠 asyncio.CancelledError：任务被取消之后，finally 里
-                # 落盘的 await 会被**二次取消**，于是"停止"的那一轮整个不落盘 ——
-                # 2026-09-26 实测：停止后刷新，那一轮在库里查不到（显示与落盘不一致）。
-                # 这里在 yield 之前轻量探一次连接，断开就走**正常收尾路径**（不触发取消）。
+                # 客户端断开（研究者按了「停止」、或关掉页面）→ 尽早走**正常收尾路径**。
+                # 说明：正常写法下 uvicorn/Starlette 会先在流上抛 CancelledError（下面那个
+                # except 就是兜它的），所以这里多数时候探测不到；留着是因为"先探到"能让收尾
+                # 更干净（不依赖取消）。真正保证"停止也落盘"的是 finally 里的落盘条件。
                 if await request.is_disconnected():
                     aborted = True
                     error_info = {
@@ -1256,7 +1255,19 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
                     *(conversation.get("compactions") or []),
                     *compactions_out,
                 ]
-            if generated or error_info is None or is_edit or pending_approval is not None:
+            #: 研究者主动停止（前端 abort → 客户端断开）。这一轮**没有正文也得留痕**：
+            #  思考过程、过程行、待批卡片都是"已产出"的东西，更别说用户那句话本身 ——
+            #  2026-09-26 实测：按原来的条件（无正文 + 有错误）会被判成"没什么可记的"，
+            #  于是整轮跳过落盘，接着被下面那条 delete 把**整个会话**清掉，
+            #  表现就是"点了停止、刷新后那一轮连同自己的提问一起消失"（前端保留、后端没有）。
+            stopped_by_client = bool(error_info) and error_info.get("code") == "client_disconnected"
+            if (
+                generated
+                or error_info is None
+                or is_edit
+                or pending_approval is not None
+                or stopped_by_client
+            ):
                 conversations.append_turns(
                     conversation,
                     [
@@ -1281,8 +1292,10 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
                         },
                     ],
                 )
-            if is_new and error_info is not None and not generated:
-                # 一个字都没生成也没落轮的「空会话」不留垃圾记录
+            if is_new and error_info is not None and not generated and not stopped_by_client:
+                # 一个字都没生成也没落轮的「空会话」不留垃圾记录。
+                # ⚠️ 但**研究者主动停止不算垃圾**：他刚敲进去的那句话必须留着，
+                #    否则停止一下连提问都没了。
                 conversations.delete(conversation_id)
 
         if error_info is not None:
