@@ -1,0 +1,341 @@
+{
+  "browser": "C:/Program Files/Google/Chrome/Application/chrome.exe",
+  "steps": [
+    "页面已加载并完成首次连接",
+    "研究确认卡：已出现（确认前无执行进度）",
+    "确认前是否出现假进度：没有",
+    "审批卡：已出现",
+    "批准后工具执行：已完成",
+    "停止前：看到执行中并点了中断按钮=是",
+    "停止按钮：点击前 {\"running\":true,\"buttons\":1}；点击后立即收束=是（三点/计时不再出现）",
+    "断线期间另一客户端写入：成功",
+    "重连后补齐：是（游标从 8 前进到 15）",
+    "断线重连：断开后状态=reconnecting；自动恢复到 connected=是；断开前游标=8；恢复后快照={\"currentThreadId\":\"th_001a1216537762dadd95b50\",\"cursor\":15,\"applied\":50,\"duplicates\":0,\"lateDropped\":0,\"items\":3,\"toolCalls\":0,\"approvals\":0,\"connection\":\"connected\",\"owner\":true}"
+  ],
+  "shots": [
+    "D:\\aicoding竞赛\\.learnbuddy\\tmp\\evidence\\01-research-confirm.png",
+    "D:\\aicoding竞赛\\.learnbuddy\\tmp\\evidence\\02-approval-pending.png",
+    "D:\\aicoding竞赛\\.learnbuddy\\tmp\\evidence\\03-approval-approved.png",
+    "D:\\aicoding竞赛\\.learnbuddy\\tmp\\evidence\\04-stopped.png",
+    "D:\\aicoding竞赛\\.learnbuddy\\tmp\\evidence\\05-after-reconnect.png"
+  ],
+  "logs": [
+    {
+      "at": "2026-10-09T16:00:29.026Z",
+      "kind": "boot",
+      "detail": "预览已加载，目标 ws://127.0.0.1:8100/api/v2/agent/ws"
+    },
+    {
+      "at": "2026-10-09T16:00:29.166Z",
+      "kind": "connection",
+      "detail": "connecting -> connected"
+    },
+    {
+      "at": "2026-10-09T16:00:38.670Z",
+      "kind": "input",
+      "detail": "在输入框写入：帮我调研一下长上下文推理的相关研究"
+    },
+    {
+      "at": "2026-10-09T16:00:38.675Z",
+      "kind": "input",
+      "detail": "点击发送"
+    },
+    {
+      "at": "2026-10-09T16:00:38.823Z",
+      "kind": "events",
+      "detail": "已应用事件 1 条"
+    },
+    {
+      "at": "2026-10-09T16:00:38.825Z",
+      "kind": "events",
+      "detail": "已应用事件 2 条"
+    },
+    {
+      "at": "2026-10-09T16:00:38.826Z",
+      "kind": "events",
+      "detail": "已应用事件 3 条"
+    },
+    {
+      "at": "2026-10-09T16:00:38.827Z",
+      "kind": "events",
+      "detail": "已应用事件 4 条"
+    },
+    {
+      "at": "2026-10-09T16:00:38.987Z",
+      "kind": "events",
+      "detail": "已应用事件 5 条"
+    },
+    {
+      "at": "2026-10-09T16:00:38.989Z",
+      "kind": "events",
+      "detail": "已应用事件 6 条"
+    },
+    {
+      "at": "2026-10-09T16:00:38.994Z",
+      "kind": "events",
+      "detail": "已应用事件 7 条"
+    },
+    {
+      "at": "2026-10-09T16:00:38.995Z",
+      "kind": "events",
+      "detail": "已应用事件 8 条"
+    },
+    {
+      "at": "2026-10-09T16:00:38.996Z",
+      "kind": "events",
+      "detail": "已应用事件 9 条"
+    },
+    {
+      "at": "2026-10-09T16:00:38.997Z",
+      "kind": "events",
+      "detail": "已应用事件 10 条"
+    },
+    {
+      "at": "2026-10-09T16:00:41.170Z",
+      "kind": "turn",
+      "detail": "已发起一轮：请执行测试命令核对结果"
+    },
+    {
+      "at": "2026-10-09T16:00:41.225Z",
+      "kind": "events",
+      "detail": "已应用事件 11 条"
+    },
+    {
+      "at": "2026-10-09T16:00:41.228Z",
+      "kind": "events",
+      "detail": "已应用事件 12 条"
+    },
+    {
+      "at": "2026-10-09T16:00:41.230Z",
+      "kind": "events",
+      "detail": "已应用事件 13 条"
+    },
+    {
+      "at": "2026-10-09T16:00:41.231Z",
+      "kind": "events",
+      "detail": "已应用事件 14 条"
+    },
+    {
+      "at": "2026-10-09T16:00:41.565Z",
+      "kind": "events",
+      "detail": "已应用事件 15 条"
+    },
+    {
+      "at": "2026-10-09T16:00:41.566Z",
+      "kind": "events",
+      "detail": "已应用事件 16 条"
+    },
+    {
+      "at": "2026-10-09T16:00:41.567Z",
+      "kind": "events",
+      "detail": "已应用事件 17 条"
+    },
+    {
+      "at": "2026-10-09T16:00:41.567Z",
+      "kind": "events",
+      "detail": "已应用事件 18 条"
+    },
+    {
+      "at": "2026-10-09T16:00:41.568Z",
+      "kind": "events",
+      "detail": "已应用事件 19 条"
+    },
+    {
+      "at": "2026-10-09T16:00:41.570Z",
+      "kind": "events",
+      "detail": "已应用事件 20 条"
+    },
+    {
+      "at": "2026-10-09T16:00:41.571Z",
+      "kind": "events",
+      "detail": "已应用事件 21 条"
+    },
+    {
+      "at": "2026-10-09T16:00:41.572Z",
+      "kind": "events",
+      "detail": "已应用事件 22 条"
+    },
+    {
+      "at": "2026-10-09T16:00:41.574Z",
+      "kind": "events",
+      "detail": "已应用事件 23 条"
+    },
+    {
+      "at": "2026-10-09T16:00:41.575Z",
+      "kind": "events",
+      "detail": "已应用事件 24 条"
+    },
+    {
+      "at": "2026-10-09T16:00:41.578Z",
+      "kind": "events",
+      "detail": "已应用事件 25 条"
+    },
+    {
+      "at": "2026-10-09T16:00:42.384Z",
+      "kind": "events",
+      "detail": "已应用事件 26 条"
+    },
+    {
+      "at": "2026-10-09T16:00:42.389Z",
+      "kind": "events",
+      "detail": "已应用事件 27 条"
+    },
+    {
+      "at": "2026-10-09T16:00:42.391Z",
+      "kind": "events",
+      "detail": "已应用事件 28 条"
+    },
+    {
+      "at": "2026-10-09T16:00:42.392Z",
+      "kind": "events",
+      "detail": "已应用事件 29 条"
+    },
+    {
+      "at": "2026-10-09T16:00:42.393Z",
+      "kind": "events",
+      "detail": "已应用事件 30 条"
+    },
+    {
+      "at": "2026-10-09T16:00:42.395Z",
+      "kind": "events",
+      "detail": "已应用事件 31 条"
+    },
+    {
+      "at": "2026-10-09T16:00:42.657Z",
+      "kind": "events",
+      "detail": "已应用事件 32 条"
+    },
+    {
+      "at": "2026-10-09T16:00:42.658Z",
+      "kind": "events",
+      "detail": "已应用事件 33 条"
+    },
+    {
+      "at": "2026-10-09T16:00:42.659Z",
+      "kind": "events",
+      "detail": "已应用事件 34 条"
+    },
+    {
+      "at": "2026-10-09T16:00:42.660Z",
+      "kind": "events",
+      "detail": "已应用事件 35 条"
+    },
+    {
+      "at": "2026-10-09T16:00:42.661Z",
+      "kind": "events",
+      "detail": "已应用事件 36 条"
+    },
+    {
+      "at": "2026-10-09T16:00:44.605Z",
+      "kind": "input",
+      "detail": "在输入框写入：请写一段很长的分析"
+    },
+    {
+      "at": "2026-10-09T16:00:44.609Z",
+      "kind": "input",
+      "detail": "点击发送"
+    },
+    {
+      "at": "2026-10-09T16:00:44.797Z",
+      "kind": "events",
+      "detail": "已应用事件 37 条"
+    },
+    {
+      "at": "2026-10-09T16:00:44.799Z",
+      "kind": "events",
+      "detail": "已应用事件 38 条"
+    },
+    {
+      "at": "2026-10-09T16:00:44.800Z",
+      "kind": "events",
+      "detail": "已应用事件 39 条"
+    },
+    {
+      "at": "2026-10-09T16:00:44.921Z",
+      "kind": "events",
+      "detail": "已应用事件 40 条"
+    },
+    {
+      "at": "2026-10-09T16:00:44.927Z",
+      "kind": "events",
+      "detail": "已应用事件 41 条"
+    },
+    {
+      "at": "2026-10-09T16:00:44.934Z",
+      "kind": "stop",
+      "detail": "停止按钮：界面立刻收束（三点/计时/生成中立即消失）"
+    },
+    {
+      "at": "2026-10-09T16:00:45.094Z",
+      "kind": "events",
+      "detail": "已应用事件 42 条"
+    },
+    {
+      "at": "2026-10-09T16:00:45.095Z",
+      "kind": "events",
+      "detail": "已应用事件 43 条"
+    },
+    {
+      "at": "2026-10-09T16:00:46.176Z",
+      "kind": "connection",
+      "detail": "模拟网络中断（底层连接被断开）"
+    },
+    {
+      "at": "2026-10-09T16:00:46.178Z",
+      "kind": "connection",
+      "detail": "connected -> reconnecting"
+    },
+    {
+      "at": "2026-10-09T16:00:46.594Z",
+      "kind": "connection",
+      "detail": "reconnecting -> connected"
+    },
+    {
+      "at": "2026-10-09T16:00:47.017Z",
+      "kind": "events",
+      "detail": "已应用事件 44 条"
+    },
+    {
+      "at": "2026-10-09T16:00:47.018Z",
+      "kind": "events",
+      "detail": "已应用事件 45 条"
+    },
+    {
+      "at": "2026-10-09T16:00:47.019Z",
+      "kind": "events",
+      "detail": "已应用事件 46 条"
+    },
+    {
+      "at": "2026-10-09T16:00:47.019Z",
+      "kind": "events",
+      "detail": "已应用事件 47 条"
+    },
+    {
+      "at": "2026-10-09T16:00:47.020Z",
+      "kind": "events",
+      "detail": "已应用事件 48 条"
+    },
+    {
+      "at": "2026-10-09T16:00:47.021Z",
+      "kind": "events",
+      "detail": "已应用事件 49 条"
+    },
+    {
+      "at": "2026-10-09T16:00:47.022Z",
+      "kind": "events",
+      "detail": "已应用事件 50 条"
+    }
+  ],
+  "snapshots": {
+    "currentThreadId": "th_001a1216537762dadd95b50",
+    "cursor": 15,
+    "applied": 50,
+    "duplicates": 0,
+    "lateDropped": 0,
+    "items": 3,
+    "toolCalls": 0,
+    "approvals": 0,
+    "connection": "connected",
+    "owner": true
+  }
+}

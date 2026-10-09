@@ -1,0 +1,4 @@
+{"type": "meta", "thread_name": "断线重连与游标补齐", "model": "fake-resume"}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第一轮：已记录基线指标。"}, {"kind": "usage", "input_tokens": 10, "output_tokens": 6}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第二轮：已加入消融实验。"}, {"kind": "usage", "input_tokens": 14, "output_tokens": 8}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第三轮：已生成对照结论。"}, {"kind": "usage", "input_tokens": 16, "output_tokens": 9}, {"kind": "completed", "stop_reason": "end_turn"}]}

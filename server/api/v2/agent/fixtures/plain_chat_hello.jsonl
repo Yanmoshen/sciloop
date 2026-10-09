@@ -1,0 +1,2 @@
+{"type": "meta", "thread_name": "简单问候", "model": "fake-chat"}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "你好！我在。想让我帮你处理什么？"}, {"kind": "usage", "input_tokens": 8, "output_tokens": 12}, {"kind": "completed", "stop_reason": "end_turn"}]}

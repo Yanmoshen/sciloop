@@ -1,0 +1,3 @@
+{"type": "meta", "thread_name": "运行时不可用", "model": "fake-down"}
+{"type": "runtime", "available": false}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "这一条不会被发出：运行时不可用。"}, {"kind": "completed", "stop_reason": "end_turn"}]}

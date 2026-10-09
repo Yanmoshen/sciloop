@@ -1,0 +1,3 @@
+{"type": "meta", "thread_name": "纯文本多轮", "model": "fake-text"}
+{"type": "model_response", "items": [{"kind": "reasoning_delta", "text": "先确认问题的范围与已有材料。"}, {"kind": "text_delta", "text": "第一轮：这是纯文本多轮会话的第一轮回答，材料已确认。"}, {"kind": "usage", "input_tokens": 12, "output_tokens": 8}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "reasoning_delta", "text": "回顾第一轮的结论。"}, {"kind": "text_delta", "text": "第二轮：沿用第一轮的结论，补充两点可验证的后续动作。"}, {"kind": "usage", "input_tokens": 18, "output_tokens": 10}, {"kind": "completed", "stop_reason": "end_turn"}]}

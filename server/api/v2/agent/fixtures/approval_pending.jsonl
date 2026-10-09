@@ -1,0 +1,6 @@
+{"type": "meta", "thread_name": "等待审批", "model": "fake-approval"}
+{"type": "tool_spec", "name": "run_command", "kind": "side_effect", "description": "执行宿主机命令（高危）"}
+{"type": "approval_required", "name": "run_command"}
+{"type": "tool_result", "name": "run_command", "status": "succeeded", "output": {"exit_code": 0, "stdout": "12 passed"}}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "这一步需要执行命令，我先申请授权。"}, {"kind": "tool_call_delta", "call_id": "call_0000000000000000000012d", "name": "run_command", "arguments_delta": "{\"cmd\": \"python -m pytes"}, {"kind": "tool_call_delta", "call_id": "call_0000000000000000000012d", "name": null, "arguments_delta": "t -q\", \"cwd\": \"D:/work\"}"}, {"kind": "tool_call_completed", "call_id": "call_0000000000000000000012d", "name": "run_command", "arguments": {"cmd": "python -m pytest -q", "cwd": "D:/work"}}, {"kind": "usage", "input_tokens": 40, "output_tokens": 18}, {"kind": "completed", "stop_reason": "tool_use"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "命令已执行并通过：12 passed。"}, {"kind": "usage", "input_tokens": 52, "output_tokens": 20}, {"kind": "completed", "stop_reason": "end_turn"}]}

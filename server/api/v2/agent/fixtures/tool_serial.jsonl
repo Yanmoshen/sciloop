@@ -1,0 +1,9 @@
+{"type": "meta", "thread_name": "副作用工具串行", "model": "fake-serial"}
+{"type": "tool_spec", "name": "write_file", "kind": "side_effect", "description": "写入文件"}
+{"type": "tool_spec", "name": "run_command", "kind": "side_effect", "description": "执行命令"}
+{"type": "tool_delay", "name": "write_file", "seconds": 0.03}
+{"type": "tool_delay", "name": "run_command", "seconds": 0.03}
+{"type": "tool_result", "name": "write_file", "status": "succeeded", "output": {"path": "notes/a.md"}}
+{"type": "tool_result", "name": "run_command", "status": "succeeded", "output": {"exit_code": 0}}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "两个写操作我按顺序做，先写文件再执行命令。"}, {"kind": "tool_call_delta", "call_id": "call_000000000000000000000c9", "name": "write_file", "arguments_delta": "{\"path\": \"notes/a."}, {"kind": "tool_call_delta", "call_id": "call_000000000000000000000c9", "name": null, "arguments_delta": "md\", \"text\": \"草稿\"}"}, {"kind": "tool_call_completed", "call_id": "call_000000000000000000000c9", "name": "write_file", "arguments": {"path": "notes/a.md", "text": "草稿"}}, {"kind": "tool_call_delta", "call_id": "call_000000000000000000000ca", "name": "run_command", "arguments_delta": "{\"cmd\": \"python"}, {"kind": "tool_call_delta", "call_id": "call_000000000000000000000ca", "name": null, "arguments_delta": " -m pytest -q\"}"}, {"kind": "tool_call_completed", "call_id": "call_000000000000000000000ca", "name": "run_command", "arguments": {"cmd": "python -m pytest -q"}}, {"kind": "usage", "input_tokens": 50, "output_tokens": 26}, {"kind": "completed", "stop_reason": "tool_use"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "文件已写入，命令也已执行完成。"}, {"kind": "usage", "input_tokens": 60, "output_tokens": 18}, {"kind": "completed", "stop_reason": "end_turn"}]}
