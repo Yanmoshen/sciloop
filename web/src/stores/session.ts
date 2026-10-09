@@ -103,8 +103,10 @@ export const useSessionStore = defineStore('session', () => {
   const ownerToken = ref<string>(getOwnerToken())
   const accessMode = ref<AccessMode>('public_demo')
 
-  /** owner 令牌已就位即视为可写面（后端仍会独立校验） */
-  const isOwner = computed(() => ownerToken.value.length > 0)
+  /** owner_mode 是本地管理员测试面；public_demo 仍需浏览器里的 Owner 令牌。 */
+  const isOwner = computed(
+    () => accessMode.value === 'owner_mode' || ownerToken.value.length > 0,
+  )
   const accessLabel = computed(() =>
     isOwner.value ? '可编辑（Owner）' : '浏览模式（只读）',
   )

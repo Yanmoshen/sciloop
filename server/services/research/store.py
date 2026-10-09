@@ -197,20 +197,31 @@ async def reap_stale_running_runs(session: AsyncSession) -> int:
     - 只在**服务启动时**调用：此刻任何 ``running`` 必然是上一代进程留下的。
     """
 
-    result = await session.execute(
-        text(
-            """
-            UPDATE research_node_runs
-               SET status = 'pending',
-                   payload = COALESCE(payload, '{}'::jsonb)
-                             || '{"reaped_reason": "服务重启：上一代进程没跑完，本节点回到未开始，重新跑即可"}'::jsonb,
-                   updated_at = now()
-             WHERE status = 'running'
-            """
+    dialect = getattr(getattr(session, "bind", None), "dialect", None)
+    if getattr(dialect, "name", "") == "sqlite":
+        rows = (await session.execute(select(ResearchNodeRun).where(ResearchNodeRun.status == "running"))).scalars().all()
+        for row in rows:
+            payload = dict(row.payload or {})
+            payload["reaped_reason"] = "服务重启：上一代进程没跑完，本节点回到未开始，重新跑即可"
+            row.status = "pending"
+            row.payload = payload
+        result_count = len(rows)
+    else:
+        result = await session.execute(
+            text(
+                """
+                UPDATE research_node_runs
+                   SET status = 'pending',
+                       payload = COALESCE(payload, '{}'::jsonb)
+                                 || '{"reaped_reason": "服务重启：上一代进程没跑完，本节点回到未开始，重新跑即可"}'::jsonb,
+                       updated_at = now()
+                 WHERE status = 'running'
+                """
+            )
         )
-    )
+        result_count = int(result.rowcount or 0)
     await session.commit()
-    return int(result.rowcount or 0)
+    return result_count
 
 
 # --------------------------------------------------------------------------- #

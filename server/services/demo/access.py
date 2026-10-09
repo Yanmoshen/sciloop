@@ -11,8 +11,8 @@
 - ``public_demo``：匿名**只读**。允许全部 GET/HEAD/OPTIONS，外加
   ``POST /passports/{id}/replay``（按 ``PUBLIC_REPLAY_RATE_LIMIT_PER_HOUR`` 限额）。
   **其余写操作一律拒绝**（403 ``owner_token_required``）。
-- ``owner_mode`` / 携带有效 ``X-Owner-Token``：写操作放行，逐路由仍由
-  ``core.security.require_owner`` 二次校验（常量时间比较）。
+- ``owner_mode``（本地管理员测试面）/ 携带有效 ``X-Owner-Token``：写操作放行，逐路由仍由
+  ``core.security.require_owner`` 二次校验（管理员模式或有效令牌）。
 
 本模块提供三样东西
 ------------------

@@ -62,9 +62,9 @@ __all__ = [
 # 搜索服务（SearXNG）
 # --------------------------------------------------------------------------- #
 DEFAULT_URL = "http://searxng:8080"
-SEARXNG_URL_ENV = "SCILOOP_SEARXNG_URL"
+SEARXNG_URL_ENV = "SCILOOP_SEARXNG_URL"  # legacy HTTP adapter only
 #: 可选代理。**默认为空 = 直连**（研究者明确要"直连为主"，代理只在需要时配）。
-PROXY_ENV = "SCILOOP_SEARXNG_PROXY"
+PROXY_ENV = "SCILOOP_SEARCH_PROXY"
 #: 单个外部请求的超时。2026-09-26 从 30 秒压到 12 秒：节点检索已经改成**并发**发起，
 #: 慢源不该拖着整轮一起等它（实测一次文献调研的 178 秒里有 158 秒是在等检索，
 #: 而其中大半是「一个源不响应 → 后面所有源都在排队」）。
@@ -85,12 +85,12 @@ REASON_BAD_RESPONSE = "bad_response"
 
 HINTS: dict[str, str] = {
     REASON_SERVICE_DOWN: (
-        "联网搜索服务没启动。在项目目录里执行一次 `docker compose up -d searxng` 就好"
-        "（不启动也不影响其它能力）。"
+        "内置 searxng-compatible 联网搜索引擎当前不可用。请检查宿主机网络，或在设置中配置"
+        " SCILOOP_SEARCH_PROXY；搜索功能不依赖 Docker。"
     ),
     REASON_NO_EGRESS: (
         "搜索服务起来了，但它连不上外网。先看这台机器能不能上外网；"
-        "如果只能通过代理上网，把代理地址填到环境变量 SCILOOP_SEARXNG_PROXY 里。"
+        "如果只能通过代理上网，把代理地址填到环境变量 SCILOOP_SEARCH_PROXY 里。"
     ),
     REASON_BLOCKED: (
         "搜索服务能上网，但这一次被上游搜索引擎限流或反爬挡了（429 / 验证码）。"
@@ -143,12 +143,16 @@ SOURCE_LABELS: dict[str, str] = {
     "crossref": "Crossref",
     "github": "GitHub",
     "stackoverflow": "Stack Overflow",
+    "stackexchange": "Stack Exchange",
     "mdn": "MDN",
     "docker hub": "Docker Hub",
     "europepmc": "Europe PMC",
     "pubmed": "PubMed",
     "semantic scholar": "Semantic Scholar",
     "wikipedia": "Wikipedia",
+    "wikidata": "Wikidata",
+    "bing_news": "Bing News",
+    "wikimedia_images": "Wikimedia Commons",
     "wikidata": "Wikidata",
     "superuser": "Super User",
     "askubuntu": "Ask Ubuntu",
@@ -237,7 +241,76 @@ async def search_web(
     categories: str = DEFAULT_CATEGORIES,
     client: httpx.AsyncClient | None = None,
 ) -> dict[str, Any]:
-    """搜网页。**永不抛异常**：连不上、被限流、没结果，都如实回报。"""
+    """搜网页。
+
+    Normal application calls use the embedded SearXNG-compatible dispatcher. A
+    supplied client is retained as a wire-compatible test seam for callers
+    that still exercise the old HTTP response contract.
+    """
+
+    if client is None:
+        from services.search import SearchRequest
+        from services.search import search as embedded_search
+
+        text = (query or "").strip()
+        if not text:
+            return {"ok": False, "capability": CAPABILITY_WEB, "reason": REASON_BAD_RESPONSE, "error": "没有给搜索词"}
+        response = await embedded_search(
+            SearchRequest(
+                query=text,
+                categories=tuple(parse_categories(categories).split(",")),
+                language=language,
+                limit=max(1, limit),
+            )
+        )
+        data = response.as_dict()
+        failures = data.pop("sources_failed", [])
+        results = data.get("results", [])
+        data.update(
+            {
+                "capability": CAPABILITY_WEB,
+                "sources_used": [
+                    _source_label([item]) if item in SOURCE_LABELS else item for item in data.get("sources_used", [])
+                ],
+                "sources_unresponsive": [
+                    {
+                        "engine": SOURCE_LABELS.get(str(item.get("engine", "")).lower(), item.get("engine", "")),
+                        "reason": item.get("reason", REASON_BAD_RESPONSE),
+                        "detail": item.get("detail", ""),
+                    }
+                    for item in failures
+                ],
+                "sources_failed": failures,
+                "note": "这些是网页结果的摘要，不是论文全文；引用前请打开原始链接核对。",
+            }
+        )
+        if not results and failures:
+            reasons = {str(item.get("reason")) for item in failures}
+            reason = REASON_BLOCKED if REASON_BLOCKED in reasons else REASON_NO_EGRESS if ({"timeout", REASON_NO_EGRESS} & reasons) else REASON_BAD_RESPONSE
+            data["ok"] = False
+            data["reason"] = reason
+            data["error"] = "这次搜索没有拿到任何结果：" + "；".join(str(item.get("detail", ""))[:60] for item in failures[:4])
+            data["hint"] = HINTS.get(reason, "")
+        return data
+
+    return await _search_web_searxng(
+        query,
+        limit=limit,
+        language=language,
+        categories=categories,
+        client=client,
+    )
+
+
+async def _search_web_searxng(
+    query: str,
+    *,
+    limit: int = 8,
+    language: str = "auto",
+    categories: str = DEFAULT_CATEGORIES,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """Legacy HTTP adapter used for backwards-compatible integrations/tests."""
 
     text = (query or "").strip()
     if not text:
@@ -434,7 +507,7 @@ def _mark_source_failed(name: str, reason: str) -> None:
 
 
 async def _fetch_one(
-    name: str, text: str, limit: int, http: httpx.AsyncClient
+    name: str, text: str, limit: int, http: httpx.AsyncClient, *, respect_cooldown: bool = True
 ) -> tuple[str, list[dict[str, Any]] | None, dict[str, str] | None]:
     """并发单元：问**一个**来源，返回 ``(来源名, 命中列表, 失败描述)``。
 
@@ -445,7 +518,7 @@ async def _fetch_one(
     if fetcher is None:
         return name, None, None
     label = SOURCE_LABELS.get(name, name)
-    if not _source_ready(name):
+    if respect_cooldown and not _source_ready(name):
         return name, None, {
             "source": label,
             "reason": "cooling_down",
@@ -502,7 +575,7 @@ async def search_academic(
             # 实测一次文献调研 178 秒里 158 秒都在等检索，而这三个源彼此毫无依赖。
             # 顺序仍按 sources 声明（gather 保序），去重规则不变。
             for name, hits, failure in await asyncio.gather(
-                *(_fetch_one(name, text, limit, http) for name in sources)
+                *(_fetch_one(name, text, limit, http, respect_cooldown=client is None) for name in sources)
             ):
                 if failure is not None:
                     failed.append(failure)
@@ -542,35 +615,14 @@ async def search_academic(
 
 
 async def search_status() -> dict[str, Any]:
-    """搜索服务当前状态（给界面的常驻标识用）。**只看服务本身能不能工作，不判断上游。**"""
+    """搜索状态（内置引擎，不需要 Docker 或外部 SearXNG 服务）。"""
 
-    http, owns = _client(None)
-    try:
-        response = await http.get(f"{base_url()}/config")
-    except httpx.HTTPError as exc:
-        return {"ok": False, "reason": REASON_SERVICE_DOWN, "hint": HINTS[REASON_SERVICE_DOWN], "detail": type(exc).__name__}
-    finally:
-        if owns:
-            await http.aclose()
+    from services.search import status as embedded_status
 
-    if response.status_code != 200:
-        return {
-            "ok": False,
-            "reason": REASON_BAD_RESPONSE,
-            "hint": HINTS[REASON_BAD_RESPONSE],
-            "detail": f"HTTP {response.status_code}",
-        }
-    try:
-        payload = response.json()
-    except ValueError:
-        return {"ok": False, "reason": REASON_BAD_RESPONSE, "hint": HINTS[REASON_BAD_RESPONSE], "detail": "非 JSON"}
-    enabled = [str(item.get("name")) for item in (payload.get("engines") or []) if item.get("enabled")]
-    return {
-        "ok": True,
-        "detail": f"{len(enabled)} 个来源可用",
-        "proxy": bool(proxy_url()),
-        "academic_sources": list(SUPPORTED_SOURCES),
-    }
+    data = await embedded_status()
+    data["academic_sources"] = list(SUPPORTED_SOURCES)
+    data["detail"] = data.get("detail", "")
+    return data
 
 
 #: 兼容旧调用名（对话工具与节点都还在用 `search`）

@@ -20,12 +20,12 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from db.base import Base
+from db.types import JSONB
 
-BIGINT = BigInteger
+BIGINT = BigInteger().with_variant(__import__("sqlalchemy").Integer(), "sqlite")
 
 PIPELINE_STAGES = ("survey", "plan", "plan_review", "experiment", "writing", "review")
 TEMPLATE_IDS = (

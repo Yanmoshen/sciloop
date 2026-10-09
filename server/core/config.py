@@ -10,19 +10,21 @@ from __future__ import annotations
 
 import json
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 AccessMode = Literal["public_demo", "owner_mode"]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class Settings(BaseSettings):
     """SciLoop 运行时配置（键名与 contracts.env_keys / 附录 F.1 对齐）。"""
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=PROJECT_ROOT / ".env",
         env_file_encoding="utf-8",
         extra="ignore",
         case_sensitive=False,
@@ -42,7 +44,14 @@ class Settings(BaseSettings):
     postgres_db: str = "sciloop"
     postgres_user: str = "sciloop"
     postgres_password: str = "change_me"
-    database_url: str = "postgresql+asyncpg://sciloop:change_me@db:5432/sciloop"
+    # 宿主机默认使用仓库内 SQLite；设置 DATABASE_URL 后仍可切回 PostgreSQL/Docker。
+    database_url: str = "sqlite+aiosqlite:///./knowledge-base/sciloop.sqlite3"
+
+    # 统一保存论文、上传资料、对话、解析、翻译和 agent 产物的根目录。
+    knowledge_base_dir: str = "./knowledge-base"
+
+    # 宿主机执行器策略：workspace 允许写入和执行，workspace 外只读。
+    host_execution_mode: Literal["workspace", "full"] = "workspace"
 
     # ===== 论文数据源 =====
     arxiv_api_base: str = "https://export.arxiv.org/api/query"
@@ -78,21 +87,20 @@ class Settings(BaseSettings):
     fulltext_min_coverage: float = 0.60
     fulltext_max_pages: int = 40
     fulltext_text_cache_dir: str = Field(
-        default="",
+        default="./knowledge-base/parses/fulltext-cache",
         description=(
             "归一全文文本缓存目录（WP01 收尾新增）。空 = 沿用 text_cache 的临时目录默认值。"
-            "容器内由 docker-compose.yml 固定为 /app/server/.cache/fulltext 并 bind mount "
-            "到宿主 ./.data/fulltext-cache，避免容器重建后 offset 校验退化为 valid_by_hash。"
+            "宿主机与 Docker 均使用仓库 knowledge-base/parses/fulltext-cache，避免容器重建后 offset 校验退化。"
             "注意：services.fulltext.text_cache 直接读同名环境变量（不经过本设置），"
             "此处提供设置项供后续服务/脚本按配置访问同一目录。"
         ),
     )
 
     fetch_task_history_dir: str = Field(
-        default="",
+        default="./knowledge-base/projects/tasks",
         description=(
             "抓取/同步任务历史目录（任务监控用）。空 = 默认 <backend>/.cache/tasks；"
-            "容器内由 docker-compose.yml bind mount 到宿主 ./.data/tasks，"
+            "宿主机与 Docker 均使用仓库 knowledge-base/projects/tasks，"
             "以便容器重建后历史记录仍可查询（任务登记本身只存在进程内存里）。"
         ),
     )
@@ -208,6 +216,8 @@ class Settings(BaseSettings):
         url = (self.database_url or "").strip()
         if url.startswith("postgres://"):
             url = "postgresql://" + url[len("postgres://") :]
+        if url.startswith("sqlite+aiosqlite:///"):
+            return url.replace("sqlite+aiosqlite", "sqlite", 1)
         if "+asyncpg" in url:
             return url.replace("+asyncpg", "+psycopg")
         if url.startswith("postgresql://"):

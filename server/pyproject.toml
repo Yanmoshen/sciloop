@@ -20,6 +20,7 @@ dependencies = [
     # --- 数据库 ---
     "sqlalchemy>=2.0.30,<2.1",
     "asyncpg>=0.29,<0.31",
+    "aiosqlite>=0.20,<1.0",
     # psycopg 提供同步驱动：alembic 同步迁移、feed 端点的同步会话工厂与批量任务共用
     "psycopg[binary]>=3.1,<4.0",
     "alembic>=1.13,<2.0",
@@ -27,6 +28,7 @@ dependencies = [
     "pydantic>=2.7,<3.0",
     "pydantic-settings>=2.3,<3.0",
     "python-dotenv>=1.0,<2.0",
+    "python-multipart>=0.0.9,<1.0",
     # WP02 硬需求：结构化输出的本地 JSON Schema 校验（禁止自研校验器）
     "jsonschema>=4.21",
     # WP02 硬需求：model_configs.api_key_enc 的 fernet 加密存储（禁止明文落库）

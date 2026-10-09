@@ -12,7 +12,7 @@
  * PDF 是 `.pdf`，论文摘录 / 技能（已移出）/ 记忆都存成 `.md`，上传的代码是 `.py`。
  * 因此「怎么展示」只由扩展名决定（见 `rendererOf`），不存在"文件式条目 / 数据式条目"的分叉。
  *
- * 现状：**纯前端 demo**。数据落在浏览器 `localStorage`（键 `sciloop.kb.v2`），首次进入播种示例数据，
+ * 持久化：真实后端文件系统。历史说明（已替换）：数据落在浏览器 `localStorage`（键 `sciloop.kb.v2`），首次进入播种示例数据，
  * 刷新不丢；**不写后端、不新增迁移**。二进制格式（pdf / docx）没有真实字节，
  * 只有登记信息，需接后端后才能真正预览（文本类与表格类是**真有内容、真能预览**的）。
  *
@@ -362,408 +362,56 @@ export function sortEntries(entries: KnowledgeEntry[], field: SortField, order: 
 }
 
 /* ------------------------------------------------------------------ *
- * 四、本地实现（demo）：localStorage + 示例播种
+ * 四、文件系统 API
  * ------------------------------------------------------------------ */
 
-const STORE_KEY = 'sciloop.kb.v2'
-const SEED_KEY = 'sciloop.kb.v2.seed'
-
-interface Persisted {
-  items: KnowledgeEntry[]
-  folders: string[]
+export function loadSnapshot(): Promise<KnowledgeSnapshot> {
+  return get<KnowledgeSnapshot>('/knowledge/entries')
 }
 
-function nowIso(minutesAgo = 0): string {
-  return new Date(Date.now() - minutesAgo * 60_000).toISOString()
+export function createEntry(draft: KnowledgeDraft): Promise<KnowledgeEntry> {
+  return post<KnowledgeEntry>('/knowledge/entries', { body: draft })
 }
 
-const BENCH_PY = `"""长文本推理延迟基准：跑三档序列长度，各测 5 次取中位数。"""
-
-import statistics
-import time
-
-SEQ_LENGTHS = [8192, 16384, 32768]
-REPEAT = 5
-
-
-def measure(seq_len: int) -> float:
-    samples = []
-    for _ in range(REPEAT):
-        start = time.perf_counter()
-        run_once(seq_len)
-        samples.append(time.perf_counter() - start)
-    return statistics.median(samples)
-
-
-def main() -> None:
-    for seq_len in SEQ_LENGTHS:
-        latency = measure(seq_len)
-        print(f"seq={seq_len:>6}  {latency * 1000:6.1f} ms/token")
-`
-
-const LOG_CSV = `seq_len,tokens_total,ms_per_token,peak_memory_gb,note
-8192,8192,41.2,18.4,基线
-16384,16384,63.8,27.1,未见明显退化
-32768,32768,118.4,41.9,超过预算阈值`
-
-const LITERATURE_MD = `# 块稀疏注意力在 32k 上下文下的显存占用
-
-## 研究问题
-块稀疏注意力在 32k 上下文下能否把显存压到 1/4 以内而不掉点。
-
-## 核心方法
-固定块大小 64，块内稠密、块间按学习到的路由选择 top-k 块。
-
-## 主要结论
-32k 上下文显存降至 27%，下游任务平均掉 0.4 个点。
-
-> 摘录自论文库 #482 的解析卡片，字段均带原文定位。
-`
-
-const IDEA_MD = `# 块稀疏 + 分块 KV 缓存的组合方案
-
-把块稀疏路由与分块 KV 缓存合起来：路由决定哪些块需要常驻显存，其余按需重算。
-
-- 生成机制：组合（两篇工作各取一半）
-- 证据：2 条（论文库 #482、#517）
-- 风险：两条链路的误差会叠加，需要先做小规模对照实验
-`
-
-function seed(): Persisted {
-  const entry = (
-    partial: Pick<KnowledgeEntry, 'name' | 'bucket'> & Partial<KnowledgeEntry>,
-    minutesAgo: number,
-  ): KnowledgeEntry => {
-    const base: KnowledgeEntry = {
-      id: `kb-${Math.random().toString(36).slice(2, 10)}`,
-      name: partial.name,
-      bucket: partial.bucket,
-      content: partial.content ?? '',
-      size: partial.size ?? 0,
-      folder: partial.folder ?? [],
-      tags: partial.tags ?? [],
-      project_id: partial.project_id ?? null,
-      source_label: partial.source_label ?? '本地上传',
-      source_route: partial.source_route ?? null,
-      file_url: partial.file_url ?? null,
-      imported_at: nowIso(minutesAgo),
-      modified_at: nowIso(minutesAgo),
-      moved_at: null,
-      trashed_at: null,
-    }
-    return base
-  }
-
-  return {
-    folders: ['文献综述', '实验', '实验/2026-09-18', '论文初稿'],
-    items: [
-      entry(
-        {
-          name: '块稀疏注意力在 32k 上下文下的显存占用.md',
-          bucket: 'literature',
-          content: LITERATURE_MD,
-          size: LITERATURE_MD.length,
-          folder: ['文献综述'],
-          tags: ['块稀疏', '显存'],
-          source_label: '论文库 · #482',
-          source_route: '/papers/parse/482',
-        },
-        95,
-      ),
-      entry(
-        {
-          name: '滑窗+全局 token 混合方案.md',
-          bucket: 'literature',
-          content:
-            '# 滑窗 + 全局 token 的混合方案\n\n只在 8k 长度上评测，未见 32k 结果。\n\n作者说 32k 结果在补，先按 8k 的口径记着，别当成结论用。\n',
-          size: 180,
-          folder: ['文献综述'],
-          tags: ['滑窗', '待读'],
-          source_label: '论文库 · #517',
-          source_route: '/papers/parse/517',
-        },
-        300,
-      ),
-      entry(
-        {
-          name: '稀疏注意力综述-阅读笔记.md',
-          bucket: 'literature',
-          content:
-            '# 阅读笔记\n\n按「能否直接换掉 softmax」把 12 篇工作分了三组：\n\n1. 固定模式（滑窗 / 全局 token）\n2. 可训练稀疏模式（块路由）——**与我方方案最接近**\n3. 近似全注意力（低秩、核方法）\n',
-          size: 210,
-          folder: ['文献综述'],
-          tags: ['综述', '已读'],
-        },
-        1_260,
-      ),
-      entry(
-        {
-          name: '块稀疏+分块KV缓存的组合方案.md',
-          bucket: 'idea',
-          content: IDEA_MD,
-          size: IDEA_MD.length,
-          tags: ['候选方案'],
-          source_label: '研究构思 · idea #37',
-          source_route: '/ideas',
-        },
-        88,
-      ),
-      entry(
-        {
-          name: '规则化路由：以可解释性换效率.md',
-          bucket: 'idea',
-          content:
-            '# 规则化路由\n\n用「句法边界 + 实体位置」的规则表替代学习到的路由，换取可解释性；代价是可能需要更多算力。\n',
-          size: 150,
-          tags: ['可解释性', '待评估'],
-          source_label: '研究构思 · idea #41',
-          source_route: '/ideas',
-        },
-        420,
-      ),
-      entry(
-        {
-          name: '实验日志-2026-09-18.csv',
-          bucket: 'experiment',
-          content: LOG_CSV,
-          size: LOG_CSV.length,
-          folder: ['实验', '2026-09-18'],
-          tags: ['实验记录', '延迟'],
-        },
-        240,
-      ),
-      entry(
-        {
-          name: 'run_benchmark.py',
-          bucket: 'experiment',
-          content: BENCH_PY,
-          size: BENCH_PY.length,
-          folder: ['实验'],
-          tags: ['基准脚本'],
-        },
-        250,
-      ),
-      entry(
-        {
-          name: '方法章节草稿.md',
-          bucket: 'paper',
-          content:
-            '# 3 方法\n\n## 3.1 块级路由\n\n我们把注意力矩阵按 64×64 分块，块内保持稠密计算，块间由一个轻量路由网络选择 top-k…\n\n## 3.2 分块 KV 缓存\n\n（待补：缓存驱逐策略与重算代价的推导）\n',
-          size: 260,
-          folder: ['论文初稿'],
-          tags: ['写作中'],
-          project_id: null,
-        },
-        45,
-      ),
-      entry(
-        {
-          name: '审稿意见-第一轮.md',
-          bucket: 'paper',
-          content:
-            '# 第一轮评审意见\n\n1. 与 #482 的差异需要在实验部分说清（审稿人 2 提了两次）\n2. 32k 的延迟数据只有一次运行，缺误差棒\n3. 图 3 的图注与正文不一致\n',
-          size: 200,
-          folder: ['论文初稿'],
-          tags: ['评审', '待改'],
-        },
-        130,
-      ),
-      entry(
-        {
-          name: '结论必须附原文页码.md',
-          bucket: 'memory',
-          content:
-            '# 结论必须附原文页码\n\n凡是写进产出物的结论，都要能指回原文的章节与页码；只给摘要的一律退回重做。\n\n来源：关于引用规范的讨论\n',
-          size: 160,
-          tags: ['引用规范'],
-          source_label: '来自对话 · 引用规范',
-          source_route: '/c/8f3a2b1c',
-        },
-        60,
-      ),
-      entry(
-        {
-          name: '翻译用块级原位译写，不引第三方整页翻译.md',
-          bucket: 'memory',
-          content:
-            '# 翻译方案取舍\n\nPDF 翻译走 PyMuPDF 块级原位译写；排版冲突如实写进 layout_warnings，不假装排版无损。\n',
-          size: 140,
-          tags: ['翻译', '技术选型'],
-          source_label: '来自对话 · 翻译方案',
-          source_route: '/c/2d7e44a9',
-        },
-        1_500,
-      ),
-    ],
-  }
+export function updateEntry(id: string, body: Partial<KnowledgeDraft>): Promise<KnowledgeEntry> {
+  return patch<KnowledgeEntry>(`/knowledge/entries/${id}`, { body })
 }
 
-function read(): Persisted | null {
-  if (typeof localStorage === 'undefined') return null
-  const raw = localStorage.getItem(STORE_KEY)
-  if (!raw) return null
-  try {
-    const parsed = JSON.parse(raw) as Persisted
-    if (!parsed || !Array.isArray(parsed.items)) return null
-    return { items: parsed.items, folders: Array.isArray(parsed.folders) ? parsed.folders : [] }
-  } catch {
-    return null
-  }
+export function uploadEntry(file: File, draft: Pick<KnowledgeDraft, 'bucket' | 'folder' | 'tags' | 'project_id'>): Promise<KnowledgeEntry> {
+  const body = new FormData()
+  body.append('file', file)
+  body.append('bucket', draft.bucket)
+  body.append('folder', folderPath(draft.folder))
+  body.append('tags', JSON.stringify(draft.tags))
+  if (draft.project_id !== null) body.append('project_id', String(draft.project_id))
+  return post<KnowledgeEntry>('/knowledge/files', { body, timeoutMs: 120_000 })
 }
 
-function write(data: Persisted): void {
-  if (typeof localStorage === 'undefined') return
-  localStorage.setItem(STORE_KEY, JSON.stringify(data))
+async function mutateEntries(action: string, ids: string[], extra: Record<string, unknown> = {}): Promise<number> {
+  if (!ids.length) return 0
+  const result = await post<{ changed: number }>(`/knowledge/entries/${action}`, { body: { ids, ...extra } })
+  return result.changed
 }
 
-/** 首次进入播种；用户清空后不再自动塞回来 */
-export function ensureSeeded(): void {
-  if (typeof localStorage === 'undefined') return
-  if (localStorage.getItem(SEED_KEY) === '1') return
-  localStorage.setItem(SEED_KEY, '1')
-  if (!read()) write(seed())
-}
+export const trashEntries = (ids: string[]) => mutateEntries('trash', ids)
+export const restoreEntries = (ids: string[]) => mutateEntries('restore', ids)
+export const moveEntries = (ids: string[], folder: string[]) => mutateEntries('move', ids, { folder })
+export const tagEntries = (ids: string[], tag: string) => mutateEntries('tag', ids, { tag })
 
-/* ------------------------------------------------------------------ *
- * 五、读写接口（远端可用时走远端，否则走本地）
- * ------------------------------------------------------------------ */
-
-/** 设为 '1' 即走真后端（server 侧实现 /knowledge 之后） */
-const REMOTE = import.meta.env?.VITE_KB_REMOTE === '1'
-
-export async function loadSnapshot(): Promise<KnowledgeSnapshot> {
-  if (REMOTE) {
-    return get<KnowledgeSnapshot>('/knowledge/entries', { query: { page_size: 500 } })
-  }
-  ensureSeeded()
-  return read() ?? { items: [], folders: [] }
-}
-
-export async function createEntry(draft: KnowledgeDraft): Promise<KnowledgeEntry> {
-  if (REMOTE) return post<KnowledgeEntry>('/knowledge/entries', { body: draft })
-  const stamp = new Date().toISOString()
-  const entry: KnowledgeEntry = {
-    ...draft,
-    id: `kb-${Math.random().toString(36).slice(2, 10)}`,
-    imported_at: stamp,
-    modified_at: stamp,
-    moved_at: null,
-    trashed_at: null,
-  }
-  const data = read() ?? { items: [], folders: [] }
-  const nextFolders = ensureFolderPath(data.folders, draft.folder)
-  write({ items: [entry, ...data.items], folders: nextFolders })
-  return entry
-}
-
-export async function updateEntry(id: string, patchBody: Partial<KnowledgeDraft>): Promise<KnowledgeEntry | null> {
-  if (REMOTE) return patch<KnowledgeEntry>(`/knowledge/entries/${id}`, { body: patchBody })
-  const data = read() ?? { items: [], folders: [] }
-  const index = data.items.findIndex((item) => item.id === id)
-  if (index < 0) return null
-  const current = data.items[index]!
-  const touchedContent = patchBody.content !== undefined && patchBody.content !== current.content
-  const next: KnowledgeEntry = {
-    ...current,
-    ...patchBody,
-    modified_at: touchedContent ? new Date().toISOString() : current.modified_at,
-  }
-  data.items[index] = next
-  write(data)
-  return next
-}
-
-/** 移入回收站 */
-export async function trashEntries(ids: string[]): Promise<number> {
-  const data = read() ?? { items: [], folders: [] }
-  const stamp = new Date().toISOString()
-  let changed = 0
-  const items = data.items.map((entry) => {
-    if (!ids.includes(entry.id) || entry.trashed_at) return entry
-    changed += 1
-    return { ...entry, trashed_at: stamp }
-  })
-  write({ items, folders: data.folders })
-  return changed
-}
-
-/** 从回收站还原 */
-export async function restoreEntries(ids: string[]): Promise<number> {
-  const data = read() ?? { items: [], folders: [] }
-  let changed = 0
-  const items = data.items.map((entry) => {
-    if (!ids.includes(entry.id) || !entry.trashed_at) return entry
-    changed += 1
-    return { ...entry, trashed_at: null }
-  })
-  write({ items, folders: data.folders })
-  return changed
-}
-
-/** 彻底删除（回收站里才允许） */
 export async function deleteEntries(ids: string[]): Promise<number> {
-  if (REMOTE) {
-    const result = await del<{ deleted: number }>('/knowledge/entries', { query: { ids: ids.join(',') } })
-    return result.deleted ?? 0
-  }
-  const data = read() ?? { items: [], folders: [] }
-  const remain = data.items.filter((entry) => !ids.includes(entry.id))
-  write({ items: remain, folders: data.folders })
-  return data.items.length - remain.length
+  if (!ids.length) return 0
+  const result = await del<{ deleted: number }>('/knowledge/entries', { query: { ids: ids.join(',') } })
+  return result.deleted
 }
 
-/** 清空回收站（只清回收站里那些） */
 export async function emptyTrash(): Promise<number> {
-  const data = read() ?? { items: [], folders: [] }
-  const remain = data.items.filter((entry) => !entry.trashed_at)
-  write({ items: remain, folders: data.folders })
-  return data.items.length - remain.length
+  const snapshot = await loadSnapshot()
+  return deleteEntries(snapshot.items.filter((entry) => entry.trashed_at).map((entry) => entry.id))
 }
 
-/** 移动到文件夹（含"移到根目录"：folder = []） */
-export async function moveEntries(ids: string[], folder: string[]): Promise<number> {
-  const data = read() ?? { items: [], folders: [] }
-  const stamp = new Date().toISOString()
-  let changed = 0
-  const items = data.items.map((entry) => {
-    if (!ids.includes(entry.id)) return entry
-    if (folderPath(entry.folder) === folderPath(folder)) return entry
-    changed += 1
-    return { ...entry, folder: [...folder], moved_at: stamp }
-  })
-  write({ items, folders: ensureFolderPath(data.folders, folder) })
-  return changed
-}
-
-export async function tagEntries(ids: string[], tag: string): Promise<number> {
-  const clean = tag.trim()
-  if (!clean) return 0
-  const data = read() ?? { items: [], folders: [] }
-  let changed = 0
-  const items = data.items.map((entry) => {
-    if (!ids.includes(entry.id) || entry.tags.includes(clean)) return entry
-    changed += 1
-    return { ...entry, tags: [...entry.tags, clean] }
-  })
-  write({ items, folders: data.folders })
-  return changed
-}
-
-/** 在当前路径下新建文件夹（允许空文件夹；父目录一并登记） */
 export async function createFolder(folder: string[]): Promise<string[]> {
-  const data = read() ?? { items: [], folders: [] }
-  const folders = ensureFolderPath(data.folders, folder)
-  write({ items: data.items, folders })
-  return folders
-}
-
-function ensureFolderPath(folders: string[], folder: string[]): string[] {
-  const next = [...folders]
-  for (let depth = 1; depth <= folder.length; depth += 1) {
-    const path = folderPath(folder.slice(0, depth))
-    if (path && !next.includes(path)) next.push(path)
-  }
-  return next.sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))
+  const result = await post<{ folders: string[] }>('/knowledge/folders', { body: { folder } })
+  return result.folders
 }
 
 /* ------------------------------------------------------------------ *

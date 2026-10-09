@@ -18,7 +18,7 @@ import { computed, ref, watch } from 'vue'
 
 import {
   BUCKET_LABELS,
-  createEntry,
+  uploadEntry,
   formatOf,
   formatSize,
   hasContent,
@@ -137,7 +137,7 @@ async function submit(): Promise<void> {
         source_route: null,
         file_url: item.dataUrl,
       }
-      created.push(await createEntry(draft))
+      created.push(await uploadEntry(item.file, draft))
     }
     emit('added', created)
     close()

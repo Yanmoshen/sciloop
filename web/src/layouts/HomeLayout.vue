@@ -79,7 +79,8 @@ const HOME_NAV: HomeNavItem[] = [
       { key: 'translate', label: '论文翻译', path: '/papers/translate' },
       { key: 'parse', label: '论文解析', path: '/papers/parse' },
       // 「聚合对比」2026-09-24 从界面下掉（用户口径）：后端能力与数据保留，界面不再提供入口
-      { key: 'export', label: '多格式导出', path: '/papers/export' },
+      // 「多格式导出」2026-09-26 从界面下掉（研究者口径）：后端导出能力与数据保留，
+      // 界面不再提供入口（与「聚合对比」同一处理）。
     ],
   },
   // 2026-09-26 研究者口径：「研究构想」从底部二级入口移到主序列，
@@ -247,7 +248,6 @@ const LITERATURE_MODULES = [
   'import',
   'translate',
   'reader',
-  'export',
 ]
 const literatureOpen = ref(false)
 const literatureActive = computed(
@@ -1555,6 +1555,13 @@ onUnmounted(() => {
   top: calc(100% - 4px);
   z-index: 40;
   display: none;
+  /* ⚠️ 必须让卡片**对鼠标透明**（研究者 2026-09-26 报「悬停信息有时候不会自动关闭」）。
+     卡片高约 90px、还压住项目行下缘，会盖在下面几行上；而它是 `.crow--project` 的**子元素**，
+     于是鼠标移进卡片区域时（视觉上已经在别的行上了）`:hover` 仍被判为"还在项目行上" →
+     卡片一直不收，要移开很远才消失 ✗。
+     卡片本身只展示数据（项目名 / 对话数 / 目录），不需要点、不需要选，pointer-events: none
+     既让它不再截获指针，也让 `.crow--project:hover` 如实反映"鼠标是不是真在项目行上"。 */
+  pointer-events: none;
   flex-direction: column;
   gap: 4px;
   min-width: 200px;

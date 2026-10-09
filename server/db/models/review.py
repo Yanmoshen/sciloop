@@ -28,12 +28,13 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from db.base import Base
+from db.types import JSONB
 
-BIGINT = BigInteger
+BIGINT = BigInteger().with_variant(__import__("sqlalchemy").Integer(), "sqlite")
 
 del _PG_BIGINT
 
@@ -163,6 +164,8 @@ class ModelConfig(Base):
     base_url: Mapped[str] = mapped_column(Text, nullable=False)
     api_key_enc: Mapped[str] = mapped_column(Text, nullable=False)
     models: Mapped[Any] = mapped_column(JSONB, nullable=False)
+    #: Endpoint type (openai / anthropic / compatible); null keeps legacy routing.
+    type: Mapped[str | None] = mapped_column(String(32))
     is_default: Mapped[bool | None] = mapped_column(Boolean, server_default="false")
     last_tested_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True)
@@ -314,7 +317,7 @@ class ReviewCalibration(Base):
     candidate_order: Mapped[Any] = mapped_column(JSONB, nullable=False)
     model_scores: Mapped[Any] = mapped_column(JSONB, nullable=False)
     human_labels: Mapped[Any] = mapped_column(
-        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+        JSONB, nullable=False, server_default=text("'[]'")
     )
     sample_size: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default="0"

@@ -34,12 +34,12 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from db.base import Base
+from db.types import JSONB
 
-BIGINT = BigInteger
+BIGINT = BigInteger().with_variant(__import__("sqlalchemy").Integer(), "sqlite")
 
 #: 七个研究节点（顺序即推荐推进顺序；回退边见 services/research/graph.py）
 RESEARCH_NODES: tuple[str, ...] = (
@@ -107,7 +107,7 @@ class ResearchNodeRun(Base):
     retry_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     #: 结构化交接块（契约输出，已通过校验）
     payload: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default="'{}'::jsonb"
+        JSONB, nullable=False, server_default="{}"
     )
     #: 模型原始输出（排查用；未通过校验时也要留）
     raw_output: Mapped[str | None] = mapped_column(Text)

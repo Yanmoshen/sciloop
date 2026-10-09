@@ -46,7 +46,9 @@ def _write_permission(owner: bool, access_mode: str) -> dict[str, Any]:
     return {
         "writes_allowed": bool(owner),
         "reason": (
-            "已携带有效 X-Owner-Token"
+            "owner_mode 管理员测试面已启用"
+            if access_mode == "owner_mode" and owner
+            else "已携带有效 X-Owner-Token"
             if owner
             else f"匿名会话在 {access_mode} 面只读，写操作返回 403 owner_token_required"
         ),

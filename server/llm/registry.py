@@ -263,11 +263,12 @@ class SqlModelRegistry:
         from sqlalchemy import text
 
         engine = self._resolve_engine()
+        json_expr = "json(:models)" if engine.dialect.name == "sqlite" else "CAST(:models AS JSONB)"
         async with engine.begin() as conn:
             result = await conn.execute(
                 text(
-                    "INSERT INTO model_configs (name, base_url, api_key_enc, models, is_default, type) "
-                    "VALUES (:name, :base_url, :api_key_enc, CAST(:models AS JSONB), :is_default, :type) "
+                    f"INSERT INTO model_configs (name, base_url, api_key_enc, models, is_default, type) "
+                    f"VALUES (:name, :base_url, :api_key_enc, {json_expr}, :is_default, :type) "
                     "RETURNING id"
                 ),
                 {
@@ -289,14 +290,14 @@ class SqlModelRegistry:
             return
         assignments: list[str] = []
         params: dict[str, Any] = {"id": int(config_id)}
+        engine = self._resolve_engine()
         for key, value in fields.items():
             if key == "models":
-                assignments.append("models = CAST(:models AS JSONB)")
+                assignments.append("models = json(:models)" if engine.dialect.name == "sqlite" else "models = CAST(:models AS JSONB)")
                 params["models"] = json.dumps(value, ensure_ascii=False)
             else:
                 assignments.append(f"{key} = :{key}")
                 params[key] = value
-        engine = self._resolve_engine()
         async with engine.begin() as conn:
             await conn.execute(
                 text(f"UPDATE model_configs SET {', '.join(assignments)} WHERE id = :id"), params
@@ -313,10 +314,11 @@ class SqlModelRegistry:
         from sqlalchemy import text
 
         engine = self._resolve_engine()
+        timestamp_fn = "CURRENT_TIMESTAMP" if engine.dialect.name == "sqlite" else "now()"
         async with engine.begin() as conn:
             await conn.execute(
                 text(
-                    "UPDATE model_configs SET test_ok = :ok, last_tested_at = now() WHERE id = :id"
+                    f"UPDATE model_configs SET test_ok = :ok, last_tested_at = {timestamp_fn} WHERE id = :id"
                 ),
                 {"ok": bool(ok), "id": int(config_id)},
             )

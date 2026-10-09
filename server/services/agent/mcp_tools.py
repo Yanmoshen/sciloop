@@ -219,11 +219,11 @@ _HOST_TOOL_SCHEMAS: list[dict[str, Any]] = [
 def agent_workspace() -> Path:
     """agent 的工作区（也是它唯一被允许写入的根）。
 
-    放在 `server/.cache/agent-workspace`：与 ingest / reader / translate 的 `.cache`
-    口径一致（`parents[2]` == server 根），且容器内该目录已由 compose 挂载。
+    放在 `knowledge-base/exports/agent-workspace`，与其它运行时产物共用知识库根目录。
     """
 
-    return Path(__file__).resolve().parents[2] / ".cache" / "agent-workspace"
+    from services.storage import knowledge_root
+    return knowledge_root() / "exports" / "agent-workspace"
 
 
 def _allowed_hosts() -> tuple[str, ...]:
@@ -669,7 +669,7 @@ def arguments_of(call: dict[str, Any]) -> dict[str, Any]:
 
 
 async def run_tool_call(
-    call: dict[str, Any], *, approval_token: str | None = None
+    call: dict[str, Any], *, approval_token: str | None = None, access_mode: str = "workspace", workspace_root: str | None = None
 ) -> tuple[dict[str, Any], str]:
     """执行一次工具调用，返回 `(给模型看的结果, 一句话摘要)`。
 
@@ -751,6 +751,8 @@ async def run_tool_call(
                 command=arguments.get("command") if isinstance(arguments.get("command"), str) else None,
                 cwd=cwd,
                 timeout_s=int(arguments.get("timeout_s") or 120),
+                workspace_root=workspace_root or cwd,
+                access_mode=access_mode,
             )
         else:
             result = await host_runner.call_fs(
@@ -759,6 +761,8 @@ async def run_tool_call(
                 to=arguments.get("to") if isinstance(arguments.get("to"), str) else None,
                 content=arguments.get("content") if isinstance(arguments.get("content"), str) else None,
                 recursive=bool(arguments.get("recursive")),
+                workspace_root=workspace_root,
+                access_mode=access_mode,
             )
         summary = _summarize(name, result)
         return {"ok": bool(result.get("ok")), "tool": name, "result": result}, summary

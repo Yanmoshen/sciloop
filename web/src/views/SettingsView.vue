@@ -710,11 +710,8 @@ const session = useSessionStore()
 /** 访问面以服务端 `/owner/session` 判定为准（前端不自行推断"我认为可写"） */
 const demoSession = useDemoSession()
 
-/**
- * 写控件是否可用：沿用既有语义——本机会话里有 OWNER_TOKEN 即视为可写面，
- * 服务端仍会逐条校验（令牌无效时写请求会如实 403）。
- */
-const canWrite = computed(() => store.hasOwnerToken)
+/** owner_mode 是本地管理员测试面；public_demo 才需要浏览器里的令牌。 */
+const canWrite = computed(() => session.isOwner)
 
 const sessionPill = computed(() =>
   demoSession.isOwner ? '研究者身份 · 可写' : '只读浏览 · 匿名',

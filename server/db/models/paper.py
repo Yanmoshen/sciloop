@@ -34,12 +34,12 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from db.base import Base
+from db.types import JSONB
 
-BIGINT = BigInteger
+BIGINT = BigInteger().with_variant(__import__("sqlalchemy").Integer(), "sqlite")
 
 
 class Paper(Base):

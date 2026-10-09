@@ -16,10 +16,10 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import DateTime, String, func, text
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from db.base import Base
+from db.types import JSONB
 
 
 class AppSetting(Base):
@@ -31,7 +31,7 @@ class AppSetting(Base):
     value: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
         nullable=False,
-        server_default=text("'{}'::jsonb"),
+        server_default=text("'{}'"),
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

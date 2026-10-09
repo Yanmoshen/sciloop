@@ -23,7 +23,14 @@ import { ElMessage } from 'element-plus'
 import { humanError, writeDenied } from '@/utils/messages'
 import { useRoute, useRouter } from 'vue-router'
 
-import { fetchAccessMode, isApprovalCard, setAccessMode, streamApprovalDecision, streamChatHome } from '@/api/chat'
+import {
+  compactChat,
+  fetchAccessMode,
+  isApprovalCard,
+  setAccessMode,
+  streamApprovalDecision,
+  streamChatHome,
+} from '@/api/chat'
 import { searchReportOf } from '@/api/chat'
 import type {
   ApprovalCard,
@@ -103,6 +110,7 @@ const dialogPrefill = ref('')
 const pickedRef = ref('')
 const pickerOpen = ref(false)
 const copiedIndex = ref<number | null>(null)
+const compactBusy = ref(false)
 
 /** 计时：进行中显示递增秒数，完成后换成后端回传的真实耗时 */
 const elapsedMs = ref(0)
@@ -526,6 +534,31 @@ function pickedModel(): PickedModel | null {
     return null
   }
   return { configId, modelId }
+}
+
+async function compactConversation(): Promise<void> {
+  if (compactBusy.value || phase.value === 'thinking' || !conversationId.value) return
+  const model = pickedModel()
+  if (!model) return
+  compactBusy.value = true
+  errorText.value = ''
+  try {
+    const result = await compactChat({
+      conversation_id: conversationId.value,
+      model_config_id: model.configId,
+      model_id: model.modelId,
+    })
+    if (result.changed) {
+      await loadConversation(conversationId.value)
+      ElMessage.success('上下文已压缩，原始对话仍保留在检查点中')
+    } else {
+      ElMessage.info('当前上下文没有足够的早期内容可压缩')
+    }
+  } catch (error) {
+    errorText.value = error instanceof Error ? error.message : String(error)
+  } finally {
+    compactBusy.value = false
+  }
 }
 
 /** 同一 request_id 只留一张卡：后端在裁决后会把**同一张卡**以新状态再发一次。 */
@@ -1668,6 +1701,20 @@ onUnmounted(() => {
         </div>
 
         <div class="bar__right">
+          <button
+            v-if="conversationId && turns.length"
+            class="icon-btn"
+            type="button"
+            title="压缩上下文"
+            aria-label="压缩上下文"
+            :disabled="compactBusy || phase === 'thinking'"
+            @click="compactConversation"
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M3 8a5 5 0 0 1 8.7-3.4M13 8a5 5 0 0 1-8.7 3.4" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" />
+              <path d="M11.7 2.5v2.8H9M4.3 13.5v-2.8H7" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          </button>
           <!-- 完全访问模式：默认关。开着时①节点跑完自动接力下一站
                ②普通动手操作（跑命令/写文件）不再逐一确认；**高危操作仍会先弹批准卡**。
                转人工 / 失败 / 下一节点是占位都会自动停住。 -->

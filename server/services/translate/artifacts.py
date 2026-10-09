@@ -30,6 +30,7 @@ import re
 import tempfile
 from pathlib import Path
 from typing import Any
+from services.storage import knowledge_root
 
 #: manifest schema 版本（阅读器据此做兼容）
 SCHEMA_VERSION = 1
@@ -62,7 +63,7 @@ def default_artifact_root() -> Path:
     override = os.environ.get("TRANSLATE_ARTIFACT_DIR")
     if override:
         return Path(override)
-    return Path(__file__).resolve().parents[2] / ".cache" / "artifacts"
+    return knowledge_root() / "translations"
 
 
 def safe_task_id(task_id: str) -> str:

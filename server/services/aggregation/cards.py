@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 logger = logging.getLogger("sciloop.wp08.cards")
 
@@ -162,9 +162,26 @@ async def load_cards(session: Any, paper_ids: list[int]) -> list[dict[str, Any]]
     ids = [int(pid) for pid in paper_ids]
     if not ids:
         return []
-    card_rows = (
-        await session.execute(text(_CARDS_SQL), {"paper_ids": ids})
-    ).mappings().all()
+    dialect = getattr(getattr(session, "bind", None), "dialect", None)
+    if getattr(dialect, "name", "") == "sqlite":
+        cards_sql = """
+        SELECT pc.paper_id, pc.version, pc.research_problem, pc.core_method,
+               pc.key_innovation, pc.technical_route, pc.experimental_setup,
+               pc.main_conclusions, pc.limitations, pc.transferable,
+               p.title, p.abstract, p.venue, p.published_at, p.citation_count,
+               d.document_version, d.parse_status, d.coverage
+          FROM paper_cards pc JOIN papers p ON p.id = pc.paper_id
+          LEFT JOIN paper_documents d ON d.id = (
+              SELECT max(d2.id) FROM paper_documents d2 WHERE d2.paper_id = pc.paper_id
+          )
+         WHERE pc.paper_id IN :paper_ids
+           AND pc.version = (SELECT max(c2.version) FROM paper_cards c2
+                              WHERE c2.paper_id = pc.paper_id)
+        """
+    else:
+        cards_sql = _CARDS_SQL
+    card_stmt = text(cards_sql).bindparams(bindparam("paper_ids", expanding=True)) if " IN :paper_ids" in cards_sql else text(cards_sql)
+    card_rows = (await session.execute(card_stmt, {"paper_ids": ids})).mappings().all()
     by_id: dict[int, dict[str, Any]] = {}
     for row in card_rows:
         row_dict = dict(row)
@@ -178,9 +195,12 @@ async def load_cards(session: Any, paper_ids: list[int]) -> list[dict[str, Any]]
         }
 
     if by_id:
-        span_rows = (
-            await session.execute(text(_SPANS_SQL), {"paper_ids": list(by_id)})
-        ).mappings().all()
+        span_stmt = text("""
+            SELECT id, paper_id, document_version, section_name, page_number,
+                   char_start, char_end, quote_text, quote_sha256
+              FROM paper_spans WHERE paper_id IN :paper_ids ORDER BY paper_id, id
+        """).bindparams(bindparam("paper_ids", expanding=True))
+        span_rows = (await session.execute(span_stmt, {"paper_ids": list(by_id)})).mappings().all()
         for row in span_rows:
             row_dict = dict(row)
             entry = by_id.get(int(row_dict["paper_id"]))
@@ -205,11 +225,8 @@ async def existing_paper_ids(session: Any, paper_ids: list[int]) -> set[int]:
     ids = [int(pid) for pid in paper_ids]
     if not ids:
         return set()
-    rows = (
-        await session.execute(
-            text("SELECT id FROM papers WHERE id = ANY(:ids)"), {"ids": ids}
-        )
-    ).scalars().all()
+    stmt = text("SELECT id FROM papers WHERE id IN :ids").bindparams(bindparam("ids", expanding=True))
+    rows = (await session.execute(stmt, {"ids": ids})).scalars().all()
     return {int(value) for value in rows}
 
 

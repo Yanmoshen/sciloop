@@ -28,6 +28,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
+from services.storage import knowledge_root
 
 _UNSAFE_RE = re.compile(r"[^A-Za-z0-9._#-]")
 
@@ -39,7 +40,7 @@ def default_cache_dir() -> Path:
     override = os.environ.get("FULLTEXT_TEXT_CACHE_DIR")
     if override:
         return Path(override)
-    return Path(tempfile.gettempdir()) / "sciloop_fulltext_text"
+    return knowledge_root() / "parses" / "fulltext-cache"
 
 
 class TextCache:

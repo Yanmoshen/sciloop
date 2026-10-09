@@ -246,11 +246,12 @@ class SqlLLMStore:
         from sqlalchemy import text
 
         engine = self._resolve_engine()
+        json_expr = "json(:payload)" if engine.dialect.name == "sqlite" else "CAST(:payload AS JSONB)"
         async with engine.begin() as conn:
             await conn.execute(
                 text(
-                    "INSERT INTO demo_fixtures (fixture_type, fixture_key, payload, note) "
-                    "VALUES (:fixture_type, :fixture_key, CAST(:payload AS JSONB), :note) "
+                    f"INSERT INTO demo_fixtures (fixture_type, fixture_key, payload, note) "
+                    f"VALUES (:fixture_type, :fixture_key, {json_expr}, :note) "
                     "ON CONFLICT (fixture_type, fixture_key) "
                     "DO UPDATE SET payload = EXCLUDED.payload, note = EXCLUDED.note"
                 ),

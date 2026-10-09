@@ -46,34 +46,14 @@ services:
       PYTHONPATH: /app/server
       # 归一全文文本缓存：固定为容器内路径（与下面的 bind mount 一一对应），
       # 由 services.fulltext.text_cache 读取；写死是为了避免 .env 里的宿主相对路径
-      # （如 ./.data/fulltext-cache）被照搬进容器，导致缓存落到会被清空的临时位置。
-      FULLTEXT_TEXT_CACHE_DIR: /app/server/.cache/fulltext
+      # （如 ./knowledge-base/parses/fulltext-cache）被照搬进容器，导致缓存落到会被清空的临时位置。
+      FULLTEXT_TEXT_CACHE_DIR: /app/server/knowledge-base/parses/fulltext-cache
       # APScheduler 三类批量任务默认关闭：演示期不自动抓取/解析，避免消耗外部额度与 LLM 额度
       SCHEDULER_ENABLED: ${SCHEDULER_ENABLED:-0}
-      # 【联网搜索】自建搜索服务的容器内地址（服务名即可，与 compose 同网）。
-      # 用自建而不是商业搜索 API：免费、开源、可离线部署（研究者 2026-09-22 选定）。
-      SCILOOP_SEARXNG_URL: ${SCILOOP_SEARXNG_URL:-http://searxng:8080}
+      # 联网搜索由 backend 内置的 SearXNG-compatible 内核直接执行，无独立容器。
     volumes:
-      # 【WP01 跨包痛点修复】宿主 ./.data/fulltext-cache ←→ 容器全文缓存目录。
-      # 目的：容器重建 / docker compose down && up 后，paper_spans 的 offset 校验仍能判定
-      # valid，不再退化为 valid_by_hash（WP05/WP06/WP13 记录的 blocker）。
-      # 该目录已被 .gitignore 忽略，禁止入库。
-      - ./.data/fulltext-cache:/app/server/.cache/fulltext
-      # 【首页对话】宿主 ./.data/conversations ←→ 容器会话目录（刷新后接着上次对话）。
-      - ./.data/conversations:/app/server/.cache/conversations
-      # 【论文导入】宿主 ./.data/uploads ←→ 容器上传目录（services/ingest/storage.py
-      # 默认即 <server_root>/.cache/uploads）。容器重建后上传文件仍在，重复导入可被
-      # paper_documents.text_sha256 查重命中。同样已被 .gitignore 忽略，禁止入库。
-      - ./.data/uploads:/app/server/.cache/uploads
-      # 【论文翻译】宿主 ./.data/artifacts ←→ 容器翻译产物目录（单语/双语 PDF、预览 HTML）。
-      # 产物按 task_id 归档；容器重建后已完成的翻译结果仍可下载。
-      - ./.data/artifacts:/app/server/.cache/artifacts
-      # 【全文阅读器】宿主 ./.data/reader-library ←→ 容器阅读器库（不可变版本 PDF、文本索引、
-      # 页面对应关系、批注投影）。该目录必须持久化，否则数据库里的版本记录会指向不存在的文件。
-      - ./.data/reader-library:/app/server/.cache/reader-library
-      # 【同步任务历史】宿主 ./.data/tasks ←→ 容器任务历史目录。抓取任务登记在进程内存里，
-      # 容器重启就没了；这里落一份 JSONL 快照，让「同步任务历史」跨重启可查（不改数据库表）。
-      - ./.data/tasks:/app/server/.cache/tasks
+      # 知识库是仓库内唯一的运行时持久化根目录，Docker 仅做整目录挂载。
+      - ./knowledge-base:/app/server/knowledge-base
     ports:
       - "8000:8000"
     depends_on:
@@ -88,45 +68,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 12
-      start_period: 20s
-
-  # 【联网搜索】自建元搜索（SearXNG）：免费开源、不需要任何商业 API Key。
-  #
-  # 它的工作方式：**自己不爬网**，而是把查询转给上游搜索引擎（Google/Bing/DuckDuckGo…）
-  # 再把结果汇总回来 —— 所以这个容器**需要能出网**（没有 key，但不等于能离线用）。
-  # JSON 输出默认是关的，靠挂载的 `config/searxng/settings.yml` 打开（顺带关掉限流器，
-  # 否则后端的 JSON 请求会被当成机器人 429 掉）。
-  #
-  # ⚠️ 健康检查的语义（2026-09-22 补，别搞错）：**只表示"这个服务自己活着"**，
-  # 不表示"现在能搜到东西" —— 上游限流/验证码是常态，那种情况不该把容器标黄，
-  # 否则编排状态天天黄、没人再看它。**能不能搜到**由工具如实回报（服务没起 / 没外网 / 被挡，分开说），
-  # 界面另有常驻状态标识（`GET /api/v1/research/search-status`）。
-  searxng:
-    image: searxng/searxng:latest
-    container_name: sciloop-searxng
-    restart: unless-stopped
-    environment:
-      SEARXNG_BASE_URL: http://localhost:${SEARXNG_PORT:-8888}/
-      # 容器内一律用 UTC，与其它服务一致（日志对得上时间）
-      TZ: UTC
-      # 【可选】只能通过代理上网时填它（例：http://host.docker.internal:7897）。
-      # **默认空 = 直连** —— 研究者要的默认行为：实测直连就能搜到学术与 IT 内容。
-      HTTP_PROXY: ${SCILOOP_SEARXNG_PROXY:-}
-      HTTPS_PROXY: ${SCILOOP_SEARXNG_PROXY:-}
-      NO_PROXY: localhost,127.0.0.1,searxng,backend,db
-    volumes:
-      - ./config/searxng:/etc/searxng:rw
-    ports:
-      # 只在需要时自己开浏览器看：http://localhost:8888
-      - "${SEARXNG_PORT:-8888}:8080"
-    extra_hosts:
-      # 走代理时容器要能解析宿主机（Docker Desktop 自带，Linux 上靠这行）
-      - "host.docker.internal:host-gateway"
-    healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
       start_period: 20s
 
   # 容器执行环境（2026-09-24）：`docker compose up` 之后就能在"执行环境"里跑命令，
@@ -148,8 +89,9 @@ services:
     volumes:
       # 整个项目根（研究者 2026-09-24 明确要的：技能要能直接读项目里的文件）
       - ./:/workspace
-      # 产物目录：与后端看到的是**同一份**（宿主 ./.data/artifacts）
-      - ./.data/artifacts:/artifacts
+      # 产物目录：与后端看到的是**同一份**（宿主 knowledge-base/exports）
+      - ./knowledge-base/exports:/artifacts
+      - ./knowledge-base:/workspace/knowledge-base
     # ⚠️ 故意不发布端口：只在 compose 内网可达，外面连不上
     healthcheck:
       test:

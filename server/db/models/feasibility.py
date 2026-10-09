@@ -19,12 +19,12 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from db.base import Base
+from db.types import JSONB
 
-BIGINT = BigInteger
+BIGINT = BigInteger().with_variant(__import__("sqlalchemy").Integer(), "sqlite")
 
 
 class Feasibility(Base):
@@ -43,13 +43,13 @@ class Feasibility(Base):
     #: 2026-09-26 新增：规则层**没有信号**的三个维度，由模型评审给分
     #: （``services.feasibility.dimension_review``；分数口径同前四维：越高越好）
     landing_risk: Mapped[Any] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=text("'{}'")
     )
     application_value: Mapped[Any] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=text("'{}'")
     )
     ethics_compliance: Mapped[Any] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=text("'{}'")
     )
     total_score: Mapped[Decimal] = mapped_column(Numeric(5, 2), nullable=False)
     risk_list: Mapped[Any] = mapped_column(JSONB, nullable=False)

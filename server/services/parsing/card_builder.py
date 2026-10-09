@@ -904,17 +904,19 @@ class SqlCardRepository(SqlDocumentRepository):
     async def insert_card(self, row: CardRow) -> CardRow:
         from sqlalchemy import text
 
+        dialect = getattr(getattr(self.session, "bind", None), "dialect", None)
+        json_cast = "json(:{name})" if getattr(dialect, "name", "") == "sqlite" else "CAST(:{name} AS JSONB)"
         statement = text(
-            """
+            f"""
             INSERT INTO paper_cards
                 (paper_id, version, research_problem, core_method, key_innovation,
                  technical_route, experimental_setup, main_conclusions, limitations,
                  transferable, llm_call_log_id)
             VALUES
                 (:paper_id, :version, :research_problem, :core_method,
-                 CAST(:key_innovation AS JSONB), CAST(:technical_route AS JSONB),
-                 CAST(:experimental_setup AS JSONB), CAST(:main_conclusions AS JSONB),
-                 CAST(:limitations AS JSONB), CAST(:transferable AS JSONB), :llm_call_log_id)
+                 {json_cast.format(name='key_innovation')}, {json_cast.format(name='technical_route')},
+                 {json_cast.format(name='experimental_setup')}, {json_cast.format(name='main_conclusions')},
+                 {json_cast.format(name='limitations')}, {json_cast.format(name='transferable')}, :llm_call_log_id)
             RETURNING id, created_at, updated_at
             """
         )

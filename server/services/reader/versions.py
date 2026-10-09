@@ -42,6 +42,7 @@ import os
 import re
 from pathlib import Path
 from typing import Any
+from services.storage import knowledge_root
 
 from sqlalchemy import event, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -105,7 +106,7 @@ def artifacts_root() -> Path:
     override = os.environ.get("TRANSLATE_ARTIFACT_DIR")
     if override:
         return Path(override)
-    return Path(__file__).resolve().parents[2] / ".cache" / "artifacts"
+    return knowledge_root() / "translations"
 
 
 def load_manifest(task_id: str) -> dict[str, Any]:

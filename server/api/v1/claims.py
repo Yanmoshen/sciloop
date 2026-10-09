@@ -38,7 +38,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.security import require_owner
@@ -121,21 +121,17 @@ async def _claims_with_evidence(
     if not claims:
         return claims, {}
 
-    evidence_rows = (
-        await session.execute(
-            text(
-                """
+    evidence_stmt = text(
+        """
                 SELECT id, owner_id, evidence_type, paper_span_id, paper_id,
                        card_field, experiment_run_id, experiment_passport_id,
                        decision_log_id, metric_name, quote_text, weight
                   FROM evidences
-                 WHERE owner_type = 'draft_claim' AND owner_id = ANY(:claim_ids)
+                 WHERE owner_type = 'draft_claim' AND owner_id IN :claim_ids
                  ORDER BY id
-                """
-            ),
-            {"claim_ids": [int(row["id"]) for row in claims]},
-        )
-    ).mappings().all()
+        """
+        ).bindparams(bindparam("claim_ids", expanding=True))
+    evidence_rows = (await session.execute(evidence_stmt, {"claim_ids": [int(row["id"]) for row in claims]})).mappings().all()
 
     grouped: dict[int, list[dict[str, Any]]] = {}
     for row in evidence_rows:

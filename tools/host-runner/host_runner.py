@@ -35,6 +35,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import locale
 import os
@@ -58,6 +59,17 @@ STATE_FILE = STATE_DIR / "host-runner.json"
 #: 它会随 `/health` 一起报给后端 —— 后端跑在容器里、只知道容器视角的路径，
 #: 必须由执行器告诉它"宿主上这个目录是哪儿"，否则"删代码=硬拒"这条边界会失效。
 REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _load_sandbox_module() -> Any:
+    """加载仓库内沙箱模块；执行器作为独立脚本启动时不依赖包路径。"""
+    path = REPO_ROOT / "server" / "services" / "agent" / "sandbox.py"
+    spec = importlib.util.spec_from_file_location("sciloop_host_sandbox", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"找不到宿主沙箱模块：{path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 #: 研究工作项目的默认根目录（新建项目时在这里建目录；用户选本地文件夹时不受它限制）
 PROJECT_ROOT = REPO_ROOT / "research-workspaces"
@@ -209,6 +221,22 @@ def load_or_create_state(port: int) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # 两个能力：跑命令 / 动文件
 # --------------------------------------------------------------------------- #
+def _inside(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _path_write_allowed(path: Path, *, workspace_root: str | None, access_mode: str) -> bool:
+    if access_mode == "full":
+        return True
+    if not workspace_root:
+        return False
+    return _inside(path, Path(workspace_root).expanduser())
+
+
 def run_command(
     *,
     argv: list[str] | None = None,
@@ -216,6 +244,8 @@ def run_command(
     cwd: str | None = None,
     timeout_s: int = DEFAULT_TIMEOUT_S,
     env_extra: dict[str, str] | None = None,
+    workspace_root: str | None = None,
+    access_mode: str = "workspace",
 ) -> dict[str, Any]:
     """执行一条命令，返回真实退出码与输出（**不美化、不伪造**）。"""
 
@@ -241,11 +271,13 @@ def run_command(
     else:
         return {"ok": False, "error": "既没有 argv 也没有 command"}
 
-    workdir = cwd or str(Path.home())
+    workdir = cwd or workspace_root or str(Path.home())
     if not Path(workdir).is_dir():
         return {"ok": False, "error": f"工作目录不存在：{workdir}"}
 
     env = dict(os.environ)
+    env["SCILOOP_WORKSPACE_ROOT"] = str(workspace_root or workdir)
+    env["SCILOOP_ACCESS_MODE"] = access_mode
     # 让子进程的 `python` 指向研究者的科研环境（等价于"先激活环境"）：
     # 不这么做，模型探到的是"恰好拉起执行器的那个解释器"，结论会离谱（见 host_python 注释）。
     prefix = python_path_prefix()
@@ -254,6 +286,26 @@ def run_command(
         env[HOST_PYTHON_ENV] = host_python()
     if env_extra:
         env.update({str(k): str(v) for k, v in env_extra.items()})
+
+    # 工作区模式必须经过操作系统沙箱；沙箱不可用时返回明确错误，
+    # 不能为了“还能跑”而退回到无约束的宿主进程。
+    if access_mode != "full":
+        try:
+            sandbox = _load_sandbox_module()
+        except (ImportError, OSError) as exc:
+            return {"ok": False, "code": "sandbox_unavailable", "error": f"受限执行器不可用：{exc}", "workdir": workdir}
+        result = sandbox.run(
+            argv=list(argv) if argv else None,
+            command=command,
+            cwd=workdir,
+            workspace_root=str(workspace_root or workdir),
+            timeout_s=timeout_s,
+            env=env,
+            access_mode=access_mode,
+        )
+        if isinstance(result, dict):
+            result.setdefault("workdir", workdir)
+        return result
 
     # ⚠️ Windows 上必须显式给子进程一个**自己的（隐藏）控制台**。
     # 实测坑：本执行器常被"没有交互式控制台"的进程拉起（计划任务 / 被别的程序 spawn），
@@ -580,10 +632,14 @@ def _pick_native_subprocess(*, title: str, timeout_s: int) -> dict[str, Any] | N
 
 
 def fs_action(*, action: str, path: str, to: str | None, content: str | None,
-              encoding: str | None, recursive: bool) -> dict[str, Any]:
+              encoding: str | None, recursive: bool, workspace_root: str | None = None,
+              access_mode: str = "workspace") -> dict[str, Any]:
     """文件操作。删除**只在这里具备能力**，是否允许由后端按用户定的三层边界裁决。"""
 
     target = Path(path).expanduser()
+    write_actions = {"write", "mkdir", "move", "copy", "delete"}
+    if action in write_actions and not _path_write_allowed(target, workspace_root=workspace_root, access_mode=access_mode):
+        return {"ok": False, "error": "受限模式只允许在选定工作目录内写入、移动或删除；目录外仅允许读取", "code": "path_outside"}
     if action == "list":
         if not target.exists():
             return {"ok": False, "error": f"路径不存在：{path}"}
@@ -644,6 +700,8 @@ def fs_action(*, action: str, path: str, to: str | None, content: str | None,
             return {"ok": False, "error": "移动需要给目标路径"}
         try:
             dest = Path(to).expanduser()
+            if not _path_write_allowed(dest, workspace_root=workspace_root, access_mode=access_mode):
+                return {"ok": False, "error": "移动目标必须位于选定工作目录内", "code": "path_outside"}
             dest.parent.mkdir(parents=True, exist_ok=True)
             target.replace(dest)
             return {"ok": True, "path": str(target), "to": str(dest)}
@@ -797,6 +855,8 @@ class Handler(BaseHTTPRequestHandler):
                 cwd=body.get("cwd") if isinstance(body.get("cwd"), str) else None,
                 timeout_s=int(body.get("timeout_s") or DEFAULT_TIMEOUT_S),
                 env_extra=body.get("env") if isinstance(body.get("env"), dict) else None,
+                workspace_root=body.get("workspace_root") if isinstance(body.get("workspace_root"), str) else body.get("cwd"),
+                access_mode=str(body.get("access_mode") or "workspace"),
             )
         else:
             result = fs_action(
@@ -806,6 +866,8 @@ class Handler(BaseHTTPRequestHandler):
                 content=body.get("content") if isinstance(body.get("content"), str) else None,
                 encoding=body.get("encoding") if isinstance(body.get("encoding"), str) else None,
                 recursive=bool(body.get("recursive")),
+                workspace_root=body.get("workspace_root") if isinstance(body.get("workspace_root"), str) else None,
+                access_mode=str(body.get("access_mode") or "workspace"),
             )
         self._send(200 if result.get("ok") else 400, result)
 

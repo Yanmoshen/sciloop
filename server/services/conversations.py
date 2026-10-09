@@ -9,9 +9,9 @@
 
 存储位置（2026-09-20 起按项目分目录）
 -------------------------------------
-容器内 ``/app/server/.cache/conversations/<项目id>/<会话id>.json``；
+仓库 ``knowledge-base/conversations/<项目id>/<会话id>.json``；
 **未分组**的对话放 ``conversations/_ungrouped/<会话id>.json``。
-（容器目录由 docker-compose.yml 把宿主 ``./.data/conversations`` 挂进来。）
+Docker 模式下由 docker-compose.yml 挂载同一个仓库目录。
 
 历史遗留的**平铺文件**（``conversations/<会话id>.json``）仍可读，视为未分组；
 下一次写入会自动把它落进 ``_ungrouped/``。
@@ -40,14 +40,17 @@ import json
 import logging
 import os
 import re
-import uuid
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from services.naming import readable_name, time_id
+from services.storage import ensure_knowledge_root
+
 logger = logging.getLogger("sciloop.conversations")
 
-DEFAULT_DIR = "/app/server/.cache/conversations"
+DEFAULT_DIR = ""
 ID_PATTERN = re.compile(r"^[0-9a-zA-Z_-]{6,64}$")
 #: 喂给模型的历史轮数上限（用户口径 2026-09-25：**不缩减，扩到 20 轮**）。
 #: 原先 12 —— 长对话里更早的结论会被丢掉，模型只好反复问。
@@ -55,13 +58,20 @@ ID_PATTERN = re.compile(r"^[0-9a-zA-Z_-]{6,64}$")
 #: 而不是在这里少给历史。
 MAX_TURNS_FOR_CONTEXT = 20
 
+# Agent history is separate from the presentation-oriented ``turns`` list.  The
+# latter is intentionally readable, while this list must retain tool-call
+# protocol pairs so a later request can resume the same agent loop safely.
+AGENT_HISTORY_KEY = "agent_history"
+AGENT_HISTORY_SNAPSHOTS_KEY = "agent_history_snapshots"
+COMPACTION_CHECKPOINTS_KEY = "compaction_checkpoints"
+
 #: 未分组对话所在子目录名（不是数字，因此不会与任何真实项目 id 冲突）
 UNGROUPED_KEY = "_ungrouped"
 
 
 def conversations_dir() -> Path:
     """会话根目录（可用 ``CONVERSATIONS_DIR`` 覆盖，便于测试）。"""
-    path = Path(os.environ.get("CONVERSATIONS_DIR") or DEFAULT_DIR)
+    path = Path(os.environ["CONVERSATIONS_DIR"]) if os.environ.get("CONVERSATIONS_DIR") else ensure_knowledge_root() / "conversations"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -153,18 +163,29 @@ def create(
     model_ref: str,
     project_id: Any = None,
     conversation_id: str | None = None,
+    workspace_dir: str | None = None,
 ) -> dict[str, Any]:
     """新建会话记录（尚未有任何轮次）。``conversation_id`` 可在流式开场时先占位。"""
     stamp = _now()
+    chosen_id = conversation_id or time_id()
+    if conversation_id is None:
+        suffix = 1
+        while locate(chosen_id) is not None:
+            chosen_id = f"{time_id()}-{suffix}"
+            suffix += 1
     record: dict[str, Any] = {
-        "id": conversation_id or uuid.uuid4().hex[:16],
-        "title": title,
+        "id": chosen_id,
+        "title": readable_name(title, identifier=chosen_id[:10], max_length=120),
         "model_ref": model_ref,
         "project_id": normalize_project_id(project_id),
+        "workspace_dir": workspace_dir,
         "created_at": stamp,
         "updated_at": stamp,
         "archived": False,
         "turns": [],
+        AGENT_HISTORY_KEY: [],
+        AGENT_HISTORY_SNAPSHOTS_KEY: [],
+        COMPACTION_CHECKPOINTS_KEY: [],
     }
     write(record)
     return record
@@ -218,7 +239,7 @@ def rename(conversation_id: str, title: str) -> dict[str, Any] | None:
     record = read(conversation_id)
     if record is None:
         return None
-    record["title"] = title
+    record["title"] = readable_name(title, identifier=conversation_id[:10], max_length=120)
     record["updated_at"] = _now()
     write(record)
     return record
@@ -322,7 +343,7 @@ def latest(project_id: Any = "any") -> dict[str, Any] | None:
     return items[0] if items else None
 
 
-def context_messages(record: dict[str, Any], limit: int = MAX_TURNS_FOR_CONTEXT) -> list[dict[str, str]]:
+def context_messages(record: dict[str, Any], limit: int = MAX_TURNS_FOR_CONTEXT) -> list[dict[str, Any]]:
     """把最近若干轮整理成 OpenAI 兼容的 messages（实现「接着上次继续」）。
 
     两条**不进上下文**的轮次（都是"这一轮并没有真的说话"的情形）：
@@ -332,6 +353,17 @@ def context_messages(record: dict[str, Any], limit: int = MAX_TURNS_FOR_CONTEXT)
       它是界面上的如实说明，不是模型说的话 —— 当成 assistant 的历史喂回去，
       模型会以为自己说过那句话。
     """
+
+    # New records use the durable protocol history.  Do not truncate it by
+    # turn count: Codex keeps a compacted replacement history and resumes from
+    # that checkpoint until another compaction is needed.
+    agent_history = record.get(AGENT_HISTORY_KEY)
+    if isinstance(agent_history, list) and agent_history:
+        return [
+            deepcopy(message)
+            for message in agent_history
+            if isinstance(message, dict) and str(message.get("role") or "") in {"user", "assistant", "tool"}
+        ]
 
     turns = record.get("turns") or []
     messages: list[dict[str, str]] = []
@@ -343,6 +375,80 @@ def context_messages(record: dict[str, Any], limit: int = MAX_TURNS_FOR_CONTEXT)
         if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
             messages.append({"role": role, "content": content})
     return messages
+
+
+def protocol_messages(messages: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Return a JSON-safe, model-facing history without the dynamic system prompt."""
+
+    allowed_roles = {"user", "assistant", "tool", "developer"}
+    result: list[dict[str, Any]] = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "")
+        if role not in allowed_roles:
+            continue
+        # Keep protocol fields required by OpenAI-compatible tool APIs and
+        # preserve provider reasoning fields when present.
+        item = {
+            key: deepcopy(value)
+            for key, value in message.items()
+            if key in {
+                "role",
+                "content",
+                "name",
+                "tool_calls",
+                "tool_call_id",
+                "reasoning_content",
+            }
+        }
+        if role == "tool" and "tool_call_id" not in item:
+            continue
+        result.append(item)
+    return result
+
+
+def update_agent_state(
+    record: dict[str, Any],
+    messages: list[dict[str, Any]] | None,
+    *,
+    checkpoints: list[dict[str, Any]] | None = None,
+    snapshots: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Persist the active agent history and optional Codex-style checkpoints.
+
+    ``turns`` remains the human-readable audit trail.  ``agent_history`` is the
+    current replacement history sent to the model; snapshots make every
+    compaction recoverable without deleting the original protocol messages.
+    """
+
+    record[AGENT_HISTORY_KEY] = protocol_messages(messages)
+    if checkpoints:
+        record[COMPACTION_CHECKPOINTS_KEY] = [
+            *(record.get(COMPACTION_CHECKPOINTS_KEY) or []),
+            *deepcopy(checkpoints),
+        ]
+    if snapshots:
+        record[AGENT_HISTORY_SNAPSHOTS_KEY] = [
+            *(record.get(AGENT_HISTORY_SNAPSHOTS_KEY) or []),
+            *deepcopy(snapshots),
+        ]
+    return record
+
+
+def truncate_agent_history_from_user(record: dict[str, Any], user_turn_index: int) -> None:
+    """Drop the selected user message and everything after it from active history."""
+
+    history = protocol_messages(record.get(AGENT_HISTORY_KEY))
+    seen = 0
+    cut = len(history)
+    for index, message in enumerate(history):
+        if message.get("role") == "user":
+            if seen == user_turn_index:
+                cut = index
+                break
+            seen += 1
+    record[AGENT_HISTORY_KEY] = history[:cut]
 
 
 def purge_flat_test_files(keep_ids: set[str] | None = None) -> list[str]:
@@ -365,9 +471,13 @@ __all__ = [
     "TITLE_SYSTEM",
     "pick_title_line",
     "MAX_TURNS_FOR_CONTEXT",
+    "AGENT_HISTORY_KEY",
+    "AGENT_HISTORY_SNAPSHOTS_KEY",
+    "COMPACTION_CHECKPOINTS_KEY",
     "UNGROUPED_KEY",
     "append_turns",
     "context_messages",
+    "protocol_messages",
     "conversations_dir",
     "create",
     "delete",
@@ -383,6 +493,8 @@ __all__ = [
     "rename",
     "set_archived",
     "set_fields",
+    "update_agent_state",
+    "truncate_agent_history_from_user",
     "summary",
     "write",
 ]

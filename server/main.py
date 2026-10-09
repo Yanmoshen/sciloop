@@ -111,10 +111,17 @@ ROUTER_REGISTRY: tuple[tuple[str, str, bool], ...] = (
     # 11.3) 会话（本轮新增，可选）：/conversations
     #       首页对话的多轮记录（JSON 落盘），刷新后据此恢复。
     ("api.v1.conversations", "/api/v1", False),
-    # 11.4) 研究节点编排层（本轮新增，可选）：/research
+    # 11.4) 文件系统知识库（宿主机默认落在仓库 knowledge-base/）
+    ("api.v1.knowledge", "/api/v1", False),
+    # 11.5) 研究节点编排层（本轮新增，可选）：/research
     #       七节点图的程序主控执行（契约 + 硬规则 + 三类闸门），与六阶段引擎并行互不影响。
     #       同样使用顶层字面前缀，规避「静态段被参数路由抢占 → 422」。
     ("api.v1.research", "/api/v1", False),
+    # 11.6) 内置 SearXNG-compatible 搜索：/search 与 /config
+    ("api.v1.search", "/api/v1", False),
+    # SearXNG clients commonly call the root paths directly; keep a small
+    # compatibility surface alongside the normal versioned API.
+    ("api.v1.search", "", False),
     # 12) 模型配置与成本（WP02，自带 /models 与 /costs 前缀）
     ("api.v1.models_config", "/api/v1", True),
     ("api.v1.costs", "/api/v1", True),
@@ -192,6 +199,10 @@ async def _reap_stale_node_runs() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期：启动探测数据库 + 按开关挂载批量任务调度器，关闭时释放资源。"""
+    try:
+        db_session.create_schema()
+    except Exception as exc:  # noqa: BLE001 - 启动日志给出原因，健康检查仍可工作
+        logger.warning("SQLite schema 自动创建失败：%s", exc)
     probe = await db_session.ping_database()
     if probe["ok"]:
         logger.info("数据库连接正常: %s (%s)", probe.get("database"), probe.get("server_version"))

@@ -340,14 +340,16 @@ async def persist_review_score(session: Any, *, pipeline_run_id: int, result: Ma
         "disclaimer": result.get("disclaimer"),
         "total_rule": "total = novelty + rigor + completeness + reproducibility",
     }
+    dialect = getattr(getattr(session, "bind", None), "dialect", None)
+    comments_expr = "json(:comments)" if getattr(dialect, "name", "") == "sqlite" else "CAST(:comments AS JSONB)"
     row = await session.execute(
         sql_text(
-            """
+            f"""
             INSERT INTO review_scores (
                 pipeline_run_id, novelty, rigor, completeness, reproducibility, total, comments
             ) VALUES (
                 :pipeline_run_id, :novelty, :rigor, :completeness, :reproducibility, :total,
-                CAST(:comments AS JSONB)
+                {comments_expr}
             ) RETURNING id
             """
         ),

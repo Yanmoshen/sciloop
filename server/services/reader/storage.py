@@ -37,6 +37,7 @@ import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any
+from services.storage import knowledge_root
 
 from services.reader.errors import (
     ArchiveTooLargeError,
@@ -70,7 +71,7 @@ def default_library_dir() -> Path:
     override = os.environ.get("READER_LIBRARY_DIR")
     if override:
         return Path(override)
-    return Path(__file__).resolve().parents[2] / ".cache" / "reader-library"
+    return knowledge_root() / "parses" / "reader-library"
 
 
 def ensure_library_dir(root: Path | str | None = None) -> Path:

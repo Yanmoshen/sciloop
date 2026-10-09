@@ -51,12 +51,12 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from db.base import Base
+from db.types import JSONB
 
-BIGINT = BigInteger
+BIGINT = BigInteger().with_variant(__import__("sqlalchemy").Integer(), "sqlite")
 
 #: 版本种类：``original`` 由创建阅读文档时自动生成，**不允许**通过登记接口提交
 VERSION_KINDS: tuple[str, ...] = ("original", "chinese")
@@ -99,7 +99,7 @@ class ReaderDocument(Base):
     document: Mapped[Any] = mapped_column(JSONB, nullable=False)
     #: 解析结果规范化 JSON 的 SHA-256（内容指纹，用于防旧客户端覆盖新修改）
     payload_sha256: Mapped[str] = mapped_column(CHAR(64), nullable=False)
-    warnings: Mapped[Any] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    warnings: Mapped[Any] = mapped_column(JSONB, nullable=False, server_default=text("'[]'"))
     created_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -155,7 +155,7 @@ class ReaderVersion(Base):
     page_map: Mapped[Any] = mapped_column(JSONB, nullable=False)
     block_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     layout_warnings: Mapped[Any] = mapped_column(
-        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+        JSONB, nullable=False, server_default=text("'[]'")
     )
     #: manifest 原文快照（只增不改；便于事后审计，不参与业务计算）
     manifest_snapshot: Mapped[Any | None] = mapped_column(JSONB)
@@ -203,10 +203,10 @@ class ReaderState(Base):
     mode: Mapped[str] = mapped_column(String(16), nullable=False, server_default="original")
     font_size: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="16")
     understood_blocks: Mapped[Any] = mapped_column(
-        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+        JSONB, nullable=False, server_default=text("'[]'")
     )
     favorite_terms: Mapped[Any] = mapped_column(
-        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+        JSONB, nullable=False, server_default=text("'[]'")
     )
     #: 状态修订号（每次 PATCH 递增，便于前端判断本地副本是否过期）
     revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
@@ -260,7 +260,7 @@ class ReaderAnnotation(Base):
     align_status: Mapped[str] = mapped_column(
         String(16), nullable=False, server_default="pending"
     )
-    projections: Mapped[Any] = mapped_column(JSONB, nullable=False, server_default=text("'[]'::jsonb"))
+    projections: Mapped[Any] = mapped_column(JSONB, nullable=False, server_default=text("'[]'"))
     #: 内容指纹（登记时阅读文档的 ``payload_sha256``），用于识别旧客户端
     content_fingerprint: Mapped[str] = mapped_column(CHAR(64), nullable=False)
     revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")

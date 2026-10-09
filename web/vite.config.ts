@@ -28,12 +28,12 @@ export default defineConfig({
     },
   },
   server: {
-    host: '0.0.0.0',
+    host: '127.0.0.1',
     port: 5173,
     proxy: {
       // 本地开发同源转发到 FastAPI，SSE 需关闭缓冲
       '/api': {
-        target: process.env.VITE_PROXY_TARGET ?? 'http://localhost:8000',
+        target: process.env.VITE_PROXY_TARGET ?? 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
     },

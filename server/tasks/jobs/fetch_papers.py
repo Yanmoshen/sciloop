@@ -310,7 +310,7 @@ _HISTORY_LOCK = threading.Lock()
 def history_path() -> Path:
     """任务历史文件路径（环境变量 FETCH_TASK_HISTORY_DIR > settings > <backend>/.cache/tasks）。"""
     raw = os.getenv("FETCH_TASK_HISTORY_DIR") or get_settings().fetch_task_history_dir
-    base = Path(raw) if raw else Path(__file__).resolve().parents[2] / ".cache" / "tasks"
+    base = Path(raw) if raw else Path(__file__).resolve().parents[2] / "knowledge-base" / "projects" / "tasks"
     return base / _HISTORY_FILE_NAME
 
 

@@ -39,7 +39,7 @@ STATE_NAME = "skills-state.json"
 def state_path(root: Path | str | None = None) -> Path:
     """状态文件位置：**必须在挂载卷里**，否则重建容器就全丢（2026-09-23 实测踩到）。
 
-    `.cache/artifacts` 是挂着的（宿主 `./.data/artifacts`），所以放在它下面；
+    `knowledge-base/exports` 是持久化目录，所以放在它下面；
     下划线开头标明它**不是产物**，只是技能库自己的状态。
     """
 

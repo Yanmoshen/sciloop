@@ -19,8 +19,7 @@
 持久化目录
 ----------
 
-默认 ``<server_root>/.cache/uploads``（容器内即 ``/app/server/.cache/uploads``，
-与 docker-compose 的 bind mount 一一对应；宿主侧为 ``./.data/uploads``）。
+默认仓库 ``knowledge-base/uploads``；宿主机和 Docker 共用同一目录。
 可用环境变量 ``IMPORT_UPLOAD_DIR`` 覆盖（测试与离线验证使用）。
 """
 
@@ -33,6 +32,7 @@ import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from services.storage import knowledge_root
 
 #: 单文件上限 20MB（契约）
 MAX_FILE_BYTES = 20 * 1024 * 1024
@@ -78,7 +78,7 @@ def default_upload_dir() -> Path:
     override = os.environ.get("IMPORT_UPLOAD_DIR")
     if override:
         return Path(override)
-    return Path(__file__).resolve().parents[2] / ".cache" / "uploads"
+    return knowledge_root() / "uploads"
 
 
 def ensure_upload_dir(root: Path | str | None = None) -> Path:

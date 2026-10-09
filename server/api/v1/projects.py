@@ -33,6 +33,7 @@ from core.security import require_owner
 from db.models import Idea, PipelineRun, Project, Taskbook
 from db.session import AsyncSessionLocal
 from services.pipeline.stages import STAGE_ORDER
+from services.naming import readable_name, time_id
 
 logger = logging.getLogger("sciloop.api.projects")
 
@@ -292,7 +293,7 @@ async def create_project(
                 )
 
         project = Project(
-            name=name,
+            name=readable_name(name, identifier=time_id()),
             mode=mode,
             status="DRAFT",
             current_iteration=0,
@@ -433,7 +434,7 @@ async def rename_project(
             )
         previous = project.name
         if name is not None:
-            project.name = name
+            project.name = readable_name(name, identifier=str(project.name).rsplit("__", 1)[-1])
         if archived is not None:
             project.archived = archived
         project.updated_at = func.now()
@@ -500,7 +501,7 @@ async def _ensure_workspace(*, project_id: int, name: str, chosen: str) -> tuple
     # 统一成正斜杠再存：Windows 上两种都认，但混着显示（D:\a\b/96-demo）会让人以为路径不对。
     target = target.replace("\\", "/")
 
-    created = await host_runner.call_fs(action="mkdir", path=target)
+    created = await host_runner.call_fs(action="mkdir", path=target, workspace_root=target, access_mode="workspace")
     if created.get("ok"):
         return target, None
     reason = str(created.get("error") or "目录没能创建")

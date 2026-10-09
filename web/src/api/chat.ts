@@ -55,6 +55,33 @@ export interface HomeChatResult {
   }
 }
 
+export interface CompactChatResult {
+  ok: boolean
+  conversation_id: string
+  changed: boolean
+  reason?: string | null
+  checkpoint_id?: string | null
+  summary?: string | null
+  context?: {
+    system?: number
+    tools?: number
+    messages?: number
+    estimated?: number
+    projected?: number
+    limit?: number
+    ratio_percent?: number
+  }
+}
+
+/** 手动创建一个 Codex 风格的上下文检查点。 */
+export function compactChat(input: {
+  conversation_id: string
+  model_config_id: number
+  model_id: string
+}): Promise<CompactChatResult> {
+  return post<CompactChatResult>('/chat/compact', { body: input })
+}
+
 /** 非流式入口（保留：脚本 / 无 ReadableStream 环境的兜底） */
 export async function chatHome(input: HomeChatInput): Promise<HomeChatResult> {
   const response = await fetch(apiUrl('/chat/home'), {

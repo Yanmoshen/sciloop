@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -58,8 +59,13 @@ _POOL_KWARGS: dict[str, Any] = {
 
 
 def _async_dsn() -> str:
-    """归一为 ``postgresql+asyncpg://`` 形式的异步 DSN。"""
+    """归一为异步 DSN；宿主机默认使用 SQLite。"""
     url = (settings.database_url or "").strip()
+    if url.startswith("sqlite:///"):
+        url = url.replace("sqlite:///", "sqlite+aiosqlite:///", 1)
+    if url.startswith("sqlite+aiosqlite:///"):
+        _ensure_sqlite_parent(url)
+        return url
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://") :]
     if url.startswith("postgresql://"):
@@ -68,16 +74,29 @@ def _async_dsn() -> str:
 
 
 def _sync_dsn() -> str:
-    """同步 DSN（``postgresql+psycopg://``，alembic / 批量任务共用）。"""
-    return settings.sync_database_url
+    """同步 DSN（SQLite 或 ``postgresql+psycopg://``）。"""
+    url = settings.sync_database_url
+    if url.startswith("sqlite:///"):
+        _ensure_sqlite_parent(url)
+    return url
+
+
+def _ensure_sqlite_parent(url: str) -> None:
+    """创建 SQLite 文件的父目录，支持宿主机直接启动。"""
+    raw = url.removeprefix("sqlite+aiosqlite:///").removeprefix("sqlite:///")
+    if raw == ":memory:":
+        return
+    Path(raw).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
 
 
 def _build_async_engine() -> AsyncEngine | None:
     try:
+        dsn = _async_dsn()
+        kwargs = {} if dsn.startswith("sqlite") else _POOL_KWARGS
         return create_async_engine(
-            _async_dsn(),
+            dsn,
             echo=False,
-            **_POOL_KWARGS,
+            **kwargs,
         )
     except Exception as exc:  # noqa: BLE001 - 驱动缺失 / DSN 非法都不应阻断导入
         logger.error("异步引擎创建失败（driver=asyncpg）: %s", exc)
@@ -86,7 +105,9 @@ def _build_async_engine() -> AsyncEngine | None:
 
 def _build_sync_engine() -> Engine | None:
     try:
-        return create_engine(_sync_dsn(), echo=False, **_POOL_KWARGS)
+        dsn = _sync_dsn()
+        kwargs = {} if dsn.startswith("sqlite") else _POOL_KWARGS
+        return create_engine(dsn, echo=False, **kwargs)
     except Exception as exc:  # noqa: BLE001
         logger.error("同步引擎创建失败（driver=psycopg）: %s", exc)
         return None
@@ -158,15 +179,20 @@ async def ping_database(timeout_seconds: float = 3.0) -> dict[str, Any]:
         return {"ok": False, "detail": "async_engine_unavailable"}
     try:
         async with engine.connect() as conn:
-            result = await conn.execute(text("SELECT version()"))
-            version = result.scalar_one()
-            result = await conn.execute(text("SELECT current_database()"))
-            database = result.scalar_one()
+            if conn.dialect.name == "sqlite":
+                version = await conn.execute(text("SELECT sqlite_version()"))
+                version_value = version.scalar_one()
+                database = str(settings.database_url)
+            else:
+                result = await conn.execute(text("SELECT version()"))
+                version_value = result.scalar_one()
+                result = await conn.execute(text("SELECT current_database()"))
+                database = result.scalar_one()
         return {
             "ok": True,
             "detail": "connected",
             "database": database,
-            "server_version": str(version).split(" ")[0] if version else None,
+            "server_version": str(version_value).split(" ")[0] if version_value else None,
         }
     except SQLAlchemyError as exc:
         logger.warning("数据库健康检查失败: %s", exc)
@@ -176,6 +202,51 @@ async def ping_database(timeout_seconds: float = 3.0) -> dict[str, Any]:
         return {"ok": False, "detail": f"{type(exc).__name__}: {exc}"}
 
 
+def create_schema() -> None:
+    """创建宿主机 SQLite 的初始 schema；PostgreSQL 仍由 Alembic 管理。"""
+    if sync_engine is None or sync_engine.dialect.name != "sqlite":
+        return
+    from db.base import Base
+    import db.models  # noqa: F401 - 注册所有模型
+
+    # PostgreSQL 迁移中的 ``NULLS LAST`` 索引语法在 SQLite 不存在；普通业务查询
+    # 不依赖这些索引，因此宿主机初始化时跳过它们，PostgreSQL 仍由 Alembic 创建。
+    skipped_indexes = []
+    for table in Base.metadata.tables.values():
+        for index in list(table.indexes):
+            if any("NULLS LAST" in str(getattr(expr, "text", expr)).upper() for expr in index.expressions):
+                table.indexes.remove(index)
+                skipped_indexes.append((table, index))
+    try:
+        Base.metadata.create_all(sync_engine)
+        # SQLite has no Alembic process in the one-line host deployment. Keep
+        # existing local databases usable when a nullable application column is
+        # added after the first start (CREATE TABLE alone does not alter tables).
+        from sqlalchemy import inspect as sa_inspect
+
+        inspector = sa_inspect(sync_engine)
+        with sync_engine.begin() as connection:
+            for table in Base.metadata.tables.values():
+                if not inspector.has_table(table.name):
+                    continue
+                present = {item["name"] for item in inspector.get_columns(table.name)}
+                for column in table.columns:
+                    if column.name in present or column.primary_key:
+                        continue
+                    type_sql = column.type.compile(dialect=sync_engine.dialect)
+                    nullable_sql = "" if column.nullable else " NOT NULL"
+                    default_sql = ""
+                    if column.server_default is not None:
+                        default_sql = f" DEFAULT {column.server_default.arg}"
+                    connection.execute(
+                        text(
+                            f'ALTER TABLE "{table.name}" ADD COLUMN "{column.name}" '
+                            f"{type_sql}{default_sql}{nullable_sql}"
+                        )
+                    )
+    finally:
+        for table, index in skipped_indexes:
+            table.indexes.add(index)
 async def dispose_engines() -> None:
     """应用关闭时释放两个连接池。"""
     if engine is not None:

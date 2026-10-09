@@ -9,8 +9,8 @@
 研究者 2026-09-23 定的口径：
 - **按技能声明的流程跑**（`SKILL.md` 的 `steps`），不是让模型零散点脚本；
 - 脚本跑在**宿主执行器**上 —— 复用现有「研究者批准后才执行」那套，看得见输出、有留痕；
-- 产物落**项目产物目录**（`<server_root>/.cache/artifacts/<task_id>/skills/<技能>/`，compose 已把
-  宿主 `./.data/artifacts` 绑过来），并写一份 `run.json` 执行记录。
+- 产物落**项目产物目录**（`knowledge-base/exports/<task_id>/skills/<技能>/`，宿主机与 Docker
+  共用同一目录），并写一份 `run.json` 执行记录。
 
 边界（写死在代码里，别指望调用方记得）
 ----------------------------------------
@@ -37,7 +37,8 @@ from typing import Any
 
 from services.agent import host_runner, policy
 from services.skills.registry import SkillPack
-from services.translate.artifacts import default_artifact_root, sha256_file, task_dir
+from services.storage import knowledge_root
+from services.translate.artifacts import sha256_file
 
 __all__ = [
     "PYTHON_ENV",
@@ -77,11 +78,6 @@ def python_bin(executor_python: str | None = None) -> str:
     return (os.environ.get(PYTHON_ENV) or "python").strip() or "python"
 
 
-#: 产物目录的**卷映射**：容器 `<container>` ←→ 宿主 `<host_root>/<host_suffix>`
-#: （compose：`./.data/artifacts:/app/server/.cache/artifacts`）
-HOST_ARTIFACT_SUFFIX = Path(".data") / "artifacts"
-
-
 def host_mirror(container_path: Path | str, *, host_root: str | None, artifacts_view: str | None = None) -> Path | None:
     """把**容器里的产物路径**换成**宿主上的同一路径**。
 
@@ -92,16 +88,21 @@ def host_mirror(container_path: Path | str, *, host_root: str | None, artifacts_
     if not host_root:
         return None
     path = Path(container_path)
-    container_root = default_artifact_root()
+    container_root = skill_artifact_root()
     try:
         relative = path.resolve().relative_to(container_root.resolve())
     except ValueError:
         return None
-    # 执行环境**自报**它把产物目录挂在哪（容器执行器是 /artifacts；宿主机执行器没报，就用默认的 .data/artifacts）
+    # 执行环境**自报**它把产物目录挂在哪（容器执行器是 /artifacts）。
     view = str(artifacts_view or "").strip()
     if view:
         return Path(view) / relative
-    return Path(host_root) / HOST_ARTIFACT_SUFFIX / relative
+    return Path(host_root) / "knowledge-base" / "exports" / relative
+
+
+def skill_artifact_root() -> Path:
+    """Agent 技能产物根目录，与 compose 的 ``/artifacts`` 挂载对应。"""
+    return knowledge_root() / "exports"
 
 
 def _safe(value: str) -> str:
@@ -272,7 +273,7 @@ async def run_skill(
 
     result = RunResult(skill=pack.name, topic=topic, ok=False)
 
-    root = artifacts if artifacts is not None else default_artifact_root()
+    root = artifacts if artifacts is not None else skill_artifact_root()
     try:
         base = task_dir(task_id, root=root) / "skills" / _safe(pack.name)
     except Exception as exc:  # noqa: BLE001 - 非法 task_id 之类的口径问题，说清楚就好，别抛

@@ -245,6 +245,8 @@ async def call_exec(
     argv: list[str] | None = None,
     cwd: str | None = None,
     timeout_s: int = 120,
+    workspace_root: str | None = None,
+    access_mode: str | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> dict[str, Any]:
     """在研究者自己的电脑上跑一条命令（**已获批之后才调用这里**）。"""
@@ -256,6 +258,10 @@ async def call_exec(
         payload["command"] = command or ""
     if cwd:
         payload["cwd"] = cwd
+    if workspace_root or cwd:
+        payload["workspace_root"] = workspace_root or cwd
+    if access_mode:
+        payload["access_mode"] = access_mode
     return await _post("/exec", payload, timeout_s=timeout_s + 15, client=client)
 
 
@@ -266,6 +272,8 @@ async def call_fs(
     to: str | None = None,
     content: str | None = None,
     recursive: bool = False,
+    workspace_root: str | None = None,
+    access_mode: str | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> dict[str, Any]:
     """在研究者自己的电脑上读/写/列/移动/删除文件（**已获批之后才调用这里**）。"""
@@ -277,6 +285,10 @@ async def call_fs(
         payload["content"] = content
     if recursive:
         payload["recursive"] = True
+    if workspace_root:
+        payload["workspace_root"] = workspace_root
+    if access_mode:
+        payload["access_mode"] = access_mode
     return await _post("/fs", payload, timeout_s=DEFAULT_TIMEOUT_S, client=client)
 
 

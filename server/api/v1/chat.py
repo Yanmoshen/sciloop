@@ -36,8 +36,11 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 
 from core.security import require_owner
+from db.models import Project
+from db.session import AsyncSessionLocal
 from llm import adapter
 from llm.errors import LLMError
 from llm.registry import get_registry
@@ -313,6 +316,22 @@ class HomeChatResponse(BaseModel):
     usage: dict[str, Any] = Field(default_factory=dict)
 
 
+class CompactChatRequest(BaseModel):
+    conversation_id: str = Field(min_length=1, max_length=64)
+    model_config_id: int
+    model_id: str = Field(min_length=1, max_length=200)
+
+
+class CompactChatResponse(BaseModel):
+    ok: bool
+    conversation_id: str
+    changed: bool = False
+    reason: str | None = None
+    checkpoint_id: str | None = None
+    summary: str | None = None
+    context: dict[str, int] = Field(default_factory=dict)
+
+
 def _thinking_provider(model_ref: str) -> bool:
     """是不是"思考型"供应商 —— 带 `tool_calls` 的 assistant 消息**必须回传**
     `reasoning_content` 的那种（实测 deepseek 系列缺了直接 400）。
@@ -404,6 +423,16 @@ def _sse(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+async def _workspace_dir(project_id: int | None) -> str | None:
+    if project_id is None or AsyncSessionLocal is None:
+        return None
+    async with AsyncSessionLocal() as session:
+        project = (await session.execute(select(Project).where(Project.id == int(project_id)))).scalar_one_or_none()
+        settings = project.settings if project is not None and isinstance(project.settings, dict) else {}
+        value = settings.get("workspace_dir")
+        return str(value) if value else None
+
+
 async def _agent_loop(
     messages_now: list[dict[str, Any]],
     *,
@@ -414,6 +443,7 @@ async def _agent_loop(
     approvals_out: list[dict[str, Any]],
     state: dict[str, Any],
     allow_fallback_first: bool = True,
+    workspace_root: str | None = None,
 ) -> AsyncIterator[str]:
     """agent 循环：模型 → 工具 → 结果回喂 → 再模型（轮数有上限，防死循环）。
 
@@ -445,6 +475,30 @@ async def _agent_loop(
 
     meter = context_meter.get_meter()
     compactions: list[dict[str, Any]] = state.setdefault("compactions", [])
+    snapshots: list[dict[str, Any]] = state.setdefault("compaction_snapshots", [])
+    state["agent_history"] = conversations.protocol_messages(messages_now)
+
+    def save_history() -> None:
+        # Keep the dynamic system prompt out of the durable history.  It is
+        # rebuilt on every request so changed skills/project state take effect.
+        state["agent_history"] = conversations.protocol_messages(messages_now)
+
+    def checkpoint(
+        kind: str,
+        record: dict[str, Any],
+        before_messages: list[dict[str, Any]] | None = None,
+    ) -> None:
+        checkpoint_id = f"cp-{time.time_ns()}"
+        record["checkpoint_id"] = checkpoint_id
+        record["trigger"] = "auto"
+        snapshots.append(
+            {
+                "id": checkpoint_id,
+                "created_at": time.time(),
+                "reason": kind,
+                "messages": conversations.protocol_messages(before_messages or messages_now),
+            }
+        )
 
     while model_calls < agent_tools.MAX_MODEL_CALLS_PER_TURN:
         model_calls += 1
@@ -456,6 +510,7 @@ async def _agent_loop(
         # ---------------------------------------------------------------- #
         projected = meter.project(messages_now, tools=tool_defs)
         if projected > meter.limit_tokens:
+            before = conversations.protocol_messages(messages_now)
             outcome = compaction_mod.compress_tool_results(messages_now)
             if outcome.changed:
                 budget_row = {
@@ -469,7 +524,11 @@ async def _agent_loop(
                 }
                 rows.append(budget_row)
                 yield _sse("row", {"row": budget_row})
-                compactions.append(outcome.as_record())
+                compacted = outcome.as_record()
+                checkpoint("tool_results", compacted, before)
+                compacted["before_message_count"] = len(before)
+                compactions.append(compacted)
+                save_history()
                 logger.info(
                     "上下文压缩 conversation=%s count=%d freed_chars=%d projected=%d",
                     conversation_id,
@@ -502,6 +561,7 @@ async def _agent_loop(
                     logger.warning("上下文摘要失败，保持原样继续：%s", exc)
                     summary_record = None
                 if summary_record is not None and span is not None:
+                    before = conversations.protocol_messages(messages_now)
                     freed_chars = compaction_mod.apply_turn_summary(
                         messages_now, span=span, summary=str(summary_record["summary"])
                     )
@@ -515,7 +575,10 @@ async def _agent_loop(
                     }
                     rows.append(budget_row)
                     yield _sse("row", {"row": budget_row})
+                    checkpoint("turns", summary_record, before)
+                    summary_record["before_message_count"] = len(before)
                     compactions.append(summary_record)
+                    save_history()
                     logger.info(
                         "上下文摘要 conversation=%s count=%d freed_chars=%d",
                         conversation_id,
@@ -537,6 +600,7 @@ async def _agent_loop(
         #: 这一轮的思考过程从 `state["reasoning"]` 的哪个下标开始 —— 用于把**本轮**的
         #: reasoning_content 跟着 assistant.tool_calls 一起回喂（见下面 append 处）。
         reasoning_from = len(state["reasoning"])
+        text_from = len(state["text"])
         # ---------------------------------------------------------------- #
         # 「不再强制中断」（用户口径 2026-09-26）：模型这一跳失败**不再直接判死整轮**。
         # 先自愈（把报文形状修好）再重试；重试仍不成，就把失败如实摊开、
@@ -624,6 +688,21 @@ async def _agent_loop(
                 meter.calibrate(prompt_tokens=prompt_tokens, estimated=estimate_before)
         calls = agent_tools.normalize_tool_calls(getattr(round_result, "tool_calls", None) or [])
         if not calls:
+            # A completed assistant message is part of the resumable protocol
+            # history even when the model did not request a tool.
+            content = str(getattr(round_result, "content", "") or "")
+            if not content:
+                content = "".join(state["text"][text_from:])
+            assistant_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": content,
+            }
+            reasoning = "".join(state["reasoning"][reasoning_from:]).strip()
+            reasoning_value = reasoning_echo(reasoning, ref)
+            if reasoning_value is not None:
+                assistant_message["reasoning_content"] = reasoning_value
+            messages_now.append(assistant_message)
+            save_history()
             break  # 模型不再要工具 = 这一轮答完了
         if tool_calls_done >= agent_tools.MAX_TOOL_CALLS_PER_TURN:
             stopped_by = "tool_calls"
@@ -650,6 +729,7 @@ async def _agent_loop(
         if reasoning_value is not None:
             assistant_call["reasoning_content"] = reasoning_value
         messages_now.append(assistant_call)
+        save_history()
 
         # **这一轮的思考也落成一行**（2026-09-24 研究者要求）：
         # 原来整个回合的思考只存在 turn.reasoning 里，界面只能把它整段堆在正文最上方；
@@ -727,7 +807,9 @@ async def _agent_loop(
             rows.append(start_row)
             yield _sse("row", {"row": start_row})
             payload_out, summary = await agent_tools.run_tool_call(
-                call, approval_token=grant_token
+                call, approval_token=grant_token,
+                access_mode="full" if grants_now.get(agent_approvals.GRANT_FULL_ACCESS) else "workspace",
+                workspace_root=workspace_root,
             )
             end_row = agent_tools.tool_row(
                 call,
@@ -749,6 +831,7 @@ async def _agent_loop(
                     "content": agent_tools.tool_message_content(payload_out),
                 }
             )
+            save_history()
         if stopped_for_approval:
             # 等研究者裁决：这一轮到此为止，绝不"先跑了再补批准"
             break
@@ -787,6 +870,12 @@ async def _agent_loop(
                 yield _sse("reasoning", {"text": update.text})
             elif update.kind == "done":
                 state["result"] = update.result
+        wrap_content = str(getattr(state.get("result"), "content", "") or "")
+        if not wrap_content:
+            wrap_content = "".join(state["text"][-1:])
+        if wrap_content:
+            messages_now.append({"role": "assistant", "content": wrap_content})
+        save_history()
 
 
 def _streaming(source: AsyncIterator[str]) -> StreamingResponse:
@@ -878,6 +967,8 @@ def _truncate_for_edit(conversation: dict[str, Any] | None, replace_from: int | 
         )
     if (turns[replace_from] or {}).get("role") != "user":
         raise _error(422, "not_a_user_turn", "只能编辑你自己发过的消息")
+    user_turn_index = sum(1 for turn in turns[:replace_from] if (turn or {}).get("role") == "user")
+    conversations.truncate_agent_history_from_user(conversation, user_turn_index)
     conversations.truncate_from(conversation, replace_from)
     return True
 
@@ -910,13 +1001,14 @@ async def home_chat(payload: HomeChatRequest) -> HomeChatResponse:
     # 2) 正式回答：失败必须如实抛出（不能伪装成功）
     #    带上下文：同一会话的历史轮次（实现「接着上次继续」；编辑重开后即为截断后的历史）
     history = conversations.context_messages(conversation) if conversation else []
+    request_messages = [
+        {"role": "system", "content": REPLY_SYSTEM + skills_system_block()},
+        *history,
+        {"role": "user", "content": text},
+    ]
     try:
         reply_result = await adapter.chat(
-            [
-                {"role": "system", "content": REPLY_SYSTEM + skills_system_block()},
-                *history,
-                {"role": "user", "content": text},
-            ],
+            request_messages,
             model_ref=ref,
             purpose="home_reply",
             allow_fallback=False,
@@ -931,10 +1023,12 @@ async def home_chat(payload: HomeChatRequest) -> HomeChatResponse:
 
     # 3) 落盘：新会话用模型给的标题建，已知会话则只补这一轮（编辑重开时标题保持不变）
     if conversation is None:
+        workspace_dir = await _workspace_dir(payload.project_id)
         conversation = conversations.create(
             title=title,
             model_ref=ref,
             project_id=payload.project_id,
+            workspace_dir=workspace_dir,
         )
     elif not is_edit:
         conversations.rename(str(conversation["id"]), title)
@@ -950,6 +1044,18 @@ async def home_chat(payload: HomeChatRequest) -> HomeChatResponse:
             },
         ],
     )
+    assistant_message: dict[str, Any] = {
+        "role": "assistant",
+        "content": reply_result.content or "",
+    }
+    raw_reasoning = str((getattr(reply_result, "raw", None) or {}).get("reasoning") or "").strip()
+    if raw_reasoning:
+        assistant_message["reasoning_content"] = raw_reasoning
+    conversations.update_agent_state(
+        conversation,
+        [*history, {"role": "user", "content": text}, assistant_message],
+    )
+    conversations.write(conversation)
 
     usage = reply_result.usage
     return HomeChatResponse(
@@ -969,6 +1075,87 @@ async def home_chat(payload: HomeChatRequest) -> HomeChatResponse:
             "completion_tokens": getattr(usage, "completion_tokens", None),
             "total_tokens": getattr(usage, "total_tokens", None),
         },
+    )
+
+
+@router.post(
+    "/chat/compact",
+    response_model=CompactChatResponse,
+    summary="手动压缩当前对话上下文（保留原始轮次与检查点）",
+    dependencies=[Depends(require_owner)],
+)
+async def compact_chat(payload: CompactChatRequest) -> CompactChatResponse:
+    """Codex-style manual compaction.
+
+    The active history is replaced by a short, model-readable summary while
+    the pre-compaction protocol messages remain in a checkpoint snapshot.
+    """
+
+    record = conversations.read(payload.conversation_id)
+    if record is None:
+        raise _error(status.HTTP_404_NOT_FOUND, "conversation_not_found", "会话不存在")
+    ref = await _resolve_model_ref(payload.model_config_id, payload.model_id)
+    from services import context_compaction as compaction_mod
+    from services import context_meter
+
+    messages = conversations.context_messages(record)
+    span = compaction_mod.select_summary_span(messages)
+    if span is None:
+        return CompactChatResponse(
+            ok=True,
+            conversation_id=payload.conversation_id,
+            changed=False,
+            reason="nothing_to_compact",
+            context=context_meter.get_meter().breakdown(messages),
+        )
+    summary_record = await compaction_mod.summarize_early_turns(
+        messages,
+        span=span,
+        model_ref=ref,
+    )
+    if summary_record is None:
+        raise _error(
+            status.HTTP_502_BAD_GATEWAY,
+            "compaction_failed",
+            "上下文摘要没有返回有效内容，原始会话保持不变",
+        )
+    before = conversations.protocol_messages(messages)
+    freed_chars = compaction_mod.apply_turn_summary(
+        messages,
+        span=span,
+        summary=str(summary_record["summary"]),
+    )
+    checkpoint_id = f"cp-manual-{time.time_ns()}"
+    summary_record.update(
+        {
+            "checkpoint_id": checkpoint_id,
+            "trigger": "manual",
+            "before_message_count": len(before),
+            "freed_chars": freed_chars,
+        }
+    )
+    record["compactions"] = [*(record.get("compactions") or []), summary_record]
+    conversations.update_agent_state(
+        record,
+        messages,
+        checkpoints=[summary_record],
+        snapshots=[
+            {
+                "id": checkpoint_id,
+                "created_at": time.time(),
+                "reason": "manual",
+                "messages": before,
+            }
+        ],
+    )
+    conversations.write(record)
+    return CompactChatResponse(
+        ok=True,
+        conversation_id=payload.conversation_id,
+        changed=True,
+        checkpoint_id=checkpoint_id,
+        summary=str(summary_record["summary"]),
+        context=context_meter.get_meter().breakdown(messages),
     )
 
 
@@ -1006,10 +1193,12 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
     is_edit = _truncate_for_edit(conversation, payload.replace_from)
     is_new = conversation is None
     if conversation is None:
+        workspace_dir = await _workspace_dir(payload.project_id)
         conversation = conversations.create(
             title=text[:TITLE_MAX_CHARS],
             model_ref=ref,
             project_id=payload.project_id,
+            workspace_dir=workspace_dir,
         )
     conversation_id = str(conversation["id"])
     history = conversations.context_messages(conversation)
@@ -1163,6 +1352,8 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
                 "pending": None,
                 #: 本轮发生的上下文压缩（会话级落盘，刷新后研究者仍能看到"压过什么"）
                 "compactions": compactions_out,
+                "compaction_snapshots": [],
+                "agent_history": conversations.protocol_messages(messages_now),
             }
             async for frame in _agent_loop(
                 messages_now,
@@ -1172,6 +1363,7 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
                 rows=tool_rows,
                 approvals_out=approval_requests,
                 state=state,
+                workspace_root=str(conversation.get("workspace_dir") or "") or None,
             ):
                 # 客户端断开（研究者按了「停止」、或关掉页面）→ 尽早走**正常收尾路径**。
                 # 说明：正常写法下 uvicorn/Starlette 会先在流上抛 CancelledError（下面那个
@@ -1279,6 +1471,15 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
                     *(conversation.get("compactions") or []),
                     *compactions_out,
                 ]
+            # Persist the model-facing protocol history separately from the
+            # readable turns.  This is the durable resume point used by the
+            # next request, while checkpoints retain the pre-compaction view.
+            conversations.update_agent_state(
+                conversation,
+                state.get("agent_history") or [],
+                checkpoints=compactions_out,
+                snapshots=state.get("compaction_snapshots") or [],
+            )
             #: 研究者主动停止（前端 abort → 客户端断开）。这一轮**没有正文也得留痕**：
             #  思考过程、过程行、待批卡片都是"已产出"的东西，更别说用户那句话本身 ——
             #  2026-09-26 实测：按原来的条件（无正文 + 有错误）会被判成"没什么可记的"，
@@ -1458,6 +1659,7 @@ async def _approval_stream(
     from services.agent import mcp_tools as agent_tools
 
     conversation_id = str(record["id"])
+    workspace_root = str(record.get("workspace_dir") or "") or None
     request_id = str(request["id"])
     tool = str(request["tool"])
     label = agent_tools.TOOL_LABELS.get(tool, tool)
@@ -1491,6 +1693,9 @@ async def _approval_stream(
     #: 正文是**系统说明**（模型彻底失败后的如实交代），不是模型说的话
     note_only = False
     started = time.perf_counter()
+    state: dict[str, Any] = {}
+    agent_history: list[dict[str, Any]] = conversations.context_messages(record)
+    compactions_out: list[dict[str, Any]] = []
 
     try:
         if payload.decision == "deny":
@@ -1506,6 +1711,26 @@ async def _approval_stream(
             rows.append(decision_row)
             yield _sse("row", {"row": decision_row})
             yield _sse("approval", card)
+            # Close the persisted assistant/tool-call pair with a synthetic
+            # refusal result so the next turn remains protocol-valid.
+            denied_history = conversations.context_messages(record)
+            call_id = str(request.get("call_id") or f"call_{request_id}")
+            if any(
+                call_id == str(call.get("id") or "")
+                for message in denied_history
+                if isinstance(message, dict)
+                for call in (message.get("tool_calls") or [])
+            ):
+                denied_history.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": agent_tools.tool_message_content(
+                            {"ok": False, "error": "研究者拒绝了这次工具调用", "refused": True}
+                        ),
+                    }
+                )
+                agent_history = denied_history
             # 拒绝的确认话由**模型**说（口径 2026-09-26：对话正文一律模型生成）。
             text = await phrasing.say(
                 facts=(
@@ -1519,6 +1744,7 @@ async def _approval_stream(
             )
             if text:
                 buffer.append(text)
+                agent_history.append({"role": "assistant", "content": text})
                 yield _sse("delta", {"text": text})
         else:
             # ① 先签发**一次性**令牌并存指纹：会话文件里永远不会出现可用凭据
@@ -1580,7 +1806,12 @@ async def _approval_stream(
             start_row = agent_tools.tool_row(call, "start")
             rows.append(start_row)
             yield _sse("row", {"row": start_row})
-            payload_out, summary = await agent_tools.run_tool_call(call, approval_token=token)
+            payload_out, summary = await agent_tools.run_tool_call(
+                call,
+                approval_token=token,
+                access_mode="full" if agent_approvals.grants(record).get(agent_approvals.GRANT_FULL_ACCESS) else "workspace",
+                workspace_root=workspace_root,
+            )
             # 无论跑成没跑成，这次批准都**已经用掉了**（一次性）：不让"失败就再来一次"
             # 变成不受限的重试 —— 那等于把一次性批准变成了长期开关。
             agent_approvals.mark_consumed(record, request_id)
@@ -1596,12 +1827,6 @@ async def _approval_stream(
             # **把上一跳的思考过程原样带回**：思考型供应商（实测 deepseek 系列）在
             # `assistant.tool_calls` 回合会硬性要求 `reasoning_content`，缺了直接 400。
             # 它就在这一轮记录里（`turn["reasoning"]`），没理由不带。
-            assistant_call_msg = agent_tools.assistant_tool_message("", calls)
-            reasoning_before = str(((record.get("turns") or [])[turn_index] or {}).get("reasoning") or "")
-            reasoning_value = reasoning_echo(reasoning_before, ref)
-            if reasoning_value is not None:
-                assistant_call_msg["reasoning_content"] = reasoning_value
-            compactions_out: list[dict[str, Any]] = []
             messages_now: list[dict[str, Any]] = [
                 {
                     "role": "system",
@@ -1610,13 +1835,32 @@ async def _approval_stream(
                     + skills_system_block(),
                 },
                 *conversations.context_messages(record),
-                assistant_call_msg,
                 {
                     "role": "tool",
                     "tool_call_id": str(calls[0]["id"]),
                     "content": agent_tools.tool_message_content(payload_out),
                 },
             ]
+            # New records already persisted the pending assistant/tool-call
+            # message before asking for approval.  Appending it again would
+            # orphan the protocol pair on the next model request.  The
+            # fallback keeps legacy conversations resumable.
+            history = conversations.context_messages(record)
+            has_pending_call = any(
+                str(call.get("id") or "") == str(calls[0]["id"])
+                for message in history
+                if isinstance(message, dict)
+                for call in (message.get("tool_calls") or [])
+            )
+            if not has_pending_call:
+                assistant_call_msg = agent_tools.assistant_tool_message("", calls)
+                reasoning_before = str(
+                    ((record.get("turns") or [])[turn_index] or {}).get("reasoning") or ""
+                )
+                reasoning_value = reasoning_echo(reasoning_before, ref)
+                if reasoning_value is not None:
+                    assistant_call_msg["reasoning_content"] = reasoning_value
+                messages_now.insert(-1, assistant_call_msg)
             # 续答**照旧把工具摆上**：模型看到结果后常常要提下一条命令，
             # 那就再冒一张卡、再等一次裁决 —— 每条命令各批一次，这正是我们要的节奏。
             # （实测：不摆工具时，思考型供应商会因为"assistant 的 tool_calls 没带
@@ -1633,6 +1877,8 @@ async def _approval_stream(
                 "pending": None,
                 #: 本轮发生的上下文压缩（会话级落盘，刷新后研究者仍能看到"压过什么"）
                 "compactions": compactions_out,
+                "compaction_snapshots": [],
+                "agent_history": conversations.protocol_messages(messages_now),
             }
             async for frame in _agent_loop(
                 messages_now,
@@ -1643,11 +1889,13 @@ async def _approval_stream(
                 approvals_out=approvals_out,
                 state=state,
                 allow_fallback_first=False,
+                workspace_root=workspace_root,
             ):
                 yield frame
             result = state["result"]
             pending = state["pending"]
             soft_failure = state.get("soft_failure")
+            agent_history = state.get("agent_history") or conversations.protocol_messages(messages_now)
     except LLMError as exc:
         error_info = {
             "code": getattr(exc, "code", "llm_failed") or "llm_failed",
@@ -1695,6 +1943,12 @@ async def _approval_stream(
             reasoning_text = str((getattr(result, "raw", None) or {}).get("reasoning") or "")
         if REASONING_MAX_CHARS is not None and len(reasoning_text) > REASONING_MAX_CHARS:
             reasoning_text = reasoning_text[:REASONING_MAX_CHARS] + "\n…（思考过程过长，已截断）"
+        conversations.update_agent_state(
+            record,
+            agent_history,
+            checkpoints=compactions_out,
+            snapshots=state.get("compaction_snapshots") or [],
+        )
         # 裁决 + 卡片状态 + 这一轮答复**一次写入**：`append_turns` 写的就是整份记录，
         # 所以不会出现"批准记下了、卡片没更新"或反过来的半成品状态。
         if answer or rows:

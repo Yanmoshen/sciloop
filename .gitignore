@@ -52,6 +52,10 @@ htmlcov/
 # 不再丢失 offset 校验所需的全文（见 docker-compose.yml 的 backend.volumes）。
 .data/
 
+# 宿主机知识库运行时内容（用户论文、上传资料、对话与生成产物）
+knowledge-base/*
+!knowledge-base/.gitkeep
+
 # ===== 研究产出目录（模型在研究者电脑上写出来的文件，禁止入库）=====
 # research-workspaces/ 是执行器给研究项目用的默认工作目录：脚本、下载物、
 # 中间数据、图表都会落在这里，属于**研究者自己的研究内容**，不是本项目的源码。

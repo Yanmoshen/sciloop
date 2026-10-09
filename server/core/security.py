@@ -4,12 +4,12 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""访问控制：``X-Owner-Token`` 校验（WP01 公共依赖）。
+"""访问控制：本地管理员模式与 ``X-Owner-Token`` 校验。
 
 红线（contracts.api_contract.owner_header / forbidden_actions）：
 
 - ``OWNER_TOKEN`` **只能**来自服务端环境变量，禁止写入前端包或数据库
-- ``public_demo`` 面一律拒绝写操作；返回统一错误体 ``{code,message,detail}``
+- ``owner_mode`` 允许免令牌测试；``public_demo`` 的匿名写操作返回统一错误体
 - 令牌比较使用 ``secrets.compare_digest``，避免时序侧信道
 """
 
@@ -36,8 +36,15 @@ def _deny(message: str = "这个操作需要研究者身份：当前是只读浏
 
 
 def owner_token_matches(provided: str | None) -> bool:
-    """常量时间比较令牌；未配置 ``OWNER_TOKEN`` 时一律视为不通过。"""
-    expected = (get_settings().owner_token or "").strip()
+    """判断当前请求是否拥有 Owner 权限。
+
+    本地 ``owner_mode`` 是显式的管理员测试面，直接放行，方便宿主机部署后
+    无需在浏览器里重复录入令牌；``public_demo`` 仍严格要求服务端令牌。
+    """
+    settings = get_settings()
+    if settings.is_owner_mode:
+        return True
+    expected = (settings.owner_token or "").strip()
     if not expected:
         logger.warning("OWNER_TOKEN 未配置：所有写操作将被拒绝（public_demo 面）")
         return False
@@ -54,7 +61,7 @@ def is_owner(request: Request) -> bool:
 async def require_owner(
     x_owner_token: Annotated[str | None, Header(alias=OWNER_HEADER)] = None,
 ) -> None:
-    """FastAPI 依赖：写操作必须携带有效 ``X-Owner-Token``，否则 403。"""
+    """写操作允许管理员测试面或有效令牌，其余请求返回 403。"""
     if not owner_token_matches(x_owner_token):
         raise _deny()
 
