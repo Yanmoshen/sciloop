@@ -13,7 +13,14 @@
 | 交付 commit | `a240d7c`（本轮对齐）← `3518bbb`（首轮交付） |
 | 与 Agent 3 的关系 | **不等待、不依赖**：搜索/知识库/技能/MCP 全部靠 `ToolRegistry.bind(...)` 注入，未注入返回 `backend_unavailable` 结构化错误，测试全程离线 |
 
-`git diff --name-only agent-v2-contract-v1...HEAD` 命中范围：`server/services/{tool_registry_v2,approval_v2,sandbox_v2,host_execution_v2,agent_tree_tools_v2}/`、`server/tests/agent_v2/tools/`。
+`git diff --name-only 4d7bec5...HEAD`（相对**本线实现基线**）命中范围仅：
+`server/services/{tool_registry_v2,approval_v2,sandbox_v2,host_execution_v2,agent_tree_tools_v2}/`、
+`server/tests/agent_v2/tools/`；自动越界检查结果：**无越界文件**。
+
+> 口径说明：按字面执行 `git diff --name-only agent-v2-contract-v1...HEAD` 会**同时包含 Agent 1 的实现**
+> （本分支基于 `4d7bec5`，它已包含 Agent 1 在契约标签之上的提交）。因此"本线改动范围"以实现基线
+> `4d7bec5` 为参照——上表即该口径下的结果，全部落在白名单目录内。
+
 未修改：契约目录、Agent 1 运行时/线程/网关/压缩/记忆/提示词、`api/v1`、`api/v2`、`web/`、`main.py`、`mcp_server/`、旧 `agent/{policy,approvals,sandbox,host_runner}.py`、迁移与 Docker 文件。
 
 ## 2. 工具清单与权限矩阵
