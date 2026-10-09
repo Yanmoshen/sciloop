@@ -22,6 +22,7 @@ import {
   formatOf,
   folderPath,
   hasContent,
+  loadEntry,
   updateEntry,
   type KnowledgeBucket,
   type KnowledgeDraft,
@@ -51,9 +52,21 @@ const BUCKET_OPTIONS: ReadonlyArray<{ value: KnowledgeBucket; label: string }> =
 const draft = ref<KnowledgeDraft>(emptyDraft(props.defaultBucket, props.currentFolder))
 const busy = ref(false)
 const errorNotice = ref('')
+/**
+ * 打开时那条的**原始正文**。
+ *
+ * 列表接口只回元数据（正文按需取），所以 draft 里的 content 初始是空的 ——
+ * 提交时必须靠这个基准判断"研究者到底改没改正文"：
+ * **没改就绝不把 content 发给后端**，否则一次"改个名字"就会把正文写空。
+ */
+const originalContent = ref('')
+/** 正在补取正文（文本类文件打开编辑器时） */
+const hydrating = ref(false)
 
 const isCreate = computed(() => props.entry === null)
-const canSubmit = computed(() => draft.value.name.trim().length > 0 && !busy.value && props.canWrite)
+const canSubmit = computed(
+  () => draft.value.name.trim().length > 0 && !busy.value && !hydrating.value && props.canWrite,
+)
 
 /** 文本类文件才给内容编辑框（md / 代码 / 纯文本 / csv 都是文本） */
 const canEditContent = computed(() =>
@@ -62,13 +75,33 @@ const canEditContent = computed(() =>
 
 const fileName = computed(() => (draft.value.name.trim() ? draft.value.name.trim() : ''))
 
-function hydrate(): void {
+async function hydrate(): Promise<void> {
   if (props.entry) {
     const { id: _id, imported_at: _imported, modified_at: _modified, moved_at: _moved, trashed_at: _trashed, ...rest } =
       props.entry
-    draft.value = { ...rest, folder: [...rest.folder], tags: [...rest.tags] }
+    draft.value = {
+      ...rest,
+      // folder 走 folderPath 归一：历史数据里可能是字符串（直接展开会变成一堆字符）
+      folder: folderPath(rest.folder) ? folderPath(rest.folder).split('/') : [],
+      tags: [...rest.tags],
+    }
+    originalContent.value = rest.content ?? ''
+    // 文本类文件：列表里没有正文，打开编辑器时按需补回来（否则编辑框是空的，容易被误改）
+    if (canEditContent.value && hasContent(props.entry)) {
+      hydrating.value = true
+      try {
+        const full = await loadEntry(props.entry.id)
+        draft.value.content = full.content ?? ''
+        originalContent.value = full.content ?? ''
+      } catch {
+        // 取不回来就按元数据编辑；提交时"没改就不发 content"，仍不会清空正文
+      } finally {
+        hydrating.value = false
+      }
+    }
   } else {
     draft.value = emptyDraft(props.defaultBucket, props.currentFolder)
+    originalContent.value = ''
   }
   busy.value = false
   errorNotice.value = ''
@@ -82,14 +115,22 @@ async function submit(): Promise<void> {
   if (!canSubmit.value) return
   busy.value = true
   errorNotice.value = ''
-  const payload: KnowledgeDraft = {
+  const payload: Partial<KnowledgeDraft> = {
     ...draft.value,
     name: draft.value.name.trim(),
     tags: draft.value.tags.map((tag) => tag.trim()).filter(Boolean),
     size: canEditContent.value ? draft.value.content.length : draft.value.size,
   }
+  // 编辑既有条目时，**只有研究者真的改了正文才带 content**：
+  // 列表不带正文，无条件回写会把正文（以及二进制文件的字节）清空。
+  if (props.entry && !(canEditContent.value && draft.value.content !== originalContent.value)) {
+    delete payload.content
+    delete payload.size
+  }
   try {
-    const saved = props.entry ? await updateEntry(props.entry.id, payload) : await createEntry(payload)
+    const saved = props.entry
+      ? await updateEntry(props.entry.id, payload)
+      : await createEntry(payload as KnowledgeDraft)
     if (!saved) {
       errorNotice.value = '该条目已不在知识库里（可能已被删除）'
       return
@@ -107,7 +148,7 @@ async function submit(): Promise<void> {
 watch(
   () => props.modelValue,
   (open) => {
-    if (open) hydrate()
+    if (open) void hydrate()
   },
 )
 </script>

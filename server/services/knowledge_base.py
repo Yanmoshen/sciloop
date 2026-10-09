@@ -8,15 +8,18 @@ files. This keeps backups, inspection, and migration possible without the databa
 
 from __future__ import annotations
 
+import contextlib
 import json
 import mimetypes
+import os
 import secrets
+import stat
 import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from services.storage import ensure_knowledge_root, safe_folder, safe_name
+from services.storage import knowledge_root, safe_folder, safe_name
 
 _LOCK = threading.RLock()
 _MANIFEST = "entries.json"
@@ -28,11 +31,12 @@ def _now() -> str:
 
 
 def _manifest_path() -> Path:
-    return ensure_knowledge_root() / "metadata" / _MANIFEST
+    # 读路径不 mkdir：目录由 `_write_json`（写入时）保证存在，避免每个请求都做一轮建目录
+    return knowledge_root() / "metadata" / _MANIFEST
 
 
 def _folder_path() -> Path:
-    return ensure_knowledge_root() / "metadata" / _FOLDERS
+    return knowledge_root() / "metadata" / _FOLDERS
 
 
 def _read_json(path: Path, fallback: Any) -> Any:
@@ -67,58 +71,157 @@ def _bucket_dir(bucket: str) -> str:
     return {"literature": "literature", "idea": "projects", "experiment": "projects", "paper": "projects", "memory": "memories"}.get(bucket, "uploads")
 
 
+def _folder_list(value: Any) -> list[str]:
+    """把 ``folder`` 统一成 ``list[str]``。
+
+    ⚠️ 迁移进来的历史数据里有 ``folder: "uploads"`` 这类**字符串**（实测 915 条中 18 条），
+    而前端按 ``string[]`` 消费（``folder.join('/')``）——**一条坏数据就能让整页渲染抛错**，
+    界面永远停在骨架态（2026-10-09 实测的"知识库一直在闪烁"就是这个）。
+    因此出口统一在这里归一，同时兼容路径拼接与文件夹筛选两处用法。
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        parts = [piece for piece in value.replace("\\", "/").split("/") if piece.strip()]
+        return safe_folder(parts)
+    if isinstance(value, (list, tuple)):
+        return safe_folder([str(piece) for piece in value])
+    return []
+
+
 def _payload_path(entry: dict[str, Any]) -> Path:
-    root = ensure_knowledge_root()
+    """条目对应的磁盘路径。
+
+    ⚠️ 这个函数在**列表**路径上会被逐条调用（本机实测 915 条），因此这里**只做纯字符串
+    运算**：既不 mkdir（早期版本调用 `ensure_knowledge_root()`，每条目 10 次 mkdir，
+    是列表 10s 里的一大块），也不做 `.resolve()`（Windows 上每次都会打 FS）。
+    越界判断改用 `normpath` 折叠 `..` 后再做前缀比较，安全性与 resolve 版等价。
+    """
+    root = knowledge_root()
     relative_path = entry.get("relative_path")
     if isinstance(relative_path, str) and relative_path.strip():
-        candidate = (root / relative_path).resolve()
-        if candidate != root and root in candidate.parents:
-            return candidate
-    folder = safe_folder(entry.get("folder"))
+        candidate = Path(os.path.normpath(root / relative_path))
+        if candidate != root:
+            try:
+                candidate.relative_to(root)
+                return candidate
+            except ValueError:
+                pass
+    folder = _folder_list(entry.get("folder"))
     bucket = _bucket_dir(str(entry.get("bucket") or "uploads"))
     return root / bucket / Path(*folder) / str(entry["stored_name"])
 
 
-def _public_entry(entry: dict[str, Any]) -> dict[str, Any]:
+#: 能在列表里直接内联正文的文本后缀（超过 2MB 的一律不读，避免列表被大文件拖死）
+_INLINE_TEXT_SUFFIXES = {".md", ".txt", ".csv", ".json", ".py", ".js", ".ts", ".vue", ".yaml", ".yml"}
+
+
+def _stat_file(path: Path) -> tuple[bool, int]:
+    """一次 stat 同时拿到「是不是普通文件」和「字节数」（列表路径上每条都要问，省 syscall）。"""
+    try:
+        info = path.stat()
+    except OSError:
+        return False, 0
+    return stat.S_ISREG(info.st_mode), int(info.st_size)
+
+
+def _inline_text_ok(path: Path, size: int) -> bool:
+    """这个文件**是否有一段可读的文本正文**（不读内容，只看后缀与大小）。"""
+    if size == 0 or size > 2 * 1024 * 1024:
+        return False
+    if path.suffix.lower() in _INLINE_TEXT_SUFFIXES:
+        return True
+    mime = mimetypes.guess_type(path.name)[0] or ""
+    return mime.startswith("text/")
+
+
+def _public_entry(entry: dict[str, Any], *, with_content: bool = True) -> dict[str, Any]:
+    """条目对外形态。
+
+    ``with_content=False`` 用于**列表**：正文一律不回（本机实测 915 条会把响应撑到 46MB，
+    前端因此长期卡在骨架态），改为给一个 ``has_content`` 布尔量让界面知道"这条有没有正文"，
+    真正要看正文时再走单条详情接口。``file_url`` 两种情况都保留。
+    """
     result = dict(entry)
+    # folder 一律归一成 list[str]（历史数据里有字符串形态，见 _folder_list）
+    result["folder"] = _folder_list(entry.get("folder"))
     path = _payload_path(entry)
-    result["file_url"] = f"/api/v1/knowledge/files/{entry['id']}" if path.is_file() else None
-    if not result.get("content") and path.is_file() and path.stat().st_size <= 2 * 1024 * 1024:
-        mime = mimetypes.guess_type(path.name)[0] or ""
-        if mime.startswith("text/") or path.suffix.lower() in {".md", ".txt", ".csv", ".json", ".py", ".js", ".ts", ".vue", ".yaml", ".yml"}:
-            try:
-                result["content"] = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                pass
+    is_file, size = _stat_file(path)
+    result["file_url"] = f"/api/v1/knowledge/files/{entry['id']}" if is_file else None
+    result["has_content"] = bool(result.get("content")) or (is_file and _inline_text_ok(path, size))
+    if not with_content:
+        result["content"] = ""
+    elif not result.get("content") and is_file and _inline_text_ok(path, size):
+        with contextlib.suppress(OSError, UnicodeDecodeError):
+            result["content"] = path.read_text(encoding="utf-8")
     result.pop("stored_name", None)
     result.pop("relative_path", None)
     return result
 
 
-def snapshot(*, q: str = "", bucket: str | None = None, folder: list[str] | None = None, project_id: int | None = None) -> dict[str, Any]:
+def _folder_prefixes(folder: list[str]) -> list[str]:
+    return ["/".join(folder[:depth]) for depth in range(1, len(folder) + 1)]
+
+
+def _folder_tree(all_entries: list[dict[str, Any]]) -> list[str]:
+    """完整文件夹树（含每一级前缀）。
+
+    ⚠️ `folders.json` 里可能只登记了**叶子路径**（实测本机只有 `conversations/100`、
+    没有 `conversations`），而界面在根目录只列「深度正好 +1」的直接下级 →
+    结果根目录几乎什么都不显示（只剩一个 uploads），看起来像"知识库里没东西"。
+    因此这里按文件夹自身的每一级前缀补全。
+    """
+    paths: set[str] = set()
+    for value in _folders():
+        paths.update(_folder_prefixes(_folder_list(value)))
+    for item in all_entries:
+        paths.update(_folder_prefixes(_folder_list(item.get("folder"))))
+    paths.discard("")
+    return sorted(paths)
+
+
+def snapshot(
+    *, q: str = "", bucket: str | None = None, folder: list[str] | None = None, project_id: int | None = None
+) -> dict[str, Any]:
+    """列表快照：**只回元数据**（见 :func:`_public_entry` 的 ``with_content``）。"""
     needle = q.strip().lower()
     folder_key = "/".join(safe_folder(folder)) if folder is not None else None
     with _LOCK:
+        all_entries = _entries()
         entries = []
-        for item in _entries():
+        for item in all_entries:
             if bucket and item.get("bucket") != bucket:
                 continue
-            if folder_key is not None and "/".join(item.get("folder") or []) != folder_key:
+            if folder_key is not None and "/".join(_folder_list(item.get("folder"))) != folder_key:
                 continue
             if project_id is not None and item.get("project_id") != project_id:
                 continue
             if needle and needle not in json.dumps(item, ensure_ascii=False).lower():
                 continue
-            entries.append(_public_entry(item))
-        return {"items": entries, "folders": sorted(_folders())}
+            entries.append(_public_entry(item, with_content=False))
+        return {"items": entries, "folders": _folder_tree(all_entries)}
 
 
 def get(entry_id: str) -> dict[str, Any] | None:
+    """单条详情（**含正文**）。"""
     with _LOCK:
         for item in _entries():
             if item.get("id") == entry_id:
                 return _public_entry(item)
     return None
+
+
+def details(entry_ids: list[str]) -> list[dict[str, Any]]:
+    """批量详情（**含正文**），供导出这类"要正文"的操作一次取回。"""
+    wanted = {str(value) for value in entry_ids if str(value)}
+    if not wanted:
+        return []
+    found: list[dict[str, Any]] = []
+    with _LOCK:
+        for item in _entries():
+            if item.get("id") in wanted:
+                found.append(_public_entry(item))
+    return found
 
 
 def _save(entries: list[dict[str, Any]]) -> None:
@@ -180,7 +283,7 @@ def update(entry_id: str, patch: dict[str, Any]) -> dict[str, Any] | None:
         if "name" in patch:
             target["name"] = safe_name(str(patch["name"]), fallback=target["name"])
         if "folder" in patch:
-            target["folder"] = safe_folder(patch.get("folder"))
+            target["folder"] = _folder_list(patch.get("folder"))
         for key in ("bucket", "tags", "project_id", "source_label", "source_route", "content"):
             if key in patch:
                 target[key] = patch[key]
@@ -218,10 +321,8 @@ def delete(entry_ids: list[str]) -> int:
         deleted = 0
         for item in entries:
             if item.get("id") in entry_ids:
-                try:
+                with contextlib.suppress(OSError):
                     _payload_path(item).unlink(missing_ok=True)
-                except OSError:
-                    pass
                 deleted += 1
             else:
                 remain.append(item)

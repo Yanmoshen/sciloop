@@ -18,7 +18,7 @@
 import { onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
-import { loadSnapshot, type KnowledgeEntry } from '@/api/knowledge'
+import { loadEntry, type KnowledgeEntry } from '@/api/knowledge'
 import KnowledgeReader from '@/components/knowledge/KnowledgeReader.vue'
 
 const route = useRoute()
@@ -37,8 +37,8 @@ function closePage(): void {
 onMounted(async () => {
   const id = String(route.params.entryId ?? '')
   try {
-    const snapshot = await loadSnapshot()
-    entry.value = snapshot.items.find((item) => item.id === id) ?? null
+    // 列表接口只回元数据，正文按需取这一条（原来拉整份快照，915 条会到 46MB）
+    entry.value = await loadEntry(id)
   } catch {
     entry.value = null
   } finally {

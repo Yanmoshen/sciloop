@@ -33,6 +33,8 @@ import {
   formatTime,
   hasContent,
   KB_BUCKETS,
+  loadEntries,
+  loadEntry,
   loadSnapshot,
   moveEntries,
   restoreEntries,
@@ -278,6 +280,33 @@ const breadcrumb = computed(() => [
 ])
 
 const openEntry = computed(() => items.value.find((entry) => entry.id === openEntryId.value) ?? null)
+/**
+ * 打开的那一条的**完整内容**。
+ *
+ * 列表接口只回元数据（正文按需取，见 `api/knowledge.ts` 里 `has_content` 的说明），
+ * 所以阅读器不能直接吃列表项 —— 打开时单独取一次详情。
+ */
+const openDetail = ref<KnowledgeEntry | null>(null)
+const openDetailLoading = ref(false)
+watch(
+  openEntryId,
+  async (id) => {
+    openDetail.value = null
+    if (!id) {
+      openDetailLoading.value = false
+      return
+    }
+    openDetailLoading.value = true
+    try {
+      openDetail.value = await loadEntry(id)
+    } catch {
+      openDetail.value = null
+    } finally {
+      openDetailLoading.value = false
+    }
+  },
+  { immediate: true },
+)
 const selectedEntries = computed(() => items.value.filter((entry) => selected.value.includes(entry.id)))
 const tagPool = computed(() => [...new Set(items.value.flatMap((entry) => entry.tags))].sort())
 const hasSelection = computed(() => selected.value.length > 0)
@@ -319,7 +348,8 @@ function badgeOf(entry: KnowledgeEntry): { label: string; tone: string } {
 }
 
 function folderOf(entry: KnowledgeEntry): string {
-  return entry.folder.length ? `知识库 / ${entry.folder.join(' / ')}` : '知识库'
+  const path = folderPath(entry.folder)
+  return path ? `知识库 / ${path.split('/').join(' / ')}` : '知识库'
 }
 
 /* ---------------- 读写 ---------------- */
@@ -412,8 +442,10 @@ function mergeEntries(added: KnowledgeEntry[]): void {
   items.value = [...added, ...items.value]
   const paths = new Set(folders.value)
   for (const entry of added) {
-    for (let depth = 1; depth <= entry.folder.length; depth += 1) {
-      paths.add(entry.folder.slice(0, depth).join('/'))
+    // 走 folderPath 而不是直接吃 entry.folder：历史数据里有字符串形态（见 api/knowledge.ts）
+    const segments = folderPath(entry.folder) ? folderPath(entry.folder).split('/') : []
+    for (let depth = 1; depth <= segments.length; depth += 1) {
+      paths.add(segments.slice(0, depth).join('/'))
     }
   }
   folders.value = [...paths].sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'))
@@ -459,15 +491,35 @@ function download(filename: string, content: string, mime: string): void {
 }
 
 function onExportCommand(command: string): void {
+  void runExport(command)
+}
+
+async function runExport(command: string): Promise<void> {
   const scopeItems = exportScope()
   if (!scopeItems.length) return
-  const stamp = new Date().toISOString().slice(0, 10)
-  if (command === 'json') {
-    download(`sciloop-knowledge-${stamp}.json`, exportJson(scopeItems), 'application/json')
-  } else {
-    download(`sciloop-knowledge-${stamp}.md`, exportMarkdown(scopeItems), 'text/markdown')
+  busy.value = true
+  let degraded = false
+  try {
+    // 列表只回元数据，导出要正文 → 先按需批量取回（一次请求）
+    let withBody = scopeItems
+    try {
+      const full = await loadEntries(scopeItems.map((entry) => entry.id))
+      const byId = new Map(full.map((entry) => [entry.id, entry]))
+      withBody = scopeItems.map((entry) => byId.get(entry.id) ?? entry)
+    } catch {
+      // 正文取不回来也别整个失败：退化成"只导出元数据"，并如实说明
+      degraded = true
+    }
+    const stamp = new Date().toISOString().slice(0, 10)
+    if (command === 'json') {
+      download(`sciloop-knowledge-${stamp}.json`, exportJson(withBody), 'application/json')
+    } else {
+      download(`sciloop-knowledge-${stamp}.md`, exportMarkdown(withBody), 'text/markdown')
+    }
+    notice.value = degraded ? `正文读取失败，已按元数据导出 ${withBody.length} 条` : `已导出 ${withBody.length} 条`
+  } finally {
+    busy.value = false
   }
-  notice.value = `已导出 ${scopeItems.length} 条`
 }
 
 function startTagging(): void {
@@ -606,7 +658,13 @@ onMounted(async () => {
 
     <!-- 内容区 -->
     <div class="kb__content">
-      <KnowledgeReader v-if="openEntry" :entry="openEntry" @back="openEntryId = null" @open-standalone="openInNewTab" />
+      <KnowledgeReader
+        v-if="openDetail"
+        :entry="openDetail"
+        @back="openEntryId = null"
+        @open-standalone="openInNewTab"
+      />
+      <div v-else-if="openDetailLoading" class="kb__state">正在读取正文…</div>
 
       <template v-else>
         <!-- 第 1 行：批量栏（有选中时替换动作行） -->
@@ -1039,6 +1097,16 @@ onMounted(async () => {
 .kb__resizer:focus-visible {
   outline: 2px solid var(--color-brand);
   outline-offset: 2px;
+}
+
+.kb__state {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 160px;
+  font-size: 13px;
+  color: var(--color-text-secondary);
 }
 
 .kb__content {

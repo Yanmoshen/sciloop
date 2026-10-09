@@ -193,6 +193,11 @@ export interface KnowledgeEntry {
   source_route: string | null
   /** 真实文件地址（接后端后才有；demo 里二进制文件为 null） */
   file_url: string | null
+  /**
+   * 是否有正文。**列表接口只回这个布尔量，不回 `content`**（正文按需走详情接口取）——
+   * 否则 915 条的列表响应会到 46MB，页面会一直卡在加载态。
+   */
+  has_content?: boolean
   /** 导入时间 */
   imported_at: string
   /** 最近一次内容修改 */
@@ -251,12 +256,30 @@ export interface KnowledgeQuery {
  * 三、派生视图（纯函数，界面与导出共用一份口径）
  * ------------------------------------------------------------------ */
 
-export function folderPath(folder: string[]): string {
-  return folder.join('/')
+/**
+ * 文件夹路径 → 字符串。
+ *
+ * ⚠️ 入参按 `string[]` 声明，但**要容忍历史脏数据**：迁移进来的条目里存在
+ * `folder: "uploads"` 这种字符串形态，`folder.join()` 会直接抛 TypeError，
+ * 而它跑在 computed 里 → **一条坏数据就把整页渲染打断，界面永远停在骨架**。
+ * 后端已统一归一（见 `services/knowledge_base.py` 的 `_folder_list`），
+ * 这里再兜一层，保证前端不会因为一条数据整页白掉。
+ */
+export function folderPath(folder: string[] | string | null | undefined): string {
+  if (Array.isArray(folder)) return folder.join('/')
+  if (typeof folder === 'string') return folder
+  return ''
 }
 
+/**
+ * 「这条有没有正文」。
+ *
+ * 列表接口只回元数据（正文一律不回，否则 915 条的响应会到 46MB），因此这里优先看后端给的
+ * `has_content`；拿不到该字段时（例如条目详情、旧响应）再退回按 `content` 判断。
+ */
 export function hasContent(entry: KnowledgeEntry): boolean {
-  return entry.content.trim().length > 0
+  if (typeof entry.has_content === 'boolean') return entry.has_content
+  return (entry.content ?? '').trim().length > 0
 }
 
 /** 表格「修改时间」列显示的值：导入 / 移动 / 编辑三者取最近 */
@@ -369,6 +392,18 @@ export function loadSnapshot(): Promise<KnowledgeSnapshot> {
   return get<KnowledgeSnapshot>('/knowledge/entries')
 }
 
+/** 单条详情（**含正文**）——列表不带正文，阅读器打开时按需取这一条。 */
+export function loadEntry(id: string): Promise<KnowledgeEntry> {
+  return get<KnowledgeEntry>(`/knowledge/entries/${encodeURIComponent(id)}`)
+}
+
+/** 批量详情（**含正文**）——导出这类"要正文"的操作一次取回。 */
+export async function loadEntries(ids: string[]): Promise<KnowledgeEntry[]> {
+  if (!ids.length) return []
+  const result = await post<{ items: KnowledgeEntry[] }>('/knowledge/entries/details', { body: { ids } })
+  return result.items
+}
+
 export function createEntry(draft: KnowledgeDraft): Promise<KnowledgeEntry> {
   return post<KnowledgeEntry>('/knowledge/entries', { body: draft })
 }
@@ -425,16 +460,17 @@ export function exportJson(entries: KnowledgeEntry[]): string {
 export function exportMarkdown(entries: KnowledgeEntry[]): string {
   const lines: string[] = ['# 知识库导出', '', `共 ${entries.length} 条。`, '']
   for (const entry of entries) {
+    const location = folderPath(entry.folder)
     lines.push(`## ${entry.name}`, '')
     lines.push(
       `- 分类：${BUCKET_LABELS[entry.bucket]}`,
-      `- 位置：知识库${entry.folder.length ? ` / ${entry.folder.join(' / ')}` : ''}`,
+      `- 位置：知识库${location ? ` / ${location.split('/').join(' / ')}` : ''}`,
       `- 来源：${entry.source_label}`,
       `- 导入：${formatDateTime(entry.imported_at)}`,
     )
     if (entry.tags.length) lines.push(`- 标签：${entry.tags.join(' / ')}`)
     lines.push('')
-    if (entry.content.trim()) lines.push(entry.content.trim(), '')
+    if ((entry.content ?? '').trim()) lines.push((entry.content ?? '').trim(), '')
   }
   return lines.join('\n')
 }

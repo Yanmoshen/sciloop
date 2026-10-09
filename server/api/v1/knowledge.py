@@ -93,10 +93,31 @@ async def tag_entries(_owner: OwnerDep, payload: Annotated[dict, Body(...)]) -> 
     tag = str(payload.get("tag") or "").strip()
     for entry_id in payload.get("ids") or []:
         item = knowledge_base.get(str(entry_id))
-        if item and tag not in item.get("tags", []):
-            if knowledge_base.update(str(entry_id), {"tags": [*item.get("tags", []), tag]}):
-                changed += 1
+        if (
+            item
+            and tag not in item.get("tags", [])
+            and knowledge_base.update(str(entry_id), {"tags": [*item.get("tags", []), tag]})
+        ):
+            changed += 1
     return {"changed": changed}
+
+
+@router.post("/entries/details")
+async def entry_details(payload: Annotated[dict, Body(...)]) -> dict[str, list[dict]]:
+    """批量取**含正文**的条目（导出这类"要正文"的操作走这里，一次取回）。
+
+    列表接口只回元数据：本机实测 915 条把全文内联会把响应撑到 46MB、前端卡在骨架态。
+    """
+    return {"items": knowledge_base.details([str(value) for value in payload.get("ids") or []])}
+
+
+@router.get("/entries/{entry_id}")
+async def entry_detail(entry_id: str) -> dict:
+    """单条详情（含正文）。"""
+    item = knowledge_base.get(entry_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail={"code": "knowledge_not_found", "message": "条目不存在"})
+    return item
 
 
 @router.post("/folders")
