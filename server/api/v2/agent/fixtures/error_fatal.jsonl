@@ -1,0 +1,2 @@
+{"type": "meta", "thread_name": "不可恢复错误", "model": "fake-fatal"}
+{"type": "model_response", "items": [{"kind": "error", "error_class": "fatal", "message": "模型服务返回不可恢复错误（401 鉴权失败）"}]}

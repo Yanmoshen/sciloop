@@ -1,0 +1,4 @@
+{"type": "meta", "thread_name": "中断长回答", "model": "fake-slow"}
+{"type": "model_delay", "seconds": 0.02}
+{"type": "model_response", "items": [{"kind": "reasoning_delta", "text": "开始分析材料。"}, {"kind": "text_delta", "text": "第 1 段：正在逐段核对材料内容。"}, {"kind": "text_delta", "text": "第 2 段：正在逐段核对材料内容。"}, {"kind": "text_delta", "text": "第 3 段：正在逐段核对材料内容。"}, {"kind": "text_delta", "text": "第 4 段：正在逐段核对材料内容。"}, {"kind": "text_delta", "text": "第 5 段：正在逐段核对材料内容。"}, {"kind": "text_delta", "text": "第 6 段：正在逐段核对材料内容。"}, {"kind": "text_delta", "text": "第 7 段：正在逐段核对材料内容。"}, {"kind": "text_delta", "text": "第 8 段：正在逐段核对材料内容。"}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "中断后重新开始的简短回答。"}, {"kind": "completed", "stop_reason": "end_turn"}]}

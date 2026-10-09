@@ -1,0 +1,3 @@
+{"type": "meta", "thread_name": "可重试错误", "model": "fake-retry"}
+{"type": "model_response", "items": [{"kind": "error", "error_class": "retryable", "message": "上游限流（429），稍后重试", "retry_after_s": 0.0}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "重试成功：上游恢复后拿到了结果。"}, {"kind": "usage", "input_tokens": 20, "output_tokens": 10}, {"kind": "completed", "stop_reason": "end_turn"}]}
