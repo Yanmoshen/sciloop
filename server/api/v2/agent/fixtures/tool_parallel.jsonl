@@ -1,4 +1,4 @@
-{"type": "meta", "thread_name": "多工具并行与串行", "model": "fake-tools"}
+{"type": "meta", "thread_name": "只读工具并行", "model": "fake-tools"}
 {"type": "tool_spec", "name": "read_file", "kind": "read_only", "description": "读取文件"}
 {"type": "tool_spec", "name": "list_dir", "kind": "read_only", "description": "列出目录"}
 {"type": "tool_spec", "name": "write_file", "kind": "side_effect", "description": "写入文件"}

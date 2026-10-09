@@ -43,6 +43,7 @@ from contracts.agent_v2.enums import (
     ApprovalStatus,
     EventType,
     MemoryScope,
+    ToolCallStatus,
     TurnStatus,
 )
 from contracts.agent_v2.ids import is_valid_id
@@ -95,6 +96,8 @@ class CallContext:
     #: 本条请求的客户端幂等键（由 :meth:`AgentFacade.dispatch` 填入）。
     #: 透传到领域层后，Turn 记录携带的就是客户端的键，断线重试的审计线索不会断。
     idempotency_key: str | None = None
+    #: 是否具备写权限。只读访问面（public_demo 匿名）为 False，变更类方法会被拒绝。
+    owner: bool = True
 
     def notify(
         self,
@@ -153,6 +156,12 @@ class AgentFacade:
         try:
             spec = method_spec(request.method)
             validate_params(spec, request.params)
+            if spec.mutating and not ctx.owner:
+                raise ProtocolError.permission_denied(
+                    "当前是只读浏览模式，这个操作需要研究者身份。到「设置」里切换后重试。",
+                    method=spec.name,
+                    required="owner",
+                )
             if spec.mutating and not request.idempotency_key:
                 raise ProtocolError.invalid_params(
                     f"{spec.name}: mutating method requires idempotency_key",
@@ -212,7 +221,7 @@ class AgentFacade:
             return
         if entry.fingerprint != fingerprint:
             raise ProtocolError(
-                ErrorCode.DUPLICATE_REQUEST,
+                ErrorCode.IDEMPOTENCY_CONFLICT,
                 f"request id {request.id!r} was already used with a different payload "
                 f"on connection {ctx.connection_id!r}",
                 data={
@@ -303,11 +312,11 @@ class AgentFacade:
         last = store.last_sequence()
         floor = self.replay_floor(thread_id)
         if after_sequence < floor:
-            raise ProtocolError.stale_cursor(
+            raise ProtocolError.cursor_expired(
                 after_sequence, last_sequence=last, reason="below_replay_floor", floor=floor
             )
         if after_sequence > last:
-            raise ProtocolError.stale_cursor(
+            raise ProtocolError.cursor_expired(
                 after_sequence, last_sequence=last, reason="cursor_ahead", floor=floor
             )
         events = store.read_cursor(after_sequence)
@@ -458,12 +467,35 @@ class AgentFacade:
         )
         created = turn.turn_id not in before
         if created and turn.status is TurnStatus.RUNNING:
-            self.host.start(thread_id, turn.turn_id)
+            self._start_host(thread_id, turn.turn_id)
         return {
             "turn": self._turn_view(self.repo.state(thread_id).turn(turn.turn_id)),
             "created": created,
             "reused": not created,
         }
+
+    def _start_host(self, thread_id: str, turn_id: str) -> None:
+        """把 Turn 交给执行宿主。
+
+        宿主不可用时（未装配 / 已关闭 / 场景声明不可用），**先把 Turn 收成失败终态**
+        再把结构化错误抛出去——否则会留下一个没人执行的 running Turn，
+        把线程卡死（后续请求全部 concurrency 冲突）。
+        """
+        try:
+            self.host.start(thread_id, turn_id)
+        except RuntimeUnavailable:
+            current = self.repo.state(thread_id).turns.get(turn_id)
+            if current is not None and current.status in ACTIVE_TURN_STATUSES:
+                self.repo.fail_turn(
+                    thread_id,
+                    turn_id,
+                    error={
+                        "code": "runtime_unavailable",
+                        "error_class": "fatal",
+                        "message": "运行时不可用，这一轮没有开始执行。",
+                    },
+                )
+            raise
 
     def _collect_inputs(self, params: Mapping[str, Any]) -> list[dict[str, Any]]:
         raw_inputs = params.get("inputs")
@@ -503,13 +535,14 @@ class AgentFacade:
             raise ProtocolError.invalid_params("turn/steer: text must be non-empty")
         state = self.repo.state(thread_id)
         turn = state.turn(turn_id)
-        if turn.status not in ACTIVE_TURN_STATUSES:
-            raise ProtocolError(
-                ErrorCode.ILLEGAL_TURN_TRANSITION,
-                f"turn {turn_id} is {turn.status.value}; steering requires an active turn",
-                data={"turn_id": turn_id, "from": turn.status.value, "active": sorted(
-                    status.value for status in ACTIVE_TURN_STATUSES
-                )},
+        self._require_control_ready(thread_id, turn)
+        if turn.status is not TurnStatus.RUNNING:
+            raise ProtocolError.invalid_state(
+                "这个回合当前不接受追加输入。",
+                kind="turn_not_running",
+                turn_id=turn_id,
+                status=turn.status.value,
+                allowed=[TurnStatus.RUNNING.value],
             )
         item = self.repo.append_input(
             thread_id, turn_id, text, idempotency_key=ctx.idempotency_key
@@ -527,17 +560,48 @@ class AgentFacade:
         text = self._text_of(params, "text")
         state = self.repo.state(thread_id)
         turn = state.turn(turn_id)
+        self._require_control_ready(thread_id, turn)
         if turn.status is not TurnStatus.WAITING_INPUT:
-            raise ProtocolError(
-                ErrorCode.ILLEGAL_TURN_TRANSITION,
-                f"turn {turn_id} is {turn.status.value}; continue requires waiting_input",
-                data={"turn_id": turn_id, "from": turn.status.value, "to": "running",
-                      "allowed": [TurnStatus.WAITING_INPUT.value]},
+            raise ProtocolError.invalid_state(
+                "这个回合当前不需要补充输入。",
+                kind="turn_not_waiting_input",
+                turn_id=turn_id,
+                status=turn.status.value,
+                allowed=[TurnStatus.WAITING_INPUT.value],
             )
         updated = self.repo.continue_turn(thread_id, turn_id, text)
         if not self.host.is_running(thread_id):
-            self.host.start(thread_id, turn_id)
+            self._start_host(thread_id, turn_id)
         return {"turn": self._turn_view(updated)}
+
+    def _require_control_ready(self, thread_id: str, turn: Turn) -> None:
+        """控制类操作的前置判定：**按状态给出可行动的错误码**，而不是笼统的非法迁移。
+
+        前端据此能直接给出下一步动作（去审批 / 重试 / 恢复 / 直接发新消息）。
+        """
+        status = turn.status
+        if status is TurnStatus.WAITING_APPROVAL:
+            pending = [
+                approval.approval_id
+                for approval in self.repo.state(thread_id).approvals.values()
+                if approval.turn_id == turn.turn_id and approval.status is ApprovalStatus.PENDING
+            ]
+            raise ProtocolError.approval_pending(
+                thread_id=thread_id,
+                turn_id=turn.turn_id,
+                approval_id=pending[0] if pending else None,
+            )
+        if status in (TurnStatus.INTERRUPTED, TurnStatus.FAILED):
+            raise ProtocolError.turn_terminated(
+                status.value, turn_id=turn.turn_id, reason=turn.cancel_reason
+            )
+        if status is TurnStatus.COMPLETED:
+            raise ProtocolError.invalid_state(
+                "这个回合已经结束，直接发送新消息继续即可。",
+                kind="turn_completed",
+                turn_id=turn.turn_id,
+                status=status.value,
+            )
 
     async def turn_interrupt(self, params: Mapping[str, Any], ctx: CallContext) -> dict[str, Any]:
         thread_id = self._require_id("thread", params.get("thread_id"))
@@ -565,7 +629,7 @@ class AgentFacade:
             return turn
         if turn.status not in ACTIVE_TURN_STATUSES and turn.status is not TurnStatus.QUEUED:
             raise ProtocolError(
-                ErrorCode.ILLEGAL_TURN_TRANSITION,
+                ErrorCode.INVALID_STATE,
                 f"turn {turn_id} is {turn.status.value}; nothing to interrupt",
                 data={
                     "turn_id": turn_id,
@@ -594,7 +658,7 @@ class AgentFacade:
         if turn.status is TurnStatus.INTERRUPTED:
             resumed = self.repo.resume_turn(thread_id, turn_id, reason=reason)
             if not self.host.is_running(thread_id):
-                self.host.start(thread_id, turn_id)
+                self._start_host(thread_id, turn_id)
             return {"turn": self._turn_view(resumed), "mode": "resume", "retried_from": None}
         if turn.status in (TurnStatus.FAILED,):
             inputs = [
@@ -609,14 +673,14 @@ class AgentFacade:
                 or self._fallback_key(ctx),
             )
             if new_turn.status is TurnStatus.RUNNING:
-                self.host.start(thread_id, new_turn.turn_id)
+                self._start_host(thread_id, new_turn.turn_id)
             return {
                 "turn": self._turn_view(new_turn),
                 "mode": "retry",
                 "retried_from": turn_id,
             }
         raise ProtocolError(
-            ErrorCode.ILLEGAL_TURN_TRANSITION,
+            ErrorCode.INVALID_STATE,
             f"turn {turn_id} is {turn.status.value}; recover requires interrupted or failed",
             data={"turn_id": turn_id, "from": turn.status.value,
                   "allowed": [TurnStatus.INTERRUPTED.value, TurnStatus.FAILED.value]},
@@ -635,11 +699,11 @@ class AgentFacade:
         last = self.repo.store(thread_id).last_sequence()
         floor = self.replay_floor(thread_id)
         if after < floor:
-            raise ProtocolError.stale_cursor(
+            raise ProtocolError.cursor_expired(
                 after, last_sequence=last, reason="below_replay_floor", floor=floor
             )
         if after > last:
-            raise ProtocolError.stale_cursor(
+            raise ProtocolError.cursor_expired(
                 after, last_sequence=last, reason="cursor_ahead", floor=floor
             )
         sub = ctx.subscriptions.subscribe(
@@ -715,6 +779,28 @@ class AgentFacade:
                 "replayed": True,
                 "decision": approval.decision_scope,
             }
+        # 待处理的动作已经失败结束 / 回合已不在等待审批：给精确原因，别让前端猜
+        call = state.tool_calls.get(approval.call_id) if approval.call_id else None
+        failed_call = (
+            call is not None
+            and call.status
+            not in (ToolCallStatus.REQUESTED, ToolCallStatus.RUNNING, ToolCallStatus.SUCCEEDED)
+        )
+        if failed_call and call is not None:
+            raise ProtocolError.tool_failed(call.call_id, call.error or {})
+        turn = state.turn(turn_id)
+        if turn.status is TurnStatus.FAILED:
+            raise ProtocolError.turn_terminated("failed", turn_id=turn_id)
+        if turn.status is TurnStatus.INTERRUPTED:
+            raise ProtocolError.turn_terminated("interrupted", turn_id=turn_id)
+        if turn.status is not TurnStatus.WAITING_APPROVAL:
+            raise ProtocolError.invalid_state(
+                "这个回合当前没有等待审批的请求。",
+                kind="turn_not_waiting_approval",
+                turn_id=turn_id,
+                status=turn.status.value,
+                allowed=[TurnStatus.WAITING_APPROVAL.value],
+            )
         turn = self.repo.resolve_approval(
             thread_id, turn_id, approval_id, granted=granted, scope=scope, decided_by="user"
         )
@@ -744,7 +830,7 @@ class AgentFacade:
         if self.host.is_running(thread_id):
             return
         try:
-            self.host.start(thread_id, turn_id)
+            self._start_host(thread_id, turn_id)
         except Exception:  # noqa: BLE001 - 运行时不可用不应让审批响应失败
             return
 

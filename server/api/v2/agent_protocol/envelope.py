@@ -39,6 +39,8 @@ NOTIFY_THREAD_CLOSED = "thread/closed"
 NOTIFY_SHUTTING_DOWN = "server/shutting_down"
 NOTIFY_HEARTBEAT = "heartbeat"
 NOTIFY_PROTOCOL_ERROR = "protocol/error"
+#: 连接建立后的第一条通知（WP-02「WebSocket 建立后发送 protocol/ready」）。
+NOTIFY_READY = "protocol/ready"
 
 MAX_ID_LEN = 128
 MAX_IDEMPOTENCY_KEY_LEN = 200

@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from api.v2.agent_protocol import (
+    NOTIFY_READY,
     PROTOCOL_VERSION,
     Notification,
     SubscriptionRegistry,
@@ -99,6 +100,8 @@ class Connection:
     closed: bool = False
     received: int = 0
     sent: int = 0
+    #: 是否具备写权限（只读访问面为 False）。
+    owner: bool = True
 
     def next_sequence(self) -> int:
         self.sequence += 1
@@ -109,6 +112,7 @@ class Connection:
             connection_id=self.connection_id,
             subscriptions=self.subscriptions,
             next_connection_sequence=self.next_sequence,
+            owner=self.owner,
         )
 
 
@@ -210,9 +214,18 @@ class AgentV2Service:
         self._connection_counter += 1
         return f"conn-{self._connection_counter}"
 
-    def connect(self, connection_id: str | None = None) -> Connection:
+    def connect(self, connection_id: str | None = None, *, owner: bool | None = None) -> Connection:
+        """取得（或创建）连接。
+
+        ``owner`` 只在**显式传入**时生效——否则「每次取连接」都会把只读连接
+        悄悄升级成可写连接。
+        """
         cid = connection_id or self.next_connection_id()
-        conn = self._connections.get(cid) or Connection(connection_id=cid)
+        conn = self._connections.get(cid)
+        if conn is None:
+            conn = Connection(connection_id=cid, owner=True if owner is None else owner)
+        elif owner is not None:
+            conn.owner = owner
         self._connections[cid] = conn
         return conn
 
@@ -273,6 +286,24 @@ class AgentV2Service:
     ) -> Notification:
         return control_notification(
             method, sequence=conn.next_sequence(), params=params, thread_id=thread_id
+        )
+
+    def ready_notification(self, conn: Connection) -> Notification:
+        """连接建立后的第一条通知（WP-02）。
+
+        同时把「这条连接能不能写」告诉客户端，前端据此显示只读提示，
+        而不是等到第一次操作才失败。
+        """
+        return self._control(
+            conn,
+            NOTIFY_READY,
+            thread_id=None,
+            params={
+                "connection_id": conn.connection_id,
+                "owner": conn.owner,
+                "protocol_version": PROTOCOL_VERSION,
+                "service": self.describe(),
+            },
         )
 
     def heartbeat_due(self) -> bool:

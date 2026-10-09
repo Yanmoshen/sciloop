@@ -438,6 +438,13 @@ class FakeRuntimeHost:
     def start(self, thread_id: str, turn_id: str, *, register_cancel: bool = True) -> asyncio.Task[Any]:
         """把 Turn 交给执行内核，返回后台任务。"""
         runtime = self.runtime_for(thread_id)
+        if not runtime.scenario.runtime_available:
+            # 场景声明运行时不可用：以结构化错误拒绝，并释放租约，不留活动 Turn
+            self.repo.release_turn(thread_id, reason="runtime-unavailable")
+            raise RuntimeUnavailable(
+                f"thread {thread_id}: runtime is unavailable in scenario "
+                f"{runtime.scenario.name!r}"
+            )
         if runtime.is_running():
             raise RuntimeUnavailable(f"thread {thread_id} already has a running turn task")
         from contracts.agent_v2.cancellation import CancelToken

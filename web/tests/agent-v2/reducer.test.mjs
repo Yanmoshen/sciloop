@@ -547,4 +547,65 @@ export function register() {
     assert(state.notices.some((notice) => notice.level === 'error'))
     assertEqual(state.applied, 0)
   })
+  test('迟到的 delta 不会把已完成的 Turn 改回运行中（规则 4）', () => {
+    let state = applyNotification(createAgentState(), threadCreated())
+    state = applyNotification(state, turnStarted())
+    state = applyNotification(
+      state,
+      turnEvent(3, 'turn/completed', 'completed', { from: 'running', stop_reason: 'end_turn' }),
+    )
+    const before = state.lateDropped
+    // 迟到的正文增量与「又开始跑」的旧状态
+    state = applyNotification(state, eventNote(4, 'model/delta', { text: '迟到片段' }, { turn_id: TURN }))
+    state = applyNotification(state, turnStarted(5))
+    assertEqual(state.turns[TURN].status, 'completed', '终态是权威，不能被迟到事件改回')
+    assert(state.lateDropped > before, '被丢弃的迟到事件要计数，便于验收取证')
+    assertEqual(state.stream[`${THREAD}:${TURN}`] ?? '', '', '迟到增量不得进入正文缓冲')
+    assertEqual(state.cursors[THREAD], 5, '游标仍必须前进，否则缺口永远补不平')
+  })
+
+  test('中断后忽略迟到的正文与工具增量，但仍接受终态与审批（规则 5）', () => {
+    let state = applyNotification(createAgentState(), threadCreated())
+    state = applyNotification(state, turnStarted())
+    state = applyNotification(
+      state,
+      turnEvent(3, 'turn/interrupted', 'interrupted', { from: 'running', cancel_reason: '用户停止' }),
+    )
+    assertEqual(state.turns[TURN].status, 'interrupted')
+
+    state = applyNotification(state, eventNote(4, 'model/delta', { text: '停止后还在流' }, { turn_id: TURN }))
+    state = applyNotification(
+      state,
+      itemAdded(5, makeItem({ item_id: 'it_late', sequence: 5, payload: { text: '停止后才落地的正文' } })),
+    )
+    assertEqual(Object.keys(state.items).length, 0, '中断后落地的正文 Item 也必须忽略')
+
+    // 结构化事件照常应用：审批卡仍然要能出现
+    const approval = {
+      approval_id: 'ap_1',
+      thread_id: THREAD,
+      turn_id: TURN,
+      call_id: CALL,
+      status: 'pending',
+      action: { tool: 'run_command', arguments: {}, kind: 'side_effect', risk: '高危' },
+      risk: '高危',
+      created_at: AT,
+      decided_at: null,
+      decided_by: null,
+      decision_scope: null,
+      contract: 'agent.v2.contract.v1',
+    }
+    state = applyNotification(state, eventNote(6, 'approval/requested', { approval }, { turn_id: TURN }))
+    assertEqual(pendingApprovals(state, THREAD).length, 1)
+    assertEqual(state.cursors[THREAD], 6)
+  })
+
+  test('已完成的 Turn 仍然接受既有 Item（Item 是既成事实）', () => {
+    let state = applyNotification(createAgentState(), threadCreated())
+    state = applyNotification(state, turnStarted())
+    state = applyNotification(state, turnEvent(3, 'turn/completed', 'completed', { from: 'running' }))
+    state = applyNotification(state, itemAdded(4, makeItem({ sequence: 4, payload: { text: '结论' } })))
+    assertEqual(orderedItems(state, THREAD).length, 1)
+    assertEqual(assistantTextFor(state, THREAD, TURN), '结论')
+  })
 }

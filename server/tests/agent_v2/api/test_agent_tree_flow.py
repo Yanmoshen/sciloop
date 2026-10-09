@@ -9,7 +9,7 @@ from api.v2.agent_protocol import ErrorCode
 
 
 def _run_parent(api, name: str = "子 Agent 会话"):
-    thread = api.start_thread(name, scenario="subagent")["thread"]
+    thread = api.start_thread(name, scenario="child_agents")["thread"]
     thread_id = thread["thread_id"]
     api.run_turn(thread_id, "拆成三路执行")
     return thread_id

@@ -30,7 +30,7 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const WEB_ROOT = resolve(HERE, '..', '..')
 //: 编译产物目录（由本目录 .gitignore 忽略；失败时保留以便排查）
 const BUILD_DIR = join(HERE, '.test-build')
-const SUITES = ['protocol', 'reducer', 'client']
+const SUITES = ['protocol', 'cursor', 'recovery', 'reducer', 'client']
 
 function findTypeScript() {
   if (process.env.TSC && existsSync(process.env.TSC)) return process.env.TSC

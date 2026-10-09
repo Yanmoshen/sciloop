@@ -133,9 +133,12 @@ def test_ws_full_flow_with_streaming_notifications(client: TestClient) -> None:
     with client.websocket_connect(WS_URL) as ws:
         welcome = ws.receive_json()
         assert welcome["kind"] == "notification"
-        assert welcome["method"] == "subscription/started"
+        # WP-02：连接建立后的第一条通知是 protocol/ready，并告知本连接能否写入
+        assert welcome["method"] == "protocol/ready"
         assert welcome["thread_id"] is None
         assert welcome["event_id"].startswith("ev_")
+        assert welcome["params"]["protocol_version"] == PROTOCOL_VERSION
+        assert welcome["params"]["owner"] is True
         assert welcome["params"]["service"]["host"] == "fake"
 
         ws.send_json(_request("protocol/describe", rid="d1"))
@@ -231,7 +234,7 @@ def test_ws_reports_stale_cursor_on_subscribe(client: TestClient) -> None:
         )
         response = _response_for(ws, "t2")
         assert response["ok"] is False
-        assert response["error"]["code"] == "stale_cursor"
+        assert response["error"]["code"] == "cursor_expired"
         assert response["error"]["data"]["reason"] == "cursor_ahead"
 
 
@@ -252,7 +255,8 @@ def test_ws_closes_after_server_shutdown(service_factory) -> None:
     install(application, service=svc)
     with TestClient(application) as test_client, test_client.websocket_connect(WS_URL) as ws:
         welcome = ws.receive_json()
-        assert welcome["method"] == "subscription/started"
+        assert welcome["method"] == "protocol/ready"
+        assert welcome["params"]["service"]["shutting_down"] is True
         with pytest.raises(WebSocketDisconnect):
             for _ in range(20):
                 ws.receive_json()

@@ -49,7 +49,7 @@ def test_idempotency_key_reuse_with_other_payload_is_rejected(api) -> None:
     error = api.fails(
         "turn/start",
         {"thread_id": thread_id, "text": "完全不同的输入"},
-        expect=ErrorCode.DUPLICATE_REQUEST.value,
+        expect=ErrorCode.IDEMPOTENCY_CONFLICT.value,
         idem="shared-key",
     )
     assert error["data"]["idempotency_key"] == "shared-key"

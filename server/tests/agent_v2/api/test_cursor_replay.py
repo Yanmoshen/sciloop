@@ -63,7 +63,7 @@ def test_replay_pagination_with_limit(api) -> None:
 
 
 def test_replay_filter_by_call_id(api) -> None:
-    thread = api.start_thread("按调用过滤", scenario="tools_parallel")["thread"]
+    thread = api.start_thread("按调用过滤", scenario="tool_parallel")["thread"]
     thread_id = thread["thread_id"]
     api.run_turn(thread_id, "跑工具")
     events = api.events(thread_id)
@@ -148,7 +148,7 @@ def test_subscribe_with_cursor_after_tail_is_rejected(api) -> None:
     error = api.fails(
         "thread/subscribe",
         {"thread_id": thread_id, "after_sequence": 9999},
-        expect=ErrorCode.STALE_CURSOR.value,
+        expect=ErrorCode.CURSOR_EXPIRED.value,
     )
     assert error["data"]["reason"] == "cursor_ahead"
 

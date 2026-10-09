@@ -70,7 +70,7 @@ class IdempotencyStore:
             return None
         if entry.fingerprint != fingerprint:
             raise ProtocolError(
-                ErrorCode.DUPLICATE_REQUEST,
+                ErrorCode.IDEMPOTENCY_CONFLICT,
                 f"idempotency key {key!r} was already used with a different payload",
                 data={
                     "idempotency_key": key,

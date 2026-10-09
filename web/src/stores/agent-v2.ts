@@ -1,12 +1,15 @@
 /**
  * agent.v2 Pinia store：把协议客户端与 reducer 接起来，并暴露界面需要的动作与选择器。
  *
- * 三条不变量：
+ * 五条不变量：
  * 1. 状态只能由 reducer 产生（本文件不直接改状态字段），保证「实时推送 / 游标补拉 /
- *    快照重建」三条路径语义一致；
+ *    快照重建 / 本地快照恢复」四条路径语义一致；
  * 2. 变更类请求都带稳定的幂等键：断线重试沿用同一个键，服务端不会重复产生副作用；
- * 3. 检测到事件缺口时自动 `thread/events/replay` 补拉；若服务端回 `stale_cursor`
- *    （历史已被重写），则退化为 `thread/resume` 全量快照重建，**绝不重新调用模型**。
+ * 3. 检测到事件缺口时自动 `thread/events/replay` 补拉；若服务端回 `cursor_expired`
+ *    （历史已被重写），则退化为 `thread/resume` 全量快照重建，**绝不重新调用模型**；
+ * 4. **停止立刻收束**：`stopTurn()` 直接把本地状态切到「已停止」，动画/计时/生成中
+ *    立刻消失；服务端的 `turn/interrupted` 到达后只做确认，不改变界面节奏；
+ * 5. 切换 Thread 先取消旧订阅、加载目标快照、按最后游标补事件，不创建新的模型 Turn。
  */
 
 import { computed, ref, shallowRef, type Ref } from 'vue'
@@ -54,8 +57,12 @@ import {
   toolOutputFor,
   type AgentV2State,
 } from '../agent-v2/reducer'
+import { browserStorage, loadSnapshot, saveSnapshot, type StorageLike } from '../agent-v2/recovery'
 
-export type AgentV2StoreOptions = AgentV2ClientOptions
+export type AgentV2StoreOptions = AgentV2ClientOptions & {
+  /** 持久化介质（默认 localStorage；测试可注入替身或传 null 关闭）。 */
+  storage?: StorageLike | null
+}
 
 export const useAgentV2Store = defineStore('agent-v2', () => {
   const state = shallowRef<AgentV2State>(createAgentState())
@@ -65,6 +72,12 @@ export const useAgentV2Store = defineStore('agent-v2', () => {
   const busy = ref(false)
   /** 用户最近一次「发起 Turn」的幂等键：失败重试必须复用它。 */
   const lastTurnKey = new Map<string, string>()
+  /** 正在「已停止」的 Turn（停止按钮按下后立刻生效，等中断事件确认）。 */
+  const stopping = ref<string | null>(null)
+  /** 本地快照是否已被用来先渲染（供连接条提示「正在补齐事件」）。 */
+  const snapshotRestored = ref(false)
+  /** 持久化介质：默认 localStorage，`connect({ storage })` 可覆盖或关闭。 */
+  let storage: StorageLike | null = browserStorage()
 
   const currentThread = computed<ThreadView | null>(() => {
     const id = state.value.currentThreadId
@@ -138,6 +151,36 @@ export const useAgentV2Store = defineStore('agent-v2', () => {
   // ------------------------------------------------------------------ 内部
   function set(next: AgentV2State): void {
     state.value = next
+    schedulePersist()
+  }
+
+  /** 快照落盘（节流：事件流很密，不必每条都写）。 */
+  let persistTimer: ReturnType<typeof setTimeout> | null = null
+  function schedulePersist(): void {
+    if (!storage) return
+    if (persistTimer !== null) return
+    persistTimer = setTimeout(() => {
+      persistTimer = null
+      saveSnapshot(storage, state.value)
+    }, 300)
+  }
+
+  /** 立即落盘（页面卸载、切换会话等关键时刻用）。 */
+  function persistNow(): void {
+    if (persistTimer !== null) {
+      clearTimeout(persistTimer)
+      persistTimer = null
+    }
+    saveSnapshot(storage, state.value)
+  }
+
+  /** 用本地快照先渲染（WP-03 规则 6）：先有内容，再由游标补事件。 */
+  function restoreSnapshot(): boolean {
+    const restored = loadSnapshot(storage)
+    if (!restored) return false
+    state.value = { ...state.value, ...restored.applied }
+    snapshotRestored.value = true
+    return true
   }
 
   function errMessage(error: unknown): string {
@@ -164,12 +207,45 @@ export const useAgentV2Store = defineStore('agent-v2', () => {
     const before = state.value
     const next = applyNotification(before, note)
     set(next)
+    if (note.method === 'protocol/ready') {
+      const params = (note.params ?? {}) as Record<string, unknown>
+      set(
+        setConnection(next, {
+          status: 'connected',
+          attempts: 0,
+          owner: params.owner !== false,
+          message: params.owner === false ? '当前是只读浏览模式' : null,
+        }),
+      )
+      return
+    }
     if (note.method === 'event' && note.thread_id) {
+      const turnId = note.turn_id ?? null
+      if (turnId && stopping.value === turnId && note.params && typeof note.params === 'object') {
+        const type = String((note.params as Record<string, unknown>).type ?? '')
+        if (type === 'turn/interrupted' || type === 'turn/completed' || type === 'turn/failed') {
+          // 停止确认到达：本地「已停止」标记可以撤掉（界面早已收束）
+          stopping.value = null
+        }
+      }
       const gap = next.gapFrom[note.thread_id]
       if (gap !== null && gap !== undefined) void backfill(note.thread_id)
     }
     if (note.method === 'server/shutting_down') {
       subscribed.value = []
+      persistNow()
+    }
+    if (note.method === 'protocol/error') {
+      const params = (note.params ?? {}) as Record<string, unknown>
+      const error = (params.error ?? {}) as Record<string, unknown>
+      if (error.code === 'permission_denied') {
+        set(
+          setConnection(next, {
+            owner: false,
+            message: '当前是只读浏览模式，这个操作需要研究者身份',
+          }),
+        )
+      }
     }
   }
 
@@ -219,21 +295,25 @@ export const useAgentV2Store = defineStore('agent-v2', () => {
   // ------------------------------------------------------------------ 连接
   function connect(options: AgentV2StoreOptions): void {
     if (client.value) return
+    if ('storage' in options) storage = options.storage ?? null
+    // 规则 6：先用本地快照渲染，再去服务端补事件（不调用模型）
+    restoreSnapshot()
     const instance = new AgentV2Client({
       ...options,
       requestTimeoutMs: options.requestTimeoutMs ?? 30000,
       onOpen: (active, reconnected) => {
-        set(setConnection(state.value, { status: 'open', attempts: 0, message: null }))
+        set(setConnection(state.value, { status: 'connected', attempts: 0, message: null }))
         void resubscribeAll(active, reconnected)
       },
-      onClose: (_active, code, reason) => {
+      onClose: (_active, _code, reason) => {
         set(
           setConnection(state.value, {
             status: 'reconnecting',
             attempts: (state.value.connection.attempts ?? 0) + 1,
-            message: `连接已断开（${code}）；正在自动重连`,
+            message: '连接已断开；正在自动重连',
           }),
         )
+        persistNow()
         if (reason) pushError(new Error(reason))
       },
     })
@@ -259,7 +339,14 @@ export const useAgentV2Store = defineStore('agent-v2', () => {
     set(setConnection(state.value, { status: 'closed' }))
   }
 
-  /** 重连后按最后游标重新订阅：只补事件，不重新调用模型。 */
+  /**
+   * 重连后按最后游标重新订阅：只补事件，不重新调用模型。
+   *
+   * 补齐由**服务端按订阅游标推送**完成（订阅即带 after_sequence），
+   * 这里不再额外发一次 replay——两路同时补同一段会造成重复投递
+   * （去重能兜住，但「重复条数」这个指标就失去意义了）。
+   * 只有在事件乱序（本地检测到缺口）时才走 `backfill()`。
+   */
   async function resubscribeAll(active: AgentV2Client, reconnected: boolean): Promise<void> {
     for (const threadId of subscribed.value) {
       try {
@@ -273,14 +360,31 @@ export const useAgentV2Store = defineStore('agent-v2', () => {
         if (typeof result.cursor === 'number') {
           set(setThreadCursor(state.value, threadId, result.cursor))
         }
-        if (reconnected && typeof result.pending === 'number' && result.pending > 0) {
-          await backfill(threadId)
+        if (reconnected) {
+          recordResubscribe(threadId, Number(result.pending ?? 0))
         }
       } catch (error) {
         if (isStaleCursor(error)) await resumeThread(threadId)
         else pushError(error)
       }
     }
+  }
+
+  /** 重连补齐的进度提示（界面只说「正在补齐最新进度」，不展示内部条数）。 */
+  function recordResubscribe(threadId: string, pending: number): void {
+    if (pending <= 0) return
+    set({
+      ...state.value,
+      notices: [
+        ...state.value.notices,
+        {
+          level: 'info' as const,
+          text: '连接已恢复，正在补齐错过的最新进度',
+          threadId,
+          at: new Date().toISOString(),
+        },
+      ].slice(-50),
+    })
   }
 
   // ------------------------------------------------------------------ Thread
@@ -333,19 +437,67 @@ export const useAgentV2Store = defineStore('agent-v2', () => {
       }),
     )
     if (!subscribed.value.includes(threadId)) await subscribeThread(threadId)
+    // 服务端快照已到手：本地快照完成使命，连接条不再提示「已恢复本地快照」
+    snapshotRestored.value = false
+    persistNow()
   }
 
+  /**
+   * 切换会话（WP-06）：先取消旧订阅 -> 载入目标线程的本地快照（若有，立即有内容）
+   * -> 服务端快照 -> 按最后游标补事件。**不创建任何新的模型 Turn**。
+   */
   async function selectThread(threadId: string): Promise<void> {
+    const previous = state.value.currentThreadId
+    if (previous && previous !== threadId && subscribed.value.includes(previous)) {
+      try {
+        await unsubscribeThread(previous)
+      } catch (error) {
+        pushError(error)
+      }
+    }
     set({ ...state.value, currentThreadId: threadId })
+    persistNow()
     await resumeThread(threadId)
   }
+
+  /** 停止当前回合：立刻收束界面，再让服务端确认中断（WP-04）。 */
+  async function stopTurn(threadId: string, turnId: string): Promise<void> {
+    stopping.value = turnId
+    pushStopNotice(threadId)
+    try {
+      await interruptTurn(threadId, turnId, '用户停止')
+    } catch (error) {
+      // 中断失败（例如已经结束）时不留假状态
+      stopping.value = null
+      pushError(error)
+    }
+  }
+
+  function pushStopNotice(threadId: string): void {
+    set({
+      ...state.value,
+      notices: [
+        ...state.value.notices,
+        {
+          level: 'info' as const,
+          text: '已停止这一轮',
+          threadId,
+          at: new Date().toISOString(),
+        },
+      ].slice(-50),
+    })
+  }
+
+  /** 界面用它决定是否继续显示「生成中」动画与计时。 */
+  const stopRequested = computed(() => stopping.value !== null)
 
   async function subscribeThread(threadId: string): Promise<void> {
     const from = state.value.cursors[threadId] ?? 0
     const result = await call(METHOD.threadSubscribe, { thread_id: threadId, after_sequence: from })
     if (typeof result.cursor === 'number') set(setThreadCursor(state.value, threadId, result.cursor))
     if (!subscribed.value.includes(threadId)) subscribed.value = [...subscribed.value, threadId]
-    if (typeof result.pending === 'number' && result.pending > 0) await backfill(threadId)
+    // 缺失事件由服务端按订阅游标推送（订阅请求里已带 after_sequence），
+    // 这里不再额外 replay 一次；只有检测到乱序缺口时才补拉。
   }
 
   async function unsubscribeThread(threadId: string): Promise<void> {
@@ -376,6 +528,7 @@ export const useAgentV2Store = defineStore('agent-v2', () => {
     options: { retryKey?: string; model?: string } = {},
   ): Promise<TurnView> {
     busy.value = true
+    stopping.value = null
     const key = options.retryKey ?? lastTurnKey.get(threadId) ?? `turn:${threadId}:${Date.now()}`
     lastTurnKey.set(threadId, key)
     try {
@@ -410,6 +563,7 @@ export const useAgentV2Store = defineStore('agent-v2', () => {
   }
 
   async function recoverTurn(threadId: string, turnId: string): Promise<void> {
+    stopping.value = null
     await call(METHOD.turnRecover, { thread_id: threadId, turn_id: turnId }, {
       idempotencyKey: `recover:${turnId}`,
     })
@@ -571,6 +725,10 @@ export const useAgentV2Store = defineStore('agent-v2', () => {
     client,
     subscribed,
     busy,
+    stopping,
+    stopRequested,
+    snapshotRestored,
+    readOnly: computed(() => state.value.connection.owner === false),
     // 计算
     currentThread,
     threads,
@@ -594,6 +752,7 @@ export const useAgentV2Store = defineStore('agent-v2', () => {
     connect,
     disconnect,
     backfill,
+    persistNow,
     listThreads,
     createThread,
     resumeThread,
@@ -606,6 +765,7 @@ export const useAgentV2Store = defineStore('agent-v2', () => {
     steerTurn,
     continueTurn,
     interruptTurn,
+    stopTurn,
     recoverTurn,
     refreshApprovals,
     resolveApproval,

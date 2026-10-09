@@ -15,18 +15,20 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Body, WebSocket
+from fastapi import APIRouter, Body, Header, WebSocket
 
 from api.v2.agent_protocol import PROTOCOL_VERSION, describe_methods, parse_client_frame
 from api.v2.agent_protocol.errors import ProtocolError
 from api.v2.agent_protocol.schema import load_protocol_schema
 
+from .auth import check_token
 from .service import AgentV2Service
 from .ws import serve_connection
 
 ROUTER_PREFIX = "/agent"
 MOUNT_PREFIX = "/api/v2"
 WS_PATH = f"{MOUNT_PREFIX}{ROUTER_PREFIX}/ws"
+OWNER_HEADER = "X-Owner-Token"
 
 
 def build_router(get_service: Callable[[], AgentV2Service]) -> APIRouter:
@@ -48,11 +50,18 @@ def build_router(get_service: Callable[[], AgentV2Service]) -> APIRouter:
         }
 
     @router.post("/rpc")
-    async def rpc(payload: Annotated[dict, Body(...)]) -> dict[str, Any]:
-        """单请求通道：响应与本次调用产生的控制通知一并返回。"""
+    async def rpc(
+        payload: Annotated[dict, Body(...)],
+        x_owner_token: Annotated[str | None, Header(alias=OWNER_HEADER)] = None,
+    ) -> dict[str, Any]:
+        """单请求通道：响应与本次调用产生的控制通知一并返回。
+
+        鉴权与 WebSocket 一致：匿名公开面允许只读，变更类方法返回 ``permission_denied``。
+        """
         service = get_service()
+        decision = check_token(x_owner_token)
         connection_id = service.next_connection_id()
-        context = service.new_call_context(connection_id)
+        context = service.connect(connection_id, owner=decision.owner).context()
         try:
             request = parse_client_frame(payload)
         except ProtocolError as exc:

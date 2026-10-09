@@ -51,7 +51,7 @@ def test_settings_update_requires_something_to_change(api) -> None:
 
 def test_resume_rebuilds_full_state_after_refresh(api) -> None:
     """刷新页面后只靠 thread/resume 就能重建界面（不调用模型）。"""
-    thread = api.start_thread("刷新重建", scenario="tools_parallel")["thread"]
+    thread = api.start_thread("刷新重建", scenario="tool_parallel")["thread"]
     thread_id = thread["thread_id"]
     api.run_turn(thread_id, "跑一轮带工具的")
     snapshot = api.call("thread/resume", {"thread_id": thread_id})
@@ -69,7 +69,7 @@ def test_resume_rebuilds_full_state_after_refresh(api) -> None:
 
 def test_active_turn_state_rebuild_mid_flight(api) -> None:
     """活动 Turn 刷新后仍能重建（含 running 状态与已产出的增量）。"""
-    thread = api.start_thread("中途刷新", scenario="interrupt")["thread"]
+    thread = api.start_thread("中途刷新", scenario="turn_interrupt")["thread"]
     thread_id = thread["thread_id"]
     started = api.call("turn/start", {"thread_id": thread_id, "text": "长回答"}, idem="mid-1")
     turn_id = started["turn"]["turn_id"]
@@ -87,7 +87,7 @@ def test_active_turn_state_rebuild_mid_flight(api) -> None:
 
 
 def test_steer_appends_input_to_active_turn(api) -> None:
-    thread = api.start_thread("追加输入", scenario="interrupt")["thread"]
+    thread = api.start_thread("追加输入", scenario="turn_interrupt")["thread"]
     thread_id = thread["thread_id"]
     started = api.call("turn/start", {"thread_id": thread_id, "text": "长回答"}, idem="steer-t1")
     turn_id = started["turn"]["turn_id"]
@@ -140,7 +140,7 @@ def test_continue_after_waiting_input(api, service) -> None:
 
 
 def test_interrupt_produces_no_success_event(api) -> None:
-    thread = api.start_thread("中断不成功", scenario="interrupt")["thread"]
+    thread = api.start_thread("中断不成功", scenario="turn_interrupt")["thread"]
     thread_id = thread["thread_id"]
     started = api.call("turn/start", {"thread_id": thread_id, "text": "长回答"}, idem="int-t1")
     turn_id = started["turn"]["turn_id"]
@@ -159,7 +159,7 @@ def test_interrupt_produces_no_success_event(api) -> None:
 
 
 def test_interrupt_is_idempotent(api) -> None:
-    thread = api.start_thread("重复中断", scenario="interrupt")["thread"]
+    thread = api.start_thread("重复中断", scenario="turn_interrupt")["thread"]
     thread_id = thread["thread_id"]
     started = api.call("turn/start", {"thread_id": thread_id, "text": "长回答"}, idem="int2-t1")
     turn_id = started["turn"]["turn_id"]
@@ -177,7 +177,7 @@ def test_interrupt_is_idempotent(api) -> None:
 
 
 def test_recover_interrupted_turn_resumes(api) -> None:
-    thread = api.start_thread("恢复中断", scenario="interrupt")["thread"]
+    thread = api.start_thread("恢复中断", scenario="turn_interrupt")["thread"]
     thread_id = thread["thread_id"]
     started = api.call("turn/start", {"thread_id": thread_id, "text": "长回答"}, idem="rec-t1")
     turn_id = started["turn"]["turn_id"]
@@ -216,7 +216,7 @@ def test_recover_rejects_completed_turn(api) -> None:
     api.fails(
         "turn/recover",
         {"thread_id": thread["thread_id"], "turn_id": turn["turn_id"]},
-        expect=ErrorCode.ILLEGAL_TURN_TRANSITION.value,
+        expect=ErrorCode.INVALID_STATE.value,
         idem="rec-completed",
     )
 
@@ -245,7 +245,7 @@ def test_plan_is_an_item_without_mode_switch(api) -> None:
 
 def test_run_command_dispatch_keeps_ordering(api) -> None:
     """事件序号在线程内严格单调递增且不跳号（顺序性回归）。"""
-    thread = api.start_thread("顺序性", scenario="tools_parallel")["thread"]
+    thread = api.start_thread("顺序性", scenario="tool_parallel")["thread"]
     thread_id = thread["thread_id"]
     api.run_turn(thread_id, "跑工具")
     sequences = api.sequences(thread_id)

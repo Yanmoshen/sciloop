@@ -139,11 +139,16 @@ async def _handle_frame(
 
 
 async def serve_connection(websocket: WebSocket, service: AgentV2Service) -> None:
-    """一条 WebSocket 连接的完整服务过程。"""
+    """一条 WebSocket 连接的完整服务过程。
+
+    握手判定分两层：能否建立会话（``can_connect``）与是否具备写权限（``owner``）。
+    匿名公开面允许建立**只读**会话：变更类请求会得到 ``permission_denied``，
+    而不是把连接直接掐掉——否则用户只会看到「连不上」，不知道原因。
+    """
     decision = check_websocket(websocket)
     await websocket.accept()
-    conn = service.connect()
-    if not decision.allowed:
+    conn = service.connect(owner=decision.owner)
+    if not decision.can_connect:
         await _send(
             websocket,
             control_notification(
@@ -151,8 +156,8 @@ async def serve_connection(websocket: WebSocket, service: AgentV2Service) -> Non
                 sequence=conn.next_sequence(),
                 params={
                     "error": {
-                        "code": "invalid_request",
-                        "message": "访问被拒绝：请提供研究者令牌（X-Owner-Token）后重连",
+                        "code": "permission_denied",
+                        "message": "访问被拒绝：请提供研究者令牌后重连。",
                         "data": decision.to_dict(),
                     }
                 },
@@ -162,14 +167,7 @@ async def serve_connection(websocket: WebSocket, service: AgentV2Service) -> Non
         service.disconnect(conn.connection_id)
         return
 
-    await _send(
-        websocket,
-        control_notification(
-            "subscription/started",
-            sequence=conn.next_sequence(),
-            params={"connection_id": conn.connection_id, "service": service.describe()},
-        ).to_dict(),
-    )
+    await _send(websocket, service.ready_notification(conn).to_dict())
     try:
         while True:
             if service.shutting_down:

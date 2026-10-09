@@ -32,6 +32,22 @@ const tone = computed(() => {
   return 'busy'
 })
 const kindLabel = computed(() => (props.call.kind === 'read_only' ? '只读' : '有副作用'))
+/** 把内部错误码翻成用户能看懂的一句话（界面不出现 code）。 */
+const FAILURE_HINT: Record<string, string> = {
+  approval_denied: '研究者拒绝了这次操作',
+  execution_failed: '执行没有成功',
+  timeout: '执行超时',
+  cancelled: '操作已取消',
+  invalid_arguments: '参数不合法',
+  unknown_tool: '这个工具当前不可用',
+  failed: '执行失败',
+}
+const failureText = computed(() => {
+  const error = props.call.error
+  if (!error) return ''
+  return FAILURE_HINT[error.code] ?? error.message
+})
+
 const duration = computed(() => {
   const ms = props.call.duration_ms
   if (ms === null || ms === undefined) return ''
@@ -56,7 +72,6 @@ const outputText = computed(() => {
       <span v-if="duration" class="tool__duration" :title="`开始 ${call.started_at ?? '-'}，结束 ${call.finished_at ?? '-'}`">
         {{ duration }}
       </span>
-      <span class="tool__id" :title="call.call_id">{{ call.call_id.slice(0, 10) }}</span>
     </header>
 
     <details class="tool__section">
@@ -72,7 +87,7 @@ const outputText = computed(() => {
 
     <section v-if="call.error" class="tool__error">
       <p class="tool__label">失败原因</p>
-      <pre class="mono">{{ call.error.code }}：{{ call.error.message }}</pre>
+      <pre class="mono">{{ failureText }}</pre>
     </section>
   </article>
 </template>
@@ -119,15 +134,13 @@ const outputText = computed(() => {
 }
 
 .tool__kind,
-.tool__duration,
-.tool__id {
+.tool__duration {
   font-size: var(--font-size-2xs);
   color: var(--color-text-secondary);
 }
 
-.tool__id {
+.tool__duration {
   margin-left: auto;
-  font-family: var(--font-family-mono);
 }
 
 .tag {

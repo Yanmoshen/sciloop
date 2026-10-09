@@ -7,10 +7,19 @@
     "request": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["contract", "kind", "id", "method"],
+      "required": [
+        "contract",
+        "kind",
+        "id",
+        "method"
+      ],
       "properties": {
-        "contract": { "const": "agent.v2.protocol.v1" },
-        "kind": { "const": "request" },
+        "contract": {
+          "const": "agent.v2.protocol.v1"
+        },
+        "kind": {
+          "const": "request"
+        },
         "id": {
           "type": "string",
           "minLength": 1,
@@ -23,9 +32,14 @@
           "pattern": "^[a-z][a-z0-9]*(/[a-z0-9_]+)+$",
           "description": "形如 thread/start、turn/start、thread/events/replay"
         },
-        "params": { "type": "object" },
+        "params": {
+          "type": "object"
+        },
         "idempotency_key": {
-          "type": ["string", "null"],
+          "type": [
+            "string",
+            "null"
+          ],
           "minLength": 1,
           "maxLength": 200,
           "description": "客户端生成的幂等键；断线重试必须复用同一个键"
@@ -35,52 +49,95 @@
     "error": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["code", "message", "data"],
+      "required": [
+        "code",
+        "message",
+        "data"
+      ],
       "properties": {
         "code": {
           "type": "string",
           "enum": [
-            "invalid_request",
-            "invalid_params",
-            "unknown_method",
+            "approval_not_found",
+            "approval_pending",
+            "cancelled",
+            "concurrent_turn",
             "contract_mismatch",
-            "duplicate_request",
-            "stale_cursor",
-            "not_subscribed",
-            "runtime_unavailable",
-            "shutting_down",
+            "contract_violation",
+            "corrupted_event",
+            "cursor_expired",
+            "idempotency_conflict",
             "internal_error",
             "invalid_id",
-            "contract_violation",
-            "thread_not_found",
-            "turn_not_found",
-            "approval_not_found",
-            "summary_not_found",
-            "illegal_turn_transition",
-            "concurrent_turn",
+            "invalid_params",
+            "invalid_request",
+            "invalid_state",
             "lease_error",
             "memory_overwrite_denied",
-            "corrupted_event",
             "model_stream_error",
-            "cancelled"
-          ]
+            "not_subscribed",
+            "permission_denied",
+            "runtime_unavailable",
+            "server_shutting_down",
+            "summary_not_found",
+            "thread_not_found",
+            "tool_failed",
+            "turn_failed",
+            "turn_interrupted",
+            "turn_not_found",
+            "unknown_method"
+          ],
+          "description": "结构化错误码：客户端据此分支，不解析 message 文本。完整触发点见 errors.py 模块文档。"
         },
-        "message": { "type": "string" },
-        "data": { "type": "object" }
+        "message": {
+          "type": "string"
+        },
+        "data": {
+          "type": "object"
+        }
       }
     },
     "response": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["contract", "kind", "id", "ok", "result", "error"],
+      "required": [
+        "contract",
+        "kind",
+        "id",
+        "ok",
+        "result",
+        "error"
+      ],
       "properties": {
-        "contract": { "const": "agent.v2.protocol.v1" },
-        "kind": { "const": "response" },
-        "id": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "ok": { "type": "boolean" },
-        "result": { "type": ["object", "null"] },
+        "contract": {
+          "const": "agent.v2.protocol.v1"
+        },
+        "kind": {
+          "const": "response"
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "result": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
         "error": {
-          "oneOf": [{ "$ref": "#/$defs/error" }, { "type": "null" }],
+          "oneOf": [
+            {
+              "$ref": "#/$defs/error"
+            },
+            {
+              "type": "null"
+            }
+          ],
           "description": "ok=true 时为 null；失败时必须是结构化错误对象"
         },
         "replayed": {
@@ -92,14 +149,27 @@
     "notification": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["contract", "kind", "method", "event_id", "sequence", "thread_id", "params"],
+      "required": [
+        "contract",
+        "kind",
+        "method",
+        "event_id",
+        "sequence",
+        "thread_id",
+        "params"
+      ],
       "properties": {
-        "contract": { "const": "agent.v2.protocol.v1" },
-        "kind": { "const": "notification" },
+        "contract": {
+          "const": "agent.v2.protocol.v1"
+        },
+        "kind": {
+          "const": "notification"
+        },
         "method": {
           "type": "string",
           "enum": [
             "event",
+            "protocol/ready",
             "subscription/started",
             "subscription/cancelled",
             "thread/closed",
@@ -108,20 +178,58 @@
             "protocol/error"
           ]
         },
-        "event_id": { "type": "string", "pattern": "^ev_[0-9a-f]{23}$" },
-        "sequence": { "type": "integer", "minimum": 0 },
-        "thread_id": { "type": ["string", "null"], "pattern": "^th_[0-9a-f]{23}$" },
-        "turn_id": { "type": ["string", "null"], "pattern": "^tu_[0-9a-f]{23}$" },
-        "item_id": { "type": ["string", "null"], "pattern": "^it_[0-9a-f]{23}$" },
-        "call_id": { "type": ["string", "null"], "pattern": "^call_[0-9a-f]{23}$" },
-        "params": { "type": "object" }
+        "event_id": {
+          "type": "string",
+          "pattern": "^ev_[0-9a-f]{23}$"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "thread_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^th_[0-9a-f]{23}$"
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^tu_[0-9a-f]{23}$"
+        },
+        "item_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^it_[0-9a-f]{23}$"
+        },
+        "call_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^call_[0-9a-f]{23}$"
+        },
+        "params": {
+          "type": "object"
+        }
       }
     },
     "frame": {
       "oneOf": [
-        { "$ref": "#/$defs/request" },
-        { "$ref": "#/$defs/response" },
-        { "$ref": "#/$defs/notification" }
+        {
+          "$ref": "#/$defs/request"
+        },
+        {
+          "$ref": "#/$defs/response"
+        },
+        {
+          "$ref": "#/$defs/notification"
+        }
       ]
     }
   }

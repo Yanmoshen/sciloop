@@ -1,16 +1,19 @@
 /**
  * agent.v2 前端状态 reducer（纯函数，无框架依赖）。
  *
- * 三条硬规则（对应验收书 §6「乱序和重复事件不会重复渲染」「重连使用最后游标补齐事件」）：
+ * 六条硬规则（WP-03 / 验收 7.2）：
  *
- * 1. **按序号去重**：`sequence <= cursors[thread]` 的事件直接丢弃，不重复渲染；
- * 2. **乱序缓冲**：`sequence > cursors[thread] + 1` 时先存进 pending，并记录缺口起点，
- *    由上层（store）触发 `thread/events/replay` 补拉；补齐后按序一次性排空；
- * 3. **只有 event 通知参与游标**：心跳 / 订阅确认 / 关闭提示用的是连接级序号，
- *    是另一个序列空间，绝不能用来推进线程游标。
+ * 1. 按序号去重：sequence <= cursors[thread] 的事件直接丢弃，不重复渲染；
+ * 2. 乱序缓冲：sequence > cursors[thread] + 1 时先存进 pending，并暴露缺口起点，
+ *    由上层（store）触发 thread/events/replay 补拉；补齐后按序一次性排空；
+ * 3. 只有 event 通知参与游标：心跳 / 订阅确认 / 关闭提示用的是连接级序号，
+ *    是另一个序列空间，绝不能用来推进线程游标；
+ * 4. 迟到的 delta 不能复活终结的 Turn：终态是权威，后续 turn 事件不得把状态改回 running；
+ * 5. 中断后忽略迟到的正文与工具增量：只接受终态与取消类事件；
+ * 6. 纯函数：所有副作用（网络、存储、计时）都在 store/client 里。
  *
- * reducer 不发起任何请求、不调用模型：刷新页面时先 `thread/resume` 拿快照，
- * 再用游标补事件，绝不通过「重新调用模型」来恢复界面。
+ * reducer 不发起任何请求、不调用模型：刷新页面时先渲染本地快照，
+ * 再用 thread/resume + 游标补事件，绝不通过重新调用模型来恢复界面。
  */
 
 import type {
@@ -30,74 +33,24 @@ import type {
   ToolCallView,
   TurnStatus,
   TurnView,
-  UsageView,
 } from './protocol'
+import { bufferEvent, drainContiguous, isDuplicate, isOutOfOrder } from './cursor'
+import type {
+  AgentV2State,
+  ConnectionPatch,
+  NoticeLevel,
+  StreamBuffer,
+} from './types'
 
-export type ConnectionStatus = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed'
-
-export interface ConnectionState {
-  status: ConnectionStatus
-  attempts: number
-  /** 服务端是否在关闭中（收到 server/shutting_down） */
-  shuttingDown: boolean
-  lastHeartbeat: string | null
-  message: string | null
-}
-
-export interface StreamBuffer {
-  text: string
-  reasoning: string
-  updatedAt: string
-}
-
-export type NoticeLevel = 'info' | 'warning' | 'error'
-
-export interface Notice {
-  level: NoticeLevel
-  text: string
-  threadId: string | null
-  at: string
-}
-
-export interface AgentV2State {
-  connection: ConnectionState
-  threads: Record<string, ThreadView>
-  threadOrder: string[]
-  currentThreadId: string | null
-  turns: Record<string, TurnView>
-  turnsByThread: Record<string, string[]>
-  items: Record<string, ItemView>
-  itemsByThread: Record<string, string[]>
-  toolCalls: Record<string, ToolCallView>
-  toolCallsByThread: Record<string, string[]>
-  toolOutputChunks: Record<string, string[]>
-  approvals: Record<string, ApprovalView>
-  approvalsByThread: Record<string, string[]>
-  compactionRuns: Record<string, CompactionRunView[]>
-  summaries: Record<string, SummaryView[]>
-  children: Record<string, string[]>
-  childInfo: Record<string, ChildView>
-  mailbox: Record<string, MailboxMessageView[]>
-  memories: Record<string, MemoryRecordView[]>
-  plan: Record<string, PlanView>
-  stream: Record<string, StreamBuffer>
-  usage: Record<string, UsageView>
-  /** thread -> 已连续应用的最大事件序号 */
-  cursors: Record<string, number>
-  /** thread -> 乱序待应用的事件（sequence -> 通知） */
-  pending: Record<string, Record<number, EventView>>
-  /** thread -> 当前缺口的起始序号（null 表示无缺口） */
-  gapFrom: Record<string, number | null>
-  /** thread -> 已补拉的事件条数（用于「已补齐 N 条事件」提示） */
-  backfilled: Record<string, number>
-  notices: Notice[]
-  errors: ErrorPayload[]
-  applied: number
-  duplicates: number
-  /** 乱序缓冲接收过的事件数（补拉前后都可以观测） */
-  buffered: number
-  lastEventAt: string | null
-}
+export type {
+  AgentV2State,
+  ConnectionPatch,
+  ConnectionState,
+  ConnectionStatus,
+  Notice,
+  NoticeLevel,
+  StreamBuffer,
+} from './types'
 
 export function createAgentState(): AgentV2State {
   return {
@@ -105,6 +58,7 @@ export function createAgentState(): AgentV2State {
       status: 'idle',
       attempts: 0,
       shuttingDown: false,
+      owner: true,
       lastHeartbeat: null,
       message: null,
     },
@@ -138,6 +92,7 @@ export function createAgentState(): AgentV2State {
     applied: 0,
     duplicates: 0,
     buffered: 0,
+    lateDropped: 0,
     lastEventAt: null,
   }
 }
@@ -210,14 +165,6 @@ function asRecord(value: unknown): Record<string, unknown> {
 // --------------------------------------------------------------------------- //
 // 连接
 // --------------------------------------------------------------------------- //
-export interface ConnectionPatch {
-  status?: ConnectionStatus
-  attempts?: number
-  shuttingDown?: boolean
-  lastHeartbeat?: string | null
-  message?: string | null
-}
-
 export function setConnection(state: AgentV2State, patch: ConnectionPatch): AgentV2State {
   const next = clone(state)
   next.connection = { ...next.connection, ...patch }
@@ -267,7 +214,7 @@ export function applyNotification(state: AgentV2State, note: NotificationFrame):
         const current = next.cursors[note.thread_id]
         if (current === undefined || cursor > current) next.cursors[note.thread_id] = cursor
       }
-      next.connection = { ...next.connection, status: 'open', message: null }
+      next.connection = { ...next.connection, status: 'connected', message: null }
       return next
     }
     case 'subscription/cancelled':
@@ -297,7 +244,7 @@ export function applyNotification(state: AgentV2State, note: NotificationFrame):
     }
     case 'heartbeat': {
       const next = clone(state)
-      next.connection = { ...next.connection, status: 'open', lastHeartbeat: nowIso() }
+      next.connection = { ...next.connection, status: 'connected', lastHeartbeat: nowIso() }
       return next
     }
     case 'protocol/error': {
@@ -346,49 +293,94 @@ export function applyEvent(state: AgentV2State, event: EventView): AgentV2State 
   if (!threadId || typeof event.sequence !== 'number') return state
   const cursor = state.cursors[threadId] ?? 0
 
-  if (event.sequence <= cursor) {
+  if (isDuplicate(event.sequence, cursor)) {
     const next = clone(state)
     next.duplicates += 1
     return next
   }
 
-  if (event.sequence > cursor + 1) {
+  if (isOutOfOrder(event.sequence, cursor)) {
     // 乱序：先缓冲，等补拉把缺口补上再按序应用
     const next = clone(state)
-    const pending = { ...(next.pending[threadId] ?? {}) }
-    if (pending[event.sequence]) {
+    const buffered = bufferEvent(next.pending[threadId] ?? {}, event.sequence, event)
+    next.pending[threadId] = buffered.pending
+    if (buffered.duplicated) {
       next.duplicates += 1
       return next
     }
-    pending[event.sequence] = event
-    next.pending[threadId] = pending
     next.gapFrom[threadId] = cursor + 1
     next.buffered += 1
     return next
   }
 
+  // 规则 4/5：所属 Turn 已终结时，迟到的增量不再落地（但游标必须继续前进，
+  // 否则缺口永远补不平）。被丢弃的事件数记在 lateDropped 里，便于验收取证。
+  const dropped = isLateEvent(state, event)
   let next = clone(state)
-  next = applyEventBody(next, event)
+  if (dropped) {
+    next.lateDropped += 1
+  } else {
+    next = applyEventBody(next, event)
+  }
   next.cursors[threadId] = event.sequence
   next.applied += 1
   next.lastEventAt = event.created_at || nowIso()
 
-  // 排空后续连续事件
-  const pending = { ...(next.pending[threadId] ?? {}) }
-  let expected = event.sequence + 1
-  while (pending[expected]) {
-    const buffered = pending[expected]
-    delete pending[expected]
-    next = applyEventBody(next, buffered)
-    next.cursors[threadId] = expected
+  // 按序排空缓冲
+  const drained = drainContiguous(next.pending[threadId] ?? {}, event.sequence, event.sequence)
+  for (const buffered of drained.applied) {
+    const late = isLateEvent(next, buffered)
+    if (late) {
+      next.lateDropped += 1
+    } else {
+      next = applyEventBody(next, buffered)
+    }
     next.applied += 1
     next.lastEventAt = buffered.created_at || next.lastEventAt
-    expected += 1
   }
-  next.pending[threadId] = pending
-  next.gapFrom[threadId] = pending[expected] ? expected : null
+  next.cursors[threadId] = drained.cursor
+  next.pending[threadId] = drained.remaining
+  next.gapFrom[threadId] = drained.gapFrom
   return next
 }
+
+/** 该 Turn 是否已终结（终态不可被迟到事件改写）。 */
+const TERMINAL_STATUSES: readonly string[] = ['completed', 'failed', 'interrupted']
+
+function turnStatusOf(state: AgentV2State, event: EventView): string | null {
+  const turnId = event.turn_id || asString(event.payload.turn_id)
+  if (!turnId) return null
+  return state.turns[turnId]?.status ?? null
+}
+
+/**
+ * 判定「迟到事件」——WP-03 规则 4/5。
+ *
+ * - 迟到内容（正文/推理增量、工具生命周期）：Turn 已终结或已中断 -> 丢弃；
+ * - 其他事件（终态、审批结论、压缩、子 Agent、记忆）一律照常应用。
+ *
+ * 注意：这里只决定「要不要改状态」，序号推进与去重照旧。
+ */
+function isLateEvent(state: AgentV2State, event: EventView): boolean {
+  const status = turnStatusOf(state, event)
+  if (status === null) return false
+  if (event.type.startsWith('turn/')) return false
+  const isContent =
+    event.type.startsWith('model/') ||
+    event.type.startsWith('tool/') ||
+    (event.type === 'item/added' && CONTENT_ITEM_TYPES.has(asString(asRecord(event.payload.item).type)))
+  if (!isContent) return false
+  if (status === 'interrupted') return true
+  return TERMINAL_STATUSES.includes(status) && event.type !== 'item/added'
+}
+
+/**
+ * 内容型 Item。
+ *
+ * - 对**已中断**的 Turn：这些 Item 属于「停止之前来不及落地」的产物，一律忽略（规则 5）；
+ * - 对**已完成/失败**的 Turn：Item 是既成事实，仍然接收（只有流式增量会被丢弃）。
+ */
+const CONTENT_ITEM_TYPES = new Set(['assistant_text', 'reasoning', 'tool_call', 'tool_result'])
 
 function applyEventBody(state: AgentV2State, event: EventView): AgentV2State {
   const threadId = event.thread_id
@@ -562,14 +554,29 @@ function applyTurnEvent(
   payload: Record<string, unknown>,
 ): void {
   const rawTurn = asRecord(payload.turn) as unknown as TurnView
-  if (rawTurn && rawTurn.turn_id) upsertTurn(state, rawTurn)
+  if (rawTurn && rawTurn.turn_id) {
+    // 规则 4（第一道）：payload 里自带的 Turn 负载也可能是迟到的旧状态，
+    // 不能让它把已经终结的 Turn 覆盖回 running。
+    const previous = state.turns[rawTurn.turn_id]
+    const keepTerminal =
+      previous !== undefined &&
+      TERMINAL_STATUSES.includes(previous.status) &&
+      !TERMINAL_STATUSES.includes(rawTurn.status)
+    upsertTurn(state, keepTerminal ? { ...rawTurn, status: previous.status } : rawTurn)
+    if (keepTerminal) state.lateDropped += 1
+  }
   const turnId = rawTurn?.turn_id ?? asString(payload.turn_id)
   if (!turnId) return
   const turn = state.turns[turnId]
   if (!turn) return
   const to = asString(payload.to) as TurnStatus | ''
   const updated: TurnView = { ...turn }
-  if (to) updated.status = to
+  // 规则 4：终态是权威。迟到的 started/waiting_* 事件不能把终结的 Turn 改回运行态。
+  if (to && !(TERMINAL_STATUSES.includes(turn.status) && !TERMINAL_STATUSES.includes(to))) {
+    updated.status = to
+  } else if (to) {
+    state.lateDropped += 1
+  }
   if (payload.error) updated.error = asRecord(payload.error)
   if (payload.waiting) updated.waiting = asRecord(payload.waiting)
   if (payload.cancel_reason) updated.cancel_reason = asString(payload.cancel_reason)

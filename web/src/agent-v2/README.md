@@ -1,32 +1,42 @@
 # agent-v2 前端模块（Agent 3 / WP-10）
 
 本目录与 `web/src/{api/agent-v2.ts,stores/agent-v2.ts,components/agent-v2/,views/agent-v2/,tests/agent-v2/}`
-一起构成 Agent v2 的前端交付。**不修改**旧路由、旧页面与全局样式。
+一起构成 Agent v2 前端交付。**不修改**旧路由、旧页面与全局样式。
 
 ## 文件清单
 
 | 文件 | 作用 |
 |---|---|
-| `protocol.ts` | 协议与契约类型、方法名常量、需幂等键的方法集合 |
-| `reducer.ts` | 纯函数状态机：去重 / 乱序缓冲 / 缺口检测 / 快照重建 / 选择器 |
-| `../api/agent-v2.ts` | WebSocket 客户端：自动重连、游标续订、请求幂等键、超时 |
-| `../stores/agent-v2.ts` | Pinia store：把客户端与 reducer 接起来，暴露动作与选择器 |
-| `../components/agent-v2/*.vue` | 连接条 / 工具卡片 / 审批卡片 / 计划 / 压缩 / 记忆 / 子 Agent 树 / Turn 控件 / 输入框 / 流渲染 |
+| `protocol.ts` | 帧与契约类型、方法名、需幂等键的方法集合 |
+| `types.ts` | 前端视图状态类型（连接状态、流缓冲、提示、整棵状态树） |
+| `cursor.ts` | 去重 / 乱序 / 缺口排空（纯算法，单独可测） |
+| `recovery.ts` | 快照持久化与恢复（存储可注入，浏览器不可用时静默降级） |
+| `reducer.ts` | 纯函数状态机与选择器 |
+| `../api/agent-v2.ts` | WebSocket 客户端：自动重连、游标续订、幂等键复用、超时 |
+| `../stores/agent-v2.ts` | Pinia store：连接、会话切换、停止收束、快照恢复、全部动作 |
+| `../components/agent-v2/*.vue` | `ConversationShell` / `MessageItem` / `TurnStream` / `ToolCallCard` / `ApprovalCard` / `ResearchConfirmCard` / `PlanPanel` / `CompactionPanel` / `MemoryPanel` / `AgentTreePanel` / `TurnControls` / `ThreadRail` / `Composer` / `ConnectionBanner` |
+| `../components/agent-v2/blocks.ts` | 事件 → 渲染块的纯归约 + 研究意图识别 |
 | `../views/agent-v2/AgentWorkbench.vue` | 工作台页面（自身不含路由） |
-| `../tests/agent-v2/` | reducer / 协议 / 客户端的 node 测试（不新增依赖） |
+| `../tests/agent-v2/` | protocol / cursor / recovery / reducer / client 测试 + 取证预览入口 |
 
-## 三条状态不变量
+## 六条状态规则（reducer 文件头有同样一份）
 
-1. **只有 reducer 能改状态**：实时推送、游标补拉、快照重建三条路径共用同一套应用逻辑，
-   语义不会漂移。
-2. **只有 `method === "event"` 的通知参与游标**：心跳、订阅确认、关闭提示用的是
-   **连接级自增序号**，与线程事件序号是两个序列空间，混用会导致误判重复或缺口。
-3. **恢复界面不调用模型**：刷新页面走 `thread/resume`（服务端快照）+ `thread/events/replay`
-   （按游标补事件）；服务端回 `stale_cursor` 时退化为全量快照重建。
+1. 按序号去重：`sequence <= cursors[thread]` 的事件直接丢弃；
+2. 乱序缓冲：`sequence > cursor + 1` 先入 pending 并暴露缺口，由 store 触发 replay，补齐后按序排空；
+3. **只有 `method === "event"` 的通知参与游标**：心跳 / 订阅确认 / 关闭提示用的是连接级序号，
+   是另一个序列空间，混用会导致误判重复或缺中文档；
+4. 迟到的 delta 不能复活已终结的 Turn（终态是权威）；
+5. 中断后忽略迟到的正文与工具增量，只接受终态与取消类事件；
+6. 页面卸载保留快照 + 游标；重进先渲染快照，再由服务端快照与游标补齐，**绝不为恢复界面调用模型**。
+
+## 两条产品口径
+
+- **研究意图先确认**：`blocks.ts: looksLikeResearch()` 只决定「要不要弹确认卡」，不拦截请求；
+  确认前界面不得出现任何检索/执行进度。
+- **停止立刻收束**：`store.stopTurn()` 先把本地状态切到已停止（三点/计时/生成中立刻消失），
+  服务端的 `turn/interrupted` 只作确认。
 
 ## 挂载补丁（由协调 Agent 执行）
-
-本模块不自带路由，需要协调 Agent 在全局路由与导航里登记一次：
 
 ```ts
 // web/src/router/index.ts —— 新增一条路由（不要改动既有条目）
@@ -38,28 +48,20 @@
 }
 ```
 
-```vue
-<!-- 侧栏导航入口（HomeLayout.vue 的导航数组）新增一项，示例 -->
-{ path: '/agent-v2', label: 'Agent 工作台' }
-```
-
-服务端侧对应挂载补丁见 `server/api/v2/agent/mount.py` 的 `PATCH_SNIPPET`：
-
-```python
-from api.v2.agent.mount import install as install_agent_v2
-install_agent_v2(app)
-```
-
-WebSocket 地址默认 `同源 /api/v2/agent/ws`；如服务端在别的域，给页面传 `ws-url`。
-`owner_mode` 之外的访问面需要令牌，通过 `owner-token` prop 传入（会拼成查询参数）。
+服务端对应挂载片段见 `server/api/v2/agent/mount.py` 的 `PATCH_SNIPPET`。
 
 ## 测试
 
 ```bash
-# 在仓库任意位置执行；用 web 已有的 typescript 编译后跑断言，**不新增任何依赖**
-node web/tests/agent-v2/run.mjs
+node web/tests/agent-v2/run.mjs      # 用仓库已有 typescript 编译后跑断言，零新增依赖
 ```
 
-覆盖：事件去重、乱序缓冲与补拉排空、缺口检测、快照重建、协议方法与幂等键纪律、
-客户端自动重连与「重发复用同一幂等键」。测试**不依赖网络、不依赖浏览器**；
-编译产物落在 `web/tests/agent-v2/.test-build/`（已随目录 .gitignore 忽略，成功后自动清理）。
+当前结果：**57 passed / 0 failed**。覆盖事件去重、乱序缓冲与补拉排空、缺口检测、快照持久化与
+恢复、终态保护（迟到事件不复活）、中断后忽略迟到增量、协议方法与幂等键纪律、客户端自动重连与
+「重发复用同一幂等键」。
+
+## 验收预览（取证用）
+
+`web/tests/agent-v2/preview/` 提供一个只挂载 v2 工作台的最小入口（自带构建配置），
+配合只挂 v2 的后端即可出真实页面截图与时序日志；产物目录 `.preview/` 已被忽略。
+证据见 `server/api/v2/agent/evidence/`。

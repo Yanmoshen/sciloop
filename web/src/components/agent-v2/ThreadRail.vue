@@ -24,6 +24,11 @@ const sorted = computed(() =>
   [...props.threads].sort((a, b) => (b.updated_at ?? '').localeCompare(a.updated_at ?? '')),
 )
 
+/** 只表达「有没有进行中的回合」，不暴露序号等内部状态。 */
+function runningLabel(thread: ThreadView): string {
+  return thread.active_turn_id ? '进行中' : '空闲'
+}
+
 function create(): void {
   const value = name.value.trim()
   if (!value) return
@@ -57,8 +62,8 @@ function create(): void {
       >
         <button type="button" class="row__main" @click="emit('select', thread.thread_id)">
           <span class="row__name">{{ thread.name }}</span>
-          <span class="row__meta" :title="`最后事件序号 ${thread.last_sequence}`">
-            {{ thread.status === 'archived' ? '已归档' : `序号 ${thread.last_sequence}` }}
+          <span class="row__meta">
+            {{ thread.status === 'archived' ? '已归档' : runningLabel(thread) }}
           </span>
         </button>
         <button

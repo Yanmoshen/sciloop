@@ -41,6 +41,7 @@ export interface ResponseFrame {
 /** 通知通道。只有 `event` 参与事件游标；其余是连接/订阅级控制通知。 */
 export type NotificationMethod =
   | 'event'
+  | 'protocol/ready'
   | 'subscription/started'
   | 'subscription/cancelled'
   | 'thread/closed'

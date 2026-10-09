@@ -60,7 +60,7 @@ function submitEdit(): void {
       已压缩：{{ lastRun.tokens_before }} → {{ lastRun.tokens_after }} tokens（触发方式 {{ lastRun.trigger }}）
     </p>
     <p v-else-if="lastRun && lastRun.error" class="compact__fail">
-      压缩未完成：{{ lastRun.error.code }}。原上下文保持不变，可重试。
+      压缩未完成，原上下文保持不变，可以重试。
     </p>
 
     <p v-if="phase === 'started'" class="compact__running">正在压缩…</p>
@@ -68,7 +68,6 @@ function submitEdit(): void {
     <div v-if="summaries.length" class="compact__list">
       <article v-for="summary in summaries" :key="summary.summary_id" class="summary">
         <header class="summary__head">
-          <span class="summary__id mono">{{ summary.summary_id.slice(0, 12) }}</span>
           <span v-if="summary.active" class="tag tag--active">生效中</span>
           <span v-if="summary.edited" class="tag">已修订</span>
           <span class="summary__meta">{{ summary.trigger }} · 覆盖至 {{ summary.covered_until ?? '-' }}</span>
@@ -210,10 +209,6 @@ function submitEdit(): void {
 .tag--active {
   color: var(--color-success);
   background: var(--color-success-soft);
-}
-
-.mono {
-  font-family: var(--font-family-mono);
 }
 
 .link {

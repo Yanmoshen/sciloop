@@ -86,7 +86,7 @@ export function register() {
     client.connect()
     assertEqual(client.status, 'connecting')
     FakeSocket.latest().open()
-    assertEqual(client.status, 'open')
+    assertEqual(client.status, 'connected')
     client.close()
   })
 
@@ -139,7 +139,7 @@ export function register() {
       id: socket.sent[0].id,
       ok: false,
       result: null,
-      error: { code: 'stale_cursor', message: 'cursor 已过期', data: { reason: 'cursor_ahead' } },
+      error: { code: 'cursor_expired', message: 'cursor 已过期', data: { reason: 'cursor_ahead' } },
       replayed: false,
     })
     let caught = null
@@ -149,7 +149,7 @@ export function register() {
       caught = error
     }
     assert(caught instanceof AgentV2RequestError, '必须是带 code 的客户端错误')
-    assertEqual(caught.code, 'stale_cursor')
+    assertEqual(caught.code, 'cursor_expired')
     assertEqual(caught.data.reason, 'cursor_ahead')
     client.close()
   })
@@ -184,7 +184,7 @@ export function register() {
     await wait(10)
     assertEqual(FakeSocket.instances.length, 2, '退避后必须新建连接')
     FakeSocket.latest().open()
-    assertEqual(client.status, 'open')
+    assertEqual(client.status, 'connected')
     assertEqual(client.attempts, 0)
     const statuses = events.filter((event) => event.type === 'status').map((event) => event.status)
     assert(statuses.includes('reconnecting'), '必须上报重连状态')

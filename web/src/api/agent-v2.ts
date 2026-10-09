@@ -25,7 +25,7 @@ export interface AgentSocketLike {
 
 export type SocketFactory = (url: string) => AgentSocketLike
 
-export type ClientStatus = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed'
+export type ClientStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'closed'
 
 export interface PendingRequest {
   id: string
@@ -123,13 +123,13 @@ export class AgentV2Client {
   }
 
   isOpen(): boolean {
-    return this.status === 'open'
+    return this.status === 'connected'
   }
 
   private handleOpen(): void {
     const reconnected = this.attempts > 0
     this.attempts = 0
-    this.setStatus('open')
+    this.setStatus('connected')
     this.options.onOpen?.(this, reconnected)
     this.resendPending()
   }
@@ -245,7 +245,7 @@ export class AgentV2Client {
   }
 
   private flush(entry: PendingRequest): void {
-    if (!this.socket || this.status !== 'open') {
+    if (!this.socket || this.status !== 'connected') {
       // 未连上：等 onOpen 时统一重发
       return
     }
@@ -304,9 +304,9 @@ export function unwrap<T extends Record<string, unknown>>(frame: ResponseFrame):
 
 /** 服务端明确说「游标过期」时需要走全量快照重建。 */
 export function isStaleCursor(error: unknown): boolean {
-  return error instanceof AgentV2RequestError && error.code === 'stale_cursor'
+  return error instanceof AgentV2RequestError && error.code === 'cursor_expired'
 }
 
 export function isDuplicate(error: unknown): boolean {
-  return error instanceof AgentV2RequestError && error.code === 'duplicate_request'
+  return error instanceof AgentV2RequestError && error.code === 'idempotency_conflict'
 }

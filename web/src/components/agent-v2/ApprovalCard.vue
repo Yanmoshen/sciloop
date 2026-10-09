@@ -27,7 +27,20 @@ const directory = computed(() => {
   const cwd = args.cwd ?? args.workdir ?? props.threadCwd
   return cwd ? String(cwd) : '—'
 })
-const risk = computed(() => props.approval.risk || String(action.value.risk ?? 'unknown'))
+/** 风险描述：服务端未给出具体描述时显示「未评估」，不显示 unknown 这类占位值。 */
+const risk = computed(() => {
+  const value = props.approval.risk || String(action.value.risk ?? '')
+  if (!value || value === 'unknown') return '未评估'
+  return value
+})
+
+/** 决策者：把内部 actor 标识翻成人话。 */
+const decidedBy = computed(() => {
+  const actor = props.approval.decided_by
+  if (!actor) return ''
+  if (actor === 'user' || actor === 'owner') return '研究者'
+  return actor
+})
 const busy = ref(false)
 
 const OPTIONS: { decision: ApprovalDecision; label: string; hint: string; tone: string }[] = [
@@ -92,8 +105,7 @@ function choose(decision: ApprovalDecision): void {
       </button>
     </div>
     <p v-else class="approval__decided">
-      {{ approval.decided_by ? `由 ${approval.decided_by} 决定` : '已决定' }}
-      <span v-if="approval.decided_at">· {{ approval.decided_at }}</span>
+      {{ decidedBy ? `由${decidedBy}决定` : '已决定' }}
     </p>
   </article>
 </template>

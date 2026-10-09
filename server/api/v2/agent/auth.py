@@ -1,14 +1,16 @@
 # Copyright 2026 SciLoop contributors
 # Licensed under the Apache License, Version 2.0 (the "License");
-"""访问控制（认证）。
+"""访问控制（认证与授权）。
 
-复用项目既有的 ``core.security.owner_token_matches``，不新造一套判定：
+复用项目既有的 ``core.security.owner_token_matches``，不新造一套判定。
+与 v1 的语义保持一致（``require_public_or_owner``）——**读放行、写要研究者身份**：
 
-- ``owner_mode``（本机管理员测试面）直接放行；
-- ``public_demo`` 面必须带 ``X-Owner-Token`` 头或 ``?owner_token=`` 查询参数，
-  且服务端配置了 ``OWNER_TOKEN`` 才放行；
-- 配置不可用时（例如未加载 ``.env`` 的单元测试环境）**默认放行**，但会把
-  ``degraded`` 标记带在返回值里，便于排查——绝不因为读不到配置就把人挡在门外。
+- ``owner_mode``（本机管理员测试面）：直接具备写权限；
+- ``public_demo`` 面带有效 ``X-Owner-Token`` / ``?owner_token=``：具备写权限；
+- ``public_demo`` 面匿名：**允许建立会话（只读）**，但变更类请求会得到
+  ``permission_denied``——这与「连接被拒」是两件事，前端据此显示只读提示而不是断线；
+- 配置不可用（例如未加载 ``.env`` 的单元测试环境）默认**放行且可写**，
+  并把 ``degraded`` 标记带在返回值里，绝不因为读不到配置就把人挡在门外。
 """
 
 from __future__ import annotations
@@ -20,14 +22,23 @@ from dataclasses import dataclass
 class AccessDecision:
     """一次访问判定的结果。"""
 
-    allowed: bool
+    #: 是否允许建立会话（读操作可用）。
+    can_connect: bool
+    #: 是否具备写权限（变更类方法可用）。
+    owner: bool
     access_mode: str
     reason: str
     degraded: bool = False
 
+    @property
+    def allowed(self) -> bool:
+        """历史别名：等价于 :attr:`can_connect`。"""
+        return self.can_connect
+
     def to_dict(self) -> dict[str, object]:
         return {
-            "allowed": self.allowed,
+            "can_connect": self.can_connect,
+            "owner": self.owner,
             "access_mode": self.access_mode,
             "reason": self.reason,
             "degraded": self.degraded,
@@ -44,17 +55,17 @@ def _matcher():  # noqa: ANN202 - 返回可调用对象或 None，避免模块�
 
 
 def check_token(token: str | None) -> AccessDecision:
-    """按令牌判定访问权。"""
+    """按令牌判定：能否建立会话、是否具备写权限。"""
     matcher = _matcher()
     if matcher is None:
-        return AccessDecision(True, "unknown", "config_unavailable", degraded=True)
+        return AccessDecision(True, True, "unknown", "config_unavailable", degraded=True)
     try:
-        allowed = bool(matcher(token))
+        is_owner = bool(matcher(token))
     except Exception:  # noqa: BLE001 - 配置异常不应把请求打成 500
-        return AccessDecision(True, "unknown", "config_error", degraded=True)
-    if allowed:
-        return AccessDecision(True, "owner_mode", "owner_ok")
-    return AccessDecision(False, "public_demo", "owner_token_required")
+        return AccessDecision(True, True, "unknown", "config_error", degraded=True)
+    if is_owner:
+        return AccessDecision(True, True, "owner_mode", "owner_ok")
+    return AccessDecision(True, False, "public_demo", "anonymous_readonly")
 
 
 def token_from_websocket(websocket: object) -> str | None:

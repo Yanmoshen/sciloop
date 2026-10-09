@@ -1,22 +1,24 @@
 <script setup lang="ts">
 /**
- * Agent v2 工作台（Codex 风格）：线程 / Turn / 工具 / 审批 / 计划 / 压缩 / 记忆 / 子 Agent。
+ * Agent v2 工作台（Codex 风格）：会话 / 回合 / 工具 / 审批 / 计划 / 压缩 / 记忆 / 子 Agent。
  *
- * 本页**不自带路由**：全局路由由协调 Agent 集成（见 `web/src/agent-v2/README.md` 的挂载补丁）。
- * 页面通过 props 接收服务端地址与身份参数，默认指向同源 `/api/v2/agent/ws`。
+ * 本页**不自带路由**：全局路由由协调 Agent 集成（见 `web/src/agent-v2/README.md`）。
+ * 页面只负责编排：状态来自 store，规则在 reducer，组件只管画。
+ *
+ * 两条产品口径：
+ * - 研究意图先弹确认卡，确认前不显示任何执行进度；
+ * - 停止按钮按下后，三点/计时/「生成中」立刻收束。
  */
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
 import AgentTreePanel from '../../components/agent-v2/AgentTreePanel.vue'
-import ApprovalCard from '../../components/agent-v2/ApprovalCard.vue'
 import CompactionPanel from '../../components/agent-v2/CompactionPanel.vue'
-import Composer from '../../components/agent-v2/Composer.vue'
 import ConnectionBanner from '../../components/agent-v2/ConnectionBanner.vue'
+import ConversationShell from '../../components/agent-v2/ConversationShell.vue'
 import MemoryPanel from '../../components/agent-v2/MemoryPanel.vue'
 import PlanPanel from '../../components/agent-v2/PlanPanel.vue'
 import ThreadRail from '../../components/agent-v2/ThreadRail.vue'
-import TurnControls from '../../components/agent-v2/TurnControls.vue'
-import TurnStream from '../../components/agent-v2/TurnStream.vue'
+import { looksLikeResearch, type ResearchIntent } from '../../components/agent-v2/blocks'
 import { METHOD, type ApprovalDecision, type ApprovalView } from '../../agent-v2/protocol'
 import { useAgentV2Store } from '../../stores/agent-v2'
 
@@ -31,9 +33,8 @@ const props = withDefaults(
 )
 
 const store = useAgentV2Store()
-const submittingApproval = ref(false)
-const draft = ref('')
 const scenarios = ref<string[]>([])
+const pendingResearch = ref<ResearchIntent | null>(null)
 
 const wsUrl = computed(() => {
   if (props.wsUrl) return props.wsUrl
@@ -43,28 +44,20 @@ const wsUrl = computed(() => {
 })
 
 const currentThreadId = computed(() => store.state.currentThreadId)
-const active = computed(() => store.active)
-const composerMode = computed<'new' | 'steer' | 'continue'>(() => {
-  const status = active.value?.status
-  if (status === 'waiting_input') return 'continue'
-  if (status === 'running') return 'steer'
-  return 'new'
-})
-
+const activeTurn = computed(() => store.active)
 const currentPlan = computed(() => store.plan ?? null)
 const selectedTurn = computed(() => {
-  const turn = active.value
-  if (turn) return turn
+  if (activeTurn.value) return activeTurn.value
   const list = store.turns
   return list.length ? list[list.length - 1] : null
 })
 const streamItems = computed(() => (selectedTurn.value ? store.itemsOfTurn(selectedTurn.value.turn_id) : []))
-const liveText = computed(() =>
-  selectedTurn.value ? store.assistantText(selectedTurn.value.turn_id) : '',
-)
+const liveText = computed(() => (selectedTurn.value ? store.assistantText(selectedTurn.value.turn_id) : ''))
 const liveReasoning = computed(() =>
   selectedTurn.value ? store.reasoningText(selectedTurn.value.turn_id) : '',
 )
+/** 已停止：界面立刻不再显示三点/生成中（等中断事件只是确认，不改节奏）。 */
+const stopped = computed(() => store.stopRequested && selectedTurn.value?.turn_id === store.stopping)
 
 function approvalOf(approvalId: string): ApprovalView | null {
   return store.state.approvals[approvalId] ?? null
@@ -78,44 +71,58 @@ onMounted(async () => {
   scenarios.value = (result.scenarios as string[]) ?? []
   const first = store.threads[0]
   if (first) await store.selectThread(first.thread_id)
+  window.addEventListener('beforeunload', store.persistNow)
 })
 
-onBeforeUnmount(() => store.disconnect())
+onBeforeUnmount(() => {
+  window.removeEventListener('beforeunload', store.persistNow)
+  store.persistNow()
+  store.disconnect()
+})
 
 async function onCreate(payload: { name: string; scenario?: string }): Promise<void> {
   await store.createThread(payload.name, { scenario: payload.scenario })
   await store.listThreads()
 }
 
+/** 提交：研究意图先确认；普通问候直接进入对话。 */
 async function onSubmit(text: string): Promise<void> {
-  const threadId = currentThreadId.value
-  if (!threadId) return
-  const mode = composerMode.value
-  if (mode === 'new') {
-    await store.startTurn(threadId, text)
+  if (!currentThreadId.value) return
+  if (looksLikeResearch(text)) {
+    pendingResearch.value = { question: text, sources: ['arXiv', 'Semantic Scholar', 'OpenAlex'] }
     return
   }
-  const turn = active.value
-  if (!turn) return
-  if (mode === 'continue') await store.continueTurn(threadId, turn.turn_id, text)
-  else await store.steerTurn(threadId, turn.turn_id, text)
+  await store.startTurn(currentThreadId.value, text)
+}
+
+async function onConfirmResearch(intent: ResearchIntent): Promise<void> {
+  const threadId = currentThreadId.value
+  if (!threadId) return
+  const parts = [intent.question]
+  if (intent.scope) parts.push(`范围与约束：${intent.scope}`)
+  if (intent.sources?.length) parts.push(`优先检索源：${intent.sources.join('、')}`)
+  pendingResearch.value = null
+  await store.startTurn(threadId, parts.join('\n'))
+}
+
+function onCancelResearch(): void {
+  pendingResearch.value = null
 }
 
 async function onResolve(payload: { approval: ApprovalView; decision: ApprovalDecision }): Promise<void> {
-  submittingApproval.value = true
-  try {
-    await store.resolveApproval(
-      payload.approval.thread_id,
-      payload.approval.turn_id,
-      payload.approval.approval_id,
-      payload.decision,
-    )
-  } finally {
-    submittingApproval.value = false
-  }
+  await store.resolveApproval(
+    payload.approval.thread_id,
+    payload.approval.turn_id,
+    payload.approval.approval_id,
+    payload.decision,
+  )
 }
 
-async function onMemoryLoad(payload: { scope: 'user' | 'project' | 'conversation'; scopeId: string; includeDeleted: boolean }): Promise<void> {
+async function onMemoryLoad(payload: {
+  scope: 'user' | 'project' | 'conversation'
+  scopeId: string
+  includeDeleted: boolean
+}): Promise<void> {
   await store.listMemories(payload.scope, payload.scopeId, payload.includeDeleted)
 }
 
@@ -132,18 +139,14 @@ async function onMemorySave(payload: {
 <template>
   <div class="workbench">
     <header class="workbench__header">
-      <div class="workbench__title">
-        <h1>Agent 工作台</h1>
-        <span class="workbench__sub" :title="currentThreadId ?? ''">{{ store.currentThread?.name ?? '未选择会话' }}</span>
-      </div>
+      <h1 class="workbench__title">Agent 工作台</h1>
       <ConnectionBanner
         :connection="store.connection"
-        :cursor="store.cursor"
-        :gap-from="store.gapFrom"
-        :backfilled="store.backfilled"
+        :snapshot-restored="store.snapshotRestored"
+        :gap-pending="store.gapFrom !== null"
         :notices="store.notices"
         @reconnect="store.connect({ url: wsUrl, token: props.ownerToken || undefined })"
-        @backfill="currentThreadId && store.backfill(currentThreadId)"
+        @refresh="currentThreadId && store.resumeThread(currentThreadId)"
       />
     </header>
 
@@ -159,43 +162,29 @@ async function onMemorySave(payload: {
       />
 
       <main class="workbench__main">
-        <TurnControls
-          :turn="selectedTurn"
-          :busy="store.busy"
-          :draft="draft"
-          @steer="(text) => store.steerTurn(currentThreadId as string, selectedTurn?.turn_id as string, text)"
-          @continue="(text) => store.continueTurn(currentThreadId as string, selectedTurn?.turn_id as string, text)"
-          @interrupt="store.interruptTurn(currentThreadId as string, selectedTurn?.turn_id as string)"
-          @recover="store.recoverTurn(currentThreadId as string, selectedTurn?.turn_id as string)"
-          @retry="store.startTurn(currentThreadId as string, liveText || '重试上一轮')"
-        />
-
-        <ApprovalCard
-          v-for="approval in store.approvals"
-          :key="approval.approval_id"
-          :approval="approval"
-          :thread-cwd="store.currentThread?.cwd ?? null"
-          :submitting="submittingApproval"
-          @resolve="(decision) => onResolve({ approval, decision })"
-        />
-
-        <TurnStream
+        <ConversationShell
+          :thread="store.currentThread"
           :items="streamItems"
+          :active-turn="activeTurn"
           :stream-text="liveText"
           :stream-reasoning="liveReasoning"
+          :approvals="store.approvals"
           :tool-call-of="store.toolCall"
           :tool-output-of="store.toolOutput"
           :approval-of="approvalOf"
-          :thread-cwd="store.currentThread?.cwd ?? null"
-          :submitting-approval="submittingApproval"
-          @resolve="onResolve"
-        />
-
-        <Composer
-          :mode="composerMode"
           :busy="store.busy"
-          :disabled="!currentThreadId"
+          :stopped="stopped"
+          :read-only="store.readOnly"
+          :pending-research="pendingResearch"
           @submit="onSubmit"
+          @steer="(text) => currentThreadId && activeTurn && store.steerTurn(currentThreadId, activeTurn.turn_id, text)"
+          @continue="(text) => currentThreadId && activeTurn && store.continueTurn(currentThreadId, activeTurn.turn_id, text)"
+          @interrupt="currentThreadId && activeTurn && store.stopTurn(currentThreadId, activeTurn.turn_id)"
+          @recover="currentThreadId && activeTurn && store.recoverTurn(currentThreadId, activeTurn.turn_id)"
+          @retry="currentThreadId && store.startTurn(currentThreadId, liveText || '重试上一轮')"
+          @resolve="onResolve"
+          @confirm-research="onConfirmResearch"
+          @cancel-research="onCancelResearch"
         />
       </main>
 
@@ -259,20 +248,9 @@ async function onMemorySave(payload: {
 }
 
 .workbench__title {
-  display: flex;
-  align-items: baseline;
-  gap: var(--space-3);
-}
-
-.workbench__title h1 {
   margin: 0;
   font-size: var(--font-size-xl);
   font-weight: 600;
-}
-
-.workbench__sub {
-  font-size: var(--font-size-xs);
-  color: var(--color-text-secondary);
 }
 
 .workbench__body {

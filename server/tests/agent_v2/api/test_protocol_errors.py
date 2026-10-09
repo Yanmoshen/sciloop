@@ -90,7 +90,7 @@ def test_illegal_state_transition_is_structured(api) -> None:
     error = api.fails(
         "turn/interrupt",
         {"thread_id": thread["thread_id"], "turn_id": turn["turn_id"]},
-        expect=ErrorCode.ILLEGAL_TURN_TRANSITION.value,
+        expect=ErrorCode.INVALID_STATE.value,
         idem="interrupt-completed",
     )
     assert error["data"]["turn_id"] == turn["turn_id"]
@@ -103,10 +103,12 @@ def test_continue_requires_waiting_input(api) -> None:
     error = api.fails(
         "turn/continue",
         {"thread_id": thread["thread_id"], "turn_id": turn["turn_id"], "text": "继续"},
-        expect=ErrorCode.ILLEGAL_TURN_TRANSITION.value,
+        expect=ErrorCode.INVALID_STATE.value,
         idem="continue-not-waiting",
     )
-    assert error["data"]["to"] == "running"
+    # 已完成的回合：给出可行动的细分（直接发新消息），而不是笼统的非法迁移
+    assert error["data"]["kind"] == "turn_completed"
+    assert error["data"]["status"] == "completed"
 
 
 def test_steer_requires_active_turn(api) -> None:
@@ -115,14 +117,15 @@ def test_steer_requires_active_turn(api) -> None:
     error = api.fails(
         "turn/steer",
         {"thread_id": thread["thread_id"], "turn_id": turn["turn_id"], "text": "补充"},
-        expect=ErrorCode.ILLEGAL_TURN_TRANSITION.value,
+        expect=ErrorCode.INVALID_STATE.value,
         idem="steer-completed",
     )
-    assert "active" in error["data"]
+    assert error["data"]["kind"] == "turn_completed"
+    assert error["data"]["turn_id"] == turn["turn_id"]
 
 
 def test_concurrent_turn_is_rejected(api) -> None:
-    thread = api.start_thread("并发 Turn", scenario="interrupt")["thread"]
+    thread = api.start_thread("并发 Turn", scenario="turn_interrupt")["thread"]
     result = api.call("turn/start", {"thread_id": thread["thread_id"], "text": "第一轮"}, idem="t1")
     turn_id = result["turn"]["turn_id"]
     api.wait_status(thread["thread_id"], turn_id, {"running"})
@@ -142,7 +145,7 @@ def test_cursor_ahead_is_stale_cursor(api) -> None:
     error = api.fails(
         "thread/events/replay",
         {"thread_id": thread["thread_id"], "after_sequence": last + 50},
-        expect=ErrorCode.STALE_CURSOR.value,
+        expect=ErrorCode.CURSOR_EXPIRED.value,
     )
     assert error["data"]["reason"] == "cursor_ahead"
     assert error["data"]["last_sequence"] == last
@@ -156,7 +159,7 @@ def test_cursor_below_replay_floor_is_stale_cursor(api, service) -> None:
     error = api.fails(
         "thread/events/replay",
         {"thread_id": thread["thread_id"], "after_sequence": 1},
-        expect=ErrorCode.STALE_CURSOR.value,
+        expect=ErrorCode.CURSOR_EXPIRED.value,
     )
     assert error["data"]["reason"] == "below_replay_floor"
     assert error["data"]["floor"] == last - 1
@@ -200,7 +203,7 @@ def test_duplicate_request_id_with_different_payload(api) -> None:
     error = api.fails(
         "thread/resume",
         {"thread_id": new_id("thread")},
-        expect=ErrorCode.DUPLICATE_REQUEST.value,
+        expect=ErrorCode.IDEMPOTENCY_CONFLICT.value,
         request_id="dup-1",
     )
     assert error["data"]["request_id"] == "dup-1"
@@ -213,7 +216,7 @@ def test_shutting_down_rejects_new_requests(api, service) -> None:
     thread = api.start_thread("服务关闭", scenario="text_multi_turn")["thread"]
     api.run(service.shutdown())
     error = api.fails(
-        "thread/resume", {"thread_id": thread["thread_id"]}, expect=ErrorCode.SHUTTING_DOWN.value
+        "thread/resume", {"thread_id": thread["thread_id"]}, expect=ErrorCode.SERVER_SHUTTING_DOWN.value
     )
     assert error["data"]["method"] == "thread/resume"
     api.run(service.host.shutdown())
@@ -232,7 +235,7 @@ def test_events_are_schema_valid(api) -> None:
     """写进事件流的每一条事件都必须满足冻结的 events.schema.json。"""
     from contracts.agent_v2.validate import validator_for
 
-    thread = api.start_thread("事件合规", scenario="tools_parallel")["thread"]
+    thread = api.start_thread("事件合规", scenario="tool_parallel")["thread"]
     api.run_turn(thread["thread_id"], "跑一轮带工具的执行")
     validator = validator_for("events")
     for event in api.events(thread["thread_id"]):

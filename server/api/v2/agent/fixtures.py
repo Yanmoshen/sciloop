@@ -64,6 +64,8 @@ class Scenario:
     approval_required: list[str] = field(default_factory=list)
     tool_delays: dict[str, float] = field(default_factory=dict)
     provider_delay_s: float = 0.0
+    #: 运行时是否可用（``false`` 时启动 Turn 会得到 ``runtime_unavailable``）。
+    runtime_available: bool = True
     source: str | None = None
 
     def provider(self) -> FakeProvider:
@@ -87,6 +89,7 @@ class Scenario:
             "tools": [spec.name for spec in self.specs()],
             "approval_required": list(self.approval_required),
             "provider_delay_s": self.provider_delay_s,
+            "runtime_available": self.runtime_available,
             "source": self.source,
         }
 
@@ -189,6 +192,8 @@ def parse_lines(lines: Iterable[str], *, name: str, source: str | None = None) -
             scenario.tool_outputs[str(row.get("name", ""))] = [str(chunk) for chunk in chunks]
         elif row_type == "model_delay":
             scenario.provider_delay_s = float(row.get("seconds") or 0.0)
+        elif row_type == "runtime":
+            scenario.runtime_available = bool(row.get("available", True))
         else:
             raise FixtureError(f"{where}: unknown line type {row_type!r}")
     return scenario

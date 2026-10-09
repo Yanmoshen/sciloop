@@ -1,0 +1,21 @@
+{"type": "meta", "thread_name": "二十轮对话", "model": "fake-20"}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第 1 轮：收到，我按顺序记下了这一轮的内容。"}, {"kind": "usage", "input_tokens": 11, "output_tokens": 7}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第 2 轮：收到，我按顺序记下了这一轮的内容。"}, {"kind": "usage", "input_tokens": 12, "output_tokens": 8}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第 3 轮：收到，我按顺序记下了这一轮的内容。"}, {"kind": "usage", "input_tokens": 13, "output_tokens": 9}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第 4 轮：收到，我按顺序记下了这一轮的内容。"}, {"kind": "usage", "input_tokens": 14, "output_tokens": 10}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第 5 轮：收到，我按顺序记下了这一轮的内容。"}, {"kind": "usage", "input_tokens": 15, "output_tokens": 11}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第 6 轮：收到，我按顺序记下了这一轮的内容。"}, {"kind": "usage", "input_tokens": 16, "output_tokens": 12}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第 7 轮：收到，我按顺序记下了这一轮的内容。"}, {"kind": "usage", "input_tokens": 17, "output_tokens": 13}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第 8 轮：收到，我按顺序记下了这一轮的内容。"}, {"kind": "usage", "input_tokens": 18, "output_tokens": 14}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第 9 轮：收到，我按顺序记下了这一轮的内容。"}, {"kind": "usage", "input_tokens": 19, "output_tokens": 15}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第 10 轮：收到，我按顺序记下了这一轮的内容。"}, {"kind": "usage", "input_tokens": 20, "output_tokens": 16}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第 11 轮：收到，我按顺序记下了这一轮的内容。"}, {"kind": "usage", "input_tokens": 21, "output_tokens": 17}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第 12 轮：收到，我按顺序记下了这一轮的内容。"}, {"kind": "usage", "input_tokens": 22, "output_tokens": 18}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第 13 轮：收到，我按顺序记下了这一轮的内容。"}, {"kind": "usage", "input_tokens": 23, "output_tokens": 19}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第 14 轮：收到，我按顺序记下了这一轮的内容。"}, {"kind": "usage", "input_tokens": 24, "output_tokens": 20}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第 15 轮：收到，我按顺序记下了这一轮的内容。"}, {"kind": "usage", "input_tokens": 25, "output_tokens": 21}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第 16 轮：收到，我按顺序记下了这一轮的内容。"}, {"kind": "usage", "input_tokens": 26, "output_tokens": 22}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第 17 轮：收到，我按顺序记下了这一轮的内容。"}, {"kind": "usage", "input_tokens": 27, "output_tokens": 23}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第 18 轮：收到，我按顺序记下了这一轮的内容。"}, {"kind": "usage", "input_tokens": 28, "output_tokens": 24}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第 19 轮：收到，我按顺序记下了这一轮的内容。"}, {"kind": "usage", "input_tokens": 29, "output_tokens": 25}, {"kind": "completed", "stop_reason": "end_turn"}]}
+{"type": "model_response", "items": [{"kind": "text_delta", "text": "第 20 轮：收到，我按顺序记下了这一轮的内容。"}, {"kind": "usage", "input_tokens": 30, "output_tokens": 26}, {"kind": "completed", "stop_reason": "end_turn"}]}

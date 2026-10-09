@@ -1,8 +1,9 @@
 <script setup lang="ts">
 /**
- * 连接状态条：连接状态、重连次数、事件补齐进度与提示。
+ * 连接状态条（WP-05：只显示「是否已恢复」和「是否需要刷新」）。
  *
- * 只显示事实与可执行动作；口径说明走 `title`，不写解释性小字。
+ * **不显示**内部细节：游标序号、重连次数、事件补齐条数、错误码、服务端地址。
+ * 用户需要知道的只有三件事：现在能不能用、断线时在自动恢复、什么时候需要手动刷新。
  */
 import { computed } from 'vue'
 
@@ -10,22 +11,24 @@ import type { ConnectionState, Notice } from '../../agent-v2/reducer'
 
 const props = defineProps<{
   connection: ConnectionState
-  cursor: number
-  gapFrom: number | null
-  backfilled: number
+  /** 是否已用本地快照先渲染（此时提示「正在补齐最新进度」）。 */
+  snapshotRestored?: boolean
+  /** 事件缺口尚未补平。 */
+  gapPending?: boolean
   notices: Notice[]
 }>()
 
-const emit = defineEmits<{ (event: 'reconnect'): void; (event: 'backfill'): void }>()
+const emit = defineEmits<{ (event: 'reconnect'): void; (event: 'refresh'): void }>()
 
 const label = computed(() => {
+  if (props.connection.shuttingDown) return '服务正在重启'
   switch (props.connection.status) {
-    case 'open':
+    case 'connected':
       return '已连接'
     case 'connecting':
       return '正在连接'
     case 'reconnecting':
-      return '正在重连'
+      return '正在自动重连'
     case 'closed':
       return '已断开'
     default:
@@ -33,55 +36,42 @@ const label = computed(() => {
   }
 })
 
-const tone = computed(() => {
-  if (props.connection.shuttingDown) return 'warn'
-  return props.connection.status === 'open' ? 'ok' : 'warn'
+const healthy = computed(() => props.connection.status === 'connected' && !props.connection.shuttingDown)
+
+/** 一句话告诉用户该怎么办；没有需要处理的事情时不显示。 */
+const hint = computed(() => {
+  if (props.connection.shuttingDown) return '连接会自行恢复，稍等片刻'
+  if (props.connection.status === 'reconnecting') return '正在自动恢复，已发出的内容不会重复提交'
+  if (props.connection.status === 'closed') return '请重新连接'
+  if (props.gapPending) return '正在补齐最新进度'
+  if (props.snapshotRestored) return '已显示本地记录，正在核对最新进度'
+  return ''
 })
 
-const recentNotices = computed(() => props.notices.slice(-3).reverse())
-
-const gapText = computed(() => {
-  if (props.gapFrom === null) return ''
-  return `事件缺口：等待序号 ${props.gapFrom}`
-})
+/** 只保留最近一条「需要注意」的提示，避免堆成一堵墙。 */
+const worstNotice = computed(
+  () => [...props.notices].reverse().find((notice) => notice.level !== 'info') ?? null,
+)
 </script>
 
 <template>
-  <div class="banner" :class="`banner--${tone}`">
+  <div class="banner" :class="{ 'banner--warn': !healthy }">
     <span class="banner__state">
       <i class="dot" />
       {{ label }}
     </span>
-    <span class="banner__meta" :title="`已应用事件的最后序号（游标）为 ${cursor}`">游标 {{ cursor }}</span>
-    <span v-if="connection.attempts" class="banner__meta">重连 {{ connection.attempts }} 次</span>
-    <span v-if="backfilled" class="banner__meta" :title="`最近一次重连通过游标补齐了 ${backfilled} 条事件`">
-      已补齐 {{ backfilled }} 条事件
-    </span>
-    <span v-if="gapText" class="banner__gap">{{ gapText }}</span>
-    <span v-if="connection.message" class="banner__message">{{ connection.message }}</span>
+    <span v-if="hint" class="banner__hint">{{ hint }}</span>
+    <span v-if="worstNotice" class="banner__notice">{{ worstNotice.text }}</span>
     <span class="banner__actions">
-      <button v-if="gapFrom !== null" type="button" class="link" @click="emit('backfill')">补齐事件</button>
-      <button
-        v-if="connection.status !== 'open'"
-        type="button"
-        class="link"
-        @click="emit('reconnect')"
-      >
-        重新连接
-      </button>
+      <button v-if="!healthy" type="button" class="link" @click="emit('reconnect')">重新连接</button>
+      <button v-else type="button" class="link" @click="emit('refresh')">刷新最新进度</button>
     </span>
-    <ul v-if="recentNotices.length" class="banner__notices">
-      <li v-for="(notice, index) in recentNotices" :key="index" :class="`level-${notice.level}`">
-        {{ notice.text }}
-      </li>
-    </ul>
   </div>
 </template>
 
 <style scoped>
 .banner {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-3);
   padding: var(--space-2) var(--space-4);
@@ -90,10 +80,6 @@ const gapText = computed(() => {
   background: var(--color-bg-subtle);
   font-size: var(--font-size-xs);
   color: var(--color-text-secondary);
-}
-
-.banner--ok {
-  border-color: var(--color-border);
 }
 
 .banner--warn {
@@ -119,15 +105,15 @@ const gapText = computed(() => {
   background: var(--color-danger);
 }
 
-.banner__meta {
+.banner__hint {
   white-space: nowrap;
 }
 
-.banner__gap {
-  color: var(--color-danger);
-}
-
-.banner__message {
+.banner__notice {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--color-danger);
 }
 
@@ -150,23 +136,5 @@ const gapText = computed(() => {
 .link:focus-visible {
   color: var(--color-brand-hover);
   text-decoration: underline;
-}
-
-.banner__notices {
-  flex-basis: 100%;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.level-error {
-  color: var(--color-danger);
-}
-
-.level-warning {
-  color: var(--color-warning);
 }
 </style>

@@ -54,8 +54,6 @@ function submit(mode: 'steer' | 'continue'): void {
 <template>
   <div class="controls">
     <span class="controls__status" :class="`s-${status}`">{{ STATUS_LABEL[status] ?? status }}</span>
-    <span v-if="turn" class="controls__id mono" :title="turn.turn_id">{{ turn.turn_id.slice(0, 10) }}</span>
-    <span v-if="turn?.cancel_reason" class="controls__reason">{{ turn.cancel_reason }}</span>
 
     <div class="controls__buttons">
       <button v-if="canSteer" type="button" class="btn" :disabled="busy" @click="submit('steer')">
@@ -110,12 +108,6 @@ function submit(mode: 'steer' | 'continue'): void {
   color: var(--color-success);
 }
 
-.controls__id,
-.controls__reason {
-  font-size: var(--font-size-2xs);
-  color: var(--color-text-secondary);
-}
-
 .controls__buttons {
   display: flex;
   gap: var(--space-2);
@@ -158,7 +150,4 @@ function submit(mode: 'steer' | 'continue'): void {
   color: var(--color-danger);
 }
 
-.mono {
-  font-family: var(--font-family-mono);
-}
 </style>
