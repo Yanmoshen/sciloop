@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent.v2.contract.v1/events.schema.json",
+  "title": "Agent V2 Event",
+  "description": "追加式事件存储中的一条事件。文件布局：knowledge-base/conversations/<name-id>/events.jsonl，每行一个 JSON 对象。sequence 在单个 Thread 内单调递增且不得跳号；idempotency_key 非空时，重复追加必须返回既有事件而不是新增行。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "event_id", "sequence", "type", "created_at", "thread_id", "payload"],
+  "properties": {
+    "contract": {
+      "const": "agent.v2.contract.v1"
+    },
+    "event_id": {
+      "type": "string",
+      "pattern": "^ev_[0-9a-f]{23}$"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "thread/created",
+        "thread/updated",
+        "thread/forked",
+        "thread/archived",
+        "turn/queued",
+        "turn/started",
+        "turn/paused",
+        "turn/resumed",
+        "turn/interrupted",
+        "turn/waiting_approval",
+        "turn/waiting_input",
+        "turn/completed",
+        "turn/failed",
+        "item/added",
+        "model/requested",
+        "model/delta",
+        "model/reasoning_delta",
+        "model/tool_call_started",
+        "model/tool_call_delta",
+        "model/tool_call_completed",
+        "model/completed",
+        "model/failed",
+        "model/retry_scheduled",
+        "model/usage",
+        "tool/started",
+        "tool/output",
+        "tool/completed",
+        "tool/failed",
+        "tool/timeout",
+        "tool/cancelled",
+        "tool/invalid_arguments",
+        "approval/requested",
+        "approval/granted",
+        "approval/denied",
+        "input/requested",
+        "input/provided",
+        "compaction/started",
+        "compaction/completed",
+        "compaction/failed",
+        "compaction/edited",
+        "compaction/restored",
+        "memory/written",
+        "memory/updated",
+        "memory/deleted",
+        "agent/child_created",
+        "agent/message",
+        "agent/child_completed",
+        "agent/child_failed",
+        "agent/child_interrupted"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "UTC ISO-8601，毫秒精度，形如 2026-10-09T07:36:47.123Z"
+    },
+    "thread_id": {
+      "type": "string",
+      "pattern": "^th_[0-9a-f]{23}$"
+    },
+    "turn_id": {
+      "type": ["string", "null"],
+      "pattern": "^tu_[0-9a-f]{23}$"
+    },
+    "item_id": {
+      "type": ["string", "null"],
+      "pattern": "^it_[0-9a-f]{23}$"
+    },
+    "call_id": {
+      "type": ["string", "null"],
+      "pattern": "^call_[0-9a-f]{23}$"
+    },
+    "idempotency_key": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "description": "非空时表示该事件可幂等重复提交"
+    },
+    "payload": {
+      "type": "object",
+      "description": "事件类型专属负载；压缩事件见 compaction/*，审批见 approval/*"
+    }
+  }
+}

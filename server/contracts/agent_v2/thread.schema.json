@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent.v2.contract.v1/thread.schema.json",
+  "title": "Agent V2 Thread",
+  "description": "长期线程。Thread 跨 Turn 存活；同一时刻最多一个活动 Turn（active_turn_id）。目录名形如 <可读名称>-<thread_id 短码>，落在 knowledge-base/conversations/ 下。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "thread_id", "name", "created_at", "updated_at", "status"],
+  "properties": {
+    "contract": { "const": "agent.v2.contract.v1" },
+    "thread_id": { "type": "string", "pattern": "^th_[0-9a-f]{23}$" },
+    "name": { "type": "string", "minLength": 1 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "status": { "type": "string", "enum": ["active", "archived"] },
+    "settings": {
+      "type": "object",
+      "description": "线程级设置（模型选择、审批策略摘要、语言等）"
+    },
+    "cwd": {
+      "type": ["string", "null"],
+      "description": "工作目录（宿主机绝对路径）"
+    },
+    "model": { "type": ["string", "null"] },
+    "permission_summary": {
+      "type": "object",
+      "description": "权限摘要：当前对话的授权范围与高危放行标记"
+    },
+    "active_turn_id": {
+      "type": ["string", "null"],
+      "pattern": "^tu_[0-9a-f]{23}$",
+      "description": "当前活动 Turn；null 表示线程空闲"
+    },
+    "last_sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "该线程事件流的最后序号（快照/游标对齐用）"
+    },
+    "parent_thread_id": {
+      "type": ["string", "null"],
+      "pattern": "^th_[0-9a-f]{23}$",
+      "description": "父 Agent 的 thread_id；根线程为 null"
+    },
+    "path": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^th_[0-9a-f]{23}$" },
+      "description": "从根线程到本线程的祖先链（含自身）"
+    },
+    "forked_from": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["thread_id", "sequence"],
+      "properties": {
+        "thread_id": { "type": "string", "pattern": "^th_[0-9a-f]{23}$" },
+        "sequence": { "type": "integer", "minimum": 1 }
+      },
+      "description": "分叉来源：源线程与分叉点序号"
+    }
+  }
+}

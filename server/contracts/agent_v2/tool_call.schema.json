@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent.v2.contract.v1/tool_call.schema.json",
+  "title": "Agent V2 ToolCall",
+  "description": "统一工具调用记录：同一结构承载「请求 / 成功 / 失败 / 超时 / 取消 / 参数非法」。kind=read_only 的调用可以并行调度，kind=side_effect 的调用必须串行。$defs 另附 ToolSpec（工具声明）与 ToolResult（执行器返回值）结构。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "call_id", "name", "kind", "status", "thread_id", "turn_id"],
+  "properties": {
+    "contract": { "const": "agent.v2.contract.v1" },
+    "call_id": { "type": "string", "pattern": "^call_[0-9a-f]{23}$" },
+    "name": { "type": "string", "minLength": 1 },
+    "kind": { "$ref": "#/$defs/toolKind" },
+    "status": { "$ref": "#/$defs/toolCallStatus" },
+    "thread_id": { "type": "string", "pattern": "^th_[0-9a-f]{23}$" },
+    "turn_id": { "type": "string", "pattern": "^tu_[0-9a-f]{23}$" },
+    "item_id": { "type": ["string", "null"], "pattern": "^it_[0-9a-f]{23}$" },
+    "arguments": { "type": "object" },
+    "output": { "type": ["object", "null"] },
+    "error": {
+      "type": ["object", "null"],
+      "description": "失败/超时/取消/参数非法时必须存在，至少含 code 与 message"
+    },
+    "requested_at": { "type": ["string", "null"], "format": "date-time" },
+    "started_at": { "type": ["string", "null"], "format": "date-time" },
+    "finished_at": { "type": ["string", "null"], "format": "date-time" },
+    "duration_ms": { "type": ["integer", "null"], "minimum": 0 },
+    "attempt": { "type": "integer", "minimum": 1 },
+    "truncated": { "type": "boolean" }
+  },
+  "$defs": {
+    "toolKind": {
+      "type": "string",
+      "enum": ["read_only", "side_effect"]
+    },
+    "toolCallStatus": {
+      "type": "string",
+      "enum": [
+        "requested",
+        "running",
+        "succeeded",
+        "failed",
+        "timeout",
+        "cancelled",
+        "invalid_arguments"
+      ]
+    },
+    "toolSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "kind"],
+      "properties": {
+        "contract": { "const": "agent.v2.contract.v1" },
+        "name": { "type": "string", "minLength": 1 },
+        "kind": { "$ref": "#/$defs/toolKind" },
+        "description": { "type": "string" },
+        "parameters": { "type": "object" },
+        "timeout_s": { "type": ["number", "null"], "exclusiveMinimum": 0 }
+      }
+    },
+    "toolResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["call_id", "name", "status"],
+      "properties": {
+        "contract": { "const": "agent.v2.contract.v1" },
+        "call_id": { "type": "string", "pattern": "^call_[0-9a-f]{23}$" },
+        "name": { "type": "string", "minLength": 1 },
+        "status": { "$ref": "#/$defs/toolCallStatus" },
+        "output": { "type": ["object", "null"] },
+        "error": { "type": ["object", "null"] },
+        "duration_ms": { "type": ["integer", "null"], "minimum": 0 },
+        "started_at": { "type": ["string", "null"], "format": "date-time" },
+        "finished_at": { "type": ["string", "null"], "format": "date-time" }
+      }
+    }
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent.v2.contract.v1/memory.schema.json",
+  "title": "Agent V2 MemoryRecord",
+  "description": "记忆记录。落盘布局：knowledge-base/memories/<scope>s/<scope_id>/<memory_id>.json。三作用域目录严格隔离；记录必须带来源事件、版本、时间与删除状态。origin=user 或 edited_by_user=true 的记录，自动流程（origin=auto）不得静默覆盖，必须改为新建记录或显式失败。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract",
+    "memory_id",
+    "scope",
+    "scope_id",
+    "text",
+    "version",
+    "created_at",
+    "updated_at",
+    "origin"
+  ],
+  "properties": {
+    "contract": { "const": "agent.v2.contract.v1" },
+    "memory_id": { "type": "string", "pattern": "^mem_[0-9a-f]{23}$" },
+    "scope": {
+      "type": "string",
+      "enum": ["user", "project", "conversation"]
+    },
+    "scope_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "user 作用域为用户 ID，project 为项目 ID，conversation 为 thread_id"
+    },
+    "text": { "type": "string" },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "每次更新 +1；用于审计与冲突检测"
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "origin": {
+      "type": "string",
+      "enum": ["auto", "user"]
+    },
+    "edited_by_user": {
+      "type": "boolean",
+      "description": "true 表示用户手工编辑过，自动流程不得覆盖"
+    },
+    "deleted": {
+      "type": "boolean",
+      "description": "软删除标记；文件保留以便审计"
+    },
+    "source_event_ids": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^ev_[0-9a-f]{23}$" },
+      "description": "记忆来源事件，保证可追溯"
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}
