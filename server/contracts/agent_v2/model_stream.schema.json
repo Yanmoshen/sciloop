@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent.v2.contract.v1/model_stream.schema.json",
+  "title": "Agent V2 Model Stream",
+  "description": "供应商无关的统一模型流。TurnRuntime 只消费这些条目，不得出现任何供应商专有协议分支；供应商差异必须收敛在 provider 适配器内部（provider 只负责把自家异常映射到 error_class）。用 kind 做判别式联合。",
+  "$defs": {
+    "modelRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request_id", "messages"],
+      "properties": {
+        "contract": { "const": "agent.v2.contract.v1" },
+        "request_id": { "type": "string", "minLength": 1 },
+        "messages": {
+          "type": "array",
+          "items": { "type": "object" },
+          "description": "角色化消息，至少含 role 与 content"
+        },
+        "model": { "type": ["string", "null"] },
+        "tools": { "type": "array", "items": { "type": "object" } },
+        "params": { "type": "object" },
+        "thread_id": { "type": ["string", "null"] },
+        "turn_id": { "type": ["string", "null"] }
+      }
+    },
+    "textDelta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "text"],
+      "properties": {
+        "kind": { "const": "text_delta" },
+        "text": { "type": "string" }
+      }
+    },
+    "reasoningDelta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "text"],
+      "properties": {
+        "kind": { "const": "reasoning_delta" },
+        "text": { "type": "string" }
+      }
+    },
+    "toolCallDelta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "call_id"],
+      "properties": {
+        "kind": { "const": "tool_call_delta" },
+        "call_id": { "type": "string", "minLength": 1 },
+        "name": { "type": ["string", "null"] },
+        "arguments_delta": { "type": "string" }
+      }
+    },
+    "toolCallCompleted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "call_id", "name"],
+      "properties": {
+        "kind": { "const": "tool_call_completed" },
+        "call_id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "arguments": { "type": "object" }
+      }
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "const": "usage" },
+        "input_tokens": { "type": "integer", "minimum": 0 },
+        "output_tokens": { "type": "integer", "minimum": 0 },
+        "cached_tokens": { "type": "integer", "minimum": 0 },
+        "cost_usd": { "type": ["number", "null"] }
+      }
+    },
+    "completed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "stop_reason"],
+      "properties": {
+        "kind": { "const": "completed" },
+        "stop_reason": {
+          "type": "string",
+          "enum": ["end_turn", "tool_use", "max_tokens", "stop_sequence"]
+        }
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "error_class"],
+      "properties": {
+        "kind": { "const": "error" },
+        "error_class": {
+          "type": "string",
+          "enum": ["retryable", "context_overflow", "invalid_request", "fatal"]
+        },
+        "message": { "type": "string" },
+        "retry_after_s": { "type": "number", "minimum": 0 }
+      }
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/textDelta" },
+    { "$ref": "#/$defs/reasoningDelta" },
+    { "$ref": "#/$defs/toolCallDelta" },
+    { "$ref": "#/$defs/toolCallCompleted" },
+    { "$ref": "#/$defs/usage" },
+    { "$ref": "#/$defs/completed" },
+    { "$ref": "#/$defs/error" }
+  ]
+}

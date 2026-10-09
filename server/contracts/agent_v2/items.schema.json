@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent.v2.contract.v1/items.schema.json",
+  "title": "Agent V2 Item",
+  "description": "Turn 内的最小可审计单元。每条 Item 都显式关联 thread_id，并可选关联 turn_id / call_id / subagent_thread_id，保证任何一行输出都能回溯到产生它的调用。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "item_id", "thread_id", "type", "created_at", "sequence"],
+  "properties": {
+    "contract": { "const": "agent.v2.contract.v1" },
+    "item_id": { "type": "string", "pattern": "^it_[0-9a-f]{23}$" },
+    "thread_id": { "type": "string", "pattern": "^th_[0-9a-f]{23}$" },
+    "turn_id": {
+      "type": ["string", "null"],
+      "pattern": "^tu_[0-9a-f]{23}$"
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "user_input",
+        "assistant_text",
+        "reasoning",
+        "tool_call",
+        "tool_result",
+        "plan",
+        "compaction",
+        "subagent_activity",
+        "subagent_result",
+        "approval",
+        "error"
+      ]
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "sequence": { "type": "integer", "minimum": 1 },
+    "call_id": {
+      "type": ["string", "null"],
+      "pattern": "^call_[0-9a-f]{23}$"
+    },
+    "subagent_thread_id": {
+      "type": ["string", "null"],
+      "pattern": "^th_[0-9a-f]{23}$",
+      "description": "子 Agent 相关 Item 指向的子线程"
+    },
+    "payload": {
+      "type": "object",
+      "description": "类型专属内容：user_input.text / assistant_text.text / reasoning.text / tool_call.{name,arguments} / tool_result.{status,output,error} / plan.steps / compaction.{summary_id,covered_until} / subagent_result.{child_thread_id,status,summary} / error.{error_class,message}"
+    }
+  }
+}
