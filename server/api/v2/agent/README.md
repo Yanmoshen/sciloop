@@ -9,11 +9,14 @@
 | 项目 | 值 |
 |---|---|
 | 分支 | `codex/agent-ui` |
+| 内容提交（本次交付） | `f3212d8`（68 个新文件 / 13096 行；已推送 `origin/codex/agent-ui`） |
 | worktree | `D:\aicoding竞赛-worktrees\agent-ui` |
 | 契约基线（冻结标签） | `agent-v2-contract-v1` → `6a9fa00`（`server/contracts/agent_v2/` 只读） |
 | 实现基线 | `codex/agent-runtime` 的 `4d7bec5`（以 `6a9fa00` 为父提交） |
 | 祖先校验 | `git merge-base --is-ancestor agent-v2-contract-v1 HEAD` → 真 |
 | 是否依赖 Agent 2 | **否**。本线使用冻结契约、Agent 1 的 fake provider/tool executor 与自己的 JSONL fixture 完成全部测试 |
+
+复现本次交付内容：`git log --oneline -1 4d7bec5..codex/agent-ui`（除元数据追加外，内容提交即 `f3212d8`）。
 
 未修改：`server/contracts/agent_v2/`、`server/services/{agent_runtime,agent_events,agent_threads,model_gateway,agent_compaction,agent_memory}_v2/`、
 `server/api/v1/`、`web/src/router/`、`web/src/layouts/`、旧对话数据与数据库迁移。
