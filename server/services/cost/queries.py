@@ -30,27 +30,44 @@ from llm.store import LLMStore, get_store
 #: ``cost_usd = NULL`` + ``error LIKE '%non_usd_currency:%'``，因此**本来就不会**
 #: 进入 ``SUM(cost_usd)``（NULL 不参与求和），USD 总额天然不受影响。
 #: ``unknown_price_calls`` 显式排除它们，避免把「非 USD 定价」误报成「缺单价」。
+#:
+#: 兼容性硬约束：``COUNT/SUM ... FILTER (WHERE ...)`` 与
+#: ``string_agg(DISTINCT substring(error from '...'))`` 都是 PostgreSQL 专用语法，
+#: SQLite（宿主机默认库）两者都不支持 → 这里只用标准 ``SUM(CASE WHEN ...)``；
+#: 非 USD 行是极少数，改由第二条小查询取出后在 Python 侧归并（见 ``_NON_USD_ROWS_SQL``）。
+#:
+#: 口径与 ``_buckets_from_logs``（内存路径）逐条对齐：
+#: - ``failed_calls``：``not success`` → ``success IS NOT TRUE``（NULL 也算失败）
+#: - ``unknown_price_calls``：成功 + 无单价 + error 未标非 USD（error 为 NULL 视为未标；
+#:   旧 PG 版 ``error NOT LIKE ...`` 遇 NULL 整条为 NULL，会漏掉这类行——已修正）
 _BUCKET_SQL = """
 SELECT
     stage,
     provider,
     model,
     is_replay,
-    COALESCE(SUM(cost_usd), 0)                                      AS cost_usd,
-    COUNT(*)                                                        AS calls,
-    COUNT(*) FILTER (WHERE success IS FALSE)                        AS failed_calls,
-    COUNT(*) FILTER (
-        WHERE success IS TRUE
-          AND cost_usd IS NULL
-          AND error NOT LIKE '%non_usd_currency:%'
-    )                                                               AS unknown_price_calls,
-    COUNT(*) FILTER (WHERE error LIKE '%non_usd_currency:%')        AS non_usd_calls,
-    string_agg(DISTINCT substring(error from 'non_usd_currency:([A-Za-z]+)'), ',')
-        FILTER (WHERE error LIKE '%non_usd_currency:%')             AS non_usd_currencies
+    COALESCE(SUM(cost_usd), 0)                                     AS cost_usd,
+    COUNT(*)                                                       AS calls,
+    COALESCE(SUM(CASE WHEN success IS NOT TRUE THEN 1 ELSE 0 END), 0) AS failed_calls,
+    COALESCE(SUM(CASE WHEN success IS TRUE
+                        AND cost_usd IS NULL
+                        AND (error IS NULL OR error NOT LIKE '%non_usd_currency:%')
+                       THEN 1 ELSE 0 END), 0)                      AS unknown_price_calls,
+    COALESCE(SUM(CASE WHEN error LIKE '%non_usd_currency:%'
+                      THEN 1 ELSE 0 END), 0)                       AS non_usd_calls
 FROM llm_call_logs
 WHERE (CAST(:project_id AS BIGINT) IS NULL OR project_id = CAST(:project_id AS BIGINT))
 GROUP BY stage, provider, model, is_replay
 ORDER BY stage NULLS FIRST, provider NULLS FIRST, model NULLS FIRST, is_replay
+"""
+
+#: 非 USD 行是极少数（error 带 ``non_usd_currency:`` 标记才命中），单独取出后
+#: 复用与内存分桶相同的 :func:`_non_usd_currencies` 抠币种，保证两条路径口径一致。
+_NON_USD_ROWS_SQL = """
+SELECT stage, provider, model, is_replay, error
+FROM llm_call_logs
+WHERE error LIKE '%non_usd_currency:%'
+  AND (CAST(:project_id AS BIGINT) IS NULL OR project_id = CAST(:project_id AS BIGINT))
 """
 
 
@@ -149,6 +166,23 @@ async def _buckets_from_sql(project_id: int | None) -> list[CostBucket]:
     async with engine.connect() as conn:
         result = await conn.execute(text(_BUCKET_SQL), {"project_id": project_id})
         rows = result.mappings().all()
+        currency_rows: list[dict[str, Any]] = []
+        if rows:  # 只有确实存在分桶时才去捞 rare 行，空库省一次往返
+            cursor = await conn.execute(text(_NON_USD_ROWS_SQL), {"project_id": project_id})
+            currency_rows = list(cursor.mappings().all())
+
+    # Python 侧归并非 USD 币种（key 与分桶一致，is_replay 统一成 bool）
+    currencies: dict[tuple[Any, Any, Any, bool], list[str]] = {}
+    for row in currency_rows:
+        found = _non_usd_currencies(row["error"])
+        if not found:
+            continue
+        key = (row["stage"], row["provider"], row["model"], bool(row["is_replay"]))
+        merged = currencies.setdefault(key, [])
+        for item in found:
+            if item not in merged:
+                merged.append(item)
+
     return [
         CostBucket(
             stage=row["stage"],
@@ -160,9 +194,9 @@ async def _buckets_from_sql(project_id: int | None) -> list[CostBucket]:
             failed_calls=int(row["failed_calls"]),
             unknown_price_calls=int(row["unknown_price_calls"]),
             non_usd_calls=int(row["non_usd_calls"] or 0),
-            non_usd_currencies=[
-                item for item in str(row["non_usd_currencies"] or "").split(",") if item
-            ],
+            non_usd_currencies=currencies.get(
+                (row["stage"], row["provider"], row["model"], bool(row["is_replay"])), []
+            ),
         )
         for row in rows
     ]
