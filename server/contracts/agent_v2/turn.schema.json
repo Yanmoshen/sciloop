@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent.v2.contract.v1/turn.schema.json",
+  "title": "Agent V2 Turn",
+  "description": "独立回合。合法状态迁移（封闭集合，表外迁移必须失败）：queued->running|interrupted|failed；running->waiting_approval|waiting_input|interrupted|failed|completed；waiting_approval->running|interrupted|failed；waiting_input->running|interrupted|failed；interrupted->running|failed；completed 与 failed 为终态。interrupted->completed 被刻意禁止。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "turn_id", "thread_id", "status", "created_at", "updated_at", "sequence_start"],
+  "properties": {
+    "contract": { "const": "agent.v2.contract.v1" },
+    "turn_id": { "type": "string", "pattern": "^tu_[0-9a-f]{23}$" },
+    "thread_id": { "type": "string", "pattern": "^th_[0-9a-f]{23}$" },
+    "status": {
+      "type": "string",
+      "enum": [
+        "queued",
+        "running",
+        "waiting_approval",
+        "waiting_input",
+        "interrupted",
+        "failed",
+        "completed"
+      ]
+    },
+    "created_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "sequence_start": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "该 Turn 在事件流中的起始序号"
+    },
+    "sequence_end": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "description": "终态时写入的结束序号；未终态为 null"
+    },
+    "input_item_ids": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^it_[0-9a-f]{23}$" }
+    },
+    "idempotency_key": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "description": "用于「重复提交同一输入幂等」判定"
+    },
+    "attempt": { "type": "integer", "minimum": 1 },
+    "error": { "type": ["object", "null"] },
+    "waiting": {
+      "type": ["object", "null"],
+      "description": "等待态元数据：{kind: approval|input, request_id, call_id?}"
+    },
+    "cancel_reason": { "type": ["string", "null"] }
+  }
+}

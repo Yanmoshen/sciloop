@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "agent.v2.contract.v1/approval_request.schema.json",
+  "title": "Agent V2 ApprovalRequest",
+  "description": "审批请求。Turn 进入 waiting_approval 状态时，必须已经持久化一条 pending 记录；决策落地后写 decided_at/decided_by/decision_scope。待批请求不自动过期（status 只有在被显式决策或线程归档时才离开 pending）。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract", "approval_id", "thread_id", "turn_id", "created_at", "status", "action"],
+  "properties": {
+    "contract": { "const": "agent.v2.contract.v1" },
+    "approval_id": { "type": "string", "pattern": "^ap_[0-9a-f]{23}$" },
+    "thread_id": { "type": "string", "pattern": "^th_[0-9a-f]{23}$" },
+    "turn_id": { "type": "string", "pattern": "^tu_[0-9a-f]{23}$" },
+    "call_id": { "type": ["string", "null"], "pattern": "^call_[0-9a-f]{23}$" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "status": {
+      "type": "string",
+      "enum": ["pending", "granted", "denied", "expired"]
+    },
+    "action": {
+      "type": "object",
+      "description": "待批动作：{tool, command?, path?, risk, summary}"
+    },
+    "risk": {
+      "type": "string",
+      "description": "风险等级标签，供前端展示与策略判定"
+    },
+    "decided_at": { "type": ["string", "null"], "format": "date-time" },
+    "decided_by": { "type": ["string", "null"] },
+    "decision_scope": {
+      "type": ["string", "null"],
+      "enum": ["once", "conversation", "denied", null],
+      "description": "授权范围：仅此次 / 本对话默认允许 / 拒绝"
+    }
+  }
+}
