@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +43,7 @@ from services.model_gateway_v2 import ModelGateway
 
 from .facade import DEFAULT_REPLAY_LIMIT, AgentFacade, CallContext
 from .host import FakeRuntimeHost
+from .production_host import ProductionRuntimeHost
 
 #: 长轮询间隔：接收超时后做一次「推送 + 心跳」。
 DEFAULT_POLL_INTERVAL_S = 0.05
@@ -129,6 +131,7 @@ class AgentV2Service:
         default_scenario: str | None = None,
         system_prompt: str | None = None,
         token_budget: int = 6000,
+        runtime_mode: str = "fake",
         poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
         heartbeat_s: float = DEFAULT_HEARTBEAT_S,
         pump_limit: int = DEFAULT_PUMP_LIMIT,
@@ -140,20 +143,31 @@ class AgentV2Service:
         self.poll_interval_s = float(poll_interval_s)
         self.heartbeat_s = float(heartbeat_s)
         self.pump_limit = int(pump_limit)
+        self.runtime_mode = str(runtime_mode or "fake").lower()
         self.started_at = self.clock.now_iso()
 
         self.repo = ThreadRepository(self.conversations_root, clock=self.clock)
         self.tree = AgentTree(self.repo, clock=self.clock)
-        self.host = FakeRuntimeHost(
-            repo=self.repo,
-            tree=self.tree,
-            clock=self.clock,
-            fixtures_dir=Path(fixtures_dir) if fixtures_dir else None,
-            default_scenario=default_scenario,
-            system_prompt=system_prompt,
-            token_budget=token_budget,
-        )
         self.memory = MemoryStore(self.memories_root, clock=self.clock)
+        if self.runtime_mode in {"production", "real", "live"}:
+            self.host = ProductionRuntimeHost(
+                repo=self.repo,
+                tree=self.tree,
+                memory=self.memory,
+                clock=self.clock,
+                system_prompt=system_prompt,
+                token_budget=token_budget,
+            )
+        else:
+            self.host = FakeRuntimeHost(
+                repo=self.repo,
+                tree=self.tree,
+                clock=self.clock,
+                fixtures_dir=Path(fixtures_dir) if fixtures_dir else None,
+                default_scenario=default_scenario,
+                system_prompt=system_prompt,
+                token_budget=token_budget,
+            )
         self.summarizer = SummarizerProvider()
         self.compaction = CompactionService(
             repo=self.repo,
@@ -192,7 +206,7 @@ class AgentV2Service:
             "protocol_version": PROTOCOL_VERSION,
             "contract_version": CONTRACT_VERSION,
             "contract_freeze_tag": CONTRACT_FREEZE_TAG,
-            "host": "fake",
+            "host": "production" if isinstance(self.host, ProductionRuntimeHost) else "fake",
             "shutting_down": self._closing,
             "started_at": self.started_at,
             "conversations_root": str(self.conversations_root),
@@ -344,15 +358,25 @@ class AgentV2Service:
     def reopen(self) -> None:
         """测试与热重启使用：清除关闭标记并重建运行时宿主。"""
         self._closing = False
-        self.host = FakeRuntimeHost(
-            repo=self.repo,
-            tree=self.tree,
-            clock=self.clock,
-            fixtures_dir=self.host.fixtures_dir,
-            default_scenario=self.host.default_scenario,
-            system_prompt=self.host.system_prompt,
-            token_budget=self.host.token_budget,
-        )
+        if self.runtime_mode in {"production", "real", "live"}:
+            self.host = ProductionRuntimeHost(
+                repo=self.repo,
+                tree=self.tree,
+                memory=self.memory,
+                clock=self.clock,
+                system_prompt=getattr(self.host, "system_prompt", None),
+                token_budget=getattr(self.host, "token_budget", 6000),
+            )
+        else:
+            self.host = FakeRuntimeHost(
+                repo=self.repo,
+                tree=self.tree,
+                clock=self.clock,
+                fixtures_dir=self.host.fixtures_dir,
+                default_scenario=self.host.default_scenario,
+                system_prompt=self.host.system_prompt,
+                token_budget=self.host.token_budget,
+            )
         self.facade.host = self.host
 
     async def aclose(self) -> None:
@@ -387,6 +411,7 @@ def get_service(**overrides: Any) -> AgentV2Service:
         _SERVICE = AgentV2Service(
             conversations_root=overrides.pop("conversations_root", default_conversations_root()),
             memories_root=overrides.pop("memories_root", default_memories_root()),
+            runtime_mode=overrides.pop("runtime_mode", os.getenv("AGENT_V2_RUNTIME", "production")),
             **overrides,
         )
     return _SERVICE

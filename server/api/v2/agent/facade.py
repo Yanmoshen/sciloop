@@ -801,6 +801,20 @@ class AgentFacade:
                 status=turn.status.value,
                 allowed=[TurnStatus.WAITING_APPROVAL.value],
             )
+        # Agent 2 keeps a separate approval view for sandbox/tool execution.
+        # Resolve it first when the production host exposes the adapter; the
+        # repository approval remains the authoritative Turn event stream.
+        sync_approval = getattr(self.host, "resolve_approval", None)
+        if callable(sync_approval):
+            synced = sync_approval(thread_id, approval_id, decision, by="user")
+            if hasattr(synced, "__await__"):
+                synced = await synced
+            if isinstance(synced, dict) and synced.get("ok") is False:
+                raise ProtocolError.invalid_state(
+                    "工具审批状态无法同步，请刷新后重试。",
+                    kind="approval_sync_failed",
+                    approval_id=approval_id,
+                )
         turn = self.repo.resolve_approval(
             thread_id, turn_id, approval_id, granted=granted, scope=scope, decided_by="user"
         )

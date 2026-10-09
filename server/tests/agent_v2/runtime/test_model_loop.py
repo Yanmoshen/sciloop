@@ -91,6 +91,10 @@ def test_tool_call_produces_start_output_completed_events_with_call_id(tmp_path)
 
     # 第二轮请求里必须带 tool 角色消息（结果已回喂模型）
     assert provider.call_count == 2
+    model_tool = provider.calls[0].tools[0]
+    assert model_tool["type"] == "function"
+    assert model_tool["function"]["name"] == "read_file"
+    assert model_tool["function"]["parameters"]["type"] == "object"
     second = provider.calls[1].messages
     tool_messages = [m for m in second if m.get("role") == "tool"]
     assert tool_messages and tool_messages[0]["tool_call_id"] == "call_a"

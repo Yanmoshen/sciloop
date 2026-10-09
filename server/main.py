@@ -244,6 +244,11 @@ def create_app() -> FastAPI:
     )
 
     _mount_routers(application)
+    # Agent v2 is mounted after the v1 registry so its versioned API and
+    # WebSocket channel are available without changing the legacy routes.
+    from api.v2.agent.mount import install as install_agent_v2
+
+    install_agent_v2(application)
     _install_error_handlers(application)
     return application
 

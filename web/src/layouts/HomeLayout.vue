@@ -87,6 +87,7 @@ const HOME_NAV: HomeNavItem[] = [
   // 位置在「文献调研」与「知识库」之间。
   { key: 'ideas', label: '研究构想', path: '/ideas' },
   { key: 'knowledge', label: '知识库', path: '/knowledge' },
+  { key: 'agent-v2', label: 'Agent 工作台', path: '/agent-v2' },
 ]
 
 

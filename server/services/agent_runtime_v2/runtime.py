@@ -58,6 +58,26 @@ REQUIRE: ApprovalDecision = "require"
 ApprovalGate = Callable[[ToolCall], ApprovalDecision]
 
 
+def _model_tool_schema(spec: Any) -> dict[str, Any]:
+    """Project the internal tool contract to the model provider wire shape.
+
+    ``ToolSpec.to_dict()`` is intentionally an internal contract payload and
+    contains ``kind``/``contract`` fields.  Model chat endpoints require the
+    nested ``type=function`` envelope instead.
+    """
+    parameters = dict(getattr(spec, "parameters", {}) or {})
+    if not parameters:
+        parameters = {"type": "object", "properties": {}}
+    return {
+        "type": "function",
+        "function": {
+            "name": str(getattr(spec, "name", "")),
+            "description": str(getattr(spec, "description", "") or ""),
+            "parameters": parameters,
+        },
+    }
+
+
 @dataclass
 class TurnOutcome:
     """一次 ``run`` 的结果（不抛异常地表达终态）。"""
@@ -205,7 +225,7 @@ class TurnRuntime:
                 request_id=f"{turn_id}#{iteration}",
                 messages=messages,
                 model=state.thread.model,
-                tools=[spec.to_dict() for spec in self.tools.specs()],
+                tools=[_model_tool_schema(spec) for spec in self.tools.specs()],
                 thread_id=thread_id,
                 turn_id=turn_id,
             )

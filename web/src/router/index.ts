@@ -103,6 +103,13 @@ export function moduleGroup(key: string | undefined): ModuleGroup {
  * `homeNav` 决定左栏哪一项高亮；未标注的页面（研究构思 / 工作台 / 设置）不高亮任何一项。
  */
 export const routes: RouteRecordRaw[] = [
+  // Agent v2 工作台独立占满应用视口，不套用旧 HomeLayout 的导航壳层。
+  {
+    path: '/agent-v2',
+    name: 'agent-v2',
+    component: () => import('@/views/agent-v2/AgentWorkbench.vue'),
+    meta: { title: 'Agent 工作台' },
+  },
   // ---- 独立整页阅读器（不带壳层，整屏只放内容）----
   // 知识库里「在新页面打开」落到这里（新标签页），因此它必须是**顶层路由**，
   // 否则会被 HomeLayout 包住、左栏导航还在，"全屏"就名不副实。

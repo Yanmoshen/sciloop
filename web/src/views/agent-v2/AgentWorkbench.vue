@@ -51,7 +51,11 @@ const selectedTurn = computed(() => {
   const list = store.turns
   return list.length ? list[list.length - 1] : null
 })
-const streamItems = computed(() => (selectedTurn.value ? store.itemsOfTurn(selectedTurn.value.turn_id) : []))
+// 对话正文属于整个线程；控制区仍只针对当前活动/最近一轮。
+// 之前这里只取 selectedTurn，连续对话后页面会把历史消息全部隐藏。
+const streamItems = computed(() =>
+  store.turns.flatMap((turn) => store.itemsOfTurn(turn.turn_id)),
+)
 const liveText = computed(() => (selectedTurn.value ? store.assistantText(selectedTurn.value.turn_id) : ''))
 const liveReasoning = computed(() =>
   selectedTurn.value ? store.reasoningText(selectedTurn.value.turn_id) : '',
