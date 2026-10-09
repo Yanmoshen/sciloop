@@ -11,9 +11,8 @@ from __future__ import annotations
 
 import dataclasses
 import types
-import typing
 from dataclasses import MISSING, dataclass, field
-from typing import Any, ClassVar, Optional, Union, get_args, get_origin, get_type_hints
+from typing import Any, ClassVar, Union, get_args, get_origin, get_type_hints
 
 from .enums import (
     ApprovalStatus,
@@ -68,7 +67,7 @@ def _register_str_enum_types() -> None:
     StrEnumTypes = tuple(
         obj
         for obj in vars(_enums).values()
-        if isinstance(obj, type) and issubclass(obj, _enums._StrEnum)
+        if isinstance(obj, type) and issubclass(obj, _enums.StrEnum)
     )
 
 
@@ -86,7 +85,7 @@ def _unwrap_optional(hint: Any) -> tuple[Any, bool]:
     return hint, False
 
 
-def _coerce(name: str, fname: str, hint: Any, value: Any, enum_cls: Optional[type]) -> Any:
+def _coerce(name: str, fname: str, hint: Any, value: Any, enum_cls: type | None) -> Any:
     """按类型提示做严格强制转换。"""
     inner, nullable = _unwrap_optional(hint)
     if value is None:
@@ -176,7 +175,7 @@ class ContractModel:
         *,
         strict: bool = True,
         partial: bool = False,
-    ) -> "ContractModel":
+    ) -> ContractModel:
         """反序列化。
 
         :param strict: True 时未知字段直接失败（默认；契约漂移必须显式暴露）。
@@ -222,14 +221,14 @@ class Thread(ContractModel):
     updated_at: str
     status: str = "active"
     settings: dict[str, Any] = field(default_factory=dict)
-    cwd: Optional[str] = None
-    model: Optional[str] = None
+    cwd: str | None = None
+    model: str | None = None
     permission_summary: dict[str, Any] = field(default_factory=dict)
-    active_turn_id: Optional[str] = None
+    active_turn_id: str | None = None
     last_sequence: int = 0
-    parent_thread_id: Optional[str] = None
+    parent_thread_id: str | None = None
     path: list[str] = field(default_factory=list)
-    forked_from: Optional[dict[str, Any]] = None
+    forked_from: dict[str, Any] | None = None
     contract: str = CONTRACT_VERSION
 
     _enums: ClassVar[dict[str, type]] = {}
@@ -250,13 +249,13 @@ class Turn(ContractModel):
     created_at: str
     updated_at: str
     sequence_start: int
-    sequence_end: Optional[int] = None
+    sequence_end: int | None = None
     input_item_ids: list[str] = field(default_factory=list)
-    idempotency_key: Optional[str] = None
+    idempotency_key: str | None = None
     attempt: int = 1
-    error: Optional[dict[str, Any]] = None
-    waiting: Optional[dict[str, Any]] = None
-    cancel_reason: Optional[str] = None
+    error: dict[str, Any] | None = None
+    waiting: dict[str, Any] | None = None
+    cancel_reason: str | None = None
     contract: str = CONTRACT_VERSION
 
     _enums: ClassVar[dict[str, type]] = {"status": TurnStatus}
@@ -277,9 +276,9 @@ class Item(ContractModel):
     created_at: str
     sequence: int
     payload: dict[str, Any] = field(default_factory=dict)
-    turn_id: Optional[str] = None
-    call_id: Optional[str] = None
-    subagent_thread_id: Optional[str] = None
+    turn_id: str | None = None
+    call_id: str | None = None
+    subagent_thread_id: str | None = None
     contract: str = CONTRACT_VERSION
 
     _enums: ClassVar[dict[str, type]] = {"type": ItemType}
@@ -303,14 +302,14 @@ class ToolCall(ContractModel):
     status: ToolCallStatus
     thread_id: str
     turn_id: str
-    item_id: Optional[str] = None
+    item_id: str | None = None
     arguments: dict[str, Any] = field(default_factory=dict)
-    output: Optional[dict[str, Any]] = None
-    error: Optional[dict[str, Any]] = None
-    requested_at: Optional[str] = None
-    started_at: Optional[str] = None
-    finished_at: Optional[str] = None
-    duration_ms: Optional[int] = None
+    output: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+    requested_at: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    duration_ms: int | None = None
     attempt: int = 1
     truncated: bool = False
     contract: str = CONTRACT_VERSION
@@ -337,7 +336,7 @@ class ToolSpec(ContractModel):
     kind: ToolKind
     description: str = ""
     parameters: dict[str, Any] = field(default_factory=dict)
-    timeout_s: Optional[float] = None
+    timeout_s: float | None = None
     contract: str = CONTRACT_VERSION
 
     _enums: ClassVar[dict[str, type]] = {"kind": ToolKind}
@@ -350,11 +349,11 @@ class ToolResult(ContractModel):
     call_id: str
     name: str
     status: ToolCallStatus
-    output: Optional[dict[str, Any]] = None
-    error: Optional[dict[str, Any]] = None
-    duration_ms: Optional[int] = None
-    started_at: Optional[str] = None
-    finished_at: Optional[str] = None
+    output: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+    duration_ms: int | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
     contract: str = CONTRACT_VERSION
 
     _enums: ClassVar[dict[str, type]] = {"status": ToolCallStatus}
@@ -373,10 +372,10 @@ class Event(ContractModel):
     created_at: str
     thread_id: str
     payload: dict[str, Any] = field(default_factory=dict)
-    turn_id: Optional[str] = None
-    item_id: Optional[str] = None
-    call_id: Optional[str] = None
-    idempotency_key: Optional[str] = None
+    turn_id: str | None = None
+    item_id: str | None = None
+    call_id: str | None = None
+    idempotency_key: str | None = None
     contract: str = CONTRACT_VERSION
 
     def __post_init__(self) -> None:
@@ -406,11 +405,11 @@ class ApprovalRequest(ContractModel):
     created_at: str
     status: ApprovalStatus
     action: dict[str, Any] = field(default_factory=dict)
-    call_id: Optional[str] = None
+    call_id: str | None = None
     risk: str = "unknown"
-    decided_at: Optional[str] = None
-    decided_by: Optional[str] = None
-    decision_scope: Optional[str] = None
+    decided_at: str | None = None
+    decided_by: str | None = None
+    decision_scope: str | None = None
     contract: str = CONTRACT_VERSION
 
     _enums: ClassVar[dict[str, type]] = {"status": ApprovalStatus}
@@ -457,11 +456,11 @@ class ModelRequest(ContractModel):
 
     request_id: str
     messages: list[dict[str, Any]]
-    model: Optional[str] = None
+    model: str | None = None
     tools: list[dict[str, Any]] = field(default_factory=list)
     params: dict[str, Any] = field(default_factory=dict)
-    thread_id: Optional[str] = None
-    turn_id: Optional[str] = None
+    thread_id: str | None = None
+    turn_id: str | None = None
     contract: str = CONTRACT_VERSION
 
 
@@ -495,7 +494,7 @@ class ReasoningDelta(StreamItem):
 @dataclass
 class ToolCallDelta(StreamItem):
     call_id: str
-    name: Optional[str] = None
+    name: str | None = None
     arguments_delta: str = ""
     kind: ClassVar[str] = ModelStreamKind.TOOL_CALL_DELTA
 
@@ -529,7 +528,7 @@ class Usage(StreamItem):
     input_tokens: int = 0
     output_tokens: int = 0
     cached_tokens: int = 0
-    cost_usd: Optional[float] = None
+    cost_usd: float | None = None
     kind: ClassVar[str] = ModelStreamKind.USAGE
 
     def to_dict(self) -> dict[str, Any]:

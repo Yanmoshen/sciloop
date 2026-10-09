@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -23,10 +23,12 @@ from contracts.agent_v2 import (
     MemoryOrigin,
     MemoryRecord,
     MemoryScope,
-    ModelStreamKind,
     ModelRequest,
+    ModelStreamKind,
     SchemaValidator,
     StopReason,
+    StreamCompleted,
+    StreamError,
     TextDelta,
     Thread,
     ToolCall,
@@ -38,8 +40,6 @@ from contracts.agent_v2 import (
     Turn,
     TurnStatus,
     Usage,
-    StreamCompleted,
-    StreamError,
     error_response,
     is_valid_id,
     load_schema,
@@ -64,7 +64,7 @@ from contracts.agent_v2.enums import (
 # 辅助
 # --------------------------------------------------------------------------------------
 def _now() -> str:
-    dt = datetime.now(timezone.utc)
+    dt = datetime.now(UTC)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
@@ -130,6 +130,29 @@ def test_all_schema_files_exist_and_parse():
         doc = load_schema(name)
         assert isinstance(doc, dict) and doc.get("$schema"), name
         json.dumps(doc)
+
+
+def test_validation_uses_the_official_jsonschema_engine():
+    """项目硬约定：结构化校验必须用官方 jsonschema，禁止自研校验器。
+
+    ``server/pyproject.toml`` 已把 ``jsonschema>=4.21`` 列为硬依赖（WP02 要求），
+    因此这里直接断言底层引擎是官方的 Draft 2020-12 校验器。
+    """
+    from jsonschema import Draft202012Validator
+
+    validator = validator_for("events")
+    assert isinstance(validator._validator, Draft202012Validator)  # noqa: SLF001
+    # 官方引擎才认得的 Draft 2020-12 关键字（自研子集通常不支持）
+    probe = SchemaValidator(
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {"a": {"type": "integer"}},
+            "unevaluatedProperties": False,
+        }
+    )
+    assert probe.errors({"a": 1}) == []
+    assert probe.errors({"a": 1, "b": 2}), "unevaluatedProperties 必须被官方引擎执行"
 
 
 def test_thread_turn_item_round_trip_through_schema():
@@ -276,13 +299,13 @@ def test_event_carries_version_sequence_time_association_and_idempotency():
 def test_toolcall_unified_structure_covers_success_failure_timeout_cancel():
     th, turn = _thread(), None
     turn = _turn(th.thread_id)
-    common = dict(
-        call_id=new_id("call"),
-        name="write_file",
-        kind=ToolKind.SIDE_EFFECT,
-        thread_id=th.thread_id,
-        turn_id=turn.turn_id,
-    )
+    common = {
+        "call_id": new_id("call"),
+        "name": "write_file",
+        "kind": ToolKind.SIDE_EFFECT,
+        "thread_id": th.thread_id,
+        "turn_id": turn.turn_id,
+    }
     variant = validator_for("tool_call")
 
     requested = ToolCall(status=ToolCallStatus.REQUESTED, arguments={"path": "a.txt"}, **common)
@@ -354,9 +377,7 @@ def test_tool_spec_declares_parallelism_policy():
     ],
 )
 def test_schema_enum_matches_python_enum(schema_name, field_path, enum_cls):
-    if schema_name == "toolKind":
-        doc = load_schema("tool_call")
-    elif schema_name == "toolCallStatus":
+    if schema_name == "toolKind" or schema_name == "toolCallStatus":
         doc = load_schema("tool_call")
     else:
         doc = load_schema(schema_name)
@@ -427,7 +448,7 @@ def test_model_request_and_memory_record_validate():
 # §2.6 状态机封闭性
 # --------------------------------------------------------------------------------------
 def test_turn_state_machine_is_total_and_terminals_are_closed():
-    assert set(TURN_TRANSITIONS) == {m for m in TurnStatus}, "迁移表必须覆盖全部状态"
+    assert set(TURN_TRANSITIONS) == set(TurnStatus), "迁移表必须覆盖全部状态"
     for terminal in TERMINAL_TURN_STATUSES:
         assert TURN_TRANSITIONS[terminal] == frozenset(), f"{terminal} 必须是终态"
     for status, allowed in TURN_TRANSITIONS.items():

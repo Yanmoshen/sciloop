@@ -11,8 +11,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import threading
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 from .errors import AgentV2Error
 
@@ -35,7 +37,7 @@ class CancelToken:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._cancelled = False
-        self._reason: Optional[str] = None
+        self._reason: str | None = None
         self._callbacks: list[Callable[[str], None]] = []
 
     # ---- 状态 ----
@@ -45,7 +47,7 @@ class CancelToken:
             return self._cancelled
 
     @property
-    def reason(self) -> Optional[str]:
+    def reason(self) -> str | None:
         with self._lock:
             return self._reason
 
@@ -60,10 +62,9 @@ class CancelToken:
             callbacks = list(self._callbacks)
             self._callbacks.clear()
         for cb in callbacks:
-            try:
+            # 回调失败不得影响取消传播
+            with contextlib.suppress(Exception):
                 cb(reason)
-            except Exception:  # noqa: BLE001 - 回调失败不得影响取消传播
-                pass
         return True
 
     def subscribe(self, callback: Callable[[str], None]) -> Callable[[], None]:
@@ -77,18 +78,13 @@ class CancelToken:
                 self._callbacks.append(callback)
                 reason = ""
         if fire_now:
-            try:
+            with contextlib.suppress(Exception):
                 callback(reason)
-            except Exception:  # noqa: BLE001
-                pass
             return lambda: None
 
         def unsubscribe() -> None:
-            with self._lock:
-                try:
-                    self._callbacks.remove(callback)
-                except ValueError:
-                    pass
+            with self._lock, contextlib.suppress(ValueError):
+                self._callbacks.remove(callback)
 
         return unsubscribe
 

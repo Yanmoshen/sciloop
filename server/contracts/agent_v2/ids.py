@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 import secrets
 import time
-from typing import Callable, Optional
+from collections.abc import Callable
 
 #: 对象类型 -> ID 前缀
 ID_PREFIXES: dict[str, str] = {
@@ -34,8 +34,8 @@ _ID_RE = re.compile(r"^(?P<prefix>[a-z]{2,4})_(?P<ts>[0-9a-f]{13})(?P<rand>[0-9a
 def new_id(
     kind: str,
     *,
-    now_ms: Optional[int] = None,
-    rand: Optional[Callable[[int], str]] = None,
+    now_ms: int | None = None,
+    rand: Callable[[int], str] | None = None,
 ) -> str:
     """生成一个稳定 ID，形如 ``th_0000018f3c2a4b19a3f0c7d2e1``。
 

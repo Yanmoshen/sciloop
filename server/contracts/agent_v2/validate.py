@@ -1,23 +1,27 @@
-"""契约 JSON Schema 加载与校验（纯标准库实现）。
+"""契约 JSON Schema 加载与校验。
 
-为什么自己实现而不用 `jsonschema` 包：计划书 §2 明确禁止修改依赖锁文件，
-且本契约包要被 Agent 2 / Agent 3 直接 import，越少的环境耦合越好。
+**校验引擎用官方 `jsonschema` 库**，不自研校验器——`server/pyproject.toml` 已把
+`jsonschema>=4.21` 列为硬依赖（项目 WP02 的硬要求就是"结构化输出的本地 JSON Schema
+校验，禁止自研校验器"），因此本模块不需要新增任何依赖。
 
-支持的 JSON Schema 关键字子集（覆盖本契约全部用法）：
-``type`` / ``const`` / ``enum`` / ``required`` / ``properties`` /
-``additionalProperties``(bool|schema) / ``items`` / ``minLength`` / ``minimum`` /
-``exclusiveMinimum`` / ``maximum`` / ``pattern`` / ``oneOf`` / ``anyOf`` / ``allOf`` /
-``$ref``(仅本地 ``#/$defs/*``) / ``$defs``。
+对外接口：
 
-``format`` 只作为文档性标注，不做校验（date-time 由模型层保证）。
+    validator_for("events").check(event.to_dict())        # 失败抛 ContractViolation
+    validator_for("events").errors(event.to_dict())       # 返回可读错误列表
+    SchemaValidator.branch("tool_call", "$defs/toolSpec") # 校验文档内的子模式
+    schema_enum(load_schema("turn"), "status")            # 取字段的合法枚举
 """
 
 from __future__ import annotations
 
 import json
-import re
+from collections.abc import Iterable
+from functools import cache
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any
+
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
 
 from .errors import ContractViolation
 
@@ -36,167 +40,85 @@ SCHEMA_FILES: tuple[str, ...] = (
 )
 
 
-def _type_ok(expected: str, value: Any) -> bool:
-    if expected == "object":
-        return isinstance(value, dict)
-    if expected == "array":
-        return isinstance(value, (list, tuple))
-    if expected == "string":
-        return isinstance(value, str)
-    if expected == "integer":
-        return isinstance(value, int) and not isinstance(value, bool)
-    if expected == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if expected == "boolean":
-        return isinstance(value, bool)
-    if expected == "null":
-        return value is None
-    return True  # 未知类型不做判定
-
-
-class SchemaValidator:
-    """针对单份 schema 文档的校验器。
-
-    :param schema: 当前生效的子模式（可以是文档本身，也可以是 ``$defs`` 里的分支）。
-    :param root: ``$ref`` 的解析根。抽取分支校验时**必须**传入文档根，
-        否则 ``#/$defs/...`` 无法解析——用 :meth:`branch` 最省事。
-    """
-
-    def __init__(self, schema: dict[str, Any], *, root: Optional[dict[str, Any]] = None) -> None:
-        if not isinstance(schema, dict):
-            raise ContractViolation("schema must be an object")
-        self.schema = schema
-        self.root = root if root is not None else schema
-
-    @classmethod
-    def branch(cls, name: str, pointer: str) -> "SchemaValidator":
-        """按 JSON Pointer 校验文档内的子模式，``$ref`` 仍从文档根解析。
-
-        例：``SchemaValidator.branch("tool_call", "$defs/toolSpec")``
-        """
-        doc = load_schema(name)
-        node: Any = doc
-        for part in pointer.strip("/").split("/"):
-            part = part.replace("~1", "/").replace("~0", "~")
-            if not isinstance(node, dict) or part not in node:
-                raise ContractViolation(f"schema {name!r} has no branch {pointer!r}")
-            node = node[part]
-        if not isinstance(node, dict):
-            raise ContractViolation(f"branch {pointer!r} of {name!r} is not a schema object")
-        return cls(node, root=doc)
-
-    # ---- 公开接口 ----
-    def errors(self, instance: Any, *, path: str = "$") -> list[str]:
-        """返回错误消息列表，空列表表示通过。"""
-        out: list[str] = []
-        self._walk(self.schema, instance, path, out)
-        return out
-
-    def check(self, instance: Any, *, label: str = "instance") -> None:
-        """校验失败时抛 :class:`ContractViolation`。"""
-        errs = self.errors(instance)
-        if errs:
-            raise ContractViolation(f"{label} does not satisfy schema: " + "; ".join(errs[:6]))
-
-    # ---- 内部 ----
-    def _resolve(self, ref: str) -> dict[str, Any]:
-        if not ref.startswith("#/"):
-            raise ContractViolation(f"only local $ref is supported, got {ref!r}")
-        node: Any = self.root
-        for part in ref[2:].split("/"):
-            part = part.replace("~1", "/").replace("~0", "~")
-            if not isinstance(node, dict) or part not in node:
-                raise ContractViolation(f"unresolvable $ref {ref!r}")
-            node = node[part]
-        if not isinstance(node, dict):
-            raise ContractViolation(f"$ref {ref!r} does not point to a schema object")
-        return node
-
-    def _walk(self, schema: dict[str, Any], value: Any, path: str, out: list[str]) -> None:
-        if "$ref" in schema:
-            merged = dict(self._resolve(schema["$ref"]))
-            for k, v in schema.items():
-                if k != "$ref" and k not in merged:
-                    merged[k] = v
-            schema = merged
-
-        for kw in ("allOf",):
-            for sub in schema.get(kw, []) or []:
-                self._walk(sub, value, path, out)
-
-        if "anyOf" in schema:
-            if not any(not self._sub_errors(sub, value) for sub in schema["anyOf"]):
-                out.append(f"{path}: matches none of anyOf branches")
-        if "oneOf" in schema:
-            hits = sum(1 for sub in schema["oneOf"] if not self._sub_errors(sub, value))
-            if hits != 1:
-                out.append(f"{path}: expected exactly 1 matching oneOf branch, got {hits}")
-
-        if "const" in schema and value != schema["const"]:
-            out.append(f"{path}: expected const {schema['const']!r}, got {value!r}")
-
-        if "enum" in schema and value not in schema["enum"]:
-            out.append(f"{path}: {value!r} not in enum {schema['enum']}")
-
-        if "type" in schema:
-            expected = schema["type"]
-            names: Iterable[str] = [expected] if isinstance(expected, str) else expected
-            if not any(_type_ok(t, value) for t in names):
-                out.append(f"{path}: expected type {sorted(names)}, got {type(value).__name__}")
-
-        if isinstance(value, str):
-            if "minLength" in schema and len(value) < schema["minLength"]:
-                out.append(f"{path}: shorter than minLength {schema['minLength']}")
-            if "pattern" in schema and not re.search(schema["pattern"], value):
-                out.append(f"{path}: does not match pattern {schema['pattern']!r}")
-
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            if "minimum" in schema and value < schema["minimum"]:
-                out.append(f"{path}: below minimum {schema['minimum']}")
-            if "exclusiveMinimum" in schema and value <= schema["exclusiveMinimum"]:
-                out.append(f"{path}: not greater than exclusiveMinimum {schema['exclusiveMinimum']}")
-            if "maximum" in schema and value > schema["maximum"]:
-                out.append(f"{path}: above maximum {schema['maximum']}")
-
-        if isinstance(value, dict):
-            self._walk_object(schema, value, path, out)
-
-        if isinstance(value, (list, tuple)):
-            item_schema = schema.get("items")
-            if isinstance(item_schema, dict):
-                for idx, item in enumerate(value):
-                    self._walk(item_schema, item, f"{path}[{idx}]", out)
-
-    def _walk_object(
-        self, schema: dict[str, Any], value: dict[str, Any], path: str, out: list[str]
-    ) -> None:
-        props = schema.get("properties") or {}
-        for req in schema.get("required", []) or []:
-            if req not in value:
-                out.append(f"{path}: missing required field '{req}'")
-        addl = schema.get("additionalProperties", True)
-        for key, item in value.items():
-            if key in props:
-                self._walk(props[key], item, f"{path}.{key}", out)
-            elif addl is False:
-                out.append(f"{path}: unexpected field '{key}'")
-            elif isinstance(addl, dict):
-                self._walk(addl, item, f"{path}.{key}", out)
-
-    def _sub_errors(self, schema: dict[str, Any], value: Any) -> list[str]:
-        out: list[str] = []
-        self._walk(schema, value, "$", out)
-        return out
-
-
+@cache
 def load_schema(name: str) -> dict[str, Any]:
-    """按文件名或裸名加载契约 schema。"""
+    """按文件名或裸名加载契约 schema（进程内缓存）。"""
     filename = name if name.endswith(".json") else f"{name}.schema.json"
     path = _SCHEMA_DIR / filename
     if not path.is_file():
         raise ContractViolation(f"schema file not found: {filename}")
     with path.open("r", encoding="utf-8") as fh:
-        return json.load(fh)
+        schema = json.load(fh)
+    try:
+        Draft202012Validator.check_schema(schema)
+    except SchemaError as exc:  # pragma: no cover - schema 自身写错才会走到
+        raise ContractViolation(f"schema {filename} is invalid: {exc.message}") from exc
+    return schema
+
+
+def _pointer(doc: dict[str, Any], pointer: str) -> dict[str, Any]:
+    node: Any = doc
+    for part in pointer.strip("/").split("/"):
+        part = part.replace("~1", "/").replace("~0", "~")
+        if not isinstance(node, dict) or part not in node:
+            raise ContractViolation(f"schema has no branch {pointer!r}")
+        node = node[part]
+    if not isinstance(node, dict):
+        raise ContractViolation(f"branch {pointer!r} is not a schema object")
+    return node
+
+
+def _format_error(error: Any) -> str:
+    location = "$" + "".join(
+        f"[{part}]" if isinstance(part, int) else f".{part}" for part in error.absolute_path
+    )
+    return f"{location}: {error.message}"
+
+
+class SchemaValidator:
+    """针对某份 schema（或其中某个子模式）的校验器。
+
+    :param schema: 生效的子模式。
+    :param root: 文档根。给了 ``root`` 时按子模式校验，但 ``$ref`` 仍从根解析。
+        用 :meth:`branch` 构造最省事。
+    """
+
+    def __init__(self, schema: dict[str, Any], *, root: dict[str, Any] | None = None) -> None:
+        if not isinstance(schema, dict):
+            raise ContractViolation("schema must be an object")
+        self.schema = schema
+        self.root = root if root is not None else schema
+        # 校验器建在文档根上，子模式通过 descend 使用——这样 #/$defs/... 才能解析
+        self._validator = Draft202012Validator(self.root)
+
+    @classmethod
+    def branch(cls, name: str, pointer: str) -> SchemaValidator:
+        """按 JSON Pointer 校验文档内的子模式，``$ref`` 从文档根解析。
+
+        例：``SchemaValidator.branch("tool_call", "$defs/toolSpec")``
+        """
+        doc = load_schema(name)
+        return cls(_pointer(doc, pointer), root=doc)
+
+    # ---- 公开接口 ----
+    def errors(self, instance: Any) -> list[str]:
+        """返回可读错误列表；空列表表示通过。"""
+        if self.schema is self.root:
+            errors: Iterable[Any] = self._validator.iter_errors(instance)
+        else:
+            errors = self._validator.descend(instance, self.schema)
+        return [_format_error(e) for e in errors]
+
+    def check(self, instance: Any, *, label: str = "instance") -> None:
+        """校验失败时抛 :class:`ContractViolation`（消息里带前若干条错误）。"""
+        problems = self.errors(instance)
+        if problems:
+            raise ContractViolation(
+                f"{label} does not satisfy schema: " + "; ".join(sorted(problems)[:6])
+            )
+
+    def is_valid(self, instance: Any) -> bool:
+        return not self.errors(instance)
 
 
 def validator_for(name: str) -> SchemaValidator:
@@ -209,8 +131,8 @@ def validate_all_present() -> list[str]:
     return [f for f in SCHEMA_FILES if not (_SCHEMA_DIR / f).is_file()]
 
 
-def schema_enum(schema: dict[str, Any], field_path: str) -> Optional[list[str]]:
-    """从 schema 中取出某个字段的 enum 列表（``field_path`` 形如 ``type`` 或 ``a.b``）。"""
+def schema_enum(schema: dict[str, Any], field_path: str) -> list[str] | None:
+    """从 schema 中取出某个字段的 enum 列表（``field_path`` 形如 ``type`` 或 ``$defs.toolKind``）。"""
     node: Any = schema
     for part in field_path.split("."):
         if not isinstance(node, dict):

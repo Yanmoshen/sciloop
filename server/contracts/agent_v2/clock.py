@@ -4,13 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Protocol
 
 
 def iso_ms(timestamp_ms: int) -> str:
     """毫秒时间戳 -> UTC ISO-8601（毫秒精度，Z 结尾）。"""
-    dt = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
+    dt = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=UTC)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 

@@ -6,18 +6,11 @@
 
 from __future__ import annotations
 
-from enum import Enum
-from typing import Mapping
+from collections.abc import Mapping
+from enum import StrEnum
 
 
-class _StrEnum(str, Enum):
-    """Python 3.9 兼容的 str 枚举基类。"""
-
-    def __str__(self) -> str:  # pragma: no cover - 便于日志
-        return str(self.value)
-
-
-class TurnStatus(_StrEnum):
+class TurnStatus(StrEnum):
     """Turn 生命周期状态（计划书 §4.1 的封闭集合）。"""
 
     QUEUED = "queued"
@@ -74,7 +67,7 @@ def can_transition(src: TurnStatus | str, dst: TurnStatus | str) -> bool:
     return d in TURN_TRANSITIONS[s]
 
 
-class ItemType(_StrEnum):
+class ItemType(StrEnum):
     """Item 类型（计划书 §4.1）。"""
 
     USER_INPUT = "user_input"
@@ -90,14 +83,14 @@ class ItemType(_StrEnum):
     ERROR = "error"
 
 
-class ToolKind(_StrEnum):
+class ToolKind(StrEnum):
     """工具副作用等级，决定调度策略。"""
 
     READ_ONLY = "read_only"
     SIDE_EFFECT = "side_effect"
 
 
-class ToolCallStatus(_StrEnum):
+class ToolCallStatus(StrEnum):
     """工具调用状态（输入/输出/失败/取消结构统一）。"""
 
     REQUESTED = "requested"
@@ -109,7 +102,7 @@ class ToolCallStatus(_StrEnum):
     INVALID_ARGUMENTS = "invalid_arguments"
 
 
-class ErrorClass(_StrEnum):
+class ErrorClass(StrEnum):
     """模型/运行时错误分类，决定重试与降级策略。"""
 
     RETRYABLE = "retryable"
@@ -118,7 +111,7 @@ class ErrorClass(_StrEnum):
     FATAL = "fatal"
 
 
-class MemoryScope(_StrEnum):
+class MemoryScope(StrEnum):
     """记忆作用域。"""
 
     USER = "user"
@@ -126,14 +119,14 @@ class MemoryScope(_StrEnum):
     CONVERSATION = "conversation"
 
 
-class MemoryOrigin(_StrEnum):
+class MemoryOrigin(StrEnum):
     """记忆写入来源。``USER`` 写入的记录受自动流程覆盖保护。"""
 
     AUTO = "auto"
     USER = "user"
 
 
-class ApprovalStatus(_StrEnum):
+class ApprovalStatus(StrEnum):
     """审批请求状态。"""
 
     PENDING = "pending"
@@ -142,7 +135,7 @@ class ApprovalStatus(_StrEnum):
     EXPIRED = "expired"
 
 
-class ModelStreamKind(_StrEnum):
+class ModelStreamKind(StrEnum):
     """统一模型流条目类型（供应商无关）。"""
 
     TEXT_DELTA = "text_delta"
@@ -154,7 +147,7 @@ class ModelStreamKind(_StrEnum):
     ERROR = "error"
 
 
-class StopReason(_StrEnum):
+class StopReason(StrEnum):
     """模型流正常结束原因。"""
 
     END_TURN = "end_turn"
@@ -163,7 +156,7 @@ class StopReason(_StrEnum):
     STOP_SEQUENCE = "stop_sequence"
 
 
-class EventType(_StrEnum):
+class EventType(StrEnum):
     """事件类型总表（追加式事件存储的唯一合法取值域）。"""
 
     # Thread

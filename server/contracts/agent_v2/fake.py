@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Optional, Protocol, Sequence, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
-from .cancellation import CancelToken, CancelledError
+from .cancellation import CancelledError, CancelToken
 from .enums import ErrorClass, StopReason, ToolCallStatus, ToolKind
 from .errors import ModelStreamError
 from .models import (
@@ -26,9 +27,9 @@ from .models import (
     StreamError,
     StreamItem,
     TextDelta,
+    ToolCall,
     ToolCallCompleted,
     ToolCallDelta,
-    ToolCall,
     ToolResult,
     ToolSpec,
     Usage,
@@ -48,7 +49,7 @@ class ModelProvider(Protocol):
     """
 
     def stream(
-        self, request: ModelRequest, cancel: Optional[CancelToken] = None
+        self, request: ModelRequest, cancel: CancelToken | None = None
     ) -> AsyncIterator[StreamItem]: ...
 
 
@@ -58,10 +59,10 @@ class ToolExecutor(Protocol):
 
     def specs(self) -> Sequence[ToolSpec]: ...
 
-    def spec(self, name: str) -> Optional[ToolSpec]: ...
+    def spec(self, name: str) -> ToolSpec | None: ...
 
     async def execute(
-        self, call: ToolCall, cancel: Optional[CancelToken] = None
+        self, call: ToolCall, cancel: CancelToken | None = None
     ) -> ToolResult: ...
 
 
@@ -70,10 +71,7 @@ class ToolExecutor(Protocol):
 # --------------------------------------------------------------------------------------
 def text_response(text: str, *, stop_reason: str = StopReason.END_TURN) -> list[StreamItem]:
     """构造「纯文本」应答流。"""
-    parts = [p for p in (text,)]
-    items: list[StreamItem] = [TextDelta(p) for p in parts]
-    items.append(StreamCompleted(stop_reason))
-    return items
+    return [TextDelta(text), StreamCompleted(stop_reason)]
 
 
 def reasoning_response(
@@ -92,7 +90,7 @@ def tool_call_response(
     arguments: dict[str, Any],
     *,
     call_id: str,
-    text_prefix: Optional[str] = None,
+    text_prefix: str | None = None,
     stop_reason: str = StopReason.TOOL_USE,
     stream_deltas: bool = True,
 ) -> list[StreamItem]:
@@ -122,7 +120,7 @@ def error_response(
 
 
 def usage_item(
-    input_tokens: int = 10, output_tokens: int = 5, *, cost_usd: Optional[float] = None
+    input_tokens: int = 10, output_tokens: int = 5, *, cost_usd: float | None = None
 ) -> StreamItem:
     return Usage(input_tokens=input_tokens, output_tokens=output_tokens, cost_usd=cost_usd)
 
@@ -155,7 +153,7 @@ class FakeProvider:
     #: 每次调用是否在 yield 前检查取消令牌
     honor_cancel: bool = True
 
-    def queue(self, items: Sequence[StreamItem]) -> "FakeProvider":
+    def queue(self, items: Sequence[StreamItem]) -> FakeProvider:
         self.script.append(list(items))
         return self
 
@@ -164,7 +162,7 @@ class FakeProvider:
         return len(self.calls)
 
     async def stream(
-        self, request: ModelRequest, cancel: Optional[CancelToken] = None
+        self, request: ModelRequest, cancel: CancelToken | None = None
     ) -> AsyncIterator[StreamItem]:
         self.calls.append(request)
         if not self.script:
@@ -218,7 +216,7 @@ class FakeToolExecutor:
     def specs(self) -> Sequence[ToolSpec]:
         return list(self.specs_list)
 
-    def spec(self, name: str) -> Optional[ToolSpec]:
+    def spec(self, name: str) -> ToolSpec | None:
         for s in self.specs_list:
             if s.name == name:
                 return s
@@ -228,7 +226,7 @@ class FakeToolExecutor:
         return [c for c in self.calls if c.name == name]
 
     async def execute(
-        self, call: ToolCall, cancel: Optional[CancelToken] = None
+        self, call: ToolCall, cancel: CancelToken | None = None
     ) -> ToolResult:
         self._active += 1
         self.max_concurrency = max(self.max_concurrency, self._active)
@@ -261,13 +259,15 @@ class FakeToolExecutor:
                 status=status_enum,
                 error={"code": status_enum.value, "message": f"synthetic {status_enum.value}"},
             )
-        except (CancelledError, asyncio.CancelledError):
+        except CancelledError:
             return ToolResult(
                 call_id=call.call_id,
                 name=call.name,
                 status=ToolCallStatus.CANCELLED,
                 error={"code": "cancelled", "message": "cancelled during execution"},
             )
+        # 注意：**不吞 asyncio.CancelledError**。协程必须如实向上传播异步取消，
+        # 否则 asyncio.wait_for 的超时语义会被破坏（超时会被误判成 cancelled）。
         finally:
             self._active -= 1
 

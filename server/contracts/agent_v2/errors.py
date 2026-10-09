@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 
 class AgentV2Error(Exception):
@@ -72,7 +72,7 @@ class CorruptedEventError(AgentV2Error):
         reason: str,
         *,
         raw_prefix: str = "",
-        sequence: Optional[int] = None,
+        sequence: int | None = None,
     ) -> None:
         self.path = path
         self.line_no = line_no
@@ -91,6 +91,18 @@ class CorruptedEventError(AgentV2Error):
             "raw_prefix": self.raw_prefix,
             "sequence": self.sequence,
         }
+
+
+class ApprovalNotFound(AgentV2Error):
+    """审批请求不存在。"""
+
+    code = "approval_not_found"
+
+
+class SummaryNotFound(AgentV2Error):
+    """压缩摘要不存在。"""
+
+    code = "summary_not_found"
 
 
 class LeaseError(AgentV2Error):
@@ -131,6 +143,8 @@ __all__ = [
     "ConcurrentTurnError",
     "ThreadNotFound",
     "TurnNotFound",
+    "ApprovalNotFound",
+    "SummaryNotFound",
     "CorruptedEventError",
     "LeaseError",
     "MemoryOverwriteDenied",

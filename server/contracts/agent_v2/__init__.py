@@ -12,7 +12,7 @@
 
 from __future__ import annotations
 
-from .cancellation import CancelToken, CancelledError, never_cancelled
+from .cancellation import CancelledError, CancelToken, never_cancelled
 from .clock import Clock, FakeClock, SystemClock, iso_ms
 from .enums import (
     ACTIVE_TURN_STATUSES,
@@ -34,6 +34,7 @@ from .enums import (
 )
 from .errors import (
     AgentV2Error,
+    ApprovalNotFound,
     ConcurrentTurnError,
     ContractViolation,
     CorruptedEventError,
@@ -41,6 +42,7 @@ from .errors import (
     LeaseError,
     MemoryOverwriteDenied,
     ModelStreamError,
+    SummaryNotFound,
     ThreadNotFound,
     TurnNotFound,
 )
@@ -123,6 +125,8 @@ __all__ = [
     "ConcurrentTurnError",
     "ThreadNotFound",
     "TurnNotFound",
+    "ApprovalNotFound",
+    "SummaryNotFound",
     "CorruptedEventError",
     "LeaseError",
     "MemoryOverwriteDenied",
