@@ -40,25 +40,25 @@ def call_for(registry, parent, name, arguments, kind=None):
 # ---------------------------------------------------------------------------- §6.1
 def test_five_agent_tools_exist_with_declared_params(registry) -> None:
     for name in (
-        "spawn_agent",
-        "send_message",
-        "wait_agent",
-        "interrupt_agent",
-        "close_agent",
+        "agent.spawn",
+        "agent.send",
+        "agent.wait",
+        "agent.interrupt",
+        "agent.close",
     ):
         definition = registry.definition(name)
         assert definition is not None, f"缺少工具 {name}"
         assert definition.input_schema.get("required"), f"{name} 必须声明必填参数"
 
 
-def test_spawn_agent_creates_child_and_delivers_task(tmp_path, workspace) -> None:
+def test_agent_spawn_creates_child_and_delivers_task(tmp_path, workspace) -> None:
     repo, tree, parent, registry = build(tmp_path, workspace)
     result = run(
         registry.execute(
             call_for(
                 registry,
                 parent,
-                "spawn_agent",
+                "agent.spawn",
                 {"name": "文献调研", "task": "读三篇论文", "cwd": str(workspace)},
             )
         )
@@ -83,24 +83,24 @@ def test_spawn_agent_creates_child_and_delivers_task(tmp_path, workspace) -> Non
     assert "agent/child_created" in parent_events
 
 
-def test_spawn_agent_requires_name_and_task(tmp_path, workspace) -> None:
+def test_agent_spawn_requires_name_and_task(tmp_path, workspace) -> None:
     repo, tree, parent, registry = build(tmp_path, workspace)
     missing_task = run(
-        registry.execute(call_for(registry, parent, "spawn_agent", {"name": "只有名字"}))
+        registry.execute(call_for(registry, parent, "agent.spawn", {"name": "只有名字"}))
     )
     assert missing_task.status is ToolCallStatus.INVALID_ARGUMENTS
     assert missing_task.error["code"] == "invalid_arguments"
 
     blank_name = run(
-        registry.execute(call_for(registry, parent, "spawn_agent", {"name": "", "task": "x"}))
+        registry.execute(call_for(registry, parent, "agent.spawn", {"name": "", "task": "x"}))
     )
     assert blank_name.status is ToolCallStatus.INVALID_ARGUMENTS
 
 
-def test_send_message_only_to_own_child(tmp_path, workspace) -> None:
+def test_agent_send_only_to_own_child(tmp_path, workspace) -> None:
     repo, tree, parent, registry = build(tmp_path, workspace)
     spawned = run(
-        registry.execute(call_for(registry, parent, "spawn_agent", {"name": "子", "task": "任务"}))
+        registry.execute(call_for(registry, parent, "agent.spawn", {"name": "子", "task": "任务"}))
     )
     child_id = spawned.output["agent_id"]
 
@@ -109,7 +109,7 @@ def test_send_message_only_to_own_child(tmp_path, workspace) -> None:
             call_for(
                 registry,
                 parent,
-                "send_message",
+                "agent.send",
                 {"agent_id": child_id, "content": "补充说明"},
             )
         )
@@ -123,9 +123,9 @@ def test_send_message_only_to_own_child(tmp_path, workspace) -> None:
     # 别的线程不能给别人的子 Agent 发消息
     stranger = repo.create_thread("陌生线程")
     forged = make_call(
-        "send_message",
+        "agent.send",
         {"agent_id": child_id, "content": "越权消息"},
-        kind=registry.definition("send_message").kind,
+        kind=registry.definition("agent.send").kind,
         thread_id=stranger.thread_id,
         turn_id="tu_stranger",
     )
@@ -134,7 +134,7 @@ def test_send_message_only_to_own_child(tmp_path, workspace) -> None:
     assert refused.error["code"] == "not_my_child"
 
 
-def test_wait_agent_returns_results_with_source_ids(tmp_path, workspace) -> None:
+def test_agent_wait_returns_results_with_source_ids(tmp_path, workspace) -> None:
     repo, tree, parent, registry = build(tmp_path, workspace)
     children = []
     for index in range(2):
@@ -143,7 +143,7 @@ def test_wait_agent_returns_results_with_source_ids(tmp_path, workspace) -> None
                 call_for(
                     registry,
                     parent,
-                    "spawn_agent",
+                    "agent.spawn",
                     {"name": f"子{index}", "task": f"任务{index}"},
                 )
             )
@@ -156,7 +156,7 @@ def test_wait_agent_returns_results_with_source_ids(tmp_path, workspace) -> None
 
     result = run(
         registry.execute(
-            call_for(registry, parent, "wait_agent", {"agent_ids": children, "timeout_s": 5})
+            call_for(registry, parent, "agent.wait", {"agent_ids": children, "timeout_s": 5})
         )
     )
     assert result.status is ToolCallStatus.SUCCEEDED
@@ -172,11 +172,11 @@ def test_wait_agent_returns_results_with_source_ids(tmp_path, workspace) -> None
         assert entry["result_item_id"]
 
 
-def test_wait_agent_unknown_child_is_rejected(tmp_path, workspace) -> None:
+def test_agent_wait_unknown_child_is_rejected(tmp_path, workspace) -> None:
     repo, tree, parent, registry = build(tmp_path, workspace)
     result = run(
         registry.execute(
-            call_for(registry, parent, "wait_agent", {"agent_ids": ["th_0000000000000aaaaaaaaaa"]})
+            call_for(registry, parent, "agent.wait", {"agent_ids": ["th_0000000000000aaaaaaaaaa"]})
         )
     )
     assert result.status is ToolCallStatus.FAILED
@@ -184,10 +184,10 @@ def test_wait_agent_unknown_child_is_rejected(tmp_path, workspace) -> None:
 
 
 # ---------------------------------------------------------------------------- §6.2
-def test_interrupt_agent_stops_child_turn_without_touching_parent(tmp_path, workspace) -> None:
+def test_agent_interrupt_stops_child_turn_without_touching_parent(tmp_path, workspace) -> None:
     repo, tree, parent, registry = build(tmp_path, workspace)
     spawned = run(
-        registry.execute(call_for(registry, parent, "spawn_agent", {"name": "子", "task": "任务"}))
+        registry.execute(call_for(registry, parent, "agent.spawn", {"name": "子", "task": "任务"}))
     )
     child_id = spawned.output["agent_id"]
     turn = repo.start_turn(child_id, inputs=[{"text": "开始"}])
@@ -195,7 +195,7 @@ def test_interrupt_agent_stops_child_turn_without_touching_parent(tmp_path, work
 
     result = run(
         registry.execute(
-            call_for(registry, parent, "interrupt_agent", {"agent_id": child_id, "reason": "父要求停止"})
+            call_for(registry, parent, "agent.interrupt", {"agent_id": child_id, "reason": "父要求停止"})
         )
     )
     assert result.status is ToolCallStatus.SUCCEEDED
@@ -209,16 +209,16 @@ def test_interrupt_agent_stops_child_turn_without_touching_parent(tmp_path, work
     assert not parent_state.turns, "父线程不产生 Turn/Item"
 
 
-def test_close_agent_archives_and_interrupts_active_turn(tmp_path, workspace) -> None:
+def test_agent_close_archives_and_interrupts_active_turn(tmp_path, workspace) -> None:
     repo, tree, parent, registry = build(tmp_path, workspace)
     spawned = run(
-        registry.execute(call_for(registry, parent, "spawn_agent", {"name": "子", "task": "任务"}))
+        registry.execute(call_for(registry, parent, "agent.spawn", {"name": "子", "task": "任务"}))
     )
     child_id = spawned.output["agent_id"]
     repo.start_turn(child_id, inputs=[{"text": "开始"}])
 
     closed = run(
-        registry.execute(call_for(registry, parent, "close_agent", {"agent_id": child_id}))
+        registry.execute(call_for(registry, parent, "agent.close", {"agent_id": child_id}))
     )
     assert closed.status is ToolCallStatus.SUCCEEDED
     assert closed.output["closed"] is True

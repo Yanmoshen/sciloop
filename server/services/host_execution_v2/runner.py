@@ -2,13 +2,11 @@
 # Licensed under the Apache License, Version 2.0 (the "License")
 """宿主进程运行器：argv 直启、增量输出、进程树终止（Agent 2 / WP-05）。
 
-设计要点（逐条对应验收书 §5）：
+设计要点（逐条对应文档 WP-05）：
 
-- **argv 优先**：只用 ``asyncio.create_subprocess_exec``，绝不把结构化命令重新拼成
-  shell 字符串（``shell=True`` 在本模块不存在）；
-- **进程树终止**：Windows 用 ``taskkill /F /T``，POSIX 用 ``killpg``（子进程以
-  ``start_new_session`` 起，自己就是进程组组长）；
-- **增量输出**：stdout/stderr 分块读取，逐块回调 + 累积（超上限截断并如实标记）；
+- **argv 优先**：只用 ``asyncio.create_subprocess_exec``，绝不把结构化命令重新拼成 shell；
+- **进程树终止**：软终止 → 宽限 → 硬终止（见 :mod:`.process_tree`）；
+- **增量输出**：stdout/stderr 分块回调 + 按**字节与行数**双限截断（见 :mod:`.output`）；
 - **超时/取消都能终止进程树**，且都返回**结构化记录**而不是抛异常。
 """
 
@@ -17,8 +15,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-import signal
-import subprocess
 import sys
 import time
 from collections.abc import Callable, Sequence
@@ -29,96 +25,36 @@ from typing import Any
 from contracts.agent_v2.cancellation import CancelToken
 from contracts.agent_v2.clock import Clock, SystemClock
 
+from . import unix, windows
 from .models import ExecutionRecord, ExecutionStatus
+from .output import (
+    DEFAULT_MAX_OUTPUT_BYTES,
+    DEFAULT_MAX_OUTPUT_LINES,
+    OutputCollector,
+)
+from .process_tree import (
+    KILL_GRACE_S,
+    SOFT_GRACE_S,
+    is_windows,
+    pid_alive,
+    probe_capability,
+    terminate_process_tree,
+)
 
 OutputHook = Callable[[str, str], None]
 
-#: 默认输出上限（每个通道）：超出即截断并标记
-DEFAULT_MAX_OUTPUT_BYTES = 64 * 1024
 #: 每次读取的块大小
 READ_CHUNK = 4096
-#: 杀掉进程树后等待回收的宽限时间
-KILL_GRACE_S = 5.0
 #: 无超时时的兜底上限，防止测试卡死
 DEFAULT_TIMEOUT_S = 120.0
 
 
-def is_windows() -> bool:
-    return os.name == "nt"
+def _pid_alive_alias(pid: int) -> bool:  # pragma: no cover - 兼容别名
+    return pid_alive(pid)
 
 
-def pid_alive(pid: int) -> bool:
-    """跨平台判断进程是否**真的还在跑**（不引入 psutil）。
-
-    ⚠️ 关键细节：被杀死但尚未回收的进程是**僵尸（Z）**，`os.kill(pid, 0)` 对它仍然成功。
-    容器里 PID 1 往往就是测试进程本身，被 reparent 的孙进程僵尸永远不会被回收 ——
-    因此这里显式读 ``/proc/<pid>/stat`` 的状态位，把 ``Z`` 判成"已死"，
-    否则「进程树是否真的被终止」的断言会假阴性。
-    """
-    if pid <= 0:
-        return False
-    if is_windows():
-        result = _run_windows_tool(["tasklist", "/FI", f"PID eq {pid}", "/NH"])
-        return str(pid) in result["stdout"]
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:  # pragma: no cover - 存在但无权限
-        return True
-    try:
-        with open(f"/proc/{pid}/stat", "rb") as handle:
-            payload = handle.read()
-        state = payload.rsplit(b")", 1)[1].strip().split(b" ", 1)[0]
-        if state == b"Z":
-            return False
-    except OSError:  # pragma: no cover - 无 /proc 时回退到 kill 判定
-        pass
-    return True
-
-
-def _run_windows_tool(argv: list[str]) -> dict[str, Any]:
-    """调用 Windows 命令行工具并**容错解码**。
-
-    中文 Windows 上 ``taskkill`` / ``tasklist`` 的输出是 GBK，而 Python 在 UTF-8 模式下
-    会按 UTF-8 解码 → `UnicodeDecodeError`（实测在探针里出现过）。因此这里拿字节自己解码，
-    `errors="replace"` 兜底：判断"进程是否还在"只看 PID 数字，不依赖输出里的中文。
-    """
-    result = subprocess.run(argv, capture_output=True, check=False)
-    stdout = (result.stdout or b"").decode("utf-8", errors="replace")
-    stderr = (result.stderr or b"").decode("utf-8", errors="replace")
-    if "\ufffd" in stdout or "\ufffd" in stderr:  # 试一次本地代码页（cp936）更可读
-        stdout = (result.stdout or b"").decode("gbk", errors="replace")
-        stderr = (result.stderr or b"").decode("gbk", errors="replace")
-    return {"returncode": result.returncode, "stdout": stdout, "stderr": stderr}
-
-
-def terminate_process_tree(pid: int, *, grace_s: float = KILL_GRACE_S) -> dict[str, Any]:
-    """终止整棵进程树（含孙进程）。返回可审计的终止结果。"""
-    if pid <= 0:
-        return {"pid": pid, "method": "noop", "ok": True}
-    if is_windows():
-        result = _run_windows_tool(["taskkill", "/F", "/T", "/PID", str(pid)])
-        return {
-            "pid": pid,
-            "method": "taskkill",
-            "ok": result["returncode"] == 0 or not pid_alive(pid),
-            "stdout": result["stdout"].strip(),
-            "stderr": result["stderr"].strip(),
-        }
-    method = "killpg"
-    try:
-        os.killpg(os.getpgid(pid), signal.SIGKILL)
-        ok = True
-    except ProcessLookupError:
-        ok = True
-    except OSError:
-        method = "kill"
-        with contextlib.suppress(OSError):
-            os.kill(pid, signal.SIGKILL)
-        ok = not pid_alive(pid)
-    del grace_s
-    return {"pid": pid, "method": method, "ok": ok}
+def _run_windows_tool(argv: list[str]) -> dict[str, Any]:  # pragma: no cover - 兼容别名
+    return windows.run_tool(argv)
 
 
 @dataclass
@@ -142,6 +78,14 @@ class ProcessRun:
     error: dict[str, Any] | None = None
     kill_evidence: dict[str, Any] = field(default_factory=dict)
     output_chunks: int = 0
+    channels: list[dict[str, Any]] = field(default_factory=list)
+    #: 退出方式：exited / signal / killed
+    exit_kind: str | None = None
+
+    @property
+    def signal_exit(self) -> bool:
+        """是否被信号终止（与普通非零退出区分）。"""
+        return self.exit_code is not None and self.exit_code < 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -150,6 +94,7 @@ class ProcessRun:
             "status": self.status.value,
             "pid": self.pid,
             "exit_code": self.exit_code,
+            "exit_kind": self.exit_kind,
             "stdout": self.stdout,
             "stderr": self.stderr,
             "stdout_bytes": self.stdout_bytes,
@@ -162,6 +107,7 @@ class ProcessRun:
             "error": self.error,
             "kill_evidence": self.kill_evidence,
             "output_chunks": self.output_chunks,
+            "channels": list(self.channels),
         }
 
 
@@ -173,12 +119,16 @@ class ProcessRunner:
         *,
         clock: Clock | None = None,
         max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+        max_output_lines: int = DEFAULT_MAX_OUTPUT_LINES,
         kill_grace_s: float = KILL_GRACE_S,
+        soft_grace_s: float = SOFT_GRACE_S,
         default_timeout_s: float | None = DEFAULT_TIMEOUT_S,
     ) -> None:
         self.clock = clock or SystemClock()
         self.max_output_bytes = int(max_output_bytes)
+        self.max_output_lines = int(max_output_lines)
         self.kill_grace_s = float(kill_grace_s)
+        self.soft_grace_s = float(soft_grace_s)
         self.default_timeout_s = default_timeout_s
 
     # ------------------------------------------------------------------ 入口
@@ -213,18 +163,11 @@ class ProcessRunner:
             record.argv = argv_list
             record.cwd = work_dir
 
-        environment: dict[str, str] | None
-        if env is None:
-            environment = None
-        else:
+        environment: dict[str, str] | None = None
+        if env is not None:
             environment = {**os.environ, **{str(k): str(v) for k, v in env.items()}}
 
-        creationflags = 0
-        start_new_session = False
-        if is_windows():
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-        else:
-            start_new_session = True
+        platform_kwargs = windows.spawn_kwargs() if is_windows() else unix.spawn_kwargs()
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -234,12 +177,12 @@ class ProcessRunner:
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                creationflags=creationflags,
-                start_new_session=start_new_session,
+                **platform_kwargs,
             )
         except (OSError, ValueError) as exc:
             run.status = ExecutionStatus.FAILED
             run.error = {"code": "spawn_failed", "message": f"{type(exc).__name__}: {exc}"}
+            run.exit_kind = "spawn_failed"
             run.finished_at = self.clock.now_iso()
             run.duration_ms = int((time.monotonic() - started_monotonic) * 1000)
             if record is not None:
@@ -255,10 +198,9 @@ class ProcessRunner:
             with contextlib.suppress(Exception):
                 on_spawn(process.pid)
 
-        buffers: dict[str, list[str]] = {"stdout": [], "stderr": []}
-        counters: dict[str, int] = {"stdout": 0, "stderr": 0}
-        truncated = {"flag": False}
-        chunks = {"count": 0}
+        collector = OutputCollector(
+            max_bytes=self.max_output_bytes, max_lines=self.max_output_lines
+        )
 
         async def pump(stream: asyncio.StreamReader | None, channel: str) -> None:
             if stream is None:  # pragma: no cover - 防御
@@ -268,15 +210,7 @@ class ProcessRunner:
                 if not data:
                     break
                 text = data.decode("utf-8", errors="replace")
-                counters[channel] += len(data)
-                chunks["count"] += 1
-                remaining = self.max_output_bytes - sum(len(item) for item in buffers[channel])
-                if remaining <= 0:
-                    truncated["flag"] = True
-                else:
-                    buffers[channel].append(text[:remaining] if len(text) > remaining else text)
-                    if len(text) > remaining:
-                        truncated["flag"] = True
+                collector.append(channel, text)
                 if on_output is not None:
                     on_output(channel, text)
 
@@ -293,12 +227,11 @@ class ProcessRunner:
 
             def _on_cancel(reason: str) -> None:
                 run.killed_reason = reason or "cancelled"
-                # 取消可能来自任意线程：必须切回事件循环线程再置位
                 with contextlib.suppress(RuntimeError):
                     loop.call_soon_threadsafe(cancelled_event.set)
 
             unsubscribe = cancel.subscribe(_on_cancel)
-            if cancel.cancelled:  # 注册时已取消 → subscribe 已回调一次，这里兜底
+            if cancel.cancelled:
                 cancelled_event.set()
 
         racers: dict[str, asyncio.Task[Any]] = {"process": wait_task}
@@ -319,7 +252,9 @@ class ProcessRunner:
                 run.killed_reason = "timeout"
                 run.error = {
                     "code": "timeout",
-                    "message": f"command exceeded {effective_timeout}s and its process tree was terminated",
+                    "message": (
+                        f"command exceeded {effective_timeout}s and its process tree was terminated"
+                    ),
                 }
                 await self._kill(process, run, "timeout")
             else:
@@ -330,7 +265,7 @@ class ProcessRunner:
             for task in racers.values():
                 if task is not wait_task and not task.done():
                     task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, TimeoutError, Exception):
+            with contextlib.suppress(Exception):
                 await asyncio.wait_for(asyncio.shield(wait_task), timeout=self.kill_grace_s)
 
         with contextlib.suppress(Exception):
@@ -340,36 +275,50 @@ class ProcessRunner:
             run.exit_code = run.exit_code if run.exit_code is not None else process.returncode
             if run.exit_code == 0:
                 run.status = ExecutionStatus.SUCCEEDED
+                run.exit_kind = "exited"
+            elif run.exit_code is not None and run.exit_code < 0:
+                # 被信号终止：与"普通非零退出"区分（文档 §6 测试要求）
+                run.status = ExecutionStatus.FAILED
+                run.exit_kind = "signal"
+                run.error = {
+                    "code": "signal_exit",
+                    "message": f"command was terminated by signal {-run.exit_code}",
+                    "signal": -run.exit_code,
+                }
             else:
                 run.status = ExecutionStatus.FAILED
+                run.exit_kind = "exited"
                 run.error = {
                     "code": "nonzero_exit",
                     "message": f"command exited with code {run.exit_code}",
                     "exit_code": run.exit_code,
                 }
 
-        run.stdout = "".join(buffers["stdout"])
-        run.stderr = "".join(buffers["stderr"])
-        run.stdout_bytes = counters["stdout"]
-        run.stderr_bytes = counters["stderr"]
-        run.truncated = bool(truncated["flag"])
-        run.output_chunks = chunks["count"]
+        run.stdout = collector.stdout
+        run.stderr = collector.stderr
+        run.stdout_bytes = collector.channels["stdout"].bytes_seen
+        run.stderr_bytes = collector.channels["stderr"].bytes_seen
+        run.truncated = collector.truncated
+        run.output_chunks = collector.chunks
+        run.channels = collector.output_events()
         run.finished_at = self.clock.now_iso()
         run.duration_ms = int((time.monotonic() - started_monotonic) * 1000)
         if record is not None:
+            record.metadata["channels"] = list(run.channels)
             self._apply(record, run)
         return run
 
     # ------------------------------------------------------------------ 内部
-    async def _kill(
-        self, process: asyncio.subprocess.Process, run: ProcessRun, reason: str
-    ) -> None:
+    async def _kill(self, process: asyncio.subprocess.Process, run: ProcessRun, reason: str) -> None:
         if process.returncode is None:
-            run.kill_evidence = terminate_process_tree(process.pid)
+            run.kill_evidence = terminate_process_tree(
+                process.pid, grace_s=self.soft_grace_s, force=True
+            )
             run.kill_evidence["reason"] = reason
-        with contextlib.suppress(TimeoutError, Exception):
+        with contextlib.suppress(Exception):
             await asyncio.wait_for(process.wait(), timeout=self.kill_grace_s)
         run.exit_code = process.returncode
+        run.exit_kind = "killed"
 
     @staticmethod
     def _apply(record: ExecutionRecord, run: ProcessRun) -> None:
@@ -386,6 +335,8 @@ class ProcessRunner:
         record.duration_ms = run.duration_ms
         record.killed_reason = run.killed_reason
         record.error = run.error
+        if run.exit_kind:
+            record.metadata["exit_kind"] = run.exit_kind
         if run.kill_evidence:
             record.metadata["kill_evidence"] = run.kill_evidence
 
@@ -401,9 +352,12 @@ __all__ = [
     "OutputHook",
     "terminate_process_tree",
     "pid_alive",
+    "probe_capability",
     "is_windows",
     "python_executable",
     "DEFAULT_MAX_OUTPUT_BYTES",
+    "DEFAULT_MAX_OUTPUT_LINES",
     "DEFAULT_TIMEOUT_S",
     "KILL_GRACE_S",
+    "SOFT_GRACE_S",
 ]

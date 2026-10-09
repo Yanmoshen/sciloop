@@ -1,6 +1,6 @@
 # Copyright 2026 SciLoop contributors
 # Licensed under the Apache License, Version 2.0 (the "License")
-"""内置工具集合与默认注册表（Agent 2 / WP-06）。
+"""内置工具集合与默认注册表（Agent 2 / WP-01）。
 
     from services.tool_registry_v2.builtin import build_default_registry
 
@@ -8,7 +8,7 @@
         sandbox=sandbox, host=manager, approvals=approvals, agent_tree=tree,
         cwd=workspace, search=my_search_backend,
     )
-    assert registry.names()  # 全部 19 个工具
+    len(registry.names()) == 18   # 宿主机 6 + 服务 7 + 子 Agent 5
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from __future__ import annotations
 from typing import Any
 
 from services.agent_tree_tools_v2 import agent_tree_tool_definitions
-from services.tool_registry_v2.definition import ToolDefinition
+from services.tool_registry_v2.models import ToolDefinition
 from services.tool_registry_v2.registry import ToolRegistry
 
 from .host_tools import host_tool_definitions
@@ -31,7 +31,7 @@ __all__ = [
 
 
 def default_tool_definitions() -> list[ToolDefinition]:
-    """全部内置工具声明（宿主机 + 服务 + 子 Agent）。"""
+    """全部内置工具声明（宿主机 6 + 服务 7 + 子 Agent 5 = 18）。"""
     return [
         *host_tool_definitions(),
         *service_tool_definitions(),
@@ -44,7 +44,7 @@ def build_default_registry(**keyword: Any) -> ToolRegistry:
 
     可识别的构造参数：``clock`` / ``sandbox`` / ``host`` / ``approvals`` /
     ``agent_tree`` / ``cwd`` / ``services`` / ``validate_output``；
-    其余关键字参数一律当作后端注入（``search`` / ``fetch`` / ``kb_query`` …）。
+    其余关键字参数一律当作后端注入（``search`` / ``fetch`` / ``knowledge_search`` …）。
     """
     constructor_keys = {
         "clock",

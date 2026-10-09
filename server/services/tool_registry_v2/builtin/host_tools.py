@@ -1,8 +1,8 @@
 # Copyright 2026 SciLoop contributors
 # Licensed under the Apache License, Version 2.0 (the "License")
-"""宿主机命令与文件工具（Agent 2 / WP-06）。
+"""宿主机命令与文件工具（Agent 2 / WP-01、WP-06）。
 
-- ``host.exec``：**argv 直启**（绝不拼 shell），走 :mod:`services.host_execution_v2`；
+- ``host.command``：**argv 直启**（绝不拼 shell），走 :mod:`services.host_execution_v2`；
 - ``host.file.*``：列举 / 读取 / 写入 / 移动 / 删除，全部先过沙箱裁决。
 
 错误一律用 ``{"__error__": {...}}`` 表达（注册表据此返回结构化失败），**不抛异常**。
@@ -14,14 +14,33 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from services.sandbox_v2 import AccessKind
+from services.sandbox_v2 import SandboxManager
 
-from ..definition import IdempotencyMode, ToolCategory, ToolContext, ToolDefinition
+from ..models import (
+    DEFAULT_MAX_OUTPUT_BYTES,
+    IdempotencyMode,
+    PermissionClass,
+    SideEffect,
+    ToolContext,
+    ToolDefinition,
+)
+from ..schemas import (
+    ANY_OBJECT,
+    ARGV_PROP,
+    BYTES_PROP,
+    HOST_EXEC_OUTPUT,
+    OPTIONAL_PATH_PROP,
+    PATH_PROP,
+    STRING_LIST_PROP,
+    strict_object,
+)
 
 #: 命令行工具超时上限（可被参数覆盖，但不超过它）
-MAX_EXEC_TIMEOUT_S = 600.0
+MAX_EXEC_TIMEOUT_MS = 600_000
 
-_OBJECT = {"type": "object"}
+#: 宿主机命令/文件的审计字段（每次调用都要留档）
+EXEC_AUDIT_FIELDS: tuple[str, ...] = ("argv", "cwd", "timeout_ms", "exit_code", "status")
+FILE_AUDIT_FIELDS: tuple[str, ...] = ("path", "source", "destination", "bytes")
 
 
 def _error(code: str, message: str, **extra: Any) -> dict[str, Any]:
@@ -34,75 +53,75 @@ def _resolve(path_value: str, ctx: ToolContext) -> Path:
     return normalize(path_value, base=ctx.cwd)
 
 
+def _sandbox_check_path(
+    ctx: ToolContext, path: Path, access: str
+) -> dict[str, Any] | None:
+    """沙箱裁决 → 错误字典或 None。"""
+    sandbox: SandboxManager | None = ctx.sandbox
+    if sandbox is None:
+        return None
+    verdict = {
+        "read": sandbox.check_read,
+        "write": sandbox.check_write,
+        "execute": sandbox.check_execute,
+    }[access](path)
+    if verdict.denied:
+        return _error("sandbox_denied", verdict.reason, verdict=verdict.to_dict())
+    if verdict.needs_approval:
+        return _error("approval_required", verdict.reason, verdict=verdict.to_dict())
+    return None
+
+
 # ---------------------------------------------------------------------------- 命令
-def host_exec_definition() -> ToolDefinition:
+def host_command_definition() -> ToolDefinition:
     return ToolDefinition(
-        name="host.exec",
-        category=ToolCategory.EXECUTION,
-        description="在宿主机上执行一条命令（argv 直启，不经过 shell 拼接）",
+        name="host.command",
+        permission=PermissionClass.EXEC,
+        description="在宿主机上执行一条命令（argv 数组直启，不经过 shell 拼接）",
         version="1.0.0",
-        timeout_s=MAX_EXEC_TIMEOUT_S,
+        side_effect=SideEffect.PROCESS,
+        timeout_ms=MAX_EXEC_TIMEOUT_MS,
+        max_output_bytes=DEFAULT_MAX_OUTPUT_BYTES,
         idempotency=IdempotencyMode.EXECUTION,
-        input_schema={
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["argv"],
-            "properties": {
-                "argv": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": {"type": "string", "minLength": 1},
-                    "description": "命令与参数，例如 [\"python\", \"script.py\"]",
-                },
-                "cwd": {"type": "string", "description": "工作目录（默认工作区根）"},
-                "timeout_s": {"type": "number", "exclusiveMinimum": 0},
+        parallel_safe=False,
+        cancellation_support=True,
+        audit_fields=EXEC_AUDIT_FIELDS,
+        input_schema=strict_object(
+            required=("argv",),
+            properties={
+                "argv": ARGV_PROP,
+                "cwd": OPTIONAL_PATH_PROP,
+                "timeout_ms": {"type": "integer", "minimum": 1, "maximum": MAX_EXEC_TIMEOUT_MS},
                 "env": {"type": "object", "additionalProperties": {"type": "string"}},
             },
-        },
-        output_schema={
-            "type": "object",
-            "additionalProperties": True,
-            "properties": {
-                "execution_id": {"type": "string"},
-                "argv": {"type": "array"},
-                "cwd": {"type": "string"},
-                "status": {"type": "string"},
-                "exit_code": {"type": ["integer", "null"]},
-                "stdout": {"type": "string"},
-                "stderr": {"type": "string"},
-                "duration_ms": {"type": ["integer", "null"]},
-                "truncated": {"type": "boolean"},
-            },
-        },
-        handler=run_host_exec,
+            description="命令与参数，例如 [\"python\", \"script.py\"]",
+        ),
+        output_schema=HOST_EXEC_OUTPUT,
+        metadata={"argv_only": True, "shell": False},
+        handler=run_host_command,
     )
 
 
-async def run_host_exec(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+async def run_host_command(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     argv = [str(item) for item in args.get("argv") or []]
     if not argv:
         return _error("invalid_arguments", "argv 不能为空")
     cwd = args.get("cwd") or str(ctx.cwd)
-    timeout = args.get("timeout_s")
     if ctx.host is None:
         return _error("backend_unavailable", "宿主机执行器未接入")
 
     if ctx.sandbox is not None:
-        check = ctx.sandbox.check_argv(argv, cwd=cwd)
+        # 命令级检查：cwd + argv 里每个路径 + 重定向目标 + 可疑命令升级
+        check = ctx.sandbox.check_command_paths(argv, cwd=cwd)
         if check.verdict.denied:
-            return _error(
-                "sandbox_denied",
-                check.verdict.reason,
-                verdict=check.verdict.to_dict(),
-            )
+            return _error("sandbox_denied", check.verdict.reason, verdict=check.verdict.to_dict())
         if check.verdict.needs_approval:
             # 审批由运行时在**执行前**完成（approval_gate）；走到这里说明没批准
             return _error(
-                "approval_required",
-                check.verdict.reason,
-                verdict=check.verdict.to_dict(),
+                "approval_required", check.verdict.reason, verdict=check.verdict.to_dict()
             )
 
+    timeout_ms = args.get("timeout_ms")
     record = await ctx.host.execute(
         argv,
         thread_id=ctx.thread_id,
@@ -110,7 +129,7 @@ async def run_host_exec(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
         call_id=ctx.call_id,
         cwd=cwd,
         env=dict(args.get("env") or {}) or None,
-        timeout_s=float(timeout) if timeout else None,
+        timeout_s=float(timeout_ms) / 1000.0 if timeout_ms else None,
         sandbox_check=False,
     )
     output = record.to_tool_output()
@@ -124,43 +143,31 @@ async def run_host_exec(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
 
 
 # ---------------------------------------------------------------------------- 文件
-def _sandbox_guard(
-    ctx: ToolContext, path: Path, access: AccessKind
-) -> dict[str, Any] | None:
-    """返回错误字典表示被拦下；None 表示放行。"""
-    if ctx.sandbox is None:
-        return None
-    verdict = ctx.sandbox.check_path(path, access)
-    if verdict.denied:
-        return _error("sandbox_denied", verdict.reason, verdict=verdict.to_dict())
-    if verdict.needs_approval:
-        return _error("approval_required", verdict.reason, verdict=verdict.to_dict())
-    return None
-
-
 def host_file_list_definition() -> ToolDefinition:
     return ToolDefinition(
         name="host.file.list",
-        category=ToolCategory.READ_ONLY,
+        permission=PermissionClass.READ,
         description="列举目录内容（只读）",
-        parallel=True,
-        input_schema={
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "path": {"type": "string"},
+        side_effect=SideEffect.NONE,
+        parallel_safe=True,
+        idempotency=IdempotencyMode.NONE,
+        cancellation_support=False,
+        audit_fields=("path",),
+        input_schema=strict_object(
+            properties={
+                "path": OPTIONAL_PATH_PROP,
                 "recursive": {"type": "boolean"},
-                "max_entries": {"type": "integer", "minimum": 1},
-            },
-        },
-        output_schema=_OBJECT,
+                "max_entries": {"type": "integer", "minimum": 1, "maximum": 5000},
+            }
+        ),
+        output_schema=ANY_OBJECT,
         handler=run_file_list,
     )
 
 
 async def run_file_list(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     target = _resolve(args.get("path") or ".", ctx)
-    blocked = _sandbox_guard(ctx, target, AccessKind.READ)
+    blocked = _sandbox_check_path(ctx, target, "read")
     if blocked:
         return blocked
     if not target.exists():
@@ -194,26 +201,25 @@ async def run_file_list(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
 def host_file_read_definition() -> ToolDefinition:
     return ToolDefinition(
         name="host.file.read",
-        category=ToolCategory.READ_ONLY,
+        permission=PermissionClass.READ,
         description="读取文本文件（只读）",
-        parallel=True,
-        input_schema={
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["path"],
-            "properties": {
-                "path": {"type": "string", "minLength": 1},
-                "max_bytes": {"type": "integer", "minimum": 1},
-            },
-        },
-        output_schema=_OBJECT,
+        side_effect=SideEffect.NONE,
+        parallel_safe=True,
+        idempotency=IdempotencyMode.NONE,
+        cancellation_support=False,
+        audit_fields=("path",),
+        input_schema=strict_object(
+            required=("path",),
+            properties={"path": PATH_PROP, "max_bytes": BYTES_PROP},
+        ),
+        output_schema=ANY_OBJECT,
         handler=run_file_read,
     )
 
 
 async def run_file_read(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     target = _resolve(str(args["path"]), ctx)
-    blocked = _sandbox_guard(ctx, target, AccessKind.READ)
+    blocked = _sandbox_check_path(ctx, target, "read")
     if blocked:
         return blocked
     if not target.is_file():
@@ -222,47 +228,43 @@ async def run_file_read(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     raw = target.read_bytes()
     truncated = len(raw) > max_bytes
     text = raw[:max_bytes].decode("utf-8", errors="replace")
-    return {
-        "path": str(target),
-        "bytes": len(raw),
-        "text": text,
-        "truncated": truncated,
-    }
+    return {"path": str(target), "bytes": len(raw), "text": text, "truncated": truncated}
 
 
 def host_file_write_definition() -> ToolDefinition:
     return ToolDefinition(
         name="host.file.write",
-        category=ToolCategory.WORKSPACE_WRITE,
+        permission=PermissionClass.WORKSPACE_WRITE,
         description="写入文本文件（新建或覆盖正文；目录会自动创建）",
-        timeout_s=60.0,
+        side_effect=SideEffect.FILESYSTEM,
+        timeout_ms=60_000,
         idempotency=IdempotencyMode.CALL_ID,
-        input_schema={
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["path", "content"],
-            "properties": {
-                "path": {"type": "string", "minLength": 1},
+        parallel_safe=False,
+        cancellation_support=False,
+        audit_fields=FILE_AUDIT_FIELDS,
+        input_schema=strict_object(
+            required=("path", "content"),
+            properties={
+                "path": PATH_PROP,
                 "content": {"type": "string"},
                 "append": {"type": "boolean"},
             },
-        },
-        output_schema=_OBJECT,
+        ),
+        output_schema=ANY_OBJECT,
         handler=run_file_write,
     )
 
 
 async def run_file_write(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     target = _resolve(str(args["path"]), ctx)
-    blocked = _sandbox_guard(ctx, target, AccessKind.WRITE)
+    blocked = _sandbox_check_path(ctx, target, "write")
     if blocked:
         return blocked
     content = str(args.get("content", ""))
     append = bool(args.get("append", False))
     existed = target.exists()
     target.parent.mkdir(parents=True, exist_ok=True)
-    mode = "a" if append else "w"
-    with target.open(mode, encoding="utf-8") as handle:
+    with target.open("a" if append else "w", encoding="utf-8") as handle:
         handle.write(content)
     return {
         "path": str(target),
@@ -276,21 +278,23 @@ async def run_file_write(args: dict[str, Any], ctx: ToolContext) -> dict[str, An
 def host_file_move_definition() -> ToolDefinition:
     return ToolDefinition(
         name="host.file.move",
-        category=ToolCategory.WORKSPACE_WRITE,
+        permission=PermissionClass.WORKSPACE_WRITE,
         description="移动或重命名文件/目录（覆盖既有目标需要审批）",
-        timeout_s=60.0,
+        side_effect=SideEffect.FILESYSTEM,
+        timeout_ms=60_000,
         idempotency=IdempotencyMode.CALL_ID,
-        input_schema={
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["source", "destination"],
-            "properties": {
-                "source": {"type": "string", "minLength": 1},
-                "destination": {"type": "string", "minLength": 1},
+        parallel_safe=False,
+        cancellation_support=False,
+        audit_fields=FILE_AUDIT_FIELDS,
+        input_schema=strict_object(
+            required=("source", "destination"),
+            properties={
+                "source": PATH_PROP,
+                "destination": PATH_PROP,
                 "overwrite": {"type": "boolean"},
             },
-        },
-        output_schema=_OBJECT,
+        ),
+        output_schema=ANY_OBJECT,
         handler=run_file_move,
     )
 
@@ -299,7 +303,7 @@ async def run_file_move(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     source = _resolve(str(args["source"]), ctx)
     destination = _resolve(str(args["destination"]), ctx)
     for path in (source, destination):
-        blocked = _sandbox_guard(ctx, path, AccessKind.WRITE)
+        blocked = _sandbox_check_path(ctx, path, "write")
         if blocked:
             return blocked
     if not source.exists():
@@ -322,27 +326,26 @@ async def run_file_move(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
 def host_file_delete_definition() -> ToolDefinition:
     return ToolDefinition(
         name="host.file.delete",
-        category=ToolCategory.HIGH_RISK,
+        permission=PermissionClass.DANGEROUS,
         description="删除文件或目录（高危，必须审批）",
-        timeout_s=60.0,
+        side_effect=SideEffect.FILESYSTEM,
+        timeout_ms=60_000,
         idempotency=IdempotencyMode.CALL_ID,
-        input_schema={
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["path"],
-            "properties": {
-                "path": {"type": "string", "minLength": 1},
-                "recursive": {"type": "boolean"},
-            },
-        },
-        output_schema=_OBJECT,
+        parallel_safe=False,
+        cancellation_support=False,
+        audit_fields=FILE_AUDIT_FIELDS,
+        input_schema=strict_object(
+            required=("path",),
+            properties={"path": PATH_PROP, "recursive": {"type": "boolean"}},
+        ),
+        output_schema=ANY_OBJECT,
         handler=run_file_delete,
     )
 
 
 async def run_file_delete(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     target = _resolve(str(args["path"]), ctx)
-    blocked = _sandbox_guard(ctx, target, AccessKind.WRITE)
+    blocked = _sandbox_check_path(ctx, target, "write")
     if blocked:
         return blocked
     if not target.exists():
@@ -363,7 +366,7 @@ async def run_file_delete(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
 
 def host_tool_definitions() -> list[ToolDefinition]:
     return [
-        host_exec_definition(),
+        host_command_definition(),
         host_file_list_definition(),
         host_file_read_definition(),
         host_file_write_definition(),
@@ -374,12 +377,15 @@ def host_tool_definitions() -> list[ToolDefinition]:
 
 __all__ = [
     "host_tool_definitions",
-    "host_exec_definition",
-    "run_host_exec",
+    "host_command_definition",
+    "run_host_command",
     "host_file_list_definition",
     "host_file_read_definition",
     "host_file_write_definition",
     "host_file_move_definition",
     "host_file_delete_definition",
-    "MAX_EXEC_TIMEOUT_S",
+    "MAX_EXEC_TIMEOUT_MS",
+    "EXEC_AUDIT_FIELDS",
+    "FILE_AUDIT_FIELDS",
+    "STRING_LIST_PROP",
 ]

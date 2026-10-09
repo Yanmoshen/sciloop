@@ -9,7 +9,7 @@ from services.tool_registry_v2 import (
     LEGACY_TOOLS,
     NEW_ONLY_TOOLS,
     IdempotencyMode,
-    ToolCategory,
+    PermissionClass,
     legacy_tools_for,
     mapping_table,
     new_tools_for,
@@ -21,9 +21,9 @@ def test_every_legacy_tool_is_mapped() -> None:
     for legacy in LEGACY_TOOLS:
         assert new_tools_for(legacy), f"旧工具 {legacy} 没有映射到任何新工具"
     # 反向也要能查（集成阶段需要）
-    assert legacy_tools_for("kb.query") == ("query_library",)
-    assert set(legacy_tools_for("host.exec")) == {"run_command", "run_on_computer"}
-    assert set(legacy_tools_for("web.search")) == {"search_academic", "search_web"}
+    assert legacy_tools_for("knowledge.search") == ("query_library",)
+    assert set(legacy_tools_for("host.command")) == {"run_command", "run_on_computer"}
+    assert set(legacy_tools_for("search.query")) == {"search_academic", "search_web"}
 
 
 def test_mapping_table_is_deliverable_ready() -> None:
@@ -38,7 +38,7 @@ def test_required_capabilities_are_provided(registry) -> None:
     names = set(registry.names())
     required = {
         # 宿主机命令
-        "host.exec",
+        "host.command",
         # 宿主机文件
         "host.file.list",
         "host.file.read",
@@ -46,20 +46,20 @@ def test_required_capabilities_are_provided(registry) -> None:
         "host.file.move",
         "host.file.delete",
         # 搜索与抓取
-        "web.search",
-        "web.fetch",
+        "search.query",
+        "search.fetch",
         # 知识库
-        "kb.query",
-        "kb.write",
+        "knowledge.search",
+        "knowledge.write",
         # 技能
-        "skill.load",
+        "skill.list",
         "skill.run",
         # 子 Agent
-        "spawn_agent",
-        "send_message",
-        "wait_agent",
-        "interrupt_agent",
-        "close_agent",
+        "agent.spawn",
+        "agent.send",
+        "agent.wait",
+        "agent.interrupt",
+        "agent.close",
         # MCP 桥接
         "mcp.call",
     }
@@ -73,39 +73,42 @@ def test_permission_matrix_baseline(registry) -> None:
     read_only = {
         "host.file.list",
         "host.file.read",
-        "web.search",
-        "web.fetch",
-        "kb.query",
-        "skill.load",
+        "search.query",
+        "search.fetch",
+        "knowledge.search",
+        "skill.list",
     }
     for name in read_only:
-        assert matrix[name]["category"] == ToolCategory.READ_ONLY.value
-        assert matrix[name]["parallel"] is True
-        assert matrix[name]["side_effect"] is False
+        assert matrix[name]["permission_class"] == PermissionClass.READ.value
+        assert matrix[name]["parallelizable"] is True
+        # 网络读取仍是"只读"（side_effect=network），本地只读是 none
+        assert matrix[name]["side_effect"] in {"none", "network"}
+        assert matrix[name]["audit_fields"]
 
-    assert matrix["host.file.write"]["category"] == ToolCategory.WORKSPACE_WRITE.value
-    assert matrix["host.file.move"]["category"] == ToolCategory.WORKSPACE_WRITE.value
-    assert matrix["host.file.delete"]["category"] == ToolCategory.HIGH_RISK.value
-    assert matrix["host.exec"]["category"] == ToolCategory.EXECUTION.value
-    assert matrix["skill.run"]["category"] == ToolCategory.EXECUTION.value
+    assert matrix["host.file.write"]["permission_class"] == PermissionClass.WORKSPACE_WRITE.value
+    assert matrix["host.file.move"]["permission_class"] == PermissionClass.WORKSPACE_WRITE.value
+    assert matrix["host.file.delete"]["permission_class"] == PermissionClass.DANGEROUS.value
+    assert matrix["host.command"]["permission_class"] == PermissionClass.EXEC.value
+    assert matrix["host.command"]["side_effect"] == "process"
+    assert matrix["skill.run"]["permission_class"] == PermissionClass.EXEC.value
 
-    for name in ("spawn_agent", "send_message", "wait_agent", "interrupt_agent", "close_agent"):
-        assert matrix[name]["category"] == ToolCategory.EXECUTION.value
-        assert matrix[name]["side_effect"] is True
+    for name in ("agent.spawn", "agent.send", "agent.wait", "agent.interrupt", "agent.close"):
+        assert matrix[name]["permission_class"] == PermissionClass.EXEC.value
+        assert matrix[name]["side_effect"] == "external"
 
-    # 副作用工具一律不并行
+    # 文件/进程/外部副作用一律不并行（联网读取仍可并行）
     assert all(
-        item["parallel"] is False
+        item["parallelizable"] is False
         for name, item in matrix.items()
-        if item["side_effect"]
+        if item["side_effect"] in {"filesystem", "process", "external"}
     )
 
 
 def test_idempotency_declared_for_side_effect_tools() -> None:
     for definition in default_tool_definitions():
-        if definition.category is ToolCategory.READ_ONLY:
+        if definition.permission is PermissionClass.READ:
             assert definition.idempotency is IdempotencyMode.NONE
-        elif definition.name == "kb.write":
+        elif definition.name == "knowledge.write":
             assert definition.idempotency is IdempotencyMode.CALL_ID
         else:
             assert definition.idempotency in (
@@ -122,7 +125,7 @@ def test_contract_specs_projection_is_consistent(registry) -> None:
         definition = registry.definition(spec.name)
         assert spec.kind is definition.kind
         assert spec.parameters == definition.input_schema
-        if definition.category is ToolCategory.READ_ONLY:
+        if definition.permission is PermissionClass.READ:
             assert spec.kind is ToolKind.READ_ONLY
         else:
             assert spec.kind is ToolKind.SIDE_EFFECT

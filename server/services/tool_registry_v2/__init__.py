@@ -1,28 +1,19 @@
 # Copyright 2026 SciLoop contributors
 # Licensed under the Apache License, Version 2.0 (the "License")
-"""tool_registry_v2：工具声明、校验与执行入口（Agent 2 / WP-04）。
+"""tool_registry_v2：工具声明、校验、调度与执行入口（Agent 2 / WP-01）。
 
-本包实现契约 ``ToolExecutor`` 协议（``specs`` / ``spec`` / ``execute``），
-直接可注入 Agent 1 的 ``ToolScheduler``：
+    from services.tool_registry_v2 import ToolRegistry, ToolGateway
+    from services.tool_registry_v2.builtin import build_default_registry
 
-    from services.agent_runtime_v2 import ToolScheduler
-    from services.tool_registry_v2 import ToolRegistry
-
-    registry = ToolRegistry(sandbox=sandbox, host=host, approvals=approvals)
-    scheduler = ToolScheduler(registry)
+    registry = build_default_registry(sandbox=sandbox, host=host, approvals=approvals)
+    gateway = ToolGateway(registry)
+    gateway.list_tools()               # Agent 3 侧
+    gateway.evaluate(call)             # Agent 1 侧
 """
 
 from __future__ import annotations
 
-from .definition import (
-    CONTRACT_KIND,
-    DEFAULT_MAX_OUTPUT_BYTES,
-    IdempotencyMode,
-    ToolCategory,
-    ToolContext,
-    ToolDefinition,
-    ToolHandler,
-)
+from . import schemas
 from .events import (
     EVENT_TYPE_BY_STATUS,
     event_type_for,
@@ -31,6 +22,7 @@ from .events import (
     result_event,
     started_event,
 )
+from .facade import ALLOW, REQUIRE, ApprovalEventStream, ToolGateway
 from .mapping import (
     LEGACY_TO_NEW,
     LEGACY_TOOLS,
@@ -40,17 +32,39 @@ from .mapping import (
     mapping_table,
     new_tools_for,
 )
+from .models import (
+    APPROVAL_CLASSES,
+    CONTRACT_KIND,
+    DEFAULT_MAX_OUTPUT_BYTES,
+    DEFAULT_TIMEOUT_MS,
+    IdempotencyMode,
+    PermissionClass,
+    SideEffect,
+    ToolContext,
+    ToolDefinition,
+    ToolHandler,
+)
 from .registry import ToolRegistry
+from .scheduler import ToolScheduler
 
 __all__ = [
     "ToolRegistry",
+    "ToolScheduler",
+    "ToolGateway",
+    "ApprovalEventStream",
+    "ALLOW",
+    "REQUIRE",
     "ToolDefinition",
-    "ToolCategory",
+    "PermissionClass",
+    "SideEffect",
+    "IdempotencyMode",
     "ToolContext",
     "ToolHandler",
-    "IdempotencyMode",
     "CONTRACT_KIND",
+    "APPROVAL_CLASSES",
     "DEFAULT_MAX_OUTPUT_BYTES",
+    "DEFAULT_TIMEOUT_MS",
+    "schemas",
     "EVENT_TYPE_BY_STATUS",
     "event_type_for",
     "started_event",

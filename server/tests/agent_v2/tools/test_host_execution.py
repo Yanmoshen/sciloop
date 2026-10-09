@@ -100,7 +100,15 @@ def test_timeout_terminates_process_tree(tmp_path, workspace, sandbox) -> None:
     )
     assert record.status is ExecutionStatus.TIMEOUT
     assert record.killed_reason == "timeout"
-    assert record.metadata["kill_evidence"]["method"] in {"taskkill", "killpg", "kill"}
+    assert record.metadata["kill_evidence"]["method"] in {
+        "taskkill-force",
+        "taskkill-soft",
+        "killpg-force",
+        "killpg-soft",
+        "kill-force",
+    }
+    # 软终止 → 宽限 → 硬终止的两步证据
+    assert record.metadata["kill_evidence"]["steps"][0]["phase"] == "soft"
 
     assert _wait_until(childpid_file.exists, 3.0), "孙进程没有按时启动，测试无效"
     child_pid = int(childpid_file.read_text(encoding="utf-8"))
@@ -273,7 +281,7 @@ def test_windows_powershell_tree_is_killed(tmp_path, workspace, sandbox) -> None
     argv, heart, childpid_file = _tree_command(tmp_path, workspace)
     record = run(host.execute(argv, cwd=workspace, timeout_s=2.0))
     assert record.status is ExecutionStatus.TIMEOUT
-    assert record.metadata["kill_evidence"]["method"] == "taskkill"
+    assert record.metadata["kill_evidence"]["method"] == "taskkill-force"
     assert _wait_until(childpid_file.exists, 3.0)
     assert pid_alive(int(childpid_file.read_text(encoding="utf-8"))) is False
 

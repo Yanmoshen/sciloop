@@ -9,14 +9,18 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 from contracts.agent_v2 import ToolCall, ToolCallStatus, ToolKind, new_id
-from services.tool_registry_v2.definition import (
+from services.tool_registry_v2.models import (
     IdempotencyMode,
-    ToolCategory,
+    PermissionClass,
+    SideEffect,
     ToolDefinition,
 )
 
@@ -94,22 +98,27 @@ def fake_backends() -> dict[str, Any]:
 
 
 def delayed_tool(
-    name: str, *, delay_s: float, category: ToolCategory = ToolCategory.READ_ONLY
+    name: str, *, delay_s: float, permission: PermissionClass = PermissionClass.READ
 ) -> ToolDefinition:
-    """带延时的工具（用于观测并行/串行）。"""
+    """带延时的工具（用于观测并行/串行）。
+
+    元数据如实声明：只读 + 无副作用才允许并行；写/执行类必须串行并声明副作用性质。
+    """
 
     async def handler(args: dict[str, Any], ctx: Any) -> dict[str, Any]:
         await asyncio.sleep(delay_s)
         return {"name": name, "slept": delay_s}
 
+    side_effect = SideEffect.NONE if permission is PermissionClass.READ else SideEffect.FILESYSTEM
     return ToolDefinition(
         name=name,
-        category=category,
+        permission=permission,
         description=f"delayed {name}",
         input_schema={"type": "object", "additionalProperties": True},
         output_schema={"type": "object", "additionalProperties": True},
         handler=handler,
-        parallel=category is ToolCategory.READ_ONLY,
+        side_effect=side_effect,
+        parallel_safe=permission is PermissionClass.READ,
         idempotency=IdempotencyMode.NONE,
     )
 
@@ -117,6 +126,42 @@ def delayed_tool(
 def python_bin() -> str:
     """当前解释器（子进程测试用，避免依赖 PATH）。"""
     return sys.executable or "python"
+
+
+def make_escape_link(link: Path, target: Path) -> str:
+    """在工作区内造一个指向区外的**目录链接**，返回实际用上的方式。
+
+    Windows 的现实情况（实测）：
+    - ``Path.symlink_to`` 在无权限/受限环境里可能"返回成功但没建出链接"
+      （``islink=False``、``reparse_tag=0``），因此**必须验证结果**；
+    - ``mklink /J``（junction）不需要管理员，是更现实的越界向量，且
+      ``os.path.realpath`` 能正确解析它。
+
+    返回 ``"symlink"`` / ``"junction"`` / ``"none"``（都失败时调用方 skip）。
+    """
+    link.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        link.symlink_to(target, target_is_directory=True)
+        if os.path.islink(link):
+            return "symlink"
+
+    if os.name == "nt":
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            check=False,
+        )
+        del result  # 只看结果，不看输出（中文系统是 GBK）
+        if link.exists() and (os.path.islink(link) or _is_reparse_point(link)):
+            return "junction"
+    return "none"
+
+
+def _is_reparse_point(path: Path) -> bool:
+    try:
+        return bool(os.lstat(path).st_reparse_tag)
+    except (AttributeError, OSError):
+        return False
 
 
 def write_heartbeat_script(directory: Path, filename: str = "hb.txt", period_s: float = 0.15) -> Path:

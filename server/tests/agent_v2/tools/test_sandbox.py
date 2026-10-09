@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import pytest
 from tool_helpers import make_call, run
 
 from services.sandbox_v2 import (
@@ -18,6 +19,7 @@ from services.sandbox_v2 import (
     is_protected,
     is_within,
     normalize,
+    resolve_for_check,
 )
 from services.tool_registry_v2 import ToolRegistry
 from services.tool_registry_v2.builtin import default_tool_definitions
@@ -54,7 +56,7 @@ def test_argv_paths_are_checked_not_only_cwd(sandbox, workspace, tmp_path) -> No
     # 写命令的参数就是写入目标 → 越界必须要求授权
     check = sandbox.check_argv(["mkdir", str(outside / "x")], cwd=workspace)
     assert check.verdict.needs_approval, "命令参数里的越界路径必须被拦截"
-    assert any(item.path == str(normalize(outside / "x")) for item in check.paths)
+    assert any(item.path == str(normalize(outside / "x")) for item in check.entries)
 
     # 工作区内的写命令 → 放行
     inside = sandbox.check_argv(["mkdir", str(workspace / "ok")], cwd=workspace)
@@ -84,25 +86,37 @@ def test_sensitive_targets_are_protected(sandbox, workspace) -> None:
     assert is_protected(workspace / "keys" / "server.pem")
     assert not is_protected(workspace / "notes.md")
 
-    write_env = sandbox.check_path(workspace / ".env", AccessKind.WRITE)
-    read_env = sandbox.check_path(workspace / ".env", AccessKind.READ)
+    write_env = sandbox.check_write(workspace / ".env")
+    read_env = sandbox.check_read(workspace / ".env")
     assert write_env.denied, "凭据文件必须写保护（即使在工作区内）"
-    assert read_env.needs_approval
-    assert sandbox.check_path(workspace / ".git" / "config", AccessKind.WRITE).denied
+    assert read_env.denied, "凭据文件读取同样在 deny-read 规则内"
+    assert read_env.protected_rule, "拒绝必须带审计原因（命中的规则 id）"
+    # 版本库元数据：写拒绝、读放行（git 需要读）
+    assert sandbox.check_write(workspace / ".git" / "config").denied
+    assert sandbox.check_read(workspace / ".git" / "config").allowed
 
 
 # ---------------------------------------------------------------------------- §4.3
 def test_symlink_cannot_escape_workspace_root(sandbox, workspace, tmp_path) -> None:
+    """软链 / junction 都不能绕过根边界（Windows 上用 junction，见 helper 说明）。"""
+    from tool_helpers import make_escape_link
+
     secret_dir = tmp_path / "outside-dir"
     secret_dir.mkdir()
     (secret_dir / "secret.txt").write_text("top secret", encoding="utf-8")
     link = workspace / "escape"
-    link.symlink_to(secret_dir, target_is_directory=True)
+    kind = make_escape_link(link, secret_dir)
+    if kind == "none":
+        pytest.skip("本机无法创建 symlink/junction（Windows 权限限制）")
+    assert kind in {"symlink", "junction"}
 
-    verdict = sandbox.check_path(link / "secret.txt", AccessKind.WRITE)
+    verdict = sandbox.check_write(link / "secret.txt")
     assert verdict.needs_approval, "软链解析后的真实位置在工作区外 → 必须要求授权"
     assert verdict.inside_workspace is False
-    assert verdict.path == str(normalize(secret_dir / "secret.txt"))
+    assert verdict.resolved_paths and verdict.resolved_paths[0] == str(
+        resolve_for_check(secret_dir / "secret.txt")[0]
+    )
+    assert verdict.matched_root is None
     assert is_within(link / "secret.txt", workspace) is False
 
 
@@ -139,11 +153,11 @@ def test_full_access_keeps_limits_and_cancellation(tmp_path, workspace, full_acc
     timed = run(
         registry.execute(
             make_call(
-                "host.exec",
+                "host.command",
                 {
                     "argv": [python_bin(), "-c", "import time; time.sleep(20)"],
                     "cwd": str(workspace),
-                    "timeout_s": 1.0,
+                    "timeout_ms": 1000,
                 },
             )
         )
@@ -155,7 +169,7 @@ def test_full_access_keeps_limits_and_cancellation(tmp_path, workspace, full_acc
     noisy = run(
         registry.execute(
             make_call(
-                "host.exec",
+                "host.command",
                 {"argv": [python_bin(), "-c", "print('y' * 2000)"], "cwd": str(workspace)},
             )
         )

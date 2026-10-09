@@ -1,6 +1,6 @@
 # Copyright 2026 SciLoop contributors
 # Licensed under the Apache License, Version 2.0 (the "License")
-"""ToolRegistry：工具声明、参数校验与统一执行边界（Agent 2 / WP-04）。
+"""ToolRegistry：工具注册、参数校验与执行边界（Agent 2 / WP-01）。
 
 本类就是契约里 :class:`contracts.agent_v2.fake.ToolExecutor` 的**实现**：
 
@@ -11,13 +11,15 @@
 执行流程（顺序固定，测试据此断言）：
 
 1. 未知工具 → ``invalid_arguments``（不调用任何 handler）；
-2. **参数校验**（官方 ``jsonschema``，见 ``contracts.agent_v2.validate``）→
-   非法参数在执行前被拒绝，错误信息可读；
+2. **参数校验**（官方 ``jsonschema``，见 ``contracts.agent_v2.validate``）→ 执行前拒绝；
 3. 取消令牌已触发 → ``cancelled``；
 4. 沙箱/审批前置判定 → 被拒时返回结构化错误（不抛异常）；
 5. handler 执行（带超时）→ 成功 / 失败 / 超时；
-6. 输出按 ``max_output_bytes`` **截断并如实标记**；
+6. 输出按 ``max_output_bytes`` **截断并如实标记**（不改字段类型）；
 7. 结果始终带原始 ``call_id``。
+
+Registry **不负责执行策略**（那是 Scheduler 与 ApprovalManager 的事），只负责
+"工具能做什么、参数对不对、结果怎么回来"。
 """
 
 from __future__ import annotations
@@ -33,20 +35,20 @@ from contracts.agent_v2.clock import Clock, SystemClock
 from contracts.agent_v2.enums import ToolCallStatus
 from contracts.agent_v2.models import ToolCall, ToolResult, ToolSpec
 from contracts.agent_v2.validate import SchemaValidator
-from services.approval_v2 import ApprovalManager
+from services.approval_v2 import ApprovalManager, DecisionScope
 from services.host_execution_v2 import HostExecutionManager
-from services.sandbox_v2 import AccessKind, SandboxManager
+from services.sandbox_v2 import SandboxManager
 
-from .definition import (
+from .models import (
     DEFAULT_MAX_OUTPUT_BYTES,
-    ToolCategory,
+    PermissionClass,
     ToolContext,
     ToolDefinition,
 )
 
 
 class ToolRegistry:
-    """工具注册表 + 执行器。"""
+    """工具注册表 + 执行器（契约 ``ToolExecutor`` 的实现）。"""
 
     def __init__(
         self,
@@ -75,10 +77,10 @@ class ToolRegistry:
 
     # ------------------------------------------------------------------ 注册
     def register(self, definition: ToolDefinition, *, replace: bool = False) -> ToolDefinition:
-        if definition.name in self._definitions and not replace:
-            raise ValueError(f"tool {definition.name!r} is already registered")
         if not definition.name:
             raise ValueError("tool name must not be empty")
+        if definition.name in self._definitions and not replace:
+            raise ValueError(f"tool {definition.name!r} is already registered")
         self._definitions[definition.name] = definition
         self._validators[definition.name] = SchemaValidator(definition.input_schema)
         return definition
@@ -93,7 +95,7 @@ class ToolRegistry:
         return self._definitions.pop(name, None) is not None
 
     def bind(self, **services: Any) -> ToolRegistry:
-        """注入后端实现（搜索 / 知识库 / 技能 / MCP 等），返回自身便于链式调用。"""
+        """注入后端实现（搜索 / 知识库 / 技能 / MCP 等）。"""
         for key, value in services.items():
             self.services[key] = value
         return self
@@ -108,40 +110,188 @@ class ToolRegistry:
     def definition(self, name: str) -> ToolDefinition | None:
         return self._definitions.get(name)
 
-    def category_of(self, name: str) -> ToolCategory:
+    def permission_of(self, name: str) -> PermissionClass:
         definition = self._definitions.get(name)
-        # 未知工具按高危处理：宁可要审批，也不要猜它无害
-        return definition.category if definition else ToolCategory.HIGH_RISK
+        # 未知工具按最严处理：宁可要裁决，也不要猜它无害
+        return definition.permission if definition else PermissionClass.DANGEROUS
 
+    # ------------------------------------------------------------------ 契约投影
     def specs(self) -> list[ToolSpec]:
+        """给 Agent 1 调度器的契约声明。"""
         return [item.to_spec() for item in self.definitions()]
 
     def spec(self, name: str) -> ToolSpec | None:
         definition = self._definitions.get(name)
         return None if definition is None else definition.to_spec()
 
+    # ------------------------------------------------------------------ 交付证据
     def permission_matrix(self) -> list[dict[str, Any]]:
-        """权限矩阵（交付证据之一）。"""
         return [item.describe() for item in self.definitions()]
 
-    def category_matrix(self) -> dict[str, list[str]]:
-        matrix: dict[str, list[str]] = {category.value: [] for category in ToolCategory}
+    def permission_class_matrix(self) -> dict[str, list[str]]:
+        matrix: dict[str, list[str]] = {member.value: [] for member in PermissionClass}
         for definition in self.definitions():
-            matrix[definition.category.value].append(definition.name)
+            matrix[definition.permission.value].append(definition.name)
         return matrix
+
+    def capability_matrix(self) -> dict[str, list[str]]:
+        """按副作用性质分类（交付证据之一）。"""
+        matrix: dict[str, list[str]] = {}
+        for definition in self.definitions():
+            matrix.setdefault(definition.side_effect.value, []).append(definition.name)
+        return {key: sorted(value) for key, value in sorted(matrix.items())}
+
+    def validated_schemas(self) -> dict[str, bool]:
+        """每个工具的输入/输出 Schema 是否可被 Draft 2020-12 校验器接受。"""
+        from jsonschema import Draft202012Validator
+
+        result: dict[str, bool] = {}
+        for definition in self.definitions():
+            ok = True
+            for schema in (definition.input_schema, definition.output_schema):
+                try:
+                    Draft202012Validator.check_schema(schema)
+                except Exception:  # noqa: BLE001 - 交给测试断言
+                    ok = False
+            result[definition.name] = ok
+        return result
 
     # ------------------------------------------------------------------ 校验
     def validate_arguments(self, name: str, arguments: dict[str, Any]) -> list[str]:
-        """返回参数错误列表（空 = 合法）。未知工具返回 unknown_tool。"""
         validator = self._validators.get(name)
         if validator is None:
             return [f"tool {name!r} is not registered"]
         return validator.errors(arguments or {})
 
+    # ------------------------------------------------------------------ 审批判定
+    def approval_requirement(self, call: ToolCall, *, thread_id: str) -> dict[str, Any]:
+        """参数感知的"是否需要研究者决定"判定（不执行任何东西）。"""
+        definition = self._definitions.get(call.name)
+        arguments = dict(call.arguments or {})
+        if definition is None:
+            return {"required": True, "reason": f"未知工具 {call.name!r}", "risk": "high_risk"}
+        if definition.permission is PermissionClass.READ:
+            return {"required": False, "reason": "只读工具自动执行", "risk": "read_only"}
+
+        approvals = self.approvals
+        full_access = bool(approvals is not None and approvals.full_access)
+
+        # 命令类：沙箱命令检查（cwd + 参数路径 + 重定向 + 内联代码升级）→ 风险判定
+        if definition.name in {"host.command", "skill.run"}:
+            argv = [str(item) for item in (arguments.get("argv") or [])]
+            cwd = arguments.get("cwd") or str(
+                self.default_cwd or (self.sandbox.workspace_root if self.sandbox else ".")
+            )
+            verdict: dict[str, Any] | None = None
+            if self.sandbox is not None and argv:
+                check = self.sandbox.check_command_paths(argv, cwd=cwd)
+                verdict = check.verdict.to_dict()
+                if check.verdict.denied:
+                    return {
+                        "required": False,
+                        "denied": True,
+                        "reason": check.verdict.reason,
+                        "risk": "high_risk",
+                        "verdict": verdict,
+                    }
+            if definition.name == "skill.run" and not argv:
+                if approvals is not None:
+                    assessment = approvals.assess_tool(
+                        tool=call.name,
+                        permission_class=definition.permission.value,
+                        thread_id=thread_id,
+                        arguments=arguments,
+                        cwd=cwd,
+                        summary="技能执行需要研究者决定",
+                    )
+                    payload = assessment.to_dict()
+                    payload["required"] = assessment.required
+                    return payload
+                return {"required": not full_access, "reason": "技能执行需要裁决", "risk": "high_risk"}
+            if approvals is not None:
+                assessment = approvals.assess_command(
+                    argv,
+                    cwd=cwd,
+                    thread_id=thread_id,
+                    tool=call.name,
+                    sandbox_verdict=verdict,
+                    requested_scope=DecisionScope.ONCE.value,
+                )
+                payload = assessment.to_dict()
+                payload["required"] = assessment.required
+                return payload
+            return {
+                "required": not full_access,
+                "reason": (verdict or {}).get("reason") or "命令执行需要裁决",
+                "risk": "high_risk",
+                "verdict": verdict,
+            }
+
+        # 文件工具：沙箱 + 覆盖/删除
+        if definition.name.startswith("host.file."):
+            if full_access:
+                return {"required": False, "reason": "完全访问模式自动放行（仍记账）", "risk": "normal"}
+            targets = [
+                arguments.get("path"),
+                arguments.get("source"),
+                arguments.get("destination"),
+            ]
+            if self.sandbox is not None:
+                for value in targets:
+                    if not isinstance(value, str) or not value:
+                        continue
+                    verdict = self.sandbox.check_write(value)
+                    if verdict.denied:
+                        return {
+                            "required": False,
+                            "denied": True,
+                            "reason": verdict.reason,
+                            "risk": "high_risk",
+                            "verdict": verdict.to_dict(),
+                        }
+                    if verdict.needs_approval:
+                        return {
+                            "required": True,
+                            "reason": verdict.reason,
+                            "risk": "high_risk",
+                            "verdict": verdict.to_dict(),
+                        }
+            if definition.permission is PermissionClass.DANGEROUS:
+                return {"required": True, "reason": "删除/覆盖是不可逆的高危操作", "risk": "high_risk"}
+            if bool(arguments.get("overwrite")):
+                return {"required": True, "reason": "覆盖既有内容需要裁决", "risk": "high_risk"}
+            return {"required": False, "reason": "工作区内按策略执行", "risk": "normal"}
+
+        if definition.name == "knowledge.write":
+            return {"required": False, "reason": "知识库写入不是高危操作", "risk": "normal"}
+
+        if approvals is not None:
+            assessment = approvals.assess_tool(
+                tool=call.name,
+                permission_class=definition.permission.value,
+                thread_id=thread_id,
+                arguments=arguments,
+            )
+            payload = assessment.to_dict()
+            payload["required"] = assessment.required
+            return payload
+        return {
+            "required": not full_access,
+            "reason": f"{definition.permission.value} 类别需要裁决",
+            "risk": "high_risk",
+        }
+
+    def approval_gate(self, thread_id: str) -> Callable[[ToolCall], str]:
+        """构造与 Agent 1 ``ApprovalGate`` 兼容的门（返回 ``allow`` / ``require``）。"""
+
+        def gate(call: ToolCall) -> str:
+            verdict = self.approval_requirement(call, thread_id=thread_id)
+            return "require" if verdict.get("required") else "allow"
+
+        return gate
+
     # ------------------------------------------------------------------ 执行
-    async def execute(
-        self, call: ToolCall, cancel: CancelToken | None = None
-    ) -> ToolResult:
+    async def execute(self, call: ToolCall, cancel: CancelToken | None = None) -> ToolResult:
         started_iso = self.clock.now_iso()
         started_monotonic = time.monotonic()
 
@@ -193,18 +343,15 @@ class ToolRegistry:
         if definition.handler is None:
             return finish(
                 ToolCallStatus.FAILED,
-                error={
-                    "code": "not_implemented",
-                    "message": f"tool {call.name!r} has no handler bound",
-                },
+                error={"code": "not_implemented", "message": f"tool {call.name!r} has no handler bound"},
             )
 
         context = self._context_for(call)
         try:
-            if definition.timeout_s is not None:
+            if definition.timeout_ms:
                 raw_output = await asyncio.wait_for(
                     definition.handler(dict(call.arguments or {}), context),
-                    timeout=float(definition.timeout_s),
+                    timeout=float(definition.timeout_ms) / 1000.0,
                 )
             else:
                 raw_output = await definition.handler(dict(call.arguments or {}), context)
@@ -213,12 +360,11 @@ class ToolRegistry:
                 ToolCallStatus.TIMEOUT,
                 error={
                     "code": "timeout",
-                    "message": f"tool {call.name!r} exceeded {definition.timeout_s}s",
-                    "timeout_s": definition.timeout_s,
+                    "message": f"tool {call.name!r} exceeded {definition.timeout_ms}ms",
+                    "timeout_ms": definition.timeout_ms,
                 },
             )
         except asyncio.CancelledError:
-            # 异步取消必须原样传播（与 Agent 1 的调度器口径一致）
             raise
         except CancelledError:
             return finish(
@@ -241,7 +387,7 @@ class ToolRegistry:
         if truncated:
             output["truncated"] = True
             output["truncation_notice"] = (
-                f"输出超过 {definition.max_output_bytes} 字节，已截断（完整内容请查看执行记录）"
+                f"输出超过 {definition.max_output_bytes} 字节，已截断（完整内容见执行记录）"
             )
 
         if self.validate_output and definition.output_schema:
@@ -258,128 +404,6 @@ class ToolRegistry:
                 )
 
         return finish(ToolCallStatus.SUCCEEDED, output=output)
-
-    # ------------------------------------------------------------------ 审批门
-    def approval_requirement(self, call: ToolCall, *, thread_id: str) -> dict[str, Any]:
-        """判断一个调用是否需要研究者批准（**参数感知**，不只看工具名）。
-
-        口径：
-
-        - 只读类 → 不需要；
-        - ``host.exec`` / ``skill.run`` → 走命令风险分析（含持续批准与完全访问）；
-        - ``host.file.*`` → 沙箱裁决 + 覆盖/删除判定；
-        - 其余 → 按权限类别（``execution`` / ``high_risk`` 需要）。
-        """
-        definition = self._definitions.get(call.name)
-        arguments = dict(call.arguments or {})
-        if definition is None:
-            return {"required": True, "reason": f"未知工具 {call.name!r}", "risk": "high_risk"}
-        if definition.category is ToolCategory.READ_ONLY:
-            return {"required": False, "reason": "只读工具自动执行", "risk": "read_only"}
-
-        approvals = self.approvals
-        full_access = bool(approvals is not None and approvals.full_access)
-
-        if call.name == "host.exec":
-            argv = [str(item) for item in (arguments.get("argv") or [])]
-            cwd = arguments.get("cwd") or str(self.default_cwd or (self.sandbox.workspace_root if self.sandbox else "."))
-            sandbox_reason = None
-            sandbox_verdict: dict[str, Any] | None = None
-            if self.sandbox is not None and argv:
-                check = self.sandbox.check_argv(argv, cwd=cwd)
-                sandbox_verdict = check.verdict.to_dict()
-                if check.verdict.needs_approval:
-                    sandbox_reason = check.verdict.reason
-                if check.verdict.denied:
-                    return {
-                        "required": False,
-                        "denied": True,
-                        "reason": check.verdict.reason,
-                        "risk": "high_risk",
-                        "verdict": sandbox_verdict,
-                    }
-            if approvals is not None:
-                assessment = approvals.assess_command(
-                    argv,
-                    cwd=cwd,
-                    thread_id=thread_id,
-                    tool=call.name,
-                    sandbox_reason=sandbox_reason,
-                    sandbox_verdict=sandbox_verdict,
-                )
-                payload = assessment.to_dict()
-                payload["required"] = assessment.required
-                return payload
-            return {
-                "required": not full_access,
-                "reason": sandbox_reason or "命令执行需要批准",
-                "risk": "high_risk",
-            }
-
-        if call.name.startswith("host.file."):
-            if full_access:
-                return {"required": False, "reason": "完全访问模式自动批准（仍记账）", "risk": "normal"}
-            if call.name == "host.file.delete":
-                return {"required": True, "reason": "删除是不可逆的高危操作", "risk": "high_risk"}
-            overwrite = bool(arguments.get("overwrite")) or bool(
-                arguments.get("append") is False and arguments.get("path")
-            )
-            targets = [
-                arguments.get("path"),
-                arguments.get("source"),
-                arguments.get("destination"),
-            ]
-            if self.sandbox is not None:
-                for value in targets:
-                    if not isinstance(value, str) or not value:
-                        continue
-                    verdict = self.sandbox.check_path(value, AccessKind.WRITE, cwd=self.default_cwd)
-                    if verdict.denied:
-                        return {
-                            "required": False,
-                            "denied": True,
-                            "reason": verdict.reason,
-                            "risk": "high_risk",
-                            "verdict": verdict.to_dict(),
-                        }
-                    if verdict.needs_approval:
-                        return {
-                            "required": True,
-                            "reason": verdict.reason,
-                            "risk": "high_risk",
-                            "verdict": verdict.to_dict(),
-                        }
-            if overwrite:
-                return {"required": True, "reason": "覆盖既有内容需要批准", "risk": "high_risk"}
-            return {"required": False, "reason": "工作区内写入", "risk": "normal"}
-
-        if call.name == "kb.write":
-            return {"required": False, "reason": "知识库写入不是高危操作", "risk": "normal"}
-
-        if approvals is not None:
-            assessment = approvals.assess_tool(
-                tool=call.name,
-                category=definition.category.value,
-                thread_id=thread_id,
-                arguments=arguments,
-            )
-            payload = assessment.to_dict()
-            payload["required"] = assessment.required
-            return payload
-        return {
-            "required": not full_access,
-            "reason": f"{definition.category.value} 类别需要批准",
-            "risk": "high_risk",
-        }
-
-    def approval_gate(self, thread_id: str) -> Callable[[ToolCall], str]:
-        """构造与 Agent 1 ``ApprovalGate`` 兼容的门（返回 ``allow`` / ``require``）。"""
-
-        def gate(call: ToolCall) -> str:
-            verdict = self.approval_requirement(call, thread_id=thread_id)
-            return "require" if verdict.get("required") else "allow"
-
-        return gate
 
     # ------------------------------------------------------------------ 内部
     def _context_for(self, call: ToolCall) -> ToolContext:
@@ -405,12 +429,7 @@ class ToolRegistry:
     def _enforce_output_limit(
         self, output: dict[str, Any], definition: ToolDefinition
     ) -> tuple[dict[str, Any], bool]:
-        """按上限裁剪输出，**绝不改变字段类型**。
-
-        非字符串字段（数组、数字、布尔）是结构信息：放得下就原样保留，放不下就整条丢弃——
-        早先的实现把它们 `json.dumps` 成字符串，结果 `argv` 从数组变成字符串、
-        `truncated` 从布尔变成 `""`，直接被输出 Schema 判为非法。
-        """
+        """按上限裁剪输出，**绝不改变字段类型**（结构字段保类型，只裁字符串）。"""
         limit = min(definition.max_output_bytes, self.max_output_bytes)
         try:
             encoded = json.dumps(output, ensure_ascii=False)
@@ -421,7 +440,6 @@ class ToolRegistry:
 
         trimmed: dict[str, Any] = {}
         remaining = limit
-        # 1) 结构字段优先（保持类型）
         for key, value in output.items():
             if isinstance(value, str):
                 continue
@@ -429,7 +447,6 @@ class ToolRegistry:
             if size <= remaining:
                 trimmed[key] = value
                 remaining -= size
-        # 2) 字符串字段按剩余空间裁剪（就是它们把体积撑爆的）
         for key, value in output.items():
             if not isinstance(value, str):
                 continue

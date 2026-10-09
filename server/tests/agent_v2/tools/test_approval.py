@@ -42,7 +42,7 @@ def risk_command_call(workspace, call_id):
     return (
         victim,
         tool_call_response(
-            "host.exec",
+            "host.command",
             {"argv": ["rm", "-rf", str(victim)], "cwd": str(workspace)},
             call_id=call_id,
         ),
@@ -71,14 +71,14 @@ def test_high_risk_command_pauses_turn_with_full_request(tmp_path, workspace, re
     assert request.call_id == call_id
     assert request.thread_id == thread.thread_id
     assert request.turn_id == turn.turn_id
-    assert request.action["tool"] == "host.exec"
+    assert request.action["tool"] == "host.command"
     assert request.action["arguments"]["argv"][0] == "rm"
     assert request.action["arguments"]["cwd"] == str(workspace)
     assert victim.exists(), "尚未批准，文件不能被删除"
 
     # 我的判定层给出的是"完整审批请求依据"（命令/参数/cwd/目标/风险类别/来源）
     call = make_call(
-        "host.exec",
+        "host.command",
         {"argv": ["rm", "-rf", str(victim)], "cwd": str(workspace)},
         call_id=call_id,
         thread_id=thread.thread_id,
@@ -108,7 +108,7 @@ def test_approved_once_releases_current_call(tmp_path, workspace, registry):
     # 批准后放行该 Call：先接管 Agent 1 落盘的那条审批，再按「批准一次」处理
     assert registry.approvals is not None
     registry.approvals.adopt(repo.state(thread.thread_id).approvals[approval_id])
-    registry.approvals.grant_once(approval_id)
+    registry.approvals.approve_once(approval_id)
     assert registry.approvals.is_released(call_id) is True
     assert registry.approvals.grants.list(scope_id=thread.thread_id) == [], (
         "「批准一次」不得写入持续批准规则"
@@ -133,7 +133,7 @@ def test_denied_command_leaves_no_side_effect(tmp_path, workspace, registry):
 
     assert victim.exists(), "拒绝之后工具不能执行（无实际副作用）"
     approval = repo.state(thread.thread_id).approvals[approval_id]
-    assert approval.status is ApprovalStatus.DENIED
+    assert approval.status == ApprovalStatus.DENIED.value
     assert resumed.status in (TurnStatus.WAITING_APPROVAL, TurnStatus.COMPLETED)
 
 
@@ -145,11 +145,12 @@ def test_always_allow_saves_prefix_cwd_and_scope(workspace, approvals):
     request = approvals.request_for_assessment(
         assessment, thread_id=thread_id, turn_id="tu_1", call_id="call_a"
     )
-    approval, grant = approvals.always_allow(request.approval_id, scope_id=thread_id)
+    approval, grant = approvals.approve_for_thread(request.approval_id, scope_id=thread_id)
 
-    assert approval.status is ApprovalStatus.GRANTED
+    assert approval.status == ApprovalStatus.GRANTED.value
     assert grant is not None
-    assert grant.normalized_argv[-1] == "print(1)"
+    assert grant.arg_constraints.mode == "exact"
+    assert grant.arg_constraints.argv[-1] == "print(1)"
     assert grant.cwd == str(workspace)
     assert grant.scope == "thread" and grant.scope_id == thread_id
 
@@ -171,7 +172,7 @@ def test_grant_does_not_match_changed_args_cwd_or_executable(workspace, approval
         turn_id="tu_1",
         call_id="call_b",
     )
-    approval, grant = approvals.always_allow(request.approval_id, scope_id=thread_id)
+    approval, grant = approvals.approve_for_thread(request.approval_id, scope_id=thread_id)
     assert grant is not None
 
     # 同一条命令 → 命中，不再打扰
@@ -205,9 +206,9 @@ def test_repeated_decisions_are_idempotent(workspace, approvals):
         turn_id="tu_x",
         call_id="call_x",
     )
-    first = approvals.grant_once(request.approval_id)
-    second = approvals.grant_once(request.approval_id)
-    assert first.status is ApprovalStatus.GRANTED
+    first = approvals.approve_once(request.approval_id)
+    second = approvals.approve_once(request.approval_id)
+    assert first.status == ApprovalStatus.GRANTED.value
     assert second.decided_at == first.decided_at, "重复批改不得产生第二次裁决"
     assert len(approvals.decisions()) == 1
 
@@ -239,9 +240,9 @@ def test_interrupt_and_expiry_resolve_pending(workspace, approvals, fake_clock):
 
     resolved = manager.resolve_on_interrupt("th_z", "tu_z")
     assert len(resolved) == 2, "同一 Turn 下所有未完成审批都要被收敛"
-    assert manager.get(first.approval_id).status is ApprovalStatus.DENIED
+    assert manager.get(first.approval_id).status == ApprovalStatus.DENIED.value
     assert manager.get(first.approval_id).decision_scope.startswith("cancelled:")
-    assert manager.get(second.approval_id).status is ApprovalStatus.DENIED
+    assert manager.get(second.approval_id).status == ApprovalStatus.DENIED.value
 
     # 另开一条用于验证过期
     third = manager.request_for_assessment(
@@ -250,7 +251,7 @@ def test_interrupt_and_expiry_resolve_pending(workspace, approvals, fake_clock):
     fake_clock.advance(30)
     expired = manager.expire_stale()
     assert [item.approval_id for item in expired] == [third.approval_id]
-    assert manager.get(third.approval_id).status is ApprovalStatus.EXPIRED
+    assert manager.get(third.approval_id).status == ApprovalStatus.EXPIRED.value
     assert manager.pending() == []
 
 
@@ -262,21 +263,31 @@ def test_token_never_reaches_model_visible_payload(workspace, approvals, registr
         turn_id="tu_t",
         call_id="call_t",
     )
+    approvals.approve_once(request.approval_id)
     token = approvals.issue_token(request.approval_id)
-    approvals.grant_once(request.approval_id)
 
     # 审批对象本身不含令牌
     assert token not in str(request.to_dict())
     assert "token" not in request.to_dict()
     # 核销令牌后拿到的是同一条审批
-    assert approvals.consume_token(token).approval_id == request.approval_id
+    binding = {
+        "thread_id": request.thread_id,
+        "turn_id": request.turn_id,
+        "call_id": request.call_id,
+        "tool": request.tool_name,
+    }
+    assert approvals.consume_token(token, **binding).approval_id == request.approval_id
     # 令牌不能重复使用
-    assert approvals.consume_token(token) is None
+    assert approvals.consume_token(token, **binding) is None
+    # 绑定不符（换 thread）同样拒绝
+    other = approvals.issue_token(request.approval_id)
+    assert approvals.consume_token(other, **{**binding, "thread_id": "th_other"}) is None
 
     # 工具结果（模型可见面）也不含令牌
     result = run(registry.execute(make_call("host.file.read", {"path": "nope.txt"})))
     assert token not in str(result.output or {})
     assert token not in str(result.error or {})
+    approvals.tokens.revoke(request.approval_id)
     assert approvals.token_count() == 0
 
 
@@ -316,7 +327,7 @@ def test_registry_keeps_readonly_auto_when_full_access(full_access_sandbox, work
     )["required"] is False
     # 完全访问下命令自动批准
     assert registry.approval_requirement(
-        make_call("host.exec", {"argv": ["rm", "-rf", "x"], "cwd": str(workspace)}),
+        make_call("host.command", {"argv": ["rm", "-rf", "x"], "cwd": str(workspace)}),
         thread_id="th_f",
     )["required"] is False
     # 但删除类文件工具仍然自动批准——审计信息必须保留

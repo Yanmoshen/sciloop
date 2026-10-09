@@ -24,6 +24,8 @@ from contracts.agent_v2.clock import Clock, SystemClock
 from services.sandbox_v2 import SandboxManager
 
 from .models import FINAL_STATUSES, ExecutionRecord, ExecutionStatus, new_execution_id
+from .output import DEFAULT_MAX_OUTPUT_LINES
+from .recovery import mark_after_restart, recovery_report
 from .runner import (
     DEFAULT_MAX_OUTPUT_BYTES,
     DEFAULT_TIMEOUT_S,
@@ -31,6 +33,7 @@ from .runner import (
     ProcessRun,
     ProcessRunner,
     pid_alive,
+    probe_capability,
     terminate_process_tree,
 )
 
@@ -47,6 +50,7 @@ class HostExecutionManager:
         *,
         clock: Clock | None = None,
         max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+        max_output_lines: int = DEFAULT_MAX_OUTPUT_LINES,
         default_timeout_s: float | None = DEFAULT_TIMEOUT_S,
         sandbox: SandboxManager | None = None,
         runner: ProcessRunner | None = None,
@@ -55,10 +59,12 @@ class HostExecutionManager:
         self.records_dir.mkdir(parents=True, exist_ok=True)
         self.clock = clock or SystemClock()
         self.max_output_bytes = int(max_output_bytes)
+        self.max_output_lines = int(max_output_lines)
         self.sandbox = sandbox
         self.runner = runner or ProcessRunner(
             clock=self.clock,
             max_output_bytes=self.max_output_bytes,
+            max_output_lines=self.max_output_lines,
             default_timeout_s=default_timeout_s,
         )
         self._lock = threading.RLock()
@@ -131,9 +137,13 @@ class HostExecutionManager:
         """执行一条宿主机命令。重复请求直接复用已有结论（幂等，不重跑）。"""
         argv_list = [str(item) for item in argv]
         key = (thread_id, turn_id, call_id)
+        # 只有拿到**明确身份**（thread 或 call）时才做重复执行保护：
+        # 三个都是 None 的匿名调用彼此无关（例如测试/探针），共用一把键会让第二条命令
+        # 直接复用第一条的结果——那是错的。
+        keyed = key != (None, None, None)
 
         with self._lock:
-            existing_id = self._by_key.get(key)
+            existing_id = self._by_key.get(key) if keyed else None
             if existing_id is not None:
                 existing = self.get(existing_id)
                 if existing is not None:
@@ -174,11 +184,13 @@ class HostExecutionManager:
                         "verdict": check.verdict.to_dict(),
                     }
                     record.finished_at = self.clock.now_iso()
-                    self._by_key[key] = record.execution_id
+                    if keyed:
+                        self._by_key[key] = record.execution_id
                     self._persist(record)
                     return record
 
-            self._by_key[key] = record.execution_id
+            if keyed:
+                self._by_key[key] = record.execution_id
             self._persist(record)
 
         def _on_spawn(pid: int) -> None:
@@ -273,30 +285,14 @@ class HostExecutionManager:
         - ``PENDING`` → ``interrupted``（从未真正启动）。
         """
         unresolved: list[ExecutionRecord] = []
+        now_iso = self.clock.now_iso()
         for record in self.scan():
-            if record.status is ExecutionStatus.RUNNING:
-                alive = bool(record.pid) and pid_alive(int(record.pid or 0))
-                record.status = ExecutionStatus.UNKNOWN
-                record.orphan_pid = int(record.pid) if alive and record.pid else None
-                record.finished_at = record.finished_at or self.clock.now_iso()
-                record.error = {
-                    "code": "unknown_after_restart",
-                    "message": (
-                        "服务重启时该执行未确认完成，状态记为 unknown；"
-                        "禁止自动重放，需人工确认后再提交"
-                    ),
-                    "orphan_alive": alive,
-                }
-                self._persist(record)
-                unresolved.append(record)
-            elif record.status is ExecutionStatus.PENDING:
-                record.status = ExecutionStatus.INTERRUPTED
-                record.error = {
-                    "code": "interrupted",
-                    "message": "服务重启时该执行尚未启动",
-                }
-                self._persist(record)
-                unresolved.append(record)
+            if record.status not in (ExecutionStatus.RUNNING, ExecutionStatus.PENDING):
+                continue
+            alive = bool(record.pid) and pid_alive(int(record.pid or 0))
+            mark_after_restart(record, now_iso=now_iso, orphan_alive=alive)
+            self._persist(record)
+            unresolved.append(record)
         return unresolved
 
     def kill_orphan(self, execution_id: str) -> dict[str, Any]:
@@ -329,6 +325,20 @@ class HostExecutionManager:
             )
         record = await self.execute(argv, cwd=cwd, sandbox_check=False)
         return record, False
+
+    # ------------------------------------------------------------------ 能力与证据
+    def capability(self) -> dict[str, Any]:
+        """平台执行能力（如实报告，不伪造隔离）。"""
+        return probe_capability()
+
+    def recovery_report(self) -> dict[str, Any]:
+        """未完成执行的扫描报告（交付证据）。"""
+        unresolved = [
+            item
+            for item in self.scan()
+            if item.status in (ExecutionStatus.UNKNOWN, ExecutionStatus.INTERRUPTED)
+        ]
+        return recovery_report(unresolved)
 
     def close(self) -> None:
         """终止所有活动进程（进程退出时调用，避免后台任务泄漏）。"""

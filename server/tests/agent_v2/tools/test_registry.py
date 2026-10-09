@@ -15,7 +15,8 @@ from contracts.agent_v2 import EventType, ToolCallStatus, ToolKind
 from services.agent_runtime_v2 import ToolScheduler
 from services.tool_registry_v2 import (
     IdempotencyMode,
-    ToolCategory,
+    PermissionClass,
+    SideEffect,
     ToolRegistry,
     event_type_for,
     lifecycle_events,
@@ -29,7 +30,7 @@ def test_every_tool_declares_required_metadata(registry) -> None:
     for definition in registry.definitions():
         assert definition.name
         assert definition.version, f"{definition.name} 缺版本"
-        assert isinstance(definition.category, ToolCategory)
+        assert isinstance(definition.permission, PermissionClass)
         assert definition.input_schema.get("type") == "object", f"{definition.name} 输入 Schema 非法"
         assert definition.output_schema, f"{definition.name} 缺输出 Schema"
         assert isinstance(definition.kind, ToolKind)
@@ -38,21 +39,34 @@ def test_every_tool_declares_required_metadata(registry) -> None:
         assert isinstance(definition.idempotency, IdempotencyMode)
 
 
-def test_side_effect_flag_matches_category(registry) -> None:
+def test_side_effect_metadata_is_declared(registry) -> None:
+    """副作用的**性质**必须声明；只有「只读 + 无副作用 + 声明并行」才允许并行。"""
     for definition in registry.definitions():
-        expected_side_effect = definition.category is not ToolCategory.READ_ONLY
-        assert definition.side_effect is expected_side_effect, definition.name
-        if definition.category is ToolCategory.READ_ONLY:
+        assert isinstance(definition.side_effect, SideEffect), definition.name
+        assert isinstance(definition.cancellation_support, bool)
+        # 会起进程/联网的工具必须支持取消（否则 Turn 中断杀不掉）
+        if definition.side_effect in {SideEffect.PROCESS, SideEffect.EXTERNAL, SideEffect.NETWORK}:
+            assert definition.cancellation_support is True, definition.name
+        assert definition.timeout_ms > 0
+        assert definition.max_output_bytes > 0
+        assert definition.audit_fields, f"{definition.name} 未声明审计字段"
+        if definition.permission is PermissionClass.READ:
             assert definition.kind is ToolKind.READ_ONLY
+            assert definition.parallel_safe is True
+            # 只读工具的副作用只能是 none（本地读）或 network（联网读）
+            assert definition.side_effect in {SideEffect.NONE, SideEffect.NETWORK}
             assert definition.parallelizable is True
+        else:
+            assert definition.parallelizable is False, "副作用工具不得并行"
+            assert definition.side_effect is not SideEffect.NONE
 
 
 def test_permission_matrix_covers_every_tool(registry) -> None:
-    matrix = registry.category_matrix()
+    matrix = registry.permission_class_matrix()
     total = sum(len(items) for items in matrix.values())
     assert total == len(registry.names())
-    assert matrix[ToolCategory.READ_ONLY.value], "至少要有一个只读工具"
-    assert matrix[ToolCategory.HIGH_RISK.value], "高危工具必须显式登记（删除类）"
+    assert matrix[PermissionClass.READ.value], "至少要有一个只读工具"
+    assert matrix[PermissionClass.DANGEROUS.value], "高危工具必须显式登记（删除类）"
 
 
 # ---------------------------------------------------------------------------- §2.2
@@ -159,9 +173,9 @@ def test_side_effect_tools_never_parallel(workspace) -> None:
     registry = ToolRegistry(default_cwd=str(workspace))
     registry.register_all(
         [
-            delayed_tool("slow.write.a", delay_s=0.1, category=ToolCategory.WORKSPACE_WRITE),
-            delayed_tool("slow.write.b", delay_s=0.1, category=ToolCategory.WORKSPACE_WRITE),
-            delayed_tool("slow.write.c", delay_s=0.1, category=ToolCategory.EXECUTION),
+            delayed_tool("slow.write.a", delay_s=0.1, permission=PermissionClass.WORKSPACE_WRITE),
+            delayed_tool("slow.write.b", delay_s=0.1, permission=PermissionClass.WORKSPACE_WRITE),
+            delayed_tool("slow.write.c", delay_s=0.1, permission=PermissionClass.EXEC),
         ]
     )
     scheduler = ToolScheduler(registry)
@@ -185,7 +199,7 @@ def test_timeout_and_cancellation_are_structured(workspace) -> None:
     from dataclasses import replace
 
     registry = ToolRegistry(default_cwd=str(workspace))
-    registry.register(replace(definition, timeout_s=0.2))
+    registry.register(replace(definition, timeout_ms=200))
 
     timed_out = run(registry.execute(mk("slow.tool", {})))
     assert timed_out.status is ToolCallStatus.TIMEOUT
@@ -212,7 +226,7 @@ def test_output_is_truncated_and_flagged(workspace, host, sandbox) -> None:
     result = run(
         registry.execute(
             make_call(
-                "host.exec",
+                "host.command",
                 {"argv": [python_bin(), "-c", "print('x' * 4000)"]},
             )
         )
