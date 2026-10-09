@@ -388,8 +388,42 @@ export function sortEntries(entries: KnowledgeEntry[], field: SortField, order: 
  * 四、文件系统 API
  * ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ *
+ * 列表快照的前端缓存（stale-while-revalidate）
+ *
+ * 为什么要有：切分类/在页面间来回走时，重新拉一次快照会让界面白白等网络
+ * （哪怕后端只要 0.2s，用户看到的是骨架闪一下）。这里把最近一次快照留在
+ * 模块作用域（组件销毁也不丢），命中就**先渲染出来**，再后台静默刷新。
+ * 所有写操作成功后立即失效，保证不会拿旧数据当真。
+ * ------------------------------------------------------------------ */
+export const SNAPSHOT_TTL_MS = 30_000
+
+let snapshotCache: { at: number; data: KnowledgeSnapshot } | null = null
+
+/** 取缓存（没有则 null）——同步返回，用于"先渲染再刷新"。 */
+export function peekSnapshot(): KnowledgeSnapshot | null {
+  return snapshotCache?.data ?? null
+}
+
+/** 缓存年龄（毫秒）；没有缓存返回 null。 */
+export function snapshotAgeMs(): number | null {
+  return snapshotCache ? Date.now() - snapshotCache.at : null
+}
+
+/** 主动失效（写操作后调用，也用于"重新读取"按钮强制拉新）。 */
+export function invalidateSnapshot(): void {
+  snapshotCache = null
+}
+
+/** 拉一份快照并写入缓存。 */
+export async function refreshSnapshot(): Promise<KnowledgeSnapshot> {
+  const data = await get<KnowledgeSnapshot>('/knowledge/entries')
+  snapshotCache = { at: Date.now(), data }
+  return data
+}
+
 export function loadSnapshot(): Promise<KnowledgeSnapshot> {
-  return get<KnowledgeSnapshot>('/knowledge/entries')
+  return refreshSnapshot()
 }
 
 /** 单条详情（**含正文**）——列表不带正文，阅读器打开时按需取这一条。 */
@@ -404,12 +438,19 @@ export async function loadEntries(ids: string[]): Promise<KnowledgeEntry[]> {
   return result.items
 }
 
+/** 写操作成功后统一失效缓存，避免拿旧列表当真。 */
+async function mutating<T>(work: Promise<T>): Promise<T> {
+  const result = await work
+  invalidateSnapshot()
+  return result
+}
+
 export function createEntry(draft: KnowledgeDraft): Promise<KnowledgeEntry> {
-  return post<KnowledgeEntry>('/knowledge/entries', { body: draft })
+  return mutating(post<KnowledgeEntry>('/knowledge/entries', { body: draft }))
 }
 
 export function updateEntry(id: string, body: Partial<KnowledgeDraft>): Promise<KnowledgeEntry> {
-  return patch<KnowledgeEntry>(`/knowledge/entries/${id}`, { body })
+  return mutating(patch<KnowledgeEntry>(`/knowledge/entries/${id}`, { body }))
 }
 
 export function uploadEntry(file: File, draft: Pick<KnowledgeDraft, 'bucket' | 'folder' | 'tags' | 'project_id'>): Promise<KnowledgeEntry> {
@@ -419,12 +460,14 @@ export function uploadEntry(file: File, draft: Pick<KnowledgeDraft, 'bucket' | '
   body.append('folder', folderPath(draft.folder))
   body.append('tags', JSON.stringify(draft.tags))
   if (draft.project_id !== null) body.append('project_id', String(draft.project_id))
-  return post<KnowledgeEntry>('/knowledge/files', { body, timeoutMs: 120_000 })
+  return mutating(post<KnowledgeEntry>('/knowledge/files', { body, timeoutMs: 120_000 }))
 }
 
 async function mutateEntries(action: string, ids: string[], extra: Record<string, unknown> = {}): Promise<number> {
   if (!ids.length) return 0
-  const result = await post<{ changed: number }>(`/knowledge/entries/${action}`, { body: { ids, ...extra } })
+  const result = await mutating(
+    post<{ changed: number }>(`/knowledge/entries/${action}`, { body: { ids, ...extra } }),
+  )
   return result.changed
 }
 
@@ -435,7 +478,9 @@ export const tagEntries = (ids: string[], tag: string) => mutateEntries('tag', i
 
 export async function deleteEntries(ids: string[]): Promise<number> {
   if (!ids.length) return 0
-  const result = await del<{ deleted: number }>('/knowledge/entries', { query: { ids: ids.join(',') } })
+  const result = await mutating(
+    del<{ deleted: number }>('/knowledge/entries', { query: { ids: ids.join(',') } }),
+  )
   return result.deleted
 }
 
@@ -445,7 +490,7 @@ export async function emptyTrash(): Promise<number> {
 }
 
 export async function createFolder(folder: string[]): Promise<string[]> {
-  const result = await post<{ folders: string[] }>('/knowledge/folders', { body: { folder } })
+  const result = await mutating(post<{ folders: string[] }>('/knowledge/folders', { body: { folder } }))
   return result.folders
 }
 

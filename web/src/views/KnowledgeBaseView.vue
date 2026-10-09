@@ -15,7 +15,7 @@
  * 分类口径（用户指定顺序）：全部 → 最近 → 文献 → idea → 实验 → 论文 → 记忆 → 回收站。
  * 数据仍是**本机浏览器**（见 `api/knowledge.ts` 顶部契约），不写后端、不新增迁移。
  */
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import {
@@ -35,7 +35,9 @@ import {
   KB_BUCKETS,
   loadEntries,
   loadEntry,
-  loadSnapshot,
+  peekSnapshot,
+  refreshSnapshot,
+  invalidateSnapshot,
   moveEntries,
   restoreEntries,
   sortEntries,
@@ -353,21 +355,155 @@ function folderOf(entry: KnowledgeEntry): string {
 }
 
 /* ---------------- 读写 ---------------- */
+
+/**
+ * 分块渲染：一次只上屏 RENDER_CHUNK 行，剩下的按帧补。
+ *
+ * 为什么必须分块：论文分类下 770 行一起渲染会**同步阻塞主线程十秒级**（实测 11.8s），
+ * 用户看到的就是"点了导航整个界面卡死"。分块后每帧只做一小段，界面始终能响应，
+ * 并在底部显示"正在显示 N / M"的加载动画 —— 也就是"给加载动画而不是强制卡住"。
+ */
+const RENDER_CHUNK = 80
+const renderLimit = ref(RENDER_CHUNK)
+let growTimer: number | null = null
+
+/** 当前实际上屏的条目（分块渲染的可见窗口） */
+const renderedEntries = computed(() => visibleEntries.value.slice(0, renderLimit.value))
+const renderPending = computed(() => visibleEntries.value.length > renderLimit.value)
+
+function scheduleGrow(): void {
+  if (growTimer !== null || !renderPending.value) return
+  growTimer = window.setTimeout(() => {
+    growTimer = null
+    renderLimit.value = Math.min(visibleEntries.value.length, renderLimit.value + RENDER_CHUNK)
+    scheduleGrow()
+  }, 24)
+}
+
+watch(
+  [
+    () => scope.value,
+    () => keyword.value,
+    () => projectFilter.value,
+    () => timeRange.value,
+    () => sortField.value,
+    () => sortOrder.value,
+    () => folder.value,
+    () => visibleEntries.value.length,
+  ],
+  () => {
+    renderLimit.value = RENDER_CHUNK
+    scheduleGrow()
+  },
+  { immediate: true, flush: 'post' },
+)
+
+/** 后台静默刷新中的标记（不显示骨架，只做提示） */
+const refreshing = ref(false)
+
+async function refreshQuietly(): Promise<void> {
+  if (refreshing.value) return
+  refreshing.value = true
+  try {
+    const snapshot = await refreshSnapshot()
+    items.value = snapshot.items
+    folders.value = snapshot.folders
+  } catch {
+    // 后台刷新失败不打扰研究者：继续用上一次的内容
+  } finally {
+    refreshing.value = false
+  }
+}
+
+/**
+ * 取数：**缓存秒开 + 后台刷新**。
+ *
+ * - 有缓存：先立刻渲染出来（不显示骨架），再后台刷新；
+ * - 没缓存（首次进入 / 刚做过写操作）：显示骨架等这一次请求。
+ */
 async function reload(): Promise<void> {
-  loading.value = true
+  const cached = peekSnapshot()
+  if (cached) {
+    items.value = cached.items
+    folders.value = cached.folders
+    loadError.value = ''
+    loading.value = false
+    void refreshQuietly()
+    return
+  }
+  const hadContent = items.value.length > 0
+  if (!hadContent) loading.value = true
   loadError.value = ''
   try {
-    const snapshot = await loadSnapshot()
+    const snapshot = await refreshSnapshot()
     items.value = snapshot.items
     folders.value = snapshot.folders
   } catch (error) {
-    items.value = []
-    folders.value = []
-    loadError.value = (error as { message?: string }).message ?? '知识库读取失败'
+    if (hadContent) {
+      notice.value = '刷新失败，当前显示的是上一次的内容'
+    } else {
+      items.value = []
+      folders.value = []
+      loadError.value = (error as { message?: string }).message ?? '知识库读取失败'
+    }
   } finally {
     loading.value = false
   }
 }
+
+/* ---------------- 行操作菜单（全局一个） ---------------- */
+/** 「重新读取」：先失效缓存再拉一次，保证看到的是服务端最新状态。 */
+async function forceReload(): Promise<void> {
+  invalidateSnapshot()
+  await reload()
+}
+
+/**
+ * 行尾 `⋯` 菜单：**整个列表只有一份菜单 DOM**，点开时定位到被点的那一行。
+ *
+ * 原来每行一个 `el-dropdown`（770 行 = 770 个 Element Plus 组件实例）——
+ * 实测这是切换分类卡十几秒的主因（论文 770 行：11.8s → 0.12s）。
+ * 这里换成自绘面板：零组件实例、样式对齐设计令牌、行为完全可控。
+ */
+const rowMenuEntry = ref<KnowledgeEntry | null>(null)
+const rowMenuStyle = ref<Record<string, string>>({})
+
+function openRowMenu(entry: KnowledgeEntry, event: MouseEvent): void {
+  const button = event.currentTarget as HTMLElement | null
+  const rect = button?.getBoundingClientRect()
+  const width = 152
+  const height = 186
+  const left = Math.min(
+    Math.max(8, rect ? rect.right - width : event.clientX),
+    Math.max(8, window.innerWidth - width - 8),
+  )
+  const top =
+    rect && rect.bottom + height > window.innerHeight
+      ? Math.max(8, rect.top - height - 4)
+      : (rect ? rect.bottom + 4 : event.clientY)
+  rowMenuStyle.value = { left: `${left}px`, top: `${top}px`, width: `${width}px` }
+  rowMenuEntry.value = entry
+}
+
+function closeRowMenu(): void {
+  rowMenuEntry.value = null
+}
+
+function onRowMenuCommand(command: string): void {
+  const entry = rowMenuEntry.value
+  closeRowMenu()
+  if (entry) onRowCommand(command, entry)
+}
+
+function closeRowMenuOnEscape(event: KeyboardEvent): void {
+  if (event.key === 'Escape' && rowMenuEntry.value) closeRowMenu()
+}
+
+onMounted(() => window.addEventListener('keydown', closeRowMenuOnEscape))
+onUnmounted(() => {
+  window.removeEventListener('keydown', closeRowMenuOnEscape)
+  if (growTimer !== null) window.clearTimeout(growTimer)
+})
 
 function selectScope(next: KnowledgeScope): void {
   scope.value = next
@@ -782,7 +918,7 @@ onMounted(async () => {
           <el-skeleton v-if="loading" :rows="6" animated />
 
           <el-empty v-else-if="loadError" :description="loadError">
-            <el-button size="small" @click="reload">重新读取</el-button>
+            <el-button size="small" @click="forceReload">重新读取</el-button>
           </el-empty>
 
           <div v-else class="kb__rows scroll-y">
@@ -832,9 +968,9 @@ onMounted(async () => {
               <span class="kb__cell kb__cell--act" />
             </div>
 
-            <!-- 条目 -->
+            <!-- 条目（分块上屏：renderLimit 之前的先渲染，其余按帧补齐，见 scheduleGrow） -->
             <div
-              v-for="entry in visibleEntries"
+              v-for="entry in renderedEntries"
               :key="entry.id"
               class="kb__row"
               :class="{ 'kb__row--on': selected.includes(entry.id) }"
@@ -868,24 +1004,21 @@ onMounted(async () => {
               <span class="kb__cell kb__cell--size">{{ formatSize(entry.size) }}</span>
               <span class="kb__cell kb__cell--time" :title="folderOf(entry)">{{ formatTime(entry.modified_at) }}</span>
               <span class="kb__cell kb__cell--act">
-                <el-dropdown trigger="click" @command="(command: string) => onRowCommand(command, entry)">
-                  <button class="kb__more" type="button" :aria-label="`${entry.name} 的操作`">⋯</button>
-                  <template #dropdown>
-                    <el-dropdown-menu>
-                      <template v-if="scope === 'trash'">
-                        <el-dropdown-item command="restore">还原</el-dropdown-item>
-                        <el-dropdown-item command="delete" divided>彻底删除</el-dropdown-item>
-                      </template>
-                      <template v-else>
-                        <el-dropdown-item command="edit">编辑</el-dropdown-item>
-                        <el-dropdown-item command="tag">打标签</el-dropdown-item>
-                        <el-dropdown-item command="move">移到文件夹</el-dropdown-item>
-                        <el-dropdown-item command="trash" divided>删除</el-dropdown-item>
-                      </template>
-                    </el-dropdown-menu>
-                  </template>
-                </el-dropdown>
+                <button
+                  class="kb__more"
+                  type="button"
+                  :aria-label="`${entry.name} 的操作`"
+                  @click="openRowMenu(entry, $event)"
+                >
+                  ⋯
+                </button>
               </span>
+            </div>
+
+            <!-- 还在补行：给出明确的加载动画，而不是让界面卡住 -->
+            <div v-if="renderPending" class="kb__loading-more">
+              <span class="kb__spinner" aria-hidden="true" />
+              <span>正在显示 {{ renderLimit }} / {{ visibleEntries.length }}</span>
             </div>
 
             <el-empty
@@ -971,6 +1104,45 @@ onMounted(async () => {
       :can-write="true"
       @saved="(entry: KnowledgeEntry) => mergeEntries([entry])"
     />
+
+    <!-- 行操作菜单：整个列表只有这一份 DOM（自绘，替代原来每行一个 el-dropdown） -->
+    <Teleport to="body">
+      <div v-if="rowMenuEntry" class="kb__rowmenu-mask" @click="closeRowMenu" @contextmenu.prevent="closeRowMenu" />
+      <div v-if="rowMenuEntry" class="kb__rowmenu" :style="rowMenuStyle" role="menu">
+        <template v-if="scope === 'trash'">
+          <button class="kb__rowmenu-item" type="button" role="menuitem" @click="onRowMenuCommand('restore')">
+            还原
+          </button>
+          <button
+            class="kb__rowmenu-item kb__rowmenu-item--danger kb__rowmenu-item--divided"
+            type="button"
+            role="menuitem"
+            @click="onRowMenuCommand('delete')"
+          >
+            彻底删除
+          </button>
+        </template>
+        <template v-else>
+          <button class="kb__rowmenu-item" type="button" role="menuitem" @click="onRowMenuCommand('edit')">
+            编辑
+          </button>
+          <button class="kb__rowmenu-item" type="button" role="menuitem" @click="onRowMenuCommand('tag')">
+            打标签
+          </button>
+          <button class="kb__rowmenu-item" type="button" role="menuitem" @click="onRowMenuCommand('move')">
+            移到文件夹
+          </button>
+          <button
+            class="kb__rowmenu-item kb__rowmenu-item--danger kb__rowmenu-item--divided"
+            type="button"
+            role="menuitem"
+            @click="onRowMenuCommand('trash')"
+          >
+            删除
+          </button>
+        </template>
+      </div>
+    </Teleport>
   </section>
 </template>
 
@@ -1107,6 +1279,83 @@ onMounted(async () => {
   min-height: 160px;
   font-size: 13px;
   color: var(--color-text-secondary);
+}
+
+/* 分块渲染进行中：明确的加载动画（不是把界面卡住） */
+.kb__loading-more {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  font-size: 12px;
+  color: var(--color-text-secondary);
+}
+
+.kb__spinner {
+  width: 13px;
+  height: 13px;
+  border: 1.5px solid var(--color-border-secondary);
+  border-top-color: var(--color-text-secondary);
+  border-radius: 50%;
+  animation: kb-spin 0.7s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .kb__spinner {
+    animation: none;
+  }
+}
+
+@keyframes kb-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* 行操作菜单（自绘）：视觉对齐 Element Plus 下拉菜单，但不产生组件实例 */
+.kb__rowmenu-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 2200;
+}
+
+.kb__rowmenu {
+  position: fixed;
+  z-index: 2201;
+  padding: 4px;
+  background-color: var(--color-bg-elevated);
+  border: 1px solid var(--color-border-tertiary);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-popover);
+}
+
+.kb__rowmenu-item {
+  display: block;
+  width: 100%;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  color: var(--color-text-primary);
+  text-align: left;
+  cursor: pointer;
+}
+
+.kb__rowmenu-item:hover,
+.kb__rowmenu-item:focus-visible {
+  background-color: var(--color-bg-subtle);
+}
+
+.kb__rowmenu-item--danger {
+  color: var(--color-danger);
+}
+
+.kb__rowmenu-item--divided {
+  margin-top: 4px;
+  border-top: 1px solid var(--color-border-tertiary);
+  padding-top: 8px;
 }
 
 .kb__content {
