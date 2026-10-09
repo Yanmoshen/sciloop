@@ -28,6 +28,9 @@ from services.agent_runtime_v2.context import (
     transcript,
 )
 
+from .policy import CompactionPolicy, CompactionTrigger
+from .recap import RECAP_INSTRUCTIONS, Recap, coerce_recap
+
 DEFAULT_SUMMARIZER_PROMPT = (
     "你是一个对话压缩器。请把给定的对话历史压缩成一份信息密度高的摘要，"
     "必须保留：用户的明确诉求与约束、已经确认的决定、未完成的事项、"
@@ -72,6 +75,7 @@ class CompactionService:
         gateway: Any,
         clock: Clock | None = None,
         token_budget: int = 6000,
+        policy: CompactionPolicy | None = None,
         system_prompt: str | None = None,
         summarizer_prompt: str = DEFAULT_SUMMARIZER_PROMPT,
     ) -> None:
@@ -79,6 +83,8 @@ class CompactionService:
         self.gateway = gateway
         self.clock = clock or SystemClock()
         self.token_budget = int(token_budget)
+        # 策略与执行解耦：策略只回答「该不该压」，执行仍在本服务
+        self.policy = policy or CompactionPolicy(token_budget=int(token_budget))
         self.system_prompt = system_prompt
         self.summarizer_prompt = summarizer_prompt
 
@@ -89,7 +95,40 @@ class CompactionService:
 
     def should_compact(self, thread_id: str) -> bool:
         """token 预算触发判定（压缩生效后上下文自然回落，不会反复触发）。"""
-        return self.estimate(thread_id) > self.token_budget
+        return self.policy.should_compact(
+            estimated_tokens=self.estimate(thread_id),
+            new_events_since_last=self.new_events_since_last_compaction(thread_id),
+        )
+
+    def new_events_since_last_compaction(self, thread_id: str) -> int:
+        """距上次压缩有多少条**非压缩**事件（用于防止空转）。"""
+        state = self.repo.state(thread_id)
+        active = state.active_compaction()
+        if not active:
+            return len(self.repo.store(thread_id).read_all())
+        anchor = int(active.get("sequence") or 0)
+        return sum(
+            1
+            for event in self.repo.store(thread_id).read_all()
+            if event.sequence > anchor and not event.type.startswith("compaction/")
+        )
+
+    def decide_trigger(self, thread_id: str, *, manual: bool = False, context_overflow: bool = False):
+        """返回建议的触发来源（或 None）。供路由/运行时调用。"""
+        return self.policy.decide(
+            estimated_tokens=self.estimate(thread_id),
+            new_events_since_last=self.new_events_since_last_compaction(thread_id),
+            manual_request=manual,
+            context_overflow=context_overflow,
+        )
+
+    def recap(self, thread_id: str, summary_id: str) -> Recap:
+        """取回某条摘要的结构化 recap（若无结构信息则回落到解析文本）。"""
+        entry = self.summary(thread_id, summary_id)
+        raw = entry.get("recap")
+        if isinstance(raw, dict):
+            return Recap.from_dict(raw)
+        return coerce_recap(entry.get("text"))
 
     # ------------------------------------------------------------------ 执行
     async def compact(
@@ -138,6 +177,9 @@ class CompactionService:
             EventType.COMPACTION_STARTED,
             payload={
                 "trigger": trigger,
+                "trigger_policy": self.policy.describe(
+                    _trigger_enum(trigger), estimated_tokens=tokens_before
+                ),
                 "covered_until": covered_until,
                 "tokens_before": tokens_before,
             },
@@ -175,6 +217,10 @@ class CompactionService:
 
         summary_id = new_id("summary")
         # tokens_after 按「压缩后真实上下文」估算：摘要 + covered_until 之后的 Item
+        # 结构化 recap：模型若按结构输出，则摘要即为 recap 渲染结果；
+        # 若模型没给结构（例如纯文本摘要），回落原文，保证信息不丢。
+        recap: Recap = coerce_recap(text)
+        rendered = recap.render() or text
         tail_messages: list[dict[str, Any]] = []
         for item_id in state.item_order:
             item = state.items[item_id]
@@ -184,13 +230,14 @@ class CompactionService:
             if message is not None:
                 tail_messages.append(message)
         tokens_after = estimate_tokens(
-            [{"role": "system", "content": text}, *tail_messages]
+            [{"role": "system", "content": rendered}, *tail_messages]
         )
         store.emit(
             EventType.COMPACTION_COMPLETED,
             payload={
                 "summary_id": summary_id,
-                "summary": text,
+                "summary": rendered,
+                "recap": recap.to_dict(),
                 "covered_until": covered_until,
                 "snapshot_sequence": snapshot_sequence,
                 "trigger": trigger,
@@ -205,7 +252,7 @@ class CompactionService:
             summary_id=summary_id,
             covered_until=covered_until,
             snapshot_sequence=snapshot_sequence,
-            text=text,
+            text=rendered,
             tokens_before=tokens_before,
             tokens_after=tokens_after,
         )
@@ -218,7 +265,7 @@ class CompactionService:
         request = ModelRequest(
             request_id=f"{thread_id}#compaction",
             messages=[
-                {"role": "system", "content": self.summarizer_prompt},
+                {"role": "system", "content": f"{self.summarizer_prompt}\n\n{RECAP_INSTRUCTIONS}"},
                 {"role": "user", "content": body},
             ],
             model=None,
@@ -313,6 +360,13 @@ class CompactionService:
         """压缩前快照的路径（审计用）。"""
         store = self.repo.store(thread_id)
         return str(store.snapshots_dir / f"{int(sequence)}.json")
+
+
+def _trigger_enum(trigger: str) -> CompactionTrigger:
+    try:
+        return CompactionTrigger(trigger)
+    except ValueError:
+        return CompactionTrigger.AUTO
 
 
 __all__ = ["CompactionService", "CompactionResult", "DEFAULT_SUMMARIZER_PROMPT"]

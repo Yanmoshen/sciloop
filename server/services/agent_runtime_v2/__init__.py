@@ -16,6 +16,18 @@ from .context import (
     item_to_message,
     transcript,
 )
+from .research import (
+    RESEARCH_INTENT_TERMS,
+    RESEARCH_TRANSITIONS,
+    FabricatedCitation,
+    IllegalResearchTransition,
+    ResearchEvidence,
+    ResearchNode,
+    ResearchPhase,
+    detect_research_intent,
+    is_affirmative,
+    is_negative,
+)
 from .runtime import ALLOW, REQUIRE, ApprovalGate, TurnOutcome, TurnRuntime
 from .tools import DispatchReport, ToolScheduler
 
@@ -33,4 +45,15 @@ __all__ = [
     "estimate_tokens",
     "transcript",
     "CONTEXT_ITEM_TYPES",
+    # 研究节点（WP-05 适配层）
+    "ResearchNode",
+    "ResearchPhase",
+    "ResearchEvidence",
+    "RESEARCH_TRANSITIONS",
+    "RESEARCH_INTENT_TERMS",
+    "IllegalResearchTransition",
+    "FabricatedCitation",
+    "detect_research_intent",
+    "is_affirmative",
+    "is_negative",
 ]

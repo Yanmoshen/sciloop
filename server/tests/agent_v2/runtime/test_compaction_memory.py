@@ -221,12 +221,14 @@ def test_memory_scopes_are_isolated(tmp_path):
     assert len(h.memory.project("p1")) == 1
 
     layout = h.memory.layout()
-    assert layout["user"].endswith("users")
+    # 新布局（WP-07）：user / projects / threads，每条作用域一个 records.jsonl
+    assert layout["user"].endswith("user")
     assert layout["project"].endswith("projects")
-    assert layout["conversation"].endswith("conversations")
+    assert layout["conversation"].endswith("threads")
     # 物理目录隔离
     assert Path(layout["user"], "u1").is_dir()
     assert Path(layout["project"], "p1").is_dir()
+    assert Path(layout["user"], "u1", "records.jsonl").is_file()
 
 
 def test_user_edited_memory_is_not_silently_overwritten_by_automation(tmp_path):
@@ -287,11 +289,13 @@ def test_memory_files_follow_the_planned_layout(tmp_path):
     h = Harness.create(tmp_path)
     record = h.memory.write(MemoryScope.USER, "u1", "布局", source_event_ids=[new_id("event")])
     path = h.memory.find_path(record.memory_id)
-    assert path.name == f"{record.memory_id}.json"
+    assert path.name == "records.jsonl"
     assert path.parent.name == "u1"
-    assert path.parent.parent.name == "users"
+    assert path.parent.parent.name == "user"
     assert path.parent.parent.parent == tmp_path / "memories"
-    # 落盘内容即契约对象，可直接被 schema 校验
+    # 落盘是「信封 + 契约对象」：record 部分仍可直接被 schema 校验
     from contracts.agent_v2 import validator_for
 
-    validator_for("memory").check(json.loads(path.read_text(encoding="utf-8")))
+    line = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    assert line["envelope"] == 1 and line["content_hash"]
+    validator_for("memory").check(line["record"])

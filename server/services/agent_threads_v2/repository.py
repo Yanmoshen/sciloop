@@ -1168,9 +1168,9 @@ class ThreadRepository:
                 item_id=item_id,
                 call_id=call.call_id,
             )
-            state = self.state(thread_id)
-            self._persist_state_cache(state)
-            return state.tool_calls.get(call.call_id, call)
+            # 不写状态缓存：thread.json 只是派生缓存，工具事件密集时写它是纯开销，
+            # 真实状态由事件重放得到（state() 会读到刚落的这条事件）。
+            return call
 
     # ------------------------------------------------------------------ 租约
     def turn_lock_free(self, thread_id: str) -> bool:

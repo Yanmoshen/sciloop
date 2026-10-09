@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import types
 from dataclasses import MISSING, dataclass, field
+from functools import cache
 from typing import Any, ClassVar, Union, get_args, get_origin, get_type_hints
 
 from .enums import (
@@ -129,6 +130,22 @@ def _coerce(name: str, fname: str, hint: Any, value: Any, enum_cls: type | None)
     return value
 
 
+@cache
+def _type_hints(cls: type) -> dict[str, Any]:
+    """缓存 ``typing.get_type_hints``。
+
+    事件重放会对同一批类反序列化上千次，而 ``get_type_hints`` 每次都要重新解析
+    注解字符串——不缓存时，长对话的状态重放会退化成主要耗时项。
+    """
+    return get_type_hints(cls)
+
+
+@cache
+def _declared_field_names(cls: type) -> frozenset[str]:
+    """缓存「这个类声明了哪些字段」（严格模式的未知字段检查用）。"""
+    return frozenset(f.name for f in dataclasses.fields(cls))
+
+
 class ContractModel:
     """所有契约对象的基类：``to_dict()`` / ``from_dict()``。
 
@@ -183,12 +200,11 @@ class ContractModel:
         """
         if not isinstance(data, dict):
             raise ContractViolation(f"{cls.__name__}: expected object, got {type(data).__name__}")
-        declared = {f.name for f in dataclasses.fields(cls)}
         if strict:
-            extra = sorted(set(data) - declared)
+            extra = sorted(set(data) - _declared_field_names(cls))
             if extra:
                 raise ContractViolation(f"{cls.__name__}: unexpected field(s) {extra}")
-        hints = get_type_hints(cls)
+        hints = _type_hints(cls)
         kwargs: dict[str, Any] = {}
         for f in dataclasses.fields(cls):
             if f.name not in data:

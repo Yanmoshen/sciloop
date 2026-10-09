@@ -110,6 +110,10 @@ class EventStore:
         self.events_path = self.dir / EVENTS_FILENAME
         self.snapshots_dir = self.dir / SNAPSHOT_DIRNAME
         self._lock = threading.RLock()
+        # 解析缓存：文件内容没变（size + mtime_ns 一致）时直接复用上次结果。
+        # 追加是幂等的纯函数式解析，因此按键命中不会掩盖损坏——损坏同样被缓存下来。
+        self._cache_key: tuple[int, int] | None = None
+        self._cache_value: tuple[list[Event], list[Corruption]] | None = None
 
     # ------------------------------------------------------------------ 布局
     def ensure_dirs(self) -> None:
@@ -139,8 +143,37 @@ class EventStore:
             parts.pop()
         return [(i + 1, raw) for i, raw in enumerate(parts)], truncated_tail
 
+    def _scan_cached(self) -> tuple[list[Event], list[Corruption]]:
+        """带缓存的解析（文件未变则零解析）。"""
+        try:
+            stat = self.events_path.stat()
+        except FileNotFoundError:
+            self._cache_key = None
+            self._cache_value = ([], [])
+            return [], []
+        key = (stat.st_size, stat.st_mtime_ns)
+        if self._cache_key == key and self._cache_value is not None:
+            return self._cache_value
+        parsed = self._parse()
+        self._cache_key = key
+        self._cache_value = parsed
+        return parsed
+
     def _scan(self, *, strict: bool) -> tuple[list[Event], list[Corruption]]:
         """解析全部事件；发现损坏即停止并上报。"""
+        events, corruptions = self._scan_cached()
+        if corruptions and strict:
+            first = corruptions[0]
+            raise CorruptedEventError(
+                str(self.events_path),
+                first.line_no,
+                first.reason,
+                raw_prefix=first.raw_prefix,
+                sequence=first.sequence,
+            )
+        return events, corruptions
+
+    def _parse(self) -> tuple[list[Event], list[Corruption]]:
         rows, truncated_tail = self._read_raw()
         events: list[Event] = []
         corruptions: list[Corruption] = []
@@ -199,15 +232,6 @@ class EventStore:
             events.append(event)
             expected += 1
 
-        if corruptions and strict:
-            first = corruptions[0]
-            raise CorruptedEventError(
-                str(self.events_path),
-                first.line_no,
-                first.reason,
-                raw_prefix=first.raw_prefix,
-                sequence=first.sequence,
-            )
         return events, corruptions
 
     def read_all(self, *, strict: bool = True) -> list[Event]:
