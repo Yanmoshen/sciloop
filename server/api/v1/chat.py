@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -100,19 +101,37 @@ REPLY_SYSTEM = (
     "**不要输出你的思考过程、推理草稿或自我对话**（例如「我们需要回答用户……」「让我想想……」），"
     "只输出给研究者看的最终答复。\n"
     # 2026-09-26 用户口径（新用户首轮体验，逐条确认过）：说清「现在在哪一段」、
-    # 邀请进研究链、等批准时也必须说话、首轮只问三件事。
+    # 等批准时也必须说话、首轮只问三件事。研究链邀请按会话状态追加，
+    # 不能放在这个公共提示里，否则普通对话会再次收到邀请。
     "**每一条回复的开头**先用一句话点明现在处于哪个阶段：还没开始研究链就直说"
     "「现在还没开始研究链」；已经在链上就点明当前节点名。系统消息里给了你"
     "**当前真实状态**，照它说，不要猜。\n"
-    "**还没开始研究链时**，每条回复的**最末尾**原样补上这一句（不要改写、不要省略）："
-    "「" + dialog.CHAIN_OFFER_SENTENCE + "」。研究者下一条只要没明确说不要，就算他同意 —— "
-    "你直接开始第 1 步（文献调研），不要再问第二遍；他要是明确说不需要，这件事就不要再提。\n"
     "**需要研究者批准、或要等他给信息时，也必须先写一句话**说明你在做什么、需要他点头什么 —— "
     "不允许只有动作、没有正文。\n"
     "**刚开始对话、还没搞清他要做什么时，最多问三件事**：研究主题或方向、想要的产出、数据情况；"
     "别的一律先别问。\n"
     "不要编造文献、数据或结论；没有实际查过本地数据就不要声称查过。\n\n" + OUTPUT_STYLE
 )
+
+CHAIN_OFFER_SYSTEM = (
+    "**还没开始研究链时**，每条回复的**最末尾**原样补上这一句（不要改写、不要省略）："
+    "「" + dialog.CHAIN_OFFER_SENTENCE + "」。研究者下一条只要没明确说不要，就算他同意 —— "
+    "你直接开始第 1 步（文献调研），不要再问第二遍；他要是明确说不需要，这件事就不要再提。\n"
+)
+
+PLAIN_CHAT_SYSTEM = (
+    "本对话已经明确按普通对话处理。请像正常助手一样直接回答当前问题，"
+    "不要发送、执行或再次提起研究链邀请，也不要把普通交流改成研究流程。"
+    "只有研究者明确说「开始文献调研」等执行指令时，程序才会切回研究模式。\n"
+)
+
+
+def reply_system_prompt(conversation: dict[str, Any] | None = None) -> str:
+    """Return the shared prompt with the conversation-specific chain policy."""
+
+    if conversation and conversation.get("plain_chat"):
+        return REPLY_SYSTEM + PLAIN_CHAT_SYSTEM
+    return REPLY_SYSTEM + CHAIN_OFFER_SYSTEM
 
 
 #: 技能目录块的缓存（用户口径 2026-09-25：缓存 1 小时 + 技能库一变立即失效）。
@@ -423,6 +442,54 @@ def _sse(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _repair_tool_call_pairs(
+    messages: list[dict[str, Any]],
+    replacements: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Return a provider-valid history with every tool call answered exactly once."""
+
+    tool_messages: dict[str, list[dict[str, Any]]] = {}
+    for message in messages:
+        if message.get("role") != "tool":
+            continue
+        call_id = str(message.get("tool_call_id") or "")
+        if call_id:
+            tool_messages.setdefault(call_id, []).append(message)
+
+    repaired: list[dict[str, Any]] = []
+    replacement_map = replacements or {}
+    for message in messages:
+        if message.get("role") == "tool":
+            continue
+        repaired.append(message)
+        if message.get("role") != "assistant" or not message.get("tool_calls"):
+            continue
+        for call in message.get("tool_calls") or []:
+            call_id = str(call.get("id") or "")
+            if not call_id:
+                continue
+            replacement = replacement_map.get(call_id)
+            if replacement is not None:
+                repaired.append({"role": "tool", "tool_call_id": call_id, "content": replacement})
+                tool_messages.pop(call_id, None)
+                continue
+            existing = tool_messages.get(call_id) or []
+            if existing:
+                repaired.append(existing.pop(0))
+                continue
+            repaired.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": json.dumps(
+                        {"ok": False, "error": "这次工具调用没有执行，已安全结束。", "interrupted": True},
+                        ensure_ascii=False,
+                    ),
+                }
+            )
+    return repaired
+
+
 async def _workspace_dir(project_id: int | None) -> str | None:
     if project_id is None or AsyncSessionLocal is None:
         return None
@@ -431,6 +498,175 @@ async def _workspace_dir(project_id: int | None) -> str | None:
         settings = project.settings if project is not None and isinstance(project.settings, dict) else {}
         value = settings.get("workspace_dir")
         return str(value) if value else None
+
+
+def _is_simple_question(text: str) -> bool:
+    """Recognize short conversational questions that never need tools or research routing."""
+
+    compact = " ".join((text or "").split())
+    if not compact or len(compact) > 80:
+        return False
+    research_markers = (
+        "研究",
+        "调研",
+        "文献",
+        "论文",
+        "搜索",
+        "检索",
+        "文件",
+        "目录",
+        "命令",
+        "运行",
+        "创建",
+        "写入",
+        "读取",
+        "分析",
+        "总结",
+        "知识库",
+        "子agent",
+        "子 Agent",
+    )
+    if any(marker in compact for marker in research_markers):
+        return False
+    return bool(
+        re.fullmatch(r"(?:你好|您好|嗨|hello|hi|谢谢|辛苦了|再见)[！!。.!？? ]*", compact, re.I)
+        or re.search(r"(?:等于|是多少|是什么|哪个国家|什么颜色|几岁|几点|怎么样|能做什么|你是谁|介绍一下|陪我聊|保持简洁|可以开始|你擅长)", compact)
+        or re.fullmatch(r"[\d\s+\-*/().=]+[？?。.!！ ]*", compact)
+    )
+
+
+def _fast_simple_reply(text: str) -> str | None:
+    """Return an immediate response for pure social turns.
+
+    These turns do not benefit from a model call, and waiting on a provider for
+    a greeting or sign-off makes the chat feel stalled.  Keep the scope narrow:
+    factual questions and anything mentioning a task continue through the
+    normal model path.
+    """
+
+    compact = " ".join((text or "").split()).strip().lower()
+    if re.fullmatch(r"(?:你好|您好|嗨|哈喽|早上好|晚上好)(?:呀|啊|哦)?[！!。.!？? ]*", compact, re.I):
+        return "你好，我在。你可以直接告诉我想聊的事情，或者给出一个明确任务。"
+    if re.fullmatch(r"(?:谢谢|感谢|多谢|辛苦了)(?:你的|您的)?(?:介绍|帮助)?[！!。.!？? ]*", compact, re.I):
+        return "不客气。需要时继续告诉我就好。"
+    if re.fullmatch(r"(?:谢谢[，, ]*)?(?:再见|拜拜|回头见)[！!。.!？? ]*", compact, re.I):
+        return "好的，再见。需要时随时回来。"
+    if re.search(r"状态怎么样|今天.*怎么样|你还好吗|最近怎么样|最近还好吗", compact):
+        return "我状态正常，可以直接告诉我你想完成的事情。"
+    if re.search(r"你能做什么|你是谁|介绍一下你", compact):
+        return "我是 SciLoop 的科研助手，可以帮你查资料、整理思路并推进研究任务。"
+    if re.search(r"陪我聊|继续聊聊|保持简洁|可以开始工作|你擅长整理资料", compact):
+        return "可以，我已经准备好。你想从哪件事开始？"
+    return None
+
+
+_HOST_ACTION_MARKERS = (
+    "新建",
+    "创建",
+    "写入",
+    "覆盖",
+    "修改文件",
+    "删除文件",
+    "删除目录",
+    "移动文件",
+    "复制文件",
+    "运行命令",
+    "执行命令",
+    "打开终端",
+    "读取文件",
+    "查看目录",
+    "列出目录",
+    "保存到",
+    "导出到",
+)
+_HOST_ACTION_REPLY = (
+    "这次文件操作还没有执行，因为本地执行环境暂时不可用。"
+    "启动本地执行服务后，请重新发送这条请求。"
+)
+_INTERNAL_FAILURE_REPLY = "这次回答没有完整完成，请重新发送；已经完成的内容会保留。"
+_INTERNAL_DIAGNOSTIC_RE = re.compile(
+    r"run_on_computer|files_on_computer|unreachable\s*[:：]|"
+    r"all connection attempts failed|reasoning_content|tool_call_id|"
+    r"request_id|traceback|error executing tool",
+    re.IGNORECASE,
+)
+
+# 执行器不可用时，文件请求不应每次都等待一次网络超时。失败缓存保持很短，
+# 既能合并连续请求，又允许用户启动执行器后很快恢复；成功探测会立即清除它。
+_HOST_EXECUTOR_FAILURE_TTL_S = 5.0
+_host_executor_failure_at = 0.0
+_host_executor_probe: asyncio.Task[bool] | None = None
+
+
+def _looks_like_host_action(text: str) -> bool:
+    """识别明确的文件/命令动作用于执行器预检。"""
+
+    compact = " ".join((text or "").split())
+    if len(compact) > 240 or not any(marker in compact for marker in _HOST_ACTION_MARKERS):
+        return False
+    return bool(re.search(r"请|帮我|能否|可以|在.+(?:文件|目录)|新建|创建|写入|运行|执行", compact))
+
+
+def _sanitize_assistant_content(content: str) -> str:
+    """阻止内部协议、工具名和连接诊断泄漏到用户正文。"""
+
+    text = str(content or "")
+    if not _INTERNAL_DIAGNOSTIC_RE.search(text):
+        return text
+    if re.search(r"run_on_computer|files_on_computer|unreachable|connection attempts", text, re.IGNORECASE):
+        return _HOST_ACTION_REPLY
+    return _INTERNAL_FAILURE_REPLY
+
+
+def _sanitize_compaction_summary(summary: str) -> str:
+    """Keep compaction useful while removing protocol and transport diagnostics."""
+
+    text = str(summary or "")
+    text = re.sub(r"`?(?:run_on_computer|files_on_computer)`?", "本地执行服务", text, flags=re.IGNORECASE)
+    text = re.sub(r"unreachable\s*[:：]\s*true", "当前不可用", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?:All connection attempts failed|连不上执行器[^。\n]*)", "本地执行服务暂时不可用", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(?:tool_call_id|request_id|reasoning_content)\b", "内部字段", text, flags=re.IGNORECASE)
+    return text
+
+
+async def _host_executor_available() -> bool:
+    """短时探测执行器；失败时让明确的文件请求快速收束。"""
+
+    global _host_executor_failure_at, _host_executor_probe
+    now = time.monotonic()
+    if now - _host_executor_failure_at < _HOST_EXECUTOR_FAILURE_TTL_S:
+        return False
+
+    async def probe() -> bool:
+        global _host_executor_failure_at
+        try:
+            from services.agent import host_runner
+
+            result = await asyncio.wait_for(host_runner.health(), timeout=2.2)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a failed probe must not fail a chat request
+            _host_executor_failure_at = time.monotonic()
+            return False
+        available = bool(result.get("reachable"))
+        _host_executor_failure_at = 0.0 if available else time.monotonic()
+        return available
+
+    probe_task = _host_executor_probe
+    if probe_task is None or probe_task.done():
+        probe_task = asyncio.create_task(probe())
+        _host_executor_probe = probe_task
+    try:
+        # A cancelled client request must not cancel the shared health probe for
+        # another concurrent request that is still waiting on the same result.
+        available = await asyncio.shield(probe_task)
+    except asyncio.CancelledError:
+        raise
+    finally:
+        if probe_task.done() and _host_executor_probe is probe_task:
+            _host_executor_probe = None
+
+    return available
 
 
 async def _agent_loop(
@@ -629,7 +865,20 @@ async def _agent_loop(
                 ):
                     if update.kind == "delta":
                         state["text"].append(update.text)
-                        yield _sse("delta", {"text": update.text})
+                        visible = "".join(state["text"])
+                        if _INTERNAL_DIAGNOSTIC_RE.search(visible):
+                            # A provider may reveal an internal tool diagnostic over
+                            # several deltas. Replace the accumulated visible answer
+                            # immediately so it cannot remain in the browser DOM.
+                            replacement = _HOST_ACTION_REPLY if re.search(
+                                r"run_on_computer|files_on_computer|unreachable|connection attempts",
+                                visible,
+                                re.IGNORECASE,
+                            ) else _INTERNAL_FAILURE_REPLY
+                            state["text"][:] = [replacement]
+                            yield _sse("delta", {"text": replacement})
+                        else:
+                            yield _sse("delta", {"text": update.text})
                     elif update.kind == "reasoning":
                         # **思考过程走独立通道**：它不是答复。前端折叠展示在耗时那一行下面，
                         # 落盘也单独存一个字段。此前它只被收集、最后被塞进 content 冒充正文，
@@ -748,6 +997,9 @@ async def _agent_loop(
             # 逐次裁决（不是按工具名一刀切）：同一句删除命令，删研究数据是"待批准"，
             # 删 SciLoop 自己的代码是"直接拒绝"，读文件则根本不用打扰研究者。
             verdict = await agent_tools.judge(call)
+            grants_now = agent_approvals.grants(
+                agent_approvals.load(conversation_id) or {}
+            )
             if verdict.forbidden:
                 # **没有商量余地的事不进批准队列**：直接拒绝，把原因如实回给模型，
                 # 并落一行过程行 —— 研究者看得到"它想干什么、为什么被挡"。
@@ -765,9 +1017,6 @@ async def _agent_loop(
                 continue
             if verdict.needs_approval or not verdict.harmless:
                 # 本对话当前的授权（**每轮重读**：研究者中途拨开关要立刻生效）
-                grants_now = agent_approvals.grants(
-                    agent_approvals.load(conversation_id) or {}
-                )
                 high_risk = verdict.needs_approval
                 # 三档授权：本对话默认允许（含高危）/ 完全访问模式 / **按工具授权**
                 # （用户口径 2026-09-25：批准一次命令 = 本对话内允许这个工具，换参数不再问；
@@ -888,6 +1137,74 @@ def _streaming(source: AsyncIterator[str]) -> StreamingResponse:
     )
 
 
+async def _stream_fast_simple(
+    *, conversation: dict[str, Any], conversation_id: str, text: str, reply: str
+) -> AsyncIterator[str]:
+    """Persist and stream a deterministic social reply without provider latency."""
+
+    started = time.perf_counter()
+    reply_content = _sanitize_assistant_content(reply)
+    model_ref = conversation.get("model_ref")
+    model_id = str(model_ref or "").split(":", 1)[-1]
+    provider = str(model_ref or "").split(":", 1)[0]
+    duration_ms = 0
+    persisted = False
+
+    def persist(*, interrupted: bool) -> None:
+        nonlocal duration_ms, persisted
+        if persisted:
+            return
+        duration_ms = int((time.perf_counter() - started) * 1000)
+        conversations.append_turns(
+            conversation,
+            [
+                {"role": "user", "content": text},
+                {
+                    "role": "assistant",
+                    "content": reply_content,
+                    "model_id": model_id,
+                    "duration_ms": duration_ms,
+                    "interrupted": interrupted or None,
+                },
+            ],
+        )
+        history = conversations.context_messages(conversation)
+        conversations.update_agent_state(conversation, history)
+        conversations.write(conversation)
+        persisted = True
+
+    try:
+        yield _sse(
+            "meta",
+            {
+                "conversation_id": conversation_id,
+                "project_id": conversation.get("project_id"),
+                "model_ref": model_ref,
+                "model_id": model_id,
+                "title": conversation.get("title"),
+                "turn_count": len(conversation.get("turns") or []),
+            },
+        )
+        yield _sse("delta", {"text": reply_content})
+        persist(interrupted=False)
+        yield _sse(
+            "done",
+            {
+                "conversation_id": conversation_id,
+                "content": reply_content,
+                "duration_ms": duration_ms,
+                "model_id": model_id,
+                "model_ref": model_ref,
+                "provider": provider,
+                "finish_reason": "stop",
+            },
+        )
+    finally:
+        # A browser navigation can close the stream at either yield. Keep the
+        # user's turn recoverable even when the client never receives `done`.
+        persist(interrupted=not persisted)
+
+
 async def _resolve_model_ref(model_config_id: int, model_id: str) -> str:
     """校验供应商与模型登记，返回 ``provider:model_id``。"""
     record = await get_registry().get_config(model_config_id)
@@ -1000,9 +1317,13 @@ async def home_chat(payload: HomeChatRequest) -> HomeChatResponse:
 
     # 2) 正式回答：失败必须如实抛出（不能伪装成功）
     #    带上下文：同一会话的历史轮次（实现「接着上次继续」；编辑重开后即为截断后的历史）
-    history = conversations.context_messages(conversation) if conversation else []
+    history = (
+        _repair_tool_call_pairs(conversations.context_messages(conversation))
+        if conversation
+        else []
+    )
     request_messages = [
-        {"role": "system", "content": REPLY_SYSTEM + skills_system_block()},
+        {"role": "system", "content": reply_system_prompt(conversation) + skills_system_block()},
         *history,
         {"role": "user", "content": text},
     ]
@@ -1032,13 +1353,14 @@ async def home_chat(payload: HomeChatRequest) -> HomeChatResponse:
         )
     elif not is_edit:
         conversations.rename(str(conversation["id"]), title)
+    reply_content = _sanitize_assistant_content(reply_result.content or "")
     conversations.append_turns(
         conversation,
         [
             {"role": "user", "content": text},
             {
                 "role": "assistant",
-                "content": reply_result.content or "",
+                "content": reply_content,
                 "model_id": reply_result.model_id,
                 "duration_ms": reply_result.duration_ms,
             },
@@ -1046,7 +1368,7 @@ async def home_chat(payload: HomeChatRequest) -> HomeChatResponse:
     )
     assistant_message: dict[str, Any] = {
         "role": "assistant",
-        "content": reply_result.content or "",
+        "content": reply_content,
     }
     raw_reasoning = str((getattr(reply_result, "raw", None) or {}).get("reasoning") or "").strip()
     if raw_reasoning:
@@ -1064,7 +1386,7 @@ async def home_chat(payload: HomeChatRequest) -> HomeChatResponse:
         title_note=title_note,
         conversation_id=str(conversation["id"]),
         project_id=conversation.get("project_id"),
-        reply=reply_result.content or "",
+        reply=reply_content,
         model_ref=reply_result.model_ref,
         provider=reply_result.provider,
         model_id=reply_result.model_id,
@@ -1119,6 +1441,7 @@ async def compact_chat(payload: CompactChatRequest) -> CompactChatResponse:
             "compaction_failed",
             "上下文摘要没有返回有效内容，原始会话保持不变",
         )
+    summary_record["summary"] = _sanitize_compaction_summary(str(summary_record.get("summary") or ""))
     before = conversations.protocol_messages(messages)
     freed_chars = compaction_mod.apply_turn_summary(
         messages,
@@ -1199,9 +1522,37 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
             model_ref=ref,
             project_id=payload.project_id,
             workspace_dir=workspace_dir,
+            persist=False,
         )
     conversation_id = str(conversation["id"])
-    history = conversations.context_messages(conversation)
+    history = _repair_tool_call_pairs(conversations.context_messages(conversation))
+    simple_mode = _is_simple_question(text)
+    fast_reply = _fast_simple_reply(text)
+
+    # Greetings and sign-offs are social acknowledgements, not research tasks.
+    # Complete them locally so the first visible token is immediate even when
+    # the configured provider is slow or temporarily unavailable.
+    if fast_reply is not None:
+        return _streaming(
+            _stream_fast_simple(
+                conversation=conversation,
+                conversation_id=conversation_id,
+                text=text,
+                reply=fast_reply,
+            )
+        )
+
+    # 明确的文件/命令请求先确认本地执行环境。执行器未启动时不再让模型先
+    # 生成标题、探测工具、再等待多轮失败；用户得到一条可执行的短说明。
+    if _looks_like_host_action(text) and not await _host_executor_available():
+        return _streaming(
+            _stream_fast_simple(
+                conversation=conversation,
+                conversation_id=conversation_id,
+                text=text,
+                reply=_HOST_ACTION_REPLY,
+            )
+        )
 
     # ------------------------------------------------------------------ #
     # 意图路由：**对话就是 agent 的入口**
@@ -1228,7 +1579,8 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
     # 分工写清楚，免得两边都当成"写死规则"：
     #   · 邀请**发不发**由**提示词**决定（模型自己判断）—— 程序不代它说这句话；
     #   · 程序只做**事实判断**：上一轮助手到底发出邀请没有（读它的正文，不存标志位）；
-    #   · 发过 + 这一条**没否定** ⇒ 算同意，直接按「开始文献调研」走（不再问第二遍）；
+    #   · 发过 + 这一条是明确的确认短语 ⇒ 算同意，直接按「开始文献调研」走；
+    #     普通追问、补充信息和上下文续问不算确认，避免意外启动长时间研究链；
     #   · 发过 + 明确说不要 ⇒ 走既有的「本对话声明为普通对话」（`plain_chat`，永久不再提）；
     #   · 没发过邀请 ⇒ 什么都不做（免得研究者随口一句就被拉进研究链）。
     # ------------------------------------------------------------------ #
@@ -1242,43 +1594,46 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
             return _streaming(
                 dialog.stream_plain_chat(conversation_id=conversation_id, scope=scope)
             )
-        return _streaming(
-            dialog.stream_node(
-                conversation_id=conversation_id,
-                text=text,
-                scope=scope,
-                routing=intent_mod.Intent(
-                    kind="node",
-                    node="literature_review",
-                    reason="研究者没有拒绝那道邀请，按同意处理",
-                ),
+        if dialog.is_chain_acceptance(text):
+            return _streaming(
+                dialog.stream_node(
+                    conversation_id=conversation_id,
+                    text=text,
+                    scope=scope,
+                    routing=intent_mod.Intent(
+                        kind="node",
+                        node="literature_review",
+                        reason="研究者明确接受研究链邀请",
+                    ),
+                )
             )
-        )
 
-    routing = await dialog.route(
-        text,
-        conversation_id,
-        force_plain=bool(conversation.get("plain_chat")),
-        # 规则兜底要用模型判一次 —— 用**这次对话选的模型**（不硬编码供应商）
-        model_ref=ref,
-    )
-    if routing.kind == "guide":
-        return _streaming(dialog.stream_guide(conversation_id=conversation_id, scope=scope))
-    if routing.kind == "node":
-        return _streaming(
-            dialog.stream_node(
-                conversation_id=conversation_id, text=text, scope=scope, routing=routing
-            )
+    if not simple_mode:
+        routing = await dialog.route(
+            text,
+            conversation_id,
+            force_plain=bool(conversation.get("plain_chat")),
+            # 规则兜底要用模型判一次 —— 用**这次对话选的模型**（不硬编码供应商）
+            model_ref=ref,
         )
-    if routing.kind == "query":
-        return _streaming(
-            dialog.stream_query(
-                conversation_id=conversation_id, text=text, scope=scope, routing=routing
+        if routing.kind == "guide":
+            return _streaming(dialog.stream_guide(conversation_id=conversation_id, scope=scope))
+        if routing.kind == "node":
+            return _streaming(
+                dialog.stream_node(
+                    conversation_id=conversation_id, text=text, scope=scope, routing=routing
+                )
             )
-        )
+        if routing.kind == "query":
+            return _streaming(
+                dialog.stream_query(
+                    conversation_id=conversation_id, text=text, scope=scope, routing=routing
+                )
+            )
 
     async def event_source() -> AsyncIterator[str]:
-        # 首帧：前端拿到会话 id 就能立刻把这条对话挂到左栏
+        # 首帧只建立连接，不写入新会话。浏览器可能在收到首帧后立即切页，
+        # 这时生成器会在下一个 yield 处被关闭；占位记录必须等 meta 已交付后再落盘。
         yield ": connected\n\n"
         yield _sse(
             "meta",
@@ -1291,6 +1646,11 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
                 "turn_count": len(conversation.get("turns") or []),
             },
         )
+
+        # 只有会话 id 已经交给前端后才落下新会话占位记录。若客户端在首帧或
+        # meta 帧之间切页，生成器不会执行到这里，也就不会留下空会话。
+        if is_new:
+            conversations.write(conversation)
 
         # 标题与正文并行：标题只在「新会话」时生成（续聊不改标题）
         title_task: asyncio.Task[tuple[str, str, str | None]] | None = None
@@ -1318,6 +1678,15 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
         result: Any = None
         error_info: dict[str, Any] | None = None
         aborted = False
+        state: dict[str, Any] = {
+            "text": buffer,
+            "reasoning": reasoning_buffer,
+            "result": None,
+            "pending": None,
+            "compactions": compactions_out,
+            "compaction_snapshots": [],
+            "agent_history": [],
+        }
         try:
             # ------------------------------------------------------------ #
             # agent 循环：把工具摆给模型 → 收 tool_calls → 只读的经 MCP 执行、
@@ -1332,29 +1701,29 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
             messages_now: list[dict[str, Any]] = [
                 {
                     "role": "system",
-                    "content": REPLY_SYSTEM
-                    + await research_state_block(conversation_id, conversation)
-                    + skills_system_block(),
+                    "content": (
+                        (REPLY_SYSTEM + PLAIN_CHAT_SYSTEM if simple_mode else reply_system_prompt(conversation))
+                        + await research_state_block(conversation_id, conversation)
+                        + skills_system_block()
+                    ),
                 },
                 *history,
                 {"role": "user", "content": text},
             ]
-            try:
-                tool_defs = await agent_tools.tool_schemas()
-            except Exception as exc:  # noqa: BLE001 - 工具侧不可用不该拖垮整段对话
-                logger.warning("工具声明获取失败，本轮按无工具回答：%s", exc)
+            if simple_mode:
                 tool_defs = []
+            else:
+                try:
+                    tool_defs = await agent_tools.tool_schemas()
+                except Exception as exc:  # noqa: BLE001 - 工具侧不可用不该拖垮整段对话
+                    logger.warning("工具声明获取失败，本轮按无工具回答：%s", exc)
+                    tool_defs = []
 
-            state: dict[str, Any] = {
-                "text": buffer,
-                "reasoning": reasoning_buffer,
-                "result": None,
-                "pending": None,
-                #: 本轮发生的上下文压缩（会话级落盘，刷新后研究者仍能看到"压过什么"）
-                "compactions": compactions_out,
-                "compaction_snapshots": [],
-                "agent_history": conversations.protocol_messages(messages_now),
-            }
+            state.update(
+                {
+                    "agent_history": conversations.protocol_messages(messages_now),
+                }
+            )
             async for frame in _agent_loop(
                 messages_now,
                 conversation_id=conversation_id,
@@ -1379,8 +1748,8 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
                     logger.info("首页流式：客户端断开，按中断收尾 conversation=%s", conversation_id)
                     break
                 yield frame
-            result = state["result"]
-            pending_approval = state["pending"]
+            result = state.get("result")
+            pending_approval = state.get("pending")
             soft_failure = state.get("soft_failure")
         except LLMError as exc:
             aborted = True
@@ -1414,11 +1783,11 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
                 # 本轮已经失败/断开，标题结果用不上了，别留悬挂任务
                 title_task.cancel()
             duration_ms = int((time.perf_counter() - started) * 1000)
-            generated = "".join(buffer)
+            generated = _sanitize_assistant_content("".join(buffer))
             # **显示与落盘必须一致**：部分供应商只在收尾帧给正文（delta 为空），
             # 旧代码只存 delta buffer，于是界面上有内容、库里是空串。
             if not generated and result is not None:
-                generated = str(getattr(result, "content", "") or "")
+                generated = _sanitize_assistant_content(str(getattr(result, "content", "") or ""))
             reasoning_text = "".join(reasoning_buffer)
             if not reasoning_text and result is not None:
                 reasoning_text = str((getattr(result, "raw", None) or {}).get("reasoning") or "")
@@ -1464,65 +1833,74 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
             # 编辑重开时**无条件落盘**：用户改过的正文必须留痕，否则刷新后改动就凭空消失了。
             # 等批准时也**无条件落盘**：卡片本身就是这一轮的产出（哪怕一个字都没有），
             # 不落盘就会出现"界面上有一张待批的卡、刷新后它不见了、而工具也永远没跑"。
-            if compactions_out:
-                # 会话级 `compactions[]`（用户口径 2026-09-25：**新字段存摘要、原始轮次一字不改**）。
-                # 先挂到记录上再 `append_turns`，这样"压缩 + 本轮"**一次写入**，不留半成品状态。
-                conversation["compactions"] = [
-                    *(conversation.get("compactions") or []),
-                    *compactions_out,
-                ]
-            # Persist the model-facing protocol history separately from the
-            # readable turns.  This is the durable resume point used by the
-            # next request, while checkpoints retain the pre-compaction view.
-            conversations.update_agent_state(
-                conversation,
-                state.get("agent_history") or [],
-                checkpoints=compactions_out,
-                snapshots=state.get("compaction_snapshots") or [],
-            )
-            #: 研究者主动停止（前端 abort → 客户端断开）。这一轮**没有正文也得留痕**：
-            #  思考过程、过程行、待批卡片都是"已产出"的东西，更别说用户那句话本身 ——
-            #  2026-09-26 实测：按原来的条件（无正文 + 有错误）会被判成"没什么可记的"，
-            #  于是整轮跳过落盘，接着被下面那条 delete 把**整个会话**清掉，
-            #  表现就是"点了停止、刷新后那一轮连同自己的提问一起消失"（前端保留、后端没有）。
-            stopped_by_client = bool(error_info) and error_info.get("code") == "client_disconnected"
-            if (
-                generated
-                or error_info is None
-                or is_edit
-                or pending_approval is not None
-                or stopped_by_client
-            ):
-                conversations.append_turns(
+            try:
+                if compactions_out:
+                    # 会话级 `compactions[]`（用户口径 2026-09-25：**新字段存摘要、原始轮次一字不改**）。
+                    # 先挂到记录上再 `append_turns`，这样"压缩 + 本轮"**一次写入**，不留半成品状态。
+                    conversation["compactions"] = [
+                        *(conversation.get("compactions") or []),
+                        *compactions_out,
+                    ]
+                # Persist the model-facing protocol history separately from the
+                # readable turns.  This is the durable resume point used by the
+                # next request, while checkpoints retain the pre-compaction view.
+                conversations.update_agent_state(
                     conversation,
-                    [
-                        {"role": "user", "content": text},
-                        {
-                            "role": "assistant",
-                            "content": generated,
-                            "model_id": getattr(result, "model_id", payload.model_id)
-                            if result is not None
-                            else payload.model_id,
-                            # ⚠️ 这里必须是**整轮耗时**（`started` 是请求进来时打的表），
-                            # 不能拿 `result.duration_ms` —— 那是**最后一次模型调用**的耗时：
-                            # 多轮工具调用时它只有整轮的零头，研究者会看到"跑了半天显示 10s"。
-                            "duration_ms": duration_ms,
-                            "reasoning": reasoning_text or None,
-                            "rows": tool_rows,
-                            # 批准请求随轮次落盘：裁决端点要凭它认账（一次性、带有效期）
-                            "approvals": approval_requests,
-                            "awaiting_approval": pending_approval["id"] if pending_approval else None,
-                            # 正文是系统说明（不是模型说的话）→ 别让它进下一轮的上下文
-                            "note_only": note_only or None,
-                            "interrupted": bool(error_info),
-                        },
-                    ],
+                    state.get("agent_history") or [],
+                    checkpoints=compactions_out,
+                    snapshots=state.get("compaction_snapshots") or [],
                 )
-            if is_new and error_info is not None and not generated and not stopped_by_client:
-                # 一个字都没生成也没落轮的「空会话」不留垃圾记录。
-                # ⚠️ 但**研究者主动停止不算垃圾**：他刚敲进去的那句话必须留着，
-                #    否则停止一下连提问都没了。
-                conversations.delete(conversation_id)
+                #: 研究者主动停止（前端 abort → 客户端断开）。这一轮**没有正文也得留痕**：
+                #  思考过程、过程行、待批卡片都是"已产出"的东西，更别说用户那句话本身 ——
+                #  2026-09-26 实测：按原来的条件（无正文 + 有错误）会被判成"没什么可记的"，
+                #  于是整轮跳过落盘，接着被下面那条 delete 把**整个会话**清掉，
+                #  表现就是"点了停止、刷新后那一轮连同自己的提问一起消失"（前端保留、后端没有）。
+                stopped_by_client = bool(error_info) and error_info.get("code") == "client_disconnected"
+                if (
+                    generated
+                    or error_info is None
+                    or is_edit
+                    or pending_approval is not None
+                    or stopped_by_client
+                ):
+                    conversations.append_turns(
+                        conversation,
+                        [
+                            {"role": "user", "content": text},
+                            {
+                                "role": "assistant",
+                                "content": generated,
+                                "model_id": getattr(result, "model_id", payload.model_id)
+                                if result is not None
+                                else payload.model_id,
+                                # ⚠️ 这里必须是**整轮耗时**（`started` 是请求进来时打的表），
+                                # 不能拿 `result.duration_ms` —— 那是**最后一次模型调用**的耗时：
+                                # 多轮工具调用时它只有整轮的零头，研究者会看到"跑了半天显示 10s"。
+                                "duration_ms": duration_ms,
+                                "reasoning": reasoning_text or None,
+                                "rows": tool_rows,
+                                # 批准请求随轮次落盘：裁决端点要凭它认账（一次性、带有效期）
+                                "approvals": approval_requests,
+                                "awaiting_approval": pending_approval["id"] if pending_approval else None,
+                                # 正文是系统说明（不是模型说的话）→ 别让它进下一轮的上下文
+                                "note_only": note_only or None,
+                                "interrupted": bool(error_info),
+                            },
+                        ],
+                    )
+                if is_new and error_info is not None and not generated and not stopped_by_client:
+                    # 一个字都没生成也没落轮的「空会话」不留垃圾记录。
+                    # ⚠️ 但**研究者主动停止不算垃圾**：他刚敲进去的那句话必须留着，
+                    #    否则停止一下连提问都没了。
+                    conversations.delete(conversation_id)
+            except Exception as exc:  # noqa: BLE001 - persistence must end the stream cleanly
+                logger.exception("首页对话持久化失败 conversation=%s", conversation_id)
+                if error_info is None:
+                    error_info = {
+                        "code": "conversation_persist_failed",
+                        "message": f"对话保存失败：{type(exc).__name__}",
+                        "kind": type(exc).__name__,
+                    }
 
         if error_info is not None:
             # 已生成部分照旧显示；尾部用 error 事件让前端标「已中断 / 出错」
@@ -1572,7 +1950,10 @@ async def home_chat_stream(payload: HomeChatRequest, request: Request) -> Stream
                 logger.warning("标题任务异常：%s", exc)
                 title, title_source, title_note = text[:TITLE_MAX_CHARS], "fallback", str(exc)[:200]
             if title != conversation.get("title"):
-                conversations.rename(conversation_id, title)
+                try:
+                    conversations.rename(conversation_id, title)
+                except Exception as exc:  # noqa: BLE001 - title is ancillary to the completed turn
+                    logger.warning("标题保存失败 conversation=%s：%s", conversation_id, exc)
             yield _sse(
                 "title",
                 {
@@ -1713,24 +2094,31 @@ async def _approval_stream(
             yield _sse("approval", card)
             # Close the persisted assistant/tool-call pair with a synthetic
             # refusal result so the next turn remains protocol-valid.
-            denied_history = conversations.context_messages(record)
             call_id = str(request.get("call_id") or f"call_{request_id}")
-            if any(
+            denied_call = {
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": tool,
+                    "arguments": json.dumps(request.get("args") or {}, ensure_ascii=False),
+                },
+            }
+            denied_history = conversations.context_messages(record)
+            if not any(
                 call_id == str(call.get("id") or "")
                 for message in denied_history
                 if isinstance(message, dict)
                 for call in (message.get("tool_calls") or [])
             ):
-                denied_history.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": agent_tools.tool_message_content(
-                            {"ok": False, "error": "研究者拒绝了这次工具调用", "refused": True}
-                        ),
-                    }
-                )
-                agent_history = denied_history
+                denied_history.append(agent_tools.assistant_tool_message("", [denied_call]))
+            agent_history = _repair_tool_call_pairs(
+                denied_history,
+                {
+                    call_id: agent_tools.tool_message_content(
+                        {"ok": False, "error": "研究者拒绝了这次工具调用", "refused": True}
+                    )
+                },
+            )
             # 拒绝的确认话由**模型**说（口径 2026-09-26：对话正文一律模型生成）。
             text = await phrasing.say(
                 facts=(
@@ -1827,40 +2215,27 @@ async def _approval_stream(
             # **把上一跳的思考过程原样带回**：思考型供应商（实测 deepseek 系列）在
             # `assistant.tool_calls` 回合会硬性要求 `reasoning_content`，缺了直接 400。
             # 它就在这一轮记录里（`turn["reasoning"]`），没理由不带。
+            history = conversations.context_messages(record)
+            target_id = str(calls[0]["id"])
+            if not any(
+                target_id == str(item.get("id") or "")
+                for message in history
+                if isinstance(message, dict)
+                for item in (message.get("tool_calls") or [])
+            ):
+                history.append(agent_tools.assistant_tool_message("", calls))
             messages_now: list[dict[str, Any]] = [
                 {
                     "role": "system",
-                    "content": REPLY_SYSTEM
+                    "content": reply_system_prompt(record)
                     + await research_state_block(conversation_id, record)
                     + skills_system_block(),
                 },
-                *conversations.context_messages(record),
-                {
-                    "role": "tool",
-                    "tool_call_id": str(calls[0]["id"]),
-                    "content": agent_tools.tool_message_content(payload_out),
-                },
+                *_repair_tool_call_pairs(
+                    history,
+                    {target_id: agent_tools.tool_message_content(payload_out)},
+                ),
             ]
-            # New records already persisted the pending assistant/tool-call
-            # message before asking for approval.  Appending it again would
-            # orphan the protocol pair on the next model request.  The
-            # fallback keeps legacy conversations resumable.
-            history = conversations.context_messages(record)
-            has_pending_call = any(
-                str(call.get("id") or "") == str(calls[0]["id"])
-                for message in history
-                if isinstance(message, dict)
-                for call in (message.get("tool_calls") or [])
-            )
-            if not has_pending_call:
-                assistant_call_msg = agent_tools.assistant_tool_message("", calls)
-                reasoning_before = str(
-                    ((record.get("turns") or [])[turn_index] or {}).get("reasoning") or ""
-                )
-                reasoning_value = reasoning_echo(reasoning_before, ref)
-                if reasoning_value is not None:
-                    assistant_call_msg["reasoning_content"] = reasoning_value
-                messages_now.insert(-1, assistant_call_msg)
             # 续答**照旧把工具摆上**：模型看到结果后常常要提下一条命令，
             # 那就再冒一张卡、再等一次裁决 —— 每条命令各批一次，这正是我们要的节奏。
             # （实测：不摆工具时，思考型供应商会因为"assistant 的 tool_calls 没带

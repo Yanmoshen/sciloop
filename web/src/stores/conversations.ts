@@ -16,6 +16,7 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 
 import { listConversations, type ConversationBrief } from '@/api/conversations'
+import { safeErrorMessage } from '@/utils/messages'
 
 export const useConversationStore = defineStore('conversations', () => {
   /** 未归档会话（全部项目 + 未分组） */
@@ -25,6 +26,8 @@ export const useConversationStore = defineStore('conversations', () => {
   const error = ref('')
   const archivedError = ref('')
   const loading = ref(false)
+  let loadingRequest: Promise<void> | null = null
+  let loadingArchivedRequest: Promise<void> | null = null
 
   const ungrouped = computed(() => items.value.filter((item) => item.project_id == null))
 
@@ -45,32 +48,43 @@ export const useConversationStore = defineStore('conversations', () => {
   }
 
   function message(error_: unknown): string {
-    return error_ instanceof Error ? error_.message : String(error_)
+    return safeErrorMessage(error_)
   }
 
-  async function load(): Promise<void> {
+  function load(): Promise<void> {
+    if (loadingRequest) return loadingRequest
     loading.value = true
-    try {
-      const data = await listConversations({ group: 'all', archived: false, limit: 500 })
-      items.value = data.items ?? []
-      error.value = ''
-    } catch (error_) {
-      items.value = []
-      error.value = message(error_)
-    } finally {
-      loading.value = false
-    }
+    loadingRequest = (async () => {
+      try {
+        const data = await listConversations({ group: 'all', archived: false, limit: 500 })
+        items.value = data.items ?? []
+        error.value = ''
+      } catch (error_) {
+        items.value = []
+        error.value = message(error_)
+      } finally {
+        loading.value = false
+        loadingRequest = null
+      }
+    })()
+    return loadingRequest
   }
 
-  async function loadArchived(): Promise<void> {
-    try {
-      const data = await listConversations({ group: 'all', archived: true, limit: 500 })
-      archived.value = data.items ?? []
-      archivedError.value = ''
-    } catch (error_) {
-      archived.value = []
-      archivedError.value = message(error_)
-    }
+  function loadArchived(): Promise<void> {
+    if (loadingArchivedRequest) return loadingArchivedRequest
+    loadingArchivedRequest = (async () => {
+      try {
+        const data = await listConversations({ group: 'all', archived: true, limit: 500 })
+        archived.value = data.items ?? []
+        archivedError.value = ''
+      } catch (error_) {
+        archived.value = []
+        archivedError.value = message(error_)
+      } finally {
+        loadingArchivedRequest = null
+      }
+    })()
+    return loadingArchivedRequest
   }
 
   /** 流式开场（新建会话）或收尾（标题生成）后，把这一条就地更新，避免整表重拉 */

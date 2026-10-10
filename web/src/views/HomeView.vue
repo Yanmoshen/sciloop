@@ -20,7 +20,7 @@
  */
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { humanError, writeDenied } from '@/utils/messages'
+import { humanError, safeErrorMessage, sanitizeAssistantText, writeDenied } from '@/utils/messages'
 import { useRoute, useRouter } from 'vue-router'
 
 import {
@@ -103,6 +103,9 @@ const projectId = ref<number | null>(null)
 const archived = ref(false)
 const phase = ref<'idle' | 'thinking'>('idle')
 const errorText = ref('')
+const loadingConversation = ref(
+  typeof route.params.conversationId === 'string' && Boolean(route.params.conversationId),
+)
 
 const dialogOpen = ref(false)
 const dialogPrefill = ref('')
@@ -116,6 +119,8 @@ const compactBusy = ref(false)
 const elapsedMs = ref(0)
 let tick: number | null = null
 let streamStartedAt = 0
+let autoContinueTimer: number | null = null
+let conversationLoadSequence = 0
 
 /**
  * 首页开场那一行「流程」文案（各阶段之间用 → 连接）。
@@ -132,7 +137,9 @@ const PIPELINE =
 
 
 const active = computed(() => turns.value.length > 0 || phase.value === 'thinking')
-const canSend = computed(() => prompt.value.trim().length > 0 || files.value.length > 0)
+const canSend = computed(
+  () => !loadingConversation.value && (prompt.value.trim().length > 0 || files.value.length > 0),
+)
 
 const defaultProvider = computed(() => settings.configs.find((config) => config.is_default) ?? null)
 
@@ -222,6 +229,9 @@ function toggleProcess(turnIndex: number): void {
 
 /** 这一轮的过程是否还在跑（收起时表头挂三点，否则完全看不出它在干活） */
 function processRunning(turn: Turn): boolean {
+  // A user stop settles the turn immediately. Stale process rows from the
+  // aborted stream must not keep the collapsed header animated.
+  if (turn.status !== 'streaming') return false
   if (turn.status === 'streaming') return true
   const rows = turn.rows ?? []
   for (let i = 0; i < rows.length; i++) {
@@ -286,7 +296,8 @@ function rowIsRunning(rows: TurnRow[], index: number): boolean {
 }
 
 /** 运行态动效：等人是呼吸；"在跑"才是三点；其余（完成/失败/静态）什么都不加 */
-function rowMotion(rows: TurnRow[], index: number): string {
+function rowMotion(rows: TurnRow[], index: number, active = true): string {
+  if (!active) return ''
   const row = rows[index]
   if (!row) return ''
   if (/等待研究者批准|需要你确认/.test(String(row.text ?? ''))) return 'mo-breathe'
@@ -416,6 +427,13 @@ function stopTicker(): void {
   }
 }
 
+function clearAutoContinueTimer(): void {
+  if (autoContinueTimer !== null) {
+    window.clearTimeout(autoContinueTimer)
+    autoContinueTimer = null
+  }
+}
+
 /** 把一条会话摘要同步进左栏（新建时先占位，等标题生成后再整表刷新） */
 function syncStore(): void {
   const id = conversationId.value
@@ -436,6 +454,9 @@ function syncStore(): void {
 // 加载已有对话 / 开新对话
 // --------------------------------------------------------------------------- //
 async function resetToNewConversation(): Promise<void> {
+  conversationLoadSequence += 1
+  loadingConversation.value = false
+  clearAutoContinueTimer()
   turns.value = []
   conversationId.value = null
   conversationTitle.value = ''
@@ -448,6 +469,9 @@ async function resetToNewConversation(): Promise<void> {
 }
 
 async function loadConversation(id: string): Promise<void> {
+  const sequence = ++conversationLoadSequence
+  loadingConversation.value = true
+  clearAutoContinueTimer()
   // 切会话是用户主动动作 → 重新粘住底部
   followBottom.value = true
   stopTicker()
@@ -455,6 +479,7 @@ async function loadConversation(id: string): Promise<void> {
   errorText.value = ''
   try {
     const detail = await getConversation(id)
+    if (sequence !== conversationLoadSequence || route.params.conversationId !== id) return
     conversationId.value = detail.id
     conversationTitle.value = detail.title ?? ''
     projectId.value = detail.project_id ?? null
@@ -481,7 +506,7 @@ async function loadConversation(id: string): Promise<void> {
           : 'done'
       return {
         role: turn.role,
-        content: turn.content,
+        content: sanitizeAssistantText(turn.content),
         model: turn.model_id,
         durationMs: turn.duration_ms,
         status,
@@ -494,11 +519,14 @@ async function loadConversation(id: string): Promise<void> {
         noteOnly: (turn as { note_only?: boolean }).note_only === true,
       }
     })
+    loadingConversation.value = false
     await scrollToBottom()
   } catch (error) {
+    if (sequence !== conversationLoadSequence || route.params.conversationId !== id) return
     turns.value = []
     conversationId.value = null
-    errorText.value = error instanceof Error ? error.message : String(error)
+    errorText.value = safeErrorMessage(error)
+    loadingConversation.value = false
   }
 }
 
@@ -538,24 +566,26 @@ function pickedModel(): PickedModel | null {
 
 async function compactConversation(): Promise<void> {
   if (compactBusy.value || phase.value === 'thinking' || !conversationId.value) return
+  const id = conversationId.value
   const model = pickedModel()
   if (!model) return
   compactBusy.value = true
   errorText.value = ''
   try {
     const result = await compactChat({
-      conversation_id: conversationId.value,
+      conversation_id: id,
       model_config_id: model.configId,
       model_id: model.modelId,
     })
+    if (conversationId.value !== id || route.params.conversationId !== id) return
     if (result.changed) {
-      await loadConversation(conversationId.value)
+      await loadConversation(id)
       ElMessage.success('上下文已压缩，原始对话仍保留在检查点中')
     } else {
       ElMessage.info('当前上下文没有足够的早期内容可压缩')
     }
   } catch (error) {
-    errorText.value = error instanceof Error ? error.message : String(error)
+    errorText.value = safeErrorMessage(error)
   } finally {
     compactBusy.value = false
   }
@@ -591,11 +621,24 @@ function upsertApprovalRow(rows: TurnRow[], card: ApprovalCard): TurnRow[] {  co
  * `approvalIndex` = **卡片所在那一轮**的下标。批准/拒绝的后续流渲染在新一轮里，
  * 但卡片必须回到原来那一轮换状态 —— 否则同一张卡会在两轮里各出现一次。
  */
-function streamHandlers(assistantIndex: number, approvalIndex = assistantIndex): StreamHandlers {
+const userStoppedControllers = new WeakSet<AbortController>()
+
+function streamHandlers(
+  assistantIndex: number,
+  approvalIndex = assistantIndex,
+  requestController?: AbortController,
+): StreamHandlers {
   const target = (): Turn | undefined => turns.value[assistantIndex]
   const cardOwner = (): Turn | undefined => turns.value[approvalIndex]
+  // Abort delivery is asynchronous. A frame that was already queued by the
+  // browser can still arrive after stopStream() has marked the controller.
+  // Treat that request as closed so a late `done` cannot resurrect the turn or
+  // schedule an automatic continuation.
+  const stopped = (): boolean =>
+    requestController ? userStoppedControllers.has(requestController) : false
   return {
     onMeta: (meta) => {
+      if (stopped()) return
       conversationId.value = meta.conversation_id
       projectId.value = meta.project_id
       conversationTitle.value = meta.title ?? ''
@@ -604,12 +647,14 @@ function streamHandlers(assistantIndex: number, approvalIndex = assistantIndex):
       if (pendingFullAccess !== null) void loadAccessMode(meta.conversation_id)
     },
     onDelta: (delta) => {
+      if (stopped()) return
       const current = target()
       if (!current) return
-      current.content += delta
+      current.content = sanitizeAssistantText(`${current.content}${delta}`)
       void scrollToBottom()
     },
     onReasoning: (delta) => {
+      if (stopped()) return
       // 思考过程**不拼进正文**：单独累积，渲染时折叠在耗时那一行下面
       const current = target()
       if (!current) return
@@ -617,6 +662,7 @@ function streamHandlers(assistantIndex: number, approvalIndex = assistantIndex):
       void scrollToBottom()
     },
     onRow: (row) => {
+      if (stopped()) return
       const current = target()
       if (!current) return
       // 批准卡也走 row 通道落盘，这里按 id 去重，免得同一张卡出现两次
@@ -626,6 +672,7 @@ function streamHandlers(assistantIndex: number, approvalIndex = assistantIndex):
       void scrollToBottom()
     },
     onApproval: (card) => {
+      if (stopped()) return
       const owner = cardOwner()
       if (!owner) return
       owner.rows = upsertApprovalRow(owner.rows ?? [], card)
@@ -636,15 +683,17 @@ function streamHandlers(assistantIndex: number, approvalIndex = assistantIndex):
       void scrollToBottom()
     },
     onBlocks: (blocks) => {
+      if (stopped()) return
       const current = target()
       if (!current) return
       current.blocks = [...(current.blocks ?? []), ...blocks]
       void scrollToBottom()
     },
     onDone: (done) => {
+      if (stopped()) return
       const current = target()
       if (!current) return
-      if (done.content) current.content = done.content
+      if (done.content) current.content = sanitizeAssistantText(done.content)
       if (done.model_id) current.model = done.model_id
       if (done.duration_ms) current.durationMs = done.duration_ms
       if (done.routing) current.routing = done.routing
@@ -657,6 +706,7 @@ function streamHandlers(assistantIndex: number, approvalIndex = assistantIndex):
       maybeAutoContinue(done)
     },
     onTitle: (payload) => {
+      if (stopped()) return
       conversationTitle.value = payload.title
       syncStore()
       if (payload.title_source === 'fallback' && payload.title_note) {
@@ -664,13 +714,12 @@ function streamHandlers(assistantIndex: number, approvalIndex = assistantIndex):
       }
     },
     onError: (streamError) => {
+      if (requestController && userStoppedControllers.has(requestController)) {
+        return
+      }
       const current = target()
       if (current) current.status = 'interrupted'
       // 研究者自己按的停止不是故障：本轮照旧标「已停止」，但不弹错误
-      if (stoppedByUser) {
-        void conversations.load()
-        return
-      }
       errorText.value = humanError(streamError)
       void conversations.load()
     },
@@ -690,13 +739,28 @@ function streamHandlers(assistantIndex: number, approvalIndex = assistantIndex):
  * 用它现有的中断机制）；已产出的内容保留，这一轮标「已停止」。
  */
 let streamAbort: AbortController | null = null
-/** 是不是研究者自己按的停止：是的话**不要弹错误提示**（那不是故障） */
-let stoppedByUser = false
 
 function stopStream(): void {
+  clearAutoContinueTimer()
   if (!streamAbort) return
-  stoppedByUser = true
-  streamAbort.abort()
+  const controller = streamAbort
+  userStoppedControllers.add(controller)
+  // Update the visible state before aborting the fetch. Abort delivery is
+  // asynchronous, so waiting for the stream promise leaves the stop button,
+  // ticker and loading motion active for an extra frame (or longer).
+  for (let index = turns.value.length - 1; index >= 0; index -= 1) {
+    const turn = turns.value[index]
+    if (turn.role === 'assistant' && turn.status === 'streaming') {
+      turn.status = 'interrupted'
+      break
+    }
+  }
+  phase.value = 'idle'
+  stopTicker()
+  // A pre-existing transport error is no longer actionable once the user has
+  // explicitly stopped the turn; do not leave the debug-style banner behind.
+  errorText.value = ''
+  controller.abort()
   streamAbort = null
 }
 
@@ -706,7 +770,6 @@ async function runStream(
   assistantIndex: number,
   replaceFrom?: number,
 ): Promise<void> {
-  stoppedByUser = false
   const controller = new AbortController()
   streamAbort = controller
   try {
@@ -719,15 +782,14 @@ async function runStream(
         project_id: conversationId.value ? undefined : (projectId.value ?? undefined),
         replace_from: replaceFrom,
       },
-      streamHandlers(assistantIndex),
+      streamHandlers(assistantIndex, assistantIndex, controller),
       controller.signal,
     )
   } catch (error) {
     const target = turns.value[assistantIndex]
     // 自己按的停止：**保留已产出的内容**、本轮标「已停止」，不回滚输入框、不报错（2026-09-26 口径）
-    if (stoppedByUser) {
+    if (userStoppedControllers.has(controller)) {
       if (target) target.status = 'interrupted'
-      stoppedByUser = false
       return
     }
     if (target) {
@@ -740,15 +802,13 @@ async function runStream(
       }
     }
     const withCode = error as { code?: string; message?: string }
-    errorText.value = withCode?.message
-      ? humanError(withCode)
-      : error instanceof Error
-        ? error.message
-        : String(error)
+    errorText.value = withCode?.message ? humanError(withCode) : safeErrorMessage(error)
   } finally {
-    streamAbort = null
-    stopTicker()
-    phase.value = 'idle'
+    if (streamAbort === controller) {
+      streamAbort = null
+      stopTicker()
+      phase.value = 'idle'
+    }
   }
 }
 
@@ -852,9 +912,8 @@ async function decideApprovalCard(card: ApprovalCard, decision: ApprovalDecision
   turns.value = [...turns.value, { role: 'assistant', content: '', status: 'streaming', rows: [] }]
   await scrollToBottom()
 
+  const decideController = new AbortController()
   try {
-    stoppedByUser = false
-    const decideController = new AbortController()
     streamAbort = decideController
     await streamApprovalDecision(
       {
@@ -864,7 +923,11 @@ async function decideApprovalCard(card: ApprovalCard, decision: ApprovalDecision
         model_config_id: model?.configId,
         model_id: model?.modelId,
       },
-      streamHandlers(assistantIndex, cardIndex >= 0 ? cardIndex : assistantIndex),
+      streamHandlers(
+        assistantIndex,
+        cardIndex >= 0 ? cardIndex : assistantIndex,
+        decideController,
+      ),
       decideController.signal,
     )
   } catch (error) {
@@ -891,15 +954,17 @@ async function decideApprovalCard(card: ApprovalCard, decision: ApprovalDecision
         settleApprovalTurn(owner, closed.status)
       }
     }
-    errorText.value = withCode?.message
-      ? humanError(withCode)
-      : error instanceof Error
-        ? error.message
-        : String(error)
+    if (userStoppedControllers.has(decideController)) {
+      if (target) target.status = 'interrupted'
+    } else {
+      errorText.value = withCode?.message ? humanError(withCode) : safeErrorMessage(error)
+    }
   } finally {
-    streamAbort = null
-    stopTicker()
-    phase.value = 'idle'
+    if (streamAbort === decideController) {
+      streamAbort = null
+      stopTicker()
+      phase.value = 'idle'
+    }
   }
 }
 
@@ -1053,7 +1118,7 @@ async function syncFullAccess(): Promise<boolean> {
   } catch (error) {
     // 如实说：本地拨了但后端没记上，别让界面显示成"已开"
     accessNote.value =
-      error instanceof ApiError ? `开关没改成：${error.message}` : '开关没改成（网络异常）'
+      error instanceof ApiError ? `开关没改成：${safeErrorMessage(error)}` : safeErrorMessage(error)
     ElMessage.error(accessNote.value)
     return false
   }
@@ -1063,6 +1128,7 @@ async function syncFullAccess(): Promise<boolean> {
 async function loadAccessMode(id: string): Promise<void> {
   try {
     const state = await fetchAccessMode(id)
+    if (conversationId.value !== id) return
     if (pendingFullAccess !== null && state.full_access !== pendingFullAccess) {
       // 用户在"还没有会话"时拨过开关 → 把它补写到这个会话上
       await syncFullAccess()
@@ -1083,13 +1149,16 @@ async function loadAccessMode(id: string): Promise<void> {
  * 尤其是占位节点——让它们依次「通过」等于伪造「实验做完了、论文写好了」。
  */
 function maybeAutoContinue(done: StreamDone): void {
+  clearAutoContinueTimer()
   if (!fullAccess.value) return
   if (done.routing !== 'node') return
   if (done.node_status !== 'done') return
   if (!done.next_node || done.next_node === 'end') return
   if (done.next_implemented === false) return
-  setTimeout(() => {
+  autoContinueTimer = window.setTimeout(() => {
+    autoContinueTimer = null
     if (phase.value !== 'idle') return
+    if (!conversationId.value) return
     prompt.value = '继续'
     void send()
   }, 600)
@@ -1240,6 +1309,8 @@ function onCreated(project: CreatedProject): void {
 watch(
   () => route.fullPath,
   () => {
+    if (phase.value === 'thinking' && streamAbort) stopStream()
+    clearAutoContinueTimer()
     void init()
   },
 )
@@ -1265,6 +1336,12 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  clearAutoContinueTimer()
+  if (streamAbort) {
+    userStoppedControllers.add(streamAbort)
+    streamAbort.abort()
+    streamAbort = null
+  }
   stopTicker()
   if (entranceTimer !== null) window.clearTimeout(entranceTimer)
 })
@@ -1274,11 +1351,14 @@ onUnmounted(() => {
   <section class="chat" :class="{ 'chat--active': active, 'chat--enter': entranceOn }">
     <!-- 开场区展开/收起统一走 .fold（双向高度过渡），替掉原来的 max-height 硬编码
          —— 内容不足 420px 时旧写法会"空跑"一段，收展节奏不匀。 -->
-    <div class="fold" :class="{ 'fold--open': !active }">
+    <div class="fold" :class="{ 'fold--open': !active && !loadingConversation }">
       <div class="chat__intro">
         <h1 class="chat__title rise-in rise-step-1">{{ heroTitle }}</h1>
         <p class="chat__steps rise-in rise-step-2">{{ PIPELINE }}</p>
       </div>
+    </div>
+    <div v-if="loadingConversation" class="chat__loading" role="status" aria-live="polite">
+      正在加载对话…
     </div>
 
     <!-- 对话态不再显示标题栏：标题在左栏会话行上（已高亮），「流水线工作台」入口移到左栏项目行的 ⋯ 菜单，
@@ -1530,7 +1610,7 @@ onUnmounted(() => {
               >
                 <span
                   class="row__ico"
-                  :class="rowMotion(turn.rows ?? [], rowIndex)"
+                  :class="rowMotion(turn.rows ?? [], rowIndex, turn.status !== 'interrupted' && turn.status !== 'done')"
                   aria-hidden="true"
                 >
                   <svg width="16" height="16"><use :href="`#sl-${rowIcon(row)}`" /></svg>
@@ -1539,10 +1619,10 @@ onUnmounted(() => {
                 <span v-if="rowKind(row)" class="row__kind">{{ rowKind(row) }}</span>
                 <span
                   class="row__text"
-                  :class="{ 'mo-shimmer': rowMotion(turn.rows ?? [], rowIndex) === 'mo-dots' }"
+                  :class="{ 'mo-shimmer': rowMotion(turn.rows ?? [], rowIndex, turn.status !== 'interrupted' && turn.status !== 'done') === 'mo-dots' }"
                 >{{ row.text }}</span>
                 <span
-                  v-if="rowMotion(turn.rows ?? [], rowIndex) === 'mo-dots'"
+                  v-if="rowMotion(turn.rows ?? [], rowIndex, turn.status !== 'interrupted' && turn.status !== 'done') === 'mo-dots'"
                   class="mo-dots"
                   aria-hidden="true"
                 ><i /><i /><i /></span>
@@ -1552,7 +1632,11 @@ onUnmounted(() => {
           </div>
           <MarkdownText v-if="showContent(turn)" :content="turn.content" />
           <!-- 等批准时**不要转省略号**：它不是"正在生成"，是停着等人 -->
-          <div v-else-if="!pendingCard(turn) && !turn.content" class="dots" aria-label="正在生成">
+          <div
+            v-else-if="turn.status === 'streaming' && !pendingCard(turn) && !turn.content"
+            class="dots"
+            aria-label="正在生成"
+          >
             <span class="dot" />
             <span class="dot" />
             <span class="dot" />
@@ -1594,10 +1678,6 @@ onUnmounted(() => {
                 </div>
               </div>
             </template>
-          </div>
-          <div v-if="turn.status === 'interrupted'" class="cut">
-            连接中断（服务端重启或网络波动，不是研究链自己停的）—— 已产出的内容都保留着，
-            再发一条消息就能接着往下走
           </div>
           <div v-if="turn.content && isLastOfRound(index) && turn.status !== 'streaming'" class="acts">
             <button
@@ -1676,6 +1756,7 @@ onUnmounted(() => {
         ref="textareaEl"
         v-model="prompt"
         rows="1"
+        :disabled="loadingConversation"
         placeholder="描述你的研究需求，例如：为长上下文问答设计一套可复现的评测方案"
         @keydown.enter.exact.prevent="send"
       />
@@ -1806,7 +1887,7 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <div class="fold" :class="{ 'fold--open': !active }">
+    <div class="fold" :class="{ 'fold--open': !active && !loadingConversation }">
       <section class="cards rise-in rise-step-4">
         <button class="card press" type="button" @click="openCreate(prompt)">
         <span class="card__icon">
@@ -1926,6 +2007,14 @@ onUnmounted(() => {
   margin: 0 0 40px;
   font-size: var(--font-size-lg);
   color: var(--h-fg-muted);
+}
+
+.chat__loading {
+  width: min(816px, calc(100% - 124px));
+  margin: 64px auto 0;
+  color: var(--h-fg-muted);
+  font-size: var(--font-size-sm);
+  text-align: center;
 }
 
 .ghost {
@@ -2455,15 +2544,6 @@ onUnmounted(() => {
 .editbox__send:disabled {
   opacity: 0.4;
   cursor: default;
-}
-
-.cut {
-  align-self: flex-start;
-  padding: 2px 10px;
-  border: 1px solid var(--h-line-strong);
-  border-radius: 999px;
-  color: var(--h-fg-muted);
-  font-size: var(--font-size-xs);
 }
 
 .dots {
