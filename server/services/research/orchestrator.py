@@ -34,6 +34,7 @@ import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select
@@ -288,6 +289,131 @@ async def _load_project(session: AsyncSession, project_id: int) -> _ProjectView 
     return _ProjectView(id=int(row.id), name=row.name, settings=settings)
 
 
+def _artifact_status(
+    project: _ProjectView | None,
+    *,
+    paper_writing_run: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Inspect a project's workspace without changing research-node state.
+
+    Chat-driven work can create a manuscript in the selected workspace without
+    passing through ``run_node``.  That is a real artifact, but it is not proof
+    that the ``paper_writing`` node completed.  This read-only projection keeps
+    those facts separate and makes the mismatch visible to the UI.
+    """
+
+    base: dict[str, Any] = {
+        "state": "not_configured",
+        "source": "project_workspace",
+        "workspace_dir": None,
+        "file_count": 0,
+        "scan_truncated": False,
+        "manuscript_files": [],
+        "sample_files": [],
+        "latest_modified_at": None,
+        "node_recorded": paper_writing_run is not None,
+        "paper_writing_status": (
+            str((paper_writing_run or {}).get("status") or "pending")
+        ),
+        "alignment": "no_artifact_scan",
+    }
+    if project is None:
+        base["note"] = "项目不存在，无法关联研究产物。"
+        return base
+
+    raw_workspace = str(project.settings.get("workspace_dir") or "").strip()
+    if not raw_workspace:
+        base["note"] = "项目尚未配置工作目录，未扫描文件。"
+        return base
+    base["workspace_dir"] = raw_workspace
+
+    workspace = Path(raw_workspace)
+    try:
+        if not workspace.exists():
+            base["state"] = "missing"
+            base["note"] = "项目工作目录不存在，未发现可审计产物。"
+            return base
+        if not workspace.is_dir():
+            base["state"] = "unreadable"
+            base["note"] = "项目工作目录不是目录，无法扫描产物。"
+            return base
+    except OSError:
+        base["state"] = "unreadable"
+        base["note"] = "项目工作目录不可读取，未猜测产物状态。"
+        return base
+
+    # Keep the endpoint bounded for user-selected host directories.  Symlinks
+    # are skipped so the projection cannot unexpectedly enumerate another tree.
+    limit = 5000
+    files: list[Path] = []
+    try:
+        for candidate in workspace.rglob("*"):
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+            files.append(candidate)
+            if len(files) >= limit:
+                break
+    except OSError:
+        base["state"] = "unreadable"
+        base["note"] = "扫描项目工作目录时遇到读取错误，已保留可确认的节点状态。"
+        return base
+
+    base["file_count"] = len(files)
+    base["scan_truncated"] = len(files) >= limit
+    relative: list[str] = []
+    manuscript: list[str] = []
+    latest: datetime.datetime | None = None
+    try:
+        for candidate in files:
+            rel = candidate.relative_to(workspace).as_posix()
+            relative.append(rel)
+            parts = {part.casefold() for part in Path(rel).parts}
+            suffix = candidate.suffix.casefold()
+            if (
+                suffix in {".tex", ".bib", ".pdf", ".docx"}
+                or "manuscript" in parts
+                or "论文" in candidate.name
+            ):
+                manuscript.append(rel)
+            modified = datetime.datetime.fromtimestamp(candidate.stat().st_mtime, datetime.UTC)
+            latest = modified if latest is None or modified > latest else latest
+    except OSError:
+        # A file can disappear between rglob and stat.  Keep the scan useful;
+        # the missing timestamp is preferable to inventing one.
+        pass
+
+    relative.sort()
+    manuscript.sort()
+    base["state"] = "available" if files else "empty"
+    base["sample_files"] = relative[:50]
+    base["manuscript_files"] = manuscript[:50]
+    base["latest_modified_at"] = latest.isoformat() if latest else None
+
+    node_status = base["paper_writing_status"]
+    if files and node_status == "done":
+        base["alignment"] = "node_and_artifact_present"
+        base["note"] = "已检测到项目产物，且论文写作节点有完成记录。"
+    elif files and paper_writing_run is not None:
+        base["alignment"] = "artifact_detected_node_not_completed"
+        base["note"] = (
+            "已检测到项目工作目录中的产物，但论文写作节点尚未完成；"
+            "文件不会改变节点状态。"
+        )
+    elif files:
+        base["alignment"] = "artifact_detected_without_node_run"
+        base["note"] = (
+            "已检测到项目工作目录中的产物，但研究节点表没有论文写作记录；"
+            "文件不会被推断为节点完成。"
+        )
+    elif node_status == "done":
+        base["alignment"] = "node_completed_artifact_not_found"
+        base["note"] = "论文写作节点有完成记录，但工作目录中未检测到文件。"
+    else:
+        base["alignment"] = "no_artifact_detected"
+        base["note"] = "当前未检测到项目产物；研究节点状态保持独立。"
+    return base
+
+
 async def _latest_run(
     session: AsyncSession, *, conversation_id: str, node: str
 ) -> dict[str, Any] | None:
@@ -434,6 +560,15 @@ async def chain_state(
             }
         )
 
+    # A chat may have written files directly into the project workspace.  The
+    # scan is deliberately a separate projection: it must never promote a
+    # pending research node to ``done`` merely because a file exists.
+    project = await _load_project(session, project_id) if project_id else None
+    artifact_status = _artifact_status(
+        project,
+        paper_writing_run=by_node.get("paper_writing"),
+    )
+
     return {
         "conversation_id": conversation_id,
         "project_id": project_id,
@@ -449,6 +584,7 @@ async def chain_state(
         "max_total_reverts": graph.MAX_TOTAL_REVERTS,
         "workdir": preflight_mod.workdir_key(conversation_id, project_id),
         "preflight": preflight_mod.latest_preflight(conversation_id, project_id),
+        "artifact_status": artifact_status,
     }
 
 
@@ -792,8 +928,8 @@ async def _settle_interrupted(
     2026-09-26 改：原来落成 ``failed`` —— "连接断开"这种非失败情形会让节点永久变红，
     重启后也散不掉（研究者实测反馈）。断开只是"这一轮没跑完"，重新跑即可。
 
-    用 ``asyncio.shield``：调用方此刻多半已经处于**取消**状态，不 shield 的话
-    收尾的第一次 ``await`` 会立刻再抛 ``CancelledError``，这行就还是收不了尾。
+    使用 anyio 的 shield scope：ASGI 的取消作用域会在每次 await 再次取消，
+    仅用 asyncio.shield 无法保护调用方等待，数据库收尾会再次被打断。
     收尾本身失败也**绝不掩盖**原始异常（只记日志）。
     """
 
@@ -837,12 +973,17 @@ async def _settle_interrupted(
                 to_node=node,
                 kind="stop",
                 trigger="program",
-                reason=f"「{label}」执行被中断（客户端断开或进程退出），已如实标记为失败",
+                reason=f"「{label}」执行被中断（客户端断开或进程退出），已恢复为可继续状态",
             )
 
+    # Starlette's anyio cancellation scope cancels every await in finally.
+    # asyncio.shield alone protects the task but not this caller's wait.
+    import anyio
+
     try:
-        await asyncio.shield(_write())
-    except BaseException:  # noqa: BLE001 - 收尾是尽力而为，绝不掩盖原始异常
+        with anyio.CancelScope(shield=True):
+            await _write()
+    except Exception:  # noqa: BLE001 - do not hide process termination/cancellation
         logger.warning(
             "中断收尾失败 conversation=%s node=%s", conversation_id, node, exc_info=True
         )
