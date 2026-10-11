@@ -24,9 +24,15 @@ if command -v npm >/dev/null 2>&1; then
   (cd web && if [ -f package-lock.json ]; then npm ci; else npm install; fi && npm run build)
 fi
 
-export PYTHONPATH="$INSTALL_DIR/server"
-nohup .venv/bin/python tools/host-runner/host_runner.py > host-runner.log 2>&1 &
-if command -v npm >/dev/null 2>&1; then
-  (cd web && nohup npm run dev -- --host 127.0.0.1 --port 5173 > ../frontend.log 2>&1 &)
+# 可选论文 PDF 编译：SCILOOP_BUILD_PAPER=1 时引导固定版本 Tectonic。
+if [ "${SCILOOP_BUILD_PAPER:-0}" = "1" ]; then
+  .venv/bin/python tools/compile_paper.py --bootstrap
 fi
-exec .venv/bin/python -m uvicorn main:app --app-dir server --host 127.0.0.1 --port 8000
+
+if [ "${SCILOOP_RUN_PAPER_ACCEPTANCE:-0}" = "1" ]; then
+  .venv/bin/python tools/run.py paper-acceptance
+fi
+
+# 正式运行只用 8000 提供页面和 API；执行器由后端负责启动与关闭。
+# 重复安装复用已运行实例，失败不自动换端口。
+exec .venv/bin/python tools/run.py start

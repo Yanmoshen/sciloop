@@ -21,47 +21,29 @@ curl -fsSL https://raw.githubusercontent.com/Yanmoshen/sciloop/main/install.sh |
 安装器会从 GitHub 拉取仓库，在本机创建 Python 环境、安装后端依赖、构建前端，
 并启动 API、前端和宿主执行器。搜索引擎内核随 API 进程一并启动，无需 Docker 或独立的 SearXNG 服务。首次启动前请在生成的 `.env` 中填写模型密钥。
 
-Docker 部署仍可用（用于兼容旧环境）：前置 Docker Desktop（含 compose v2）。
+宿主启动后，前端与 API 共用 http://localhost:8000；宿主执行器使用内部端口 8766。
+本项目仅使用 SQLite，不运行独立数据库服务，不占用 5432 等数据库端口。
 
 ```bash
-cp .env.example .env          # 至少填 OPENALEX_MAILTO；禁止提交 .env
-docker compose up -d --build   # db → backend（启动时自动 alembic upgrade head）→ frontend
-docker compose ps              # db / backend / frontend / executor
-curl http://localhost:8000/api/v1/health
+python tools/run.py status
+python tools/run.py restart
+python tools/run.py stop
 ```
 
-| 入口 | 地址 |
-|---|---|
-| 前端 | http://localhost:8080 |
-| 后端 API 文档 | http://localhost:8000/docs |
-| 健康检查 | http://localhost:8000/api/v1/health |
-| 数据源健康 | http://localhost:8000/api/v1/sources/health |
-| 数据库 | `docker compose exec db psql -U sciloop -d sciloop` |
-
-迁移（幂等）：
-
-```bash
-docker compose exec backend alembic upgrade head       # 建 / 升级到最新
-docker compose exec backend alembic downgrade base     # 回滚
-```
-
-迁移链：`0001_initial_schema` → `0002_passport_immutable_guard` → `0003_reader_library` →
-`0004_reader_version_kind_history` → `0005_app_settings` → `0006_model_config_type` →
-`0007_project_archived` → `0008_research_nodes` → **`0009_chain_by_conversation`（当前链头）**。
-
-> 链头以 `ls server/migrations/versions | sort | tail -1` 为准。空库迁移验证脚本
-> `scripts/verify/empty_db_migration.sh` 内置期望表清单（当前 **37 张**）—— 加表必须同步改那条断言。
+兼容 Docker 的配置也使用同一个知识库 SQLite 文件，已移除独立数据库容器。
+Docker 兼容编排仍可单独使用；宿主部署的正式前端入口固定为 8000。
+SQLite 表结构由应用启动自动创建及补齐，旧 PostgreSQL 的 Alembic 迁移已移除。
 
 ## 目录
 
 | 目录 | 职责 |
 |---|---|
-| `server/` | FastAPI + SQLAlchemy 2.x + Alembic。顶层按层分目录：`api/`（路由）、`services/`（领域服务：`paper_source` 取数 / `ingest` 导入 / `fulltext` 全文 / `parsing` 解析 / `aggregation` 聚合 / `ideation` 构思 / `feasibility` 可行性 / `pipeline` 流水线 / `research` 研究编排 / `experiment` 实验 / `writing` 写作 / `review` 评审 / `evidence` 证据链 / `translate` 翻译 / `reader` 阅读器 / `export` 导出 / `agent` 动作裁决与批准 / `skills` 技能库 / `cost` 成本 / `settings` 设置）、`db/`（会话与 ORM 模型）、`schemas/`（Pydantic DTO）、`core/`（配置与安全）、`llm/`（OpenAI 兼容适配与按环节路由）、`executor/`（进程内受限执行器）、`tasks/`（后台作业）、`mcp_server/`（自建 MCP server 与工具门）、`exec_service/`（容器执行环境）、`migrations/`（迁移链） |
+| `server/` | FastAPI + SQLAlchemy 2.x + SQLite。顶层按层分目录：`api/`（路由）、`services/`（领域服务：`paper_source` 取数 / `ingest` 导入 / `fulltext` 全文 / `parsing` 解析 / `aggregation` 聚合 / `ideation` 构思 / `feasibility` 可行性 / `pipeline` 流水线 / `research` 研究编排 / `experiment` 实验 / `writing` 写作 / `review` 评审 / `evidence` 证据链 / `translate` 翻译 / `reader` 阅读器 / `export` 导出 / `agent` 动作裁决与批准 / `skills` 技能库 / `cost` 成本 / `settings` 设置）、`db/`（会话与 ORM 模型）、`schemas/`（Pydantic DTO）、`core/`（配置与安全）、`llm/`（OpenAI 兼容适配与按环节路由）、`executor/`（进程内受限执行器）、`tasks/`（后台作业）、`mcp_server/`（自建 MCP server 与工具门）、`exec_service/`（容器执行环境） |
 | `web/` | Vue 3 + Vite + TypeScript + Pinia + Element Plus + ECharts（`api/` `views/` `components/` `stores/` `router/` `layouts/` `styles/` `utils/`） |
 | `prompts/` | 研究工作流长文档提示词（程序侧契约在 `server/services/research/`） |
 | `config/` | 非机密静态配置（`app.yaml`、`venue_whitelist.json`）；搜索引擎配置由 `server/services/search/` 管理 |
 | `tools/` | `host-runner/`：可选的真机执行器（装在研究者电脑上后，后端会自动优先用它跑命令） |
-| `docker-compose.yml` | 兼容编排：`db`（PostgreSQL 16）/ `backend`（server/ 镜像，8000）/ `frontend`（web/ 镜像，nginx，8080）/ `executor`（受限执行环境）；搜索不再是独立容器 |
+| `docker-compose.yml` | 兼容编排：`backend`（server/ 镜像，8000）/ `frontend`（web/ 镜像，nginx，8080）/ `executor`（受限执行环境）；搜索不再是独立容器 |
 
 ## 环境变量
 
@@ -102,12 +84,36 @@ docker compose exec backend alembic downgrade base     # 回滚
 | `exports/` | Agent 与系统导出的文件 |
 | `metadata/`、`trash/` | 知识库索引和回收站 |
 
+主数据库位于 `knowledge-base/sciloop.sqlite3`，同步与异步服务统一访问此文件。
+
 删除 `knowledge-base/` 会丢失论文、对话、解析、翻译和 Agent 产物。
+
+### 论文 PDF 编译
+
+论文源文件保存在知识库项目目录中。统一入口优先使用 PATH 中的
+`xelatex`；找不到时可用 `--bootstrap` 下载并校验固定版本 Tectonic（0.17.0），
+二进制只写入本地 `.data/latex/`，不会进入 Git：
+
+```powershell
+python tools/compile_paper.py --check
+python tools/compile_paper.py --bootstrap
+```
+
+也可以指定论文目录：
+
+```powershell
+python tools/compile_paper.py "knowledge-base/projects/<项目目录>" --bootstrap
+```
+
+成功时会在论文目录产生 `main.pdf`、`compile.log` 和 `compile-result.json`。
+任何引擎缺失、下载校验失败、宏包缺失或编译错误都会返回非零状态，并把真实诊断写入
+`compile.log`，不会把旧 PDF 当成新编译结果。安装时设置 `SCILOOP_BUILD_PAPER=1`，
+可在 `install.ps1` 或 `install.sh` 中显式执行该步骤。
 
 ## 许可与合规
 
 - 许可证：**Apache License 2.0**（见 `LICENSE`）
-- 第三方依赖：FastAPI / SQLAlchemy / Alembic / Pydantic / httpx / asyncpg / psycopg / PyMuPDF / Vue 3 / Vite / Element Plus / ECharts / Pinia，均遵循各自许可证
+- 第三方依赖：FastAPI / SQLAlchemy / Pydantic / httpx / aiosqlite / PyMuPDF / Vue 3 / Vite / Element Plus / ECharts / Pinia，均遵循各自许可证
 - 产出物一律标注「**本内容由 AI 辅助生成，需研究者自行核验**」；本工具定位为科研辅助工作台（教学用途），产出物为研究草稿，**不是**「可自动投稿的论文生成器」
 - 演示叙事强调「AI 执行、人保有否决权与最终判断」；回放结果必须标 `is_replay=true`
 - 数据源失败一律**降级并披露**（`null` + `source` + `confidence`），**禁止编造数据**

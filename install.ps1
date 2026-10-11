@@ -26,7 +26,19 @@ if (Get-Command npm -ErrorAction SilentlyContinue) {
   Set-Location $installDir
 }
 
-$env:PYTHONPATH = Join-Path $installDir 'server'
-Start-Process -WindowStyle Hidden -FilePath (Join-Path $installDir '.venv\Scripts\python.exe') -ArgumentList 'tools\host-runner\host_runner.py' -WorkingDirectory $installDir
-if (Get-Command npm -ErrorAction SilentlyContinue) { Start-Process -WindowStyle Hidden -FilePath 'npm.cmd' -ArgumentList 'run','dev','--','--host','127.0.0.1','--port','5173' -WorkingDirectory (Join-Path $installDir 'web') }
-& '.venv\Scripts\python.exe' -m uvicorn main:app --app-dir server --host 127.0.0.1 --port 8000
+# 可选论文 PDF 编译。设置 SCILOOP_BUILD_PAPER=1 后使用系统 XeLaTeX，
+# 或下载并校验固定版本 Tectonic 到 .data/latex。
+if ($env:SCILOOP_BUILD_PAPER -eq '1') {
+  & '.venv\Scripts\python.exe' tools/compile_paper.py --bootstrap
+  if ($LASTEXITCODE -ne 0) { throw '论文 PDF 编译失败，请查看论文目录下 compile.log。' }
+}
+
+if ($env:SCILOOP_RUN_PAPER_ACCEPTANCE -eq '1') {
+  & '.venv\Scripts\python.exe' tools/run.py paper-acceptance
+  if ($LASTEXITCODE -ne 0) { throw '论文验收失败，请查看论文项目目录中的 paper_acceptance_report.json。' }
+}
+
+# 正式运行只用 8000 提供页面和 API；执行器由后端负责启动与关闭。
+# 重复安装不会再启动另一份 Vite/API/执行器，失败不自动换端口。
+& '.venv\Scripts\python.exe' tools/run.py start
+if ($LASTEXITCODE -ne 0) { throw 'SciLoop 启动失败，请查看上方提示。' }
