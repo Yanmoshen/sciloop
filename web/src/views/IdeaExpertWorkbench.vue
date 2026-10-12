@@ -28,6 +28,8 @@ const starting = ref(false)
 const confirming = ref(false)
 const notice = ref('')
 const selectedCandidateId = ref<number | string | null>(null)
+/** POST /idea-runs 同步等待时还没有 run 对象，用本地时间保持等待状态可见。 */
+const localStartedAt = ref<number | null>(null)
 let pollTimer: ReturnType<typeof setTimeout> | null = null
 
 const stages = computed(() => run.value?.stages ?? IDEA_EXPERTS.map(([key, label], index) => ({
@@ -36,7 +38,48 @@ const stages = computed(() => run.value?.stages ?? IDEA_EXPERTS.map(([key, label
   order: index + 1,
   status: 'pending',
 } as IdeaExpertStage)))
-const completedStages = computed(() => stages.value.filter((stage) => stage.status === 'completed').length)
+function isStageCompleted(stage: IdeaExpertStage): boolean {
+  return ['completed', 'done', 'success', 'ok'].includes(String(stage.status).toLowerCase())
+}
+function isStageRunning(stage: IdeaExpertStage): boolean {
+  return ['running', 'active', 'in_progress'].includes(String(stage.status).toLowerCase())
+}
+function isStageWaiting(stage: IdeaExpertStage): boolean {
+  return ['pending', 'queued', 'idle'].includes(String(stage.status).toLowerCase())
+}
+function isStageFailed(stage: IdeaExpertStage): boolean {
+  return ['failed', 'error'].includes(String(stage.status).toLowerCase())
+}
+
+const completedStages = computed(() => stages.value.filter(isStageCompleted).length)
+const currentStage = computed(() =>
+  stages.value.find(isStageRunning) ??
+  stages.value.find(isStageFailed) ??
+  stages.value.find(isStageWaiting) ??
+  null,
+)
+const recentStage = computed(() => {
+  const finished = stages.value.filter(isStageCompleted)
+  return finished[finished.length - 1] ?? null
+})
+const runStartIso = computed(() => {
+  if (run.value?.created_at) return run.value.created_at
+  return localStartedAt.value ? new Date(localStartedAt.value).toISOString() : null
+})
+const runStartText = computed(() => formatDateTime(runStartIso.value))
+const resultGeneratedText = computed(() =>
+  formatDateTime(run.value?.completed_at ?? run.value?.created_at ?? null),
+)
+const recentStatusText = computed(() => {
+  if (starting.value && !run.value) return '已提交模型请求，等待第 1 个专家返回'
+  if (run.value?.status === 'failed') return run.value.failure_reason || currentStage.value?.error || run.value.error || '运行失败，请查看错误信息'
+  if (currentStage.value && isStageRunning(currentStage.value)) {
+    return `${stageLabel(currentStage.value)}正在处理`
+  }
+  if (recentStage.value) return `${stageLabel(recentStage.value)}已完成，等待下一阶段`
+  if (run.value) return '运行已创建，等待专家队列开始'
+  return '尚未启动专家运行'
+})
 const activeCandidate = computed(() => run.value?.candidates.find((item) => String(item.id) === String(selectedCandidateId.value)) ?? run.value?.candidates[0] ?? null)
 const isTerminal = computed(() => ['completed', 'awaiting_confirmation', 'failed', 'cancelled'].includes(String(run.value?.status)))
 const canConfirm = computed(() => Boolean(run.value && activeCandidate.value && ['completed', 'awaiting_confirmation'].includes(String(run.value.status)) && run.value.confirmation_status !== 'confirmed'))
@@ -45,14 +88,18 @@ function stageLabel(stage: IdeaExpertStage): string {
   return stage.label || stage.name || String(stage.key)
 }
 function stageStatus(stage: IdeaExpertStage): string {
-  if (stage.status === 'completed') return '已完成'
-  if (stage.status === 'running') return '运行中'
-  if (stage.status === 'failed') return '失败'
-  if (stage.status === 'skipped') return '跳过'
+  if (isStageCompleted(stage)) return '已完成'
+  if (isStageRunning(stage)) return '运行中'
+  if (isStageFailed(stage)) return '失败'
+  if (String(stage.status).toLowerCase() === 'skipped') return '跳过'
   return '等待'
 }
 function stageClass(stage: IdeaExpertStage): string {
-  return `stage--${stage.status}`
+  if (isStageCompleted(stage)) return 'stage--completed'
+  if (isStageRunning(stage)) return 'stage--running'
+  if (isStageFailed(stage)) return 'stage--failed'
+  if (String(stage.status).toLowerCase() === 'skipped') return 'stage--skipped'
+  return 'stage--pending'
 }
 function scoreTotal(candidate: NonNullable<IdeaExpertRun['candidates']>[number]): string {
   return typeof candidate.total_score === 'number' ? `${Math.round(candidate.total_score)} 分` : '待评分'
@@ -62,6 +109,12 @@ function paperLabel(id: number): string {
 }
 function ownerError(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+function formatDateTime(value: string | number | null | undefined): string {
+  if (!value) return '等待记录'
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return String(value)
+  return date.toLocaleString('zh-CN', { hour12: false })
 }
 
 async function load(): Promise<void> {
@@ -106,6 +159,7 @@ function schedulePoll(): void {
 async function startRun(): Promise<void> {
   if (aggregationId.value === null || starting.value) return
   starting.value = true
+  localStartedAt.value = Date.now()
   notice.value = ''
   try {
     run.value = await createIdeaExpertRun({
@@ -113,6 +167,7 @@ async function startRun(): Promise<void> {
       paper_ids: paperIds.value,
       candidate_count_per_direction: 2,
     })
+    localStartedAt.value = run.value.created_at ? Date.parse(run.value.created_at) || localStartedAt.value : localStartedAt.value
     selectedCandidateId.value = run.value.candidates[0]?.id ?? null
     await router.replace({ query: { ...route.query, run_id: String(run.value.id) } })
     schedulePoll()
@@ -180,6 +235,44 @@ onUnmounted(() => {
         <span class="input-note">只使用这些论文的解析卡片、解析总结和全文证据</span>
       </article>
 
+      <article v-if="starting || (run && !isTerminal)" class="panel run-monitor" aria-live="polite">
+        <header class="panel-head">
+          <div>
+            <p class="panel-kicker">运行监视</p>
+            <h2>{{ starting && !run ? '正在启动专家运行' : '专家运行中' }}</h2>
+          </div>
+          <span class="run-pulse" aria-hidden="true" />
+          <span class="spacer" />
+          <span class="muted">开始于 {{ runStartText }}</span>
+        </header>
+        <div class="run-monitor__grid">
+          <div class="run-stat">
+            <span>专家进度</span>
+            <strong>{{ completedStages }}/20</strong>
+            <small>已完成 / 总数</small>
+          </div>
+          <div class="run-stat">
+            <span>当前阶段</span>
+            <strong>{{ currentStage ? `${currentStage.order}. ${stageLabel(currentStage)}` : '等待队列' }}</strong>
+            <small>{{ currentStage ? stageStatus(currentStage) : '模型请求已提交' }}</small>
+          </div>
+          <div class="run-stat run-stat--wide">
+            <span>最近状态</span>
+            <strong>{{ recentStatusText }}</strong>
+            <small>页面会自动刷新专家状态</small>
+          </div>
+        </div>
+      </article>
+
+      <article v-if="run?.status === 'failed'" class="panel failure-panel" role="alert">
+        <div>
+          <p class="panel-kicker">运行未完成</p>
+          <h2>{{ run.failure_reason || '专家链路未完成' }}</h2>
+          <p class="failure-detail">已完成 {{ run.completed_experts ?? completedStages }}/{{ run.experts_total ?? 20 }} 个专家；失败 {{ run.failed_experts?.length ?? 0 }} 个。</p>
+          <p v-if="run.error" class="failure-detail failure-detail--mono">{{ run.error }}</p>
+        </div>
+      </article>
+
       <article class="panel">
         <header class="panel-head">
           <div>
@@ -209,6 +302,8 @@ onUnmounted(() => {
               <h2>8 条候选 Idea</h2>
             </div>
             <span class="muted">四个方向 · 每个 2 条</span>
+            <span v-if="run && isTerminal" class="result-time">生成完成于 {{ resultGeneratedText }}</span>
+            <span v-else-if="run" class="result-time">开始于 {{ runStartText }}</span>
           </header>
           <div v-if="run?.candidates.length" class="candidate-list">
             <button
@@ -278,6 +373,18 @@ onUnmounted(() => {
 .paper-tags { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-top: var(--space-3); }
 .input-note, .muted, .stage-copy small, .candidate-info small { color: var(--color-text-secondary); font-size: var(--font-size-xs); }
 .input-note { display: block; margin-top: var(--space-3); }
+.run-monitor { border-color: var(--color-border-strong); background: var(--color-bg-subtle); }
+.failure-panel { border-color: var(--color-danger); background: color-mix(in srgb, var(--color-danger) 6%, var(--color-card-bg)); }
+.failure-detail { margin: 8px 0 0; color: var(--color-text-secondary); font-size: var(--font-size-sm); }
+.failure-detail--mono { font-family: var(--font-family-mono); font-size: var(--font-size-xs); overflow-wrap: anywhere; }
+.run-monitor__grid { display: grid; grid-template-columns: minmax(150px, .7fr) minmax(200px, 1fr) minmax(260px, 1.5fr); gap: var(--space-2); margin-top: var(--space-4); }
+.run-stat { display: flex; min-height: 84px; flex-direction: column; justify-content: center; gap: 4px; padding: 12px; border: 1px solid var(--color-border); background: var(--color-card-bg); }
+.run-stat span, .run-stat small { color: var(--color-text-secondary); font-size: var(--font-size-xs); }
+.run-stat strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--font-size-md); }
+.run-stat--wide strong { white-space: normal; }
+.run-pulse { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--color-brand); box-shadow: 0 0 0 5px var(--color-brand-soft); animation: run-pulse 1.2s ease-in-out infinite; }
+.result-time { margin-left: auto; color: var(--color-text-secondary); font-size: var(--font-size-xs); }
+@keyframes run-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .45; transform: scale(.8); } }
 .stage-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin-top: var(--space-4); background: var(--color-border); border: 1px solid var(--color-border); }
 .stage { display: flex; align-items: center; gap: 9px; min-height: 68px; padding: 10px; background: var(--color-card-bg); }
 .stage-index { display: grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; background: var(--color-bg-subtle); color: var(--color-text-secondary); font: 600 var(--font-size-xs)/1 var(--font-family-mono); }
@@ -308,6 +415,6 @@ onUnmounted(() => {
 .confirm-bar { margin-top: var(--space-5); padding-top: var(--space-3); border-top: 1px solid var(--color-border); }
 .confirmed { color: var(--color-success); font-size: var(--font-size-sm); }
 .empty { margin: 0; padding: var(--space-5) 0; color: var(--color-text-secondary); text-align: center; }
-@media (max-width: 980px) { .stage-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .results-layout { grid-template-columns: 1fr; } }
+@media (max-width: 980px) { .stage-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .run-monitor__grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .run-stat--wide { grid-column: 1 / -1; } .results-layout { grid-template-columns: 1fr; } }
 @media (max-width: 560px) { .stage-grid { grid-template-columns: 1fr; } .score-grid { grid-template-columns: repeat(2, 1fr); } .workbench-head .btn { width: 100%; } }
 </style>

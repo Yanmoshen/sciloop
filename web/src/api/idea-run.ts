@@ -75,7 +75,13 @@ export interface IdeaExpertRun {
   selected_candidate_id?: number | string | null
   confirmation_status?: 'pending' | 'confirmed' | 'rejected' | string
   error?: string | null
+  failure_reason?: string | null
+  completed_experts?: number
+  failed_experts?: string[]
+  experts_total?: number
   created_at?: string | null
+  completed_at?: string | null
+  generation_seconds?: number | null
   updated_at?: string | null
   [key: string]: unknown
 }

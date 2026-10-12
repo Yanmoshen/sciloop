@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import jsonschema
 import pytest
 
 from services.ideation_experts import (
@@ -13,6 +14,7 @@ from services.ideation_experts import (
     topological_levels,
     validate_role_payload,
 )
+from services.ideation_experts.schemas import output_schema
 
 
 def _idea(role_id: str, direction: str) -> dict:
@@ -111,3 +113,31 @@ async def test_failed_critical_expert_is_not_retried_and_blocks_decision():
     assert result.results["evidence_extractor"].status == "failed"
     assert result.status == "blocked"
     assert result.ranking == []
+
+
+@pytest.mark.asyncio
+async def test_runner_resumes_completed_roles_without_calling_them_again():
+    called: list[str] = []
+
+    async def fake_call(messages, **kwargs):
+        role_id = kwargs["purpose"].split(":", 1)[1]
+        called.append(role_id)
+        return SimpleNamespace(parsed=_response(role_id), model_ref=kwargs["model_ref"], duration_ms=1, cost_usd=0.0)
+
+    context = ResearchContext(
+        selected_papers=({"paper_id": 1},),
+        evidence=(EvidenceRef(id="E1", evidence_type="source_evidence", paper_id=1, quote="source"),),
+    )
+    completed = _response("evidence_extractor")
+    initial = {"evidence_extractor": SimpleNamespace(role_id="evidence_extractor", status="succeeded", payload=completed)}
+    result = await IdeationExpertRunner(call=fake_call).run(context, model_ref="provider:model", initial_results=initial)
+    assert "evidence_extractor" not in called
+    assert len(called) == 19
+    assert result.status == "completed"
+
+
+def test_idea_schema_allows_non_semantic_note_fields():
+    idea = _idea("method_iteration", "refinement")
+    idea["unknowns_note"] = "附加说明"
+    payload = {"ideas": [idea, {**idea, "idea_id": "method_iteration-2", "idea_id_note": "附加说明"}]}
+    jsonschema.validate(payload, output_schema("method_iteration"))
