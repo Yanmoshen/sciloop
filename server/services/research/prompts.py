@@ -123,7 +123,7 @@ NODE_GUIDES: dict[str, str] = {
 
 SYSTEM_PROMPT = SCILOOP_SYSTEM_PROMPT + "\n\n" + (
     "## 当前研究节点的执行契约\n"
-    "本次只执行运行时指定的当前节点。只输出一个符合下方 schema 的 JSON 对象，"
+    "本次只执行运行时指定的当前节点。只输出一个 JSON 对象，并确保它符合下方 schema，"
     "不要解释文字或代码围栏。对用户的展示由对话层处理，不能改用自然语言代替 JSON。\n"
     "用 state 声明本节点的工作状态：\n"
     "- state=done：本节点的产出达到完成标准；不表示用户已经验收或允许推进下一节点。\n"

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from api.v1 import chat
 from services.agent_prompt_v2 import BASE_INSTRUCTIONS, RETIRED_PHRASES
+from services.output_style import OUTPUT_STYLE
 from services.research import messages, phrasing, prompts
 from services.research.contracts import NODE_OUTPUT_SCHEMAS
 from services.system_prompt import SCILOOP_SYSTEM_PROMPT, load_system_prompt
@@ -16,7 +17,7 @@ def test_bundled_prompt_matches_reviewed_copy():
 
 
 def test_all_entry_points_use_the_shared_prompt():
-    assert chat.REPLY_SYSTEM.strip() == SCILOOP_SYSTEM_PROMPT
+    assert chat.REPLY_SYSTEM.strip() == (SCILOOP_SYSTEM_PROMPT + "\n\n" + OUTPUT_STYLE).strip()
     assert BASE_INSTRUCTIONS == SCILOOP_SYSTEM_PROMPT
     assert prompts.SYSTEM_PROMPT.startswith(SCILOOP_SYSTEM_PROMPT + "\n\n")
     assert phrasing.PHRASING_SYSTEM.startswith(SCILOOP_SYSTEM_PROMPT + "\n\n")
