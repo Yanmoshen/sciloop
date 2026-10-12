@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from .registry import EXPERT_ROLES, ROLE_REGISTRY, SCORE_WEIGHTS, get_role, topological_levels
-from .schemas import ExpertCallResult, IdeationRunResult, ResearchContext, output_schema, validate_role_payload
+from .registry import EXPERT_ROLES, SCORE_WEIGHTS, get_role, topological_levels
+from .schemas import (
+    ExpertCallResult,
+    IdeationRunResult,
+    ResearchContext,
+    output_schema,
+    validate_role_payload,
+)
 
 IDEATION_STAGE = "ideate"
 MAX_IDEAS_PER_DIRECTION = 2
@@ -19,7 +24,7 @@ _PROMPT_GUIDANCE = {
     "cross_paper_reviewer": "跨论文比较；若只有一篇，比较其内部方法、实验和局限，并明确单篇限制。",
     "gap_finder": "只提出能回指输入论文证据的研究空白。",
     "question_reframer": "将空白变成清楚、范围适当且可验证的研究问题。",
-    "idea_seed_generator": "提出跨四方向的种子供后续角色独立产出最终方案；不要联网。",
+    "idea_seed_generator": "提出跨四方向的种子供后续角色独立产出最终方案；不要联网。严格只输出 8 条种子（每个方向 2 条），每条字段用简短中文短语，避免 Markdown、换行和引号；所有 evidence_refs 必须来自证据表。",
     "method_iteration": "最终只输出 2 条 refinement 方法迭代型方案。",
     "scenario_transfer": "最终只输出 2 条 transfer 场景迁移型方案。",
     "technology_fusion": "最终只输出 2 条 combination 技术融合型方案。模型先验技术仅能标记为待验证假设。",
@@ -60,6 +65,8 @@ class IdeationExpertRunner:
         *,
         project_id: int | None = None,
         model_ref: str | None = None,
+        initial_results: dict[str, ExpertCallResult] | None = None,
+        on_role_event: Callable[[str, str, ExpertCallResult | None], Awaitable[None]] | None = None,
     ) -> IdeationRunResult:
         if not context.selected_papers:
             raise IdeationExpertError("至少需要选择一篇论文")
@@ -67,21 +74,31 @@ class IdeationExpertRunner:
         evidence_ids = {item.id for item in context.evidence if item.evidence_type == "source_evidence"}
         # If no explicit evidence catalog exists, no generated proposal can pass evidence grounding.
         shared: dict[str, Any] = {"research_context": context.as_payload()}
-        results: dict[str, ExpertCallResult] = {}
+        results: dict[str, ExpertCallResult] = dict(initial_results or {})
+        shared.update({role_id: result.payload for role_id, result in results.items() if result.payload is not None})
         calls = 0
+        # Run one role at a time.  Every role still receives exactly one model
+        # call, while serialized execution respects providers whose remaining
+        # balance imposes a low concurrency limit.
         for level in topological_levels():
-            tasks = [
-                self._run_role(role_id, shared, results, context, evidence_ids, resolved_ref, project_id)
-                for role_id in level
-            ]
-            batch = await asyncio.gather(*tasks)
-            for role_id, call_result in zip(level, batch, strict=True):
+            for role_id in level:
+                existing = results.get(role_id)
+                if existing is not None and existing.status == "succeeded" and existing.payload is not None:
+                    calls += 1
+                    continue
+                if on_role_event is not None:
+                    await on_role_event(role_id, "started", None)
+                call_result = await self._run_role(
+                    role_id, shared, results, context, evidence_ids, resolved_ref, project_id
+                )
                 calls += 1
                 results[role_id] = call_result
                 if call_result.payload is not None:
                     shared[role_id] = call_result.payload
                 else:
                     shared[role_id] = {"status": "unavailable", "error": call_result.error}
+                if on_role_event is not None:
+                    await on_role_event(role_id, "finished", call_result)
 
         if calls != len(EXPERT_ROLES):
             raise IdeationExpertError(f"内部错误：预期 {len(EXPERT_ROLES)} 次专家调用，实际 {calls} 次")
@@ -135,6 +152,7 @@ class IdeationExpertRunner:
             payload = getattr(response, "parsed", None)
             if payload is None:
                 raise ValueError("LLM structured response has no parsed payload")
+            payload = _normalize_role_payload(payload)
             errors = validate_role_payload(role_id, payload, evidence_ids)
             if errors:
                 raise ValueError("; ".join(errors))
@@ -232,6 +250,23 @@ def _build_prompt(role_id: str, role_name: str, inputs: dict[str, Any], evidence
     ]
     user = json.dumps({"evidence_catalog": evidence_catalog, "inputs": inputs, "score_weights": SCORE_WEIGHTS}, ensure_ascii=False, default=str)
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def _normalize_role_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Canonicalize harmless aliases before semantic evidence validation."""
+    def visit(value: Any) -> Any:
+        if isinstance(value, list):
+            return [visit(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        normalized = {key: visit(item) for key, item in value.items()}
+        if "evidence_refs" not in normalized and isinstance(normalized.get("refs"), list):
+            normalized["evidence_refs"] = normalized["refs"]
+        if normalized.get("evidence_type") == "source_inference":
+            normalized["evidence_type"] = "model_inference"
+        return normalized
+
+    return visit(payload)
 
 
 __all__ = ["IdeationExpertRunner", "IdeationExpertError", "IDEATION_STAGE", "MAX_IDEAS_PER_DIRECTION"]

@@ -18,7 +18,12 @@ from db.models.idea_pipeline import IdeaPipelineCandidate, IdeaPipelineExpertRun
 from db.models.paper import Paper
 from services.aggregation.aggregation_service import load_gaps
 from services.aggregation.cards import load_cards
-from services.ideation_experts import EvidenceRef, IdeationExpertRunner, ResearchContext
+from services.ideation_experts import (
+    EvidenceRef,
+    ExpertCallResult,
+    IdeationExpertRunner,
+    ResearchContext,
+)
 from services.ideation_experts.registry import EXPERT_ROLES, SCORE_WEIGHTS
 
 logger = logging.getLogger("sciloop.ideation.expert_pipeline")
@@ -132,23 +137,51 @@ async def execute_run(session: AsyncSession, run_id: int, *, chat_fn: Callable[.
         experts = (await session.execute(select(IdeaPipelineExpertRun).where(IdeaPipelineExpertRun.run_id == run_id).order_by(IdeaPipelineExpertRun.expert_number))).scalars().all()
         by_key = {role.id: experts[index] for index, role in enumerate(EXPERT_ROLES)}
         run.status, run.model_ref = "running", model_ref
+        initial_results: dict[str, ExpertCallResult] = {}
         for expert in experts:
-            expert.status = "running"
             expert.input_snapshot = {"source_snapshot_sha256": snapshot["sha256"], "context": context.as_payload(), "dependencies": list(EXPERT_ROLES[expert.expert_number - 1].dependencies)}
+            if expert.status == "completed" and expert.output is not None:
+                initial_results[expert.expert_key] = ExpertCallResult(
+                    role_id=expert.expert_key,
+                    status="succeeded",
+                    payload=expert.output,
+                    model_ref=expert.model_ref or model_ref,
+                    cost_usd=expert.cost_usd,
+                )
+            elif expert.status not in {"running", "queued"}:
+                expert.status = "queued"
+            elif expert.status == "running":
+                # A process restart can leave a row in running without a
+                # result. It is safe to issue its one unfinished call again.
+                expert.status = "queued"
+                expert.completed_at = None
+        run.current_expert = None
         await session.commit()
 
         runner = IdeationExpertRunner(call=chat_fn)
-        outcome = await runner.run(context, project_id=run.project_id, model_ref=model_ref)
-        for role in EXPERT_ROLES:
-            row = by_key[role.id]
-            result = outcome.results[role.id]
-            row.status = "completed" if result.status == "succeeded" else "failed"
-            row.output = result.payload
-            row.raw_output = json.dumps(result.payload, ensure_ascii=False, default=_json_default) if result.payload is not None else None
-            row.model_ref, row.cost_usd = result.model_ref, result.cost_usd
-            row.attempts = 1
-            row.error = result.error
-            row.completed_at = dt.datetime.now(dt.UTC)
+        async def persist_role_event(role_id: str, phase: str, result: Any | None) -> None:
+            row = by_key[role_id]
+            if phase == "started":
+                row.status = "running"
+                row.started_at = dt.datetime.now(dt.UTC)
+                run.current_expert = row.expert_number
+            else:
+                row.status = "completed" if result.status == "succeeded" else "failed"
+                row.output = result.payload
+                row.raw_output = json.dumps(result.payload, ensure_ascii=False, default=_json_default) if result.payload is not None else None
+                row.model_ref, row.cost_usd = result.model_ref, result.cost_usd
+                row.attempts = 1
+                row.error = result.error
+                row.completed_at = dt.datetime.now(dt.UTC)
+            await session.commit()
+
+        outcome = await runner.run(
+            context,
+            project_id=run.project_id,
+            model_ref=model_ref,
+            initial_results=initial_results,
+            on_role_event=persist_role_event,
+        )
         run.current_expert = None
         if outcome.status != "completed":
             failed = [role.id for role in EXPERT_ROLES if role.critical and outcome.results[role.id].status != "succeeded"]
@@ -212,7 +245,30 @@ async def get_run(session: AsyncSession, run_id: int) -> dict[str, Any] | None:
         return None
     experts = (await session.execute(select(IdeaPipelineExpertRun).where(IdeaPipelineExpertRun.run_id == int(run_id)).order_by(IdeaPipelineExpertRun.expert_number))).scalars().all()
     candidates = (await session.execute(select(IdeaPipelineCandidate).where(IdeaPipelineCandidate.run_id == int(run_id)).order_by(IdeaPipelineCandidate.rank, IdeaPipelineCandidate.id))).scalars().all()
-    return {"run": {"id": int(run.id), "project_id": run.project_id, "aggregation_id": run.aggregation_id, "paper_ids": run.paper_ids, "input_snapshot_sha256": (run.input_snapshot or {}).get("sha256"), "model_ref": run.model_ref, "status": run.status, "current_expert": run.current_expert, "confirmation_status": run.confirmation_status, "decision": run.decision, "error": run.error, "created_at": run.created_at.isoformat() if run.created_at else None, "completed_at": run.completed_at.isoformat() if run.completed_at else None, "experts": [{"id": int(x.id), "expert_number": x.expert_number, "expert_key": x.expert_key, "status": x.status, "output": x.output, "raw_output": x.raw_output, "model_ref": x.model_ref, "prompt_version": x.prompt_version, "cost_usd": x.cost_usd, "attempts": x.attempts, "error": x.error} for x in experts], "candidates": [{"id": int(c.id), "direction": c.direction, "ordinal": c.ordinal, "title": c.title, "payload": c.payload, "evidence": c.evidence, "score": c.score, "rank": c.rank, "recommendation": c.recommendation, "is_selected": c.is_selected} for c in candidates]}}
+    failed_experts = [x for x in experts if x.status == "failed"]
+    completed_experts = sum(1 for x in experts if x.status == "completed")
+    failure_reason = None
+    failure_text = " ".join(str(x.error or "") for x in failed_experts)
+    if "Insufficient Balance" in failure_text or "Payment Required" in failure_text:
+        failure_reason = "模型服务余额不足，请充值默认模型后重新运行。"
+    elif "database is locked" in failure_text:
+        failure_reason = "任务写入发生数据库锁冲突，请稍后重试。"
+    elif "LLMJSONValidationError" in failure_text:
+        failure_reason = "部分专家返回格式不合规，已记录失败专家；可重新运行。"
+    elif failed_experts:
+        failure_reason = "部分专家调用失败，请查看失败专家详情后重试。"
+    generation_seconds = None
+    if run.created_at and run.completed_at:
+        created_at = run.created_at
+        completed_at = run.completed_at
+        # SQLite returns server timestamps without tzinfo while Python writes
+        # completion timestamps in UTC. Normalize both before subtraction.
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=dt.UTC)
+        if completed_at.tzinfo is None:
+            completed_at = completed_at.replace(tzinfo=dt.UTC)
+        generation_seconds = round((completed_at - created_at).total_seconds(), 3)
+    return {"run": {"id": int(run.id), "project_id": run.project_id, "aggregation_id": run.aggregation_id, "paper_ids": run.paper_ids, "input_snapshot_sha256": (run.input_snapshot or {}).get("sha256"), "model_ref": run.model_ref, "status": run.status, "current_expert": run.current_expert, "confirmation_status": run.confirmation_status, "decision": run.decision, "error": run.error, "failure_reason": failure_reason, "completed_experts": completed_experts, "failed_experts": [x.expert_key for x in failed_experts], "experts_total": len(experts), "created_at": run.created_at.isoformat() if run.created_at else None, "completed_at": run.completed_at.isoformat() if run.completed_at else None, "generation_seconds": generation_seconds, "experts": [{"id": int(x.id), "expert_number": x.expert_number, "expert_key": x.expert_key, "status": x.status, "output": x.output, "raw_output": x.raw_output, "model_ref": x.model_ref, "prompt_version": x.prompt_version, "cost_usd": x.cost_usd, "attempts": x.attempts, "started_at": x.started_at.isoformat() if x.started_at else None, "completed_at": x.completed_at.isoformat() if x.completed_at else None, "error": x.error} for x in experts], "candidates": [{"id": int(c.id), "direction": c.direction, "ordinal": c.ordinal, "title": c.title, "payload": c.payload, "evidence": c.evidence, "score": c.score, "rank": c.rank, "recommendation": c.recommendation, "is_selected": c.is_selected} for c in candidates]}}
 
 
 async def confirm_candidate(session: AsyncSession, run_id: int, candidate_id: int, *, note: str | None = None) -> dict[str, Any]:

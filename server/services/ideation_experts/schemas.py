@@ -87,22 +87,106 @@ def output_schema(role_id: str) -> dict[str, Any]:
     if role is None:
         raise KeyError(f"unknown expert role: {role_id}")
     if role.output_kind == "seeds":
-        return {"type": "object", "required": ["seeds"], "additionalProperties": False, "properties": {"seeds": {"type": "array", "minItems": 8, "items": {"$ref": "#/$defs/idea"}}}, "$defs": {"idea": _idea_schema()}}
+        return {
+            "type": "object",
+            "required": ["seeds"],
+            "additionalProperties": False,
+            "properties": {"seeds": {"type": "array", "minItems": 8, "items": {"$ref": "#/$defs/idea"}}},
+            "$defs": {"idea": _idea_schema()},
+        }
     if role.output_kind == "ideas":
-        return {"type": "object", "required": ["ideas"], "additionalProperties": False, "properties": {"ideas": {"type": "array", "minItems": 2, "maxItems": 2, "items": _idea_schema()}}}
+        return {
+            "type": "object",
+            "required": ["ideas"],
+            "additionalProperties": False,
+            "properties": {"ideas": {"type": "array", "minItems": 2, "maxItems": 2, "items": _idea_schema()}},
+        }
     if role.output_kind == "scores":
-        return {"type": "object", "required": ["scores"], "additionalProperties": False, "properties": {"scores": {"type": "array", "items": {"type": "object", "required": ["idea_id", "dimensions"], "additionalProperties": False, "properties": {"idea_id": {"type": "string"}, "dimensions": {"type": "object", "required": list(SCORE_WEIGHTS), "additionalProperties": False, "properties": {key: _score_dimension_schema() for key in SCORE_WEIGHTS}}, "total_score": {"type": "number", "minimum": 0, "maximum": 100}}}}}}
+        return {
+            "type": "object",
+            "required": ["scores"],
+            "additionalProperties": False,
+            "properties": {
+                "scores": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["idea_id", "dimensions"],
+                        "additionalProperties": True,
+                        "properties": {
+                            "idea_id": {"type": "string"},
+                            "dimensions": {
+                                "type": "object",
+                                "required": list(SCORE_WEIGHTS),
+                                "additionalProperties": True,
+                                "properties": {key: _score_dimension_schema() for key in SCORE_WEIGHTS},
+                            },
+                            "total_score": {"type": "number", "minimum": 0, "maximum": 100},
+                        },
+                    },
+                }
+            },
+        }
     if role.output_kind == "ranking":
-        return {"type": "object", "required": ["ranking"], "additionalProperties": False, "properties": {"ranking": {"type": "array", "items": {"type": "object", "required": ["idea_id", "rank", "recommendation", "reason", "conditions", "next_experiment"], "additionalProperties": False, "properties": {"idea_id": {"type": "string"}, "rank": {"type": "integer", "minimum": 1}, "recommendation": {"type": "string", "enum": ["recommend", "conditional", "defer", "reject"]}, "reason": {"type": "string"}, "conditions": {"type": "array", "items": {"type": "string"}}, "next_experiment": {"type": "string"}, "opportunity_cost": {"type": "string"}}}}}}
-    return {"type": "object", "required": ["findings"], "additionalProperties": False, "properties": {"findings": {"type": "array", "items": {"type": "object", "required": ["idea_id", "claim", "evidence_type", "evidence_refs", "confidence", "unknowns"], "additionalProperties": False, "properties": {"idea_id": {"type": "string"}, "claim": {"type": "string"}, "evidence_type": {"type": "string", "enum": sorted(EVIDENCE_TYPES)}, "evidence_refs": {"type": "array", "items": {"type": "string"}}, "confidence": {"type": "number", "minimum": 0, "maximum": 1}, "unknowns": {"type": "array", "items": {"type": "string"}}, "severity": {"type": "string"}}}}}}
+        return {
+            "type": "object",
+            "required": ["ranking"],
+            "additionalProperties": False,
+            "properties": {
+                "ranking": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["idea_id", "rank", "recommendation", "reason", "conditions", "next_experiment"],
+                        "additionalProperties": True,
+                        "properties": {
+                            "idea_id": {"type": "string"},
+                            "rank": {"type": "integer", "minimum": 1},
+                            "recommendation": {"type": "string", "enum": ["recommend", "conditional", "defer", "reject"]},
+                            "reason": {"type": "string"},
+                            "conditions": {"type": "array", "items": {"type": "string"}},
+                            "next_experiment": {"type": "string"},
+                            "opportunity_cost": {"type": "string"},
+                        },
+                    },
+                }
+            },
+        }
+    return {
+        "type": "object",
+        "required": ["findings"],
+        "additionalProperties": False,
+        "properties": {
+            "findings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["idea_id", "claim", "evidence_type", "evidence_refs", "confidence", "unknowns"],
+                    "additionalProperties": True,
+                    "properties": {
+                        "idea_id": {"type": "string"},
+                        "claim": {"type": "string"},
+                        "evidence_type": {"type": "string", "enum": sorted(EVIDENCE_TYPES) + ["source_inference"]},
+                        "evidence_refs": {"type": "array", "items": {"type": "string"}},
+                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        "unknowns": {"type": "array", "items": {"type": "string"}},
+                        "severity": {"type": "string"},
+                    },
+                },
+            }
+        },
+    }
 
 
 def _idea_schema() -> dict[str, Any]:
-    return {"type": "object", "required": ["idea_id", "direction", "title", "research_question", "hypothesis", "method", "innovation", "gap_ids", "paper_ids", "evidence_refs", "experiment_direction", "unknowns", "risks"], "additionalProperties": False, "properties": {"idea_id": {"type": "string"}, "direction": {"type": "string", "enum": ["refinement", "transfer", "combination", "paradigm"]}, "title": {"type": "string"}, "research_question": {"type": "string"}, "hypothesis": {"type": "string"}, "method": {"type": "string"}, "innovation": {"type": "string"}, "gap_ids": {"type": "array", "items": {"type": "string"}}, "paper_ids": {"type": "array", "items": {"type": ["integer", "string"]}}, "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string"}}, "experiment_direction": {"type": "string"}, "unknowns": {"type": "array", "items": {"type": "string"}}, "risks": {"type": "array", "items": {"type": "string"}}}}
+    # DeepSeek frequently appends explanatory *_note fields despite the
+    # requested contract. Keep the required research fields strict while
+    # accepting harmless annotations that the semantic validator ignores.
+    return {"type": "object", "required": ["idea_id", "direction", "title", "research_question", "hypothesis", "method", "innovation", "gap_ids", "paper_ids", "evidence_refs", "experiment_direction", "unknowns", "risks"], "additionalProperties": True, "properties": {"idea_id": {"type": "string"}, "direction": {"type": "string", "enum": ["refinement", "transfer", "combination", "paradigm"]}, "title": {"type": "string"}, "research_question": {"type": "string"}, "hypothesis": {"type": "string"}, "method": {"type": "string"}, "innovation": {"type": "string"}, "gap_ids": {"type": "array", "items": {"type": "string"}}, "paper_ids": {"type": "array", "items": {"type": ["integer", "string"]}}, "evidence_refs": {"type": "array", "minItems": 1, "items": {"type": "string"}}, "experiment_direction": {"type": "string"}, "unknowns": {"type": "array", "items": {"type": "string"}}, "risks": {"type": "array", "items": {"type": "string"}}}}
 
 
 def _score_dimension_schema() -> dict[str, Any]:
-    return {"type": "object", "required": ["score", "reason", "evidence_refs", "confidence", "deductions", "unknowns"], "additionalProperties": False, "properties": {"score": {"type": "number", "minimum": 0, "maximum": 100}, "reason": {"type": "string"}, "evidence_refs": {"type": "array", "items": {"type": "string"}}, "confidence": {"type": "number", "minimum": 0, "maximum": 1}, "deductions": {"type": "array", "items": {"type": "string"}}, "unknowns": {"type": "array", "items": {"type": "string"}}}}
+    return {"type": "object", "required": ["score", "reason", "evidence_refs", "confidence", "deductions", "unknowns"], "additionalProperties": True, "properties": {"score": {"type": "number", "minimum": 0, "maximum": 100}, "reason": {"type": "string"}, "evidence_refs": {"type": "array", "items": {"type": "string"}}, "confidence": {"type": "number", "minimum": 0, "maximum": 1}, "deductions": {"type": "array", "items": {"type": "string"}}, "unknowns": {"type": "array", "items": {"type": "string"}}}}
 
 
 def validate_role_payload(role_id: str, payload: dict[str, Any], evidence_ids: set[str]) -> list[str]:

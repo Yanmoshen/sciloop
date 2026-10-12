@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Annotated, Any
 
@@ -12,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core.security import require_owner
-from db.models import Aggregation
+from db.models import Aggregation, IdeaPipelineRun
 from db.session import AsyncSessionLocal
 from services.ideation.expert_pipeline import (
     IdeaPipelineError,
@@ -23,6 +24,8 @@ from services.ideation.expert_pipeline import (
 )
 
 router = APIRouter(tags=["idea-runs"])
+_IDEA_WORKERS: set[asyncio.Task[None]] = set()
+_IDEA_WORKER_LOCK = asyncio.Lock()
 
 
 def _error(code: int, key: str, message: str, detail: Any = None) -> HTTPException:
@@ -60,8 +63,36 @@ class IdeaRunConfirm(BaseModel):
 async def _run_worker(run_id: int) -> None:
     if AsyncSessionLocal is None:
         return
-    async with AsyncSessionLocal() as worker_session:
+    # SQLite permits one writer at a time. Serialize run workers so progress
+    # checkpoints from separate Idea runs cannot hold each other's locks.
+    async with _IDEA_WORKER_LOCK, AsyncSessionLocal() as worker_session:
         await execute_run(worker_session, run_id)
+
+
+def _track_worker(task: asyncio.Task[None]) -> None:
+    _IDEA_WORKERS.discard(task)
+    task.exception() if not task.cancelled() else None
+
+
+def _schedule_worker(run_id: int) -> None:
+    task = asyncio.create_task(_run_worker(run_id), name=f"idea-run-{run_id}")
+    _IDEA_WORKERS.add(task)
+    task.add_done_callback(_track_worker)
+
+
+async def resume_running_idea_runs() -> int:
+    """Resume runs left in ``running`` after an API process restart."""
+    if AsyncSessionLocal is None:
+        return 0
+    async with AsyncSessionLocal() as session:
+        rows = (await session.execute(select(IdeaPipelineRun.id).where(IdeaPipelineRun.status == "running"))).scalars().all()
+    scheduled = 0
+    for run_id in rows:
+        if any(task.get_name() == f"idea-run-{int(run_id)}" for task in _IDEA_WORKERS):
+            continue
+        _schedule_worker(int(run_id))
+        scheduled += 1
+    return scheduled
 
 
 @router.post(
@@ -83,7 +114,7 @@ async def post_idea_run(body: IdeaRunCreate, background_tasks: BackgroundTasks, 
         code = 404 if exc.code in {"unknown_paper_id", "aggregation_not_found"} else 422
         raise _error(code, exc.code, exc.message, exc.detail) from exc
     run_id = int(payload["run"]["id"])
-    background_tasks.add_task(_run_worker, run_id)
+    background_tasks.add_task(_schedule_worker, run_id)
     payload["run"]["status"] = "queued"
     return payload
 

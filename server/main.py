@@ -232,6 +232,14 @@ async def lifespan(app: FastAPI):
         logger.warning("数据库不可用: %s", probe.get("detail"))
     # 收尾上一代进程留下的「运行中」节点（否则界面上会有一条假的"运行中"）
     await _reap_stale_node_runs()
+    try:
+        from api.v1.idea_runs import resume_running_idea_runs
+
+        resumed = await resume_running_idea_runs()
+        if resumed:
+            logger.info("已恢复 %d 个中断的 Idea 专家运行", resumed)
+    except Exception as exc:  # noqa: BLE001 - 恢复失败不应阻塞 API 启动
+        logger.warning("恢复中断 Idea 运行失败：%s", exc)
     if settings.demo_seed_on_startup:
         logger.info("DEMO_SEED_ON_STARTUP=1：预置示例 Project 由 WP16 种子任务负责导入")
     # WP01-T6：调度器默认关闭（SCHEDULER_ENABLED=0），关闭时由 scheduler 打印「未启用」；
