@@ -42,7 +42,6 @@ import os
 import re
 from pathlib import Path
 from typing import Any
-from services.storage import knowledge_root
 
 from sqlalchemy import event, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -63,6 +62,7 @@ from services.reader.errors import (
     VersionArtifactMissingError,
     VersionNotFoundError,
 )
+from services.storage import knowledge_root
 
 logger = logging.getLogger("sciloop.reader.versions")
 

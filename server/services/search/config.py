@@ -38,7 +38,7 @@ class SearchSettings:
     github_token: str = ""
 
     @classmethod
-    def from_env(cls) -> "SearchSettings":
+    def from_env(cls) -> SearchSettings:
         proxy = _env("SCILOOP_SEARCH_PROXY") or os.getenv("HTTP_PROXY") or None
         return cls(
             enabled_engines=_csv("SCILOOP_SEARCH_ENGINES", ""),

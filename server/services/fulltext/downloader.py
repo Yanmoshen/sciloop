@@ -14,7 +14,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from services.fulltext.document_store import HttpxFetcher, SourceCandidate, document_sources
-from services.fulltext.records import PaperRef, sha256_hex
+from services.fulltext.records import sha256_hex
 from services.fulltext.repository import SqlDocumentRepository
 from services.storage import knowledge_root
 

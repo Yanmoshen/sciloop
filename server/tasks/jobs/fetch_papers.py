@@ -1458,9 +1458,10 @@ def register_jobs(
     raw_time = str(getattr(settings, "scheduler_fetch_time", "02:00") or "02:00")
     # UI settings override the environment default when available.
     try:
+        from sqlalchemy import select
+
         from db.models.settings import AppSetting
         from db.session import SessionLocal
-        from sqlalchemy import select
 
         if SessionLocal is not None:
             with SessionLocal() as db:
