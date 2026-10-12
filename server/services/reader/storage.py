@@ -37,12 +37,12 @@ import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any
-from services.storage import knowledge_root
 
 from services.reader.errors import (
     ArchiveTooLargeError,
     UnsafeArchivePathError,
 )
+from services.storage import knowledge_root
 
 #: 单份原文/版本 PDF 体积上限 50MB（EasyPaper §7 ``max_upload_mb``）
 MAX_SOURCE_BYTES = 50 * 1024 * 1024
