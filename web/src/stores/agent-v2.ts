@@ -49,6 +49,7 @@ import {
   childList,
   createAgentState,
   latestPlan,
+  markTurnInterrupted,
   orderedItems,
   pendingApprovals,
   reasoningTextFor,
@@ -58,6 +59,7 @@ import {
   type AgentV2State,
 } from '../agent-v2/reducer'
 import { browserStorage, loadSnapshot, saveSnapshot, type StorageLike } from '../agent-v2/recovery'
+import { humanError } from '../utils/messages'
 
 export type AgentV2StoreOptions = AgentV2ClientOptions & {
   /** 持久化介质（默认 localStorage；测试可注入替身或传 null 关闭）。 */
@@ -184,9 +186,9 @@ export const useAgentV2Store = defineStore('agent-v2', () => {
   }
 
   function errMessage(error: unknown): string {
-    if (error instanceof AgentV2RequestError) return `${error.code}: ${error.message}`
-    if (error instanceof Error) return error.message
-    return String(error)
+    if (error instanceof AgentV2RequestError) return humanError(error)
+    if (error instanceof Error) return humanError({ message: error.message })
+    return humanError({ message: String(error) })
   }
 
   function describeThread(threadId: string): string {
@@ -220,14 +222,8 @@ export const useAgentV2Store = defineStore('agent-v2', () => {
       return
     }
     if (note.method === 'event' && note.thread_id) {
-      const turnId = note.turn_id ?? null
-      if (turnId && stopping.value === turnId && note.params && typeof note.params === 'object') {
-        const type = String((note.params as Record<string, unknown>).type ?? '')
-        if (type === 'turn/interrupted' || type === 'turn/completed' || type === 'turn/failed') {
-          // 停止确认到达：本地「已停止」标记可以撤掉（界面早已收束）
-          stopping.value = null
-        }
-      }
+      // 停止标记由下一次 startTurn 清除；终态事件只负责确认落盘，
+      // 不能让残留的流式缓冲重新显示光标或迟到正文。
       const gap = next.gapFrom[note.thread_id]
       if (gap !== null && gap !== undefined) void backfill(note.thread_id)
     }
@@ -463,12 +459,13 @@ export const useAgentV2Store = defineStore('agent-v2', () => {
   /** 停止当前回合：立刻收束界面，再让服务端确认中断（WP-04）。 */
   async function stopTurn(threadId: string, turnId: string): Promise<void> {
     stopping.value = turnId
+    // 收束本地状态，不等待 WebSocket 的中断响应才停止动画和控件。
+    set(markTurnInterrupted(state.value, threadId, turnId))
     pushStopNotice(threadId)
     try {
       await interruptTurn(threadId, turnId, '用户停止')
     } catch (error) {
-      // 中断失败（例如已经结束）时不留假状态
-      stopping.value = null
+      // 中断失败时仍保持收束，避免旧流式缓冲重新出现；下一轮开始会清除标记。
       pushError(error)
     }
   }

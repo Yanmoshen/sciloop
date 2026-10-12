@@ -1,15 +1,10 @@
 # 内置技能包（第三方内容，来源与许可在此登记）
 
-这个目录里**不是我们写的代码**：它们是从开源技能仓库整目录拷进来的技能包，
-本仓库只做了"适配字段"的改动（见下），**正文与脚本原样保留**。
 
-## 来源
 
-| 来源仓库 | 取了多少 | 仓库级许可 | 备注 |
-|---|---|---|---|
-| [`K-Dense-AI/scientific-agent-skills`](https://github.com/K-Dense-AI/scientific-agent-skills) | **42 个技能**（766 个文件） | MIT | ⚠️ 上游说明：**每个技能可能有自己的许可**，写在各自 `SKILL.md` 里 —— 我们**原样保留**了该字段（`license`），需要逐个核时看那里 |
+#### 本仓库只做了"适配字段"的改动（见下），**正文与脚本原样保留**。
 
-## 我们改了什么（只加字段，不碰内容）
+##
 
 每个 `SKILL.md` 的 frontmatter 里增加了：
 
@@ -36,13 +31,6 @@
 引擎对这两类是**分开对待**的（`mode: scripts | instructions`），说明书型不算"跑不了"。
 
 ⚠️ 需要 API key 的技能：`generate-image`（出图）等，其 `requires_env` 里写明了变量名。
-
-## 还没纳入的两个仓库（写在这里免得以后忘）
-
-| 仓库 | 为什么先不纳入 |
-|---|---|
-| [`Imbad0202/academic-research-skills`](https://github.com/Imbad0202/academic-research-skills) | 许可是 **CC BY-NC 4.0（禁止商用）**，与本仓库的 Apache-2.0 声明**冲突**。它的理念（研究→写作→评审→投稿、人机协同、诚信闸门、引用审计）与本产品高度一致，**先用"借鉴思路、自己重写"的方式吸收**；若要整包收入，必须在本文件与 `LICENSE`/`NOTICE` 里显式声明该部分不适用 Apache-2.0。 |
-| [`liangdabiao/stem-illustration-skill`](https://github.com/liangdabiao/stem-illustration-skill) | 授权不明（仓库里写"参考父项目"）。要收入需先向作者确认。 |
 
 ## 新增一个技能（写给以后的我）
 

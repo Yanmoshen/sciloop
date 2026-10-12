@@ -276,7 +276,7 @@ defineExpose({ toggle })
         </div>
 
         <div>
-          <p class="extra-title">取数留痕（GET /papers/{{ item.id }}/sources）</p>
+          <p class="extra-title">取数留痕</p>
           <el-skeleton v-if="sourcesLoading" :rows="2" animated />
           <p v-else-if="sourcesError" class="extra-body extra-body--error">
             取数留痕加载失败：{{ sourcesError }}（缺失不等于 0，故不显示数值）
@@ -284,9 +284,7 @@ defineExpose({ toggle })
           <ul v-else-if="sourceRows.length" class="source-list">
             <li v-for="row in sourceRows" :key="`row-${row[0]}`">
               <span class="sl-source-tag">
-                {{ row[1].label }} · {{ row[1].fields }} 条字段留痕 · last_http_status={{
-                  row[1].http ?? '未获取'
-                }}
+                {{ row[1].label }} · {{ row[1].fields }} 条字段留痕
               </span>
             </li>
           </ul>

@@ -38,8 +38,10 @@ from contracts.agent_v2.models import ModelRequest, StreamItem, TextDelta
 from contracts.agent_v2.version import CONTRACT_FREEZE_TAG, CONTRACT_VERSION
 from services.agent_compaction_v2 import CompactionService
 from services.agent_memory_v2 import MemoryStore
+from services.agent_runtime_v2 import CodexSession
 from services.agent_threads_v2 import AgentTree, ThreadRepository
 from services.model_gateway_v2 import ModelGateway
+from services.system_prompt import SCILOOP_SYSTEM_PROMPT
 
 from .facade import DEFAULT_REPLAY_LIMIT, AgentFacade, CallContext
 from .host import FakeRuntimeHost
@@ -145,6 +147,11 @@ class AgentV2Service:
         self.pump_limit = int(pump_limit)
         self.runtime_mode = str(runtime_mode or "fake").lower()
         self.started_at = self.clock.now_iso()
+        # One immutable instruction bundle belongs to the session, matching
+        # Codex's Session/TurnContext ownership.  Every host and compaction
+        # request must see the same prompt unless a caller explicitly injects
+        # a test prompt.
+        self.system_prompt = system_prompt if system_prompt is not None else SCILOOP_SYSTEM_PROMPT
 
         self.repo = ThreadRepository(self.conversations_root, clock=self.clock)
         self.tree = AgentTree(self.repo, clock=self.clock)
@@ -155,7 +162,7 @@ class AgentV2Service:
                 tree=self.tree,
                 memory=self.memory,
                 clock=self.clock,
-                system_prompt=system_prompt,
+                system_prompt=self.system_prompt,
                 token_budget=token_budget,
             )
         else:
@@ -165,7 +172,7 @@ class AgentV2Service:
                 clock=self.clock,
                 fixtures_dir=Path(fixtures_dir) if fixtures_dir else None,
                 default_scenario=default_scenario,
-                system_prompt=system_prompt,
+                system_prompt=self.system_prompt,
                 token_budget=token_budget,
             )
         self.summarizer = SummarizerProvider()
@@ -174,7 +181,18 @@ class AgentV2Service:
             gateway=ModelGateway(self.summarizer),
             clock=self.clock,
             token_budget=token_budget,
-            system_prompt=system_prompt,
+            system_prompt=self.system_prompt,
+        )
+        # Codex-style session owner: the protocol facade still exposes the
+        # existing methods, while integrations that need direct turn/context
+        # orchestration can use one stable adapter for fake and production
+        # hosts alike.
+        self.session = CodexSession(
+            repo=self.repo,
+            host=self.host,
+            tree=self.tree,
+            compaction=self.compaction,
+            system_prompt=self.system_prompt,
         )
         self.idempotency = IdempotencyStore()
         self.facade = AgentFacade(
@@ -207,6 +225,7 @@ class AgentV2Service:
             "contract_version": CONTRACT_VERSION,
             "contract_freeze_tag": CONTRACT_FREEZE_TAG,
             "host": "production" if isinstance(self.host, ProductionRuntimeHost) else "fake",
+            "session": "codex",
             "shutting_down": self._closing,
             "started_at": self.started_at,
             "conversations_root": str(self.conversations_root),
@@ -352,6 +371,10 @@ class AgentV2Service:
                 )
             )
             notified.append(conn.connection_id)
+        # The session coordinator may own workers started through its direct
+        # API even when the protocol facade is idle.  Converge those workers
+        # before closing the host so no active Turn lease survives shutdown.
+        await self.session.shutdown()
         await self.host.shutdown()
         return notified
 
@@ -364,7 +387,7 @@ class AgentV2Service:
                 tree=self.tree,
                 memory=self.memory,
                 clock=self.clock,
-                system_prompt=getattr(self.host, "system_prompt", None),
+                system_prompt=self.system_prompt,
                 token_budget=getattr(self.host, "token_budget", 6000),
             )
         else:
@@ -374,13 +397,21 @@ class AgentV2Service:
                 clock=self.clock,
                 fixtures_dir=self.host.fixtures_dir,
                 default_scenario=self.host.default_scenario,
-                system_prompt=self.host.system_prompt,
+                system_prompt=self.system_prompt,
                 token_budget=self.host.token_budget,
             )
         self.facade.host = self.host
+        self.session = CodexSession(
+            repo=self.repo,
+            host=self.host,
+            tree=self.tree,
+            compaction=self.compaction,
+            system_prompt=self.system_prompt,
+        )
 
     async def aclose(self) -> None:
         with contextlib.suppress(Exception):
+            await self.session.shutdown()
             await self.host.shutdown()
 
 

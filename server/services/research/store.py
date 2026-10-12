@@ -27,7 +27,7 @@ import logging
 from typing import Any
 
 from sqlalchemy import func, or_, select, text
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models.paper import Paper, PaperCard, PaperSpan
@@ -96,7 +96,7 @@ async def upsert_node_run(
 
     冲突目标是 ``(conversation_id, node, entry_index)`` 上的**部分唯一索引**
     （``WHERE conversation_id IS NOT NULL``），所以这里必须带上 ``index_where``，
-    否则 PostgreSQL 匹配不到索引、直接报错。
+    否则 SQLite 匹配不到部分索引。
     """
 
     values = {
@@ -106,7 +106,7 @@ async def upsert_node_run(
         "entry_index": entry_index,
         **fields,
     }
-    stmt = pg_insert(ResearchNodeRun).values(**values)
+    stmt = sqlite_insert(ResearchNodeRun).values(**values)
     update_cols = {
         key: getattr(stmt.excluded, key)
         for key in values
@@ -197,29 +197,14 @@ async def reap_stale_running_runs(session: AsyncSession) -> int:
     - 只在**服务启动时**调用：此刻任何 ``running`` 必然是上一代进程留下的。
     """
 
-    dialect = getattr(getattr(session, "bind", None), "dialect", None)
-    if getattr(dialect, "name", "") == "sqlite":
-        rows = (await session.execute(select(ResearchNodeRun).where(ResearchNodeRun.status == "running"))).scalars().all()
-        for row in rows:
-            payload = dict(row.payload or {})
-            payload["reaped_reason"] = "服务重启：上一代进程没跑完，本节点回到未开始，重新跑即可"
-            row.status = "pending"
-            row.payload = payload
-        result_count = len(rows)
-    else:
-        result = await session.execute(
-            text(
-                """
-                UPDATE research_node_runs
-                   SET status = 'pending',
-                       payload = COALESCE(payload, '{}'::jsonb)
-                                 || '{"reaped_reason": "服务重启：上一代进程没跑完，本节点回到未开始，重新跑即可"}'::jsonb,
-                       updated_at = now()
-                 WHERE status = 'running'
-                """
-            )
-        )
-        result_count = int(result.rowcount or 0)
+    rows = (await session.execute(select(ResearchNodeRun).where(ResearchNodeRun.status == "running"))).scalars().all()
+    for row in rows:
+        payload = dict(row.payload or {})
+        payload["reaped_reason"] = "服务重启：上一代进程没跑完，本节点回到未开始，重新跑即可"
+        row.status = "pending"
+        row.payload = payload
+        row.updated_at = func.now()
+    result_count = len(rows)
     await session.commit()
     return result_count
 
@@ -546,7 +531,11 @@ async def _span_samples(
             PaperSpan.paper_id,
             PaperSpan.section_name,
             PaperSpan.page_number,
-            func.left(PaperSpan.quote_text, 180),
+            # ``left()`` is PostgreSQL-specific and aborts the research flow
+            # on the project's SQLite-only deployment. ``substr`` is
+            # supported by both SQLite and PostgreSQL and keeps the same
+            # one-based character slice semantics.
+            func.substr(PaperSpan.quote_text, 1, 180),
         )
         .where(PaperSpan.paper_id.in_(paper_ids))
         .order_by(PaperSpan.paper_id, PaperSpan.id)

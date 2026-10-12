@@ -332,7 +332,7 @@ def clean_env_value(value: Any) -> str:
     """清洗环境变量值：去掉行尾注释与首尾空白，非 ASCII 视为未配置。
 
     背景（实测 2026-09-17）：``.env`` 里形如 ``GITHUB_TOKEN=    # 注释`` 的**空值行**，
-    经 docker compose ``env_file`` 解析后，注释文本被当成了值
+    环境变量文件里的行内注释被当成了值
     （容器内 ``GITHUB_TOKEN="# 可选：提升代码热度查询限额"``）。非 ASCII 的请求头
     会让 httpx 直接抛 ``UnicodeEncodeError``，把整轮抓取打挂；
     而被污染成"非空"的密钥还会让 ``configured`` 误报为真。这里统一做防御性清洗。

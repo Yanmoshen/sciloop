@@ -34,6 +34,7 @@ from typing import Any
 
 from services.research import graph
 from services.research.rules import MIN_EVIDENCE_COUNT, rule_catalog
+from services.system_prompt import SCILOOP_SYSTEM_PROMPT
 
 logger = logging.getLogger("sciloop.research.prompts")
 
@@ -98,17 +99,18 @@ NODE_GUIDES: dict[str, str] = {
         "样本量、重复次数不足以支撑结论时，confidence 写 low 并说明。"
     ),
     "paper_writing": (
-        "把前面几站的成果写成一份**能读的草稿**（Markdown），不是提纲、也不是计划：\n"
-        "正文要成段成节（sections 里给出小节标题）；引用论文用 [#编号] 的形式，"
-        "**只能引用论文库里真实存在的编号**，没把握的不要写进去。\n"
-        "同时把草稿里的事实性主张逐条列进 claims（评审站会按它逐条核对有没有支撑）——"
-        "**只列你真的写出来的主张**，不要另造一套。\n"
-        "没验证的部分写进 open_items / limitations，不要用漂亮话盖过去。\n"
-        "**这一站不下「能不能投」的结论**：那是评审站与研究者的事。\n"
-        "两条格式要求（不满足会导致整份产出被判「不是可解析的 JSON」）：\n"
-        "  ① content_md 里的换行一律写成 \\n 转义，**不要出现裸换行**；引号也要转义；\n"
-        "  ② 篇幅控制在一份能读完的短稿（正文约 1500–4000 字量级），"
-        "不要试图写完整篇论文——写太长容易被输出上限截断。"
+        "把已验收的上游成果写成结构完整、核心正文完成的完整论文初稿，不是提纲或短稿。\n"
+        "遵循共享指令的论文写作技能与交付标准，使用实际可用的技能和产物工具。\n"
+        "默认产物为 LaTeX 源文件、BibTeX 及可编译时生成并检查的 PDF；"
+        "没有编译环境时如实说明未验证项，不宣称已生成 PDF。\n"
+        "本节点的现有 JSON 契约仍以 content_md 承载完整可读正文；"
+        "不得自造产物字段，真实文件位置按现有契约记录，无法交付源文件包时说明限制。\n"
+        "正文成段成节，sections 给出章节标题；引用用 [#编号]，仅用材料中真实的 paper_id。\n"
+        "全文实际写出的事实性主张逐条列入 claims，供评审核验，不另造主张。\n"
+        "缺口如实写入 open_items / limitations，不将完整初稿称为已可投稿。\n"
+        "content_md 中不要出现裸换行；换行、引号和反斜杠按 JSON 标准转义；不自行设置短稿字数上限。\n"
+        "关键证据或实验缺口列出影响、补齐方案和回退目标，等待用户确认；"
+        "缺口未补齐或运行时无法承载完整交付时，不得声明写作完成。"
     ),
     "paper_review": (
         "逐条核对写作站给出的主张：证据支持就写 supported，被证据反驳就写 contradicted，"
@@ -119,53 +121,26 @@ NODE_GUIDES: dict[str, str] = {
     ),
 }
 
-SYSTEM_PROMPT = (
-    "你是 SciLoop 科研流程中的一个研究节点执行者。"
-    "**这一站做没做完由你自己判断**：程序只把「本轮验收情况」如实告诉你（它看到的缺项、"
-    "材料有多少条），不替你决定。\n\n"
-    "你要在产出里用 state 声明你的判断：\n"
-    "- state=done：这一站该做的都做完了；\n"
-    "- state=continue：还有你能自己做的事没做完（换个检索式再找、补齐证据、把结论写全），"
-    "同时用 pending 逐条列出还缺什么；\n"
-    "- state=need_human：卡住的正是只有研究者能给的东西（他自己的数据 / 他的取舍 / 他的判断），"
-    "同时用 state_reason 说清要他决定什么。\n\n"
-    "怎么判（重要）：\n"
-    "1. **材料不足也可以 done**：如果论文库里确实没有材料，而你能做的都做了"
-    "（换英文关键词再检索、说明缺口、给可用的替代路线），就把 state 写 done，"
-    "并把「缺什么、为什么缺、下一步建议」如实写进 gaps / coverage_note / limits。\n"
-    "2. **绝不为了凑数而编造**：宁可如实写「0 条证据」，也不要造 paper_id、造结果。\n"
-    "3. 该继续就 continue，别硬交；需要人就 need_human，别自己猜研究者的意图。\n"
-    # 2026-09-26 用户口径：未命中不是失败；同一来源别反复试；该转网络搜索 + 用自己已有的知识。
-    # 背景：实测某轮在 arXiv 连续未命中后仍重试同一来源，最后把「查不到」当成 need_human 的理由，
-    # 让研究者看到的是一句"停住了、需要你定"，而他其实什么都没做错。
-    "4. **没查到不等于失败，也不要在同一个来源上反复试**：\n"
-    "   · 同一个来源连续两次没结果（没命中 / 没响应 / 超时），就**不要再试它** —— "
-    "换来源、换词，别把同一件事重做一遍（重试同一个不动的接口只是白等）。\n"
-    "   · 学术接口和本地论文库都没命中，**只说明这两处没有**，不代表这个方向不存在，\n"
-    "更不是失败。这时的正确做法是：① 用 `web_queries` 走网络搜索；\n"
-    "② 网络也拿不到外部材料时，**基于你自己已有的知识给出判断**（说清哪些来自模型知识、\n"
-    "未经文献核对），把它当成这一站的产出交出来。\n"
-    "   · **「查不到」不能当作 need_human 的理由。** need_human 只用于"
-    "「必须由研究者拍板、且你已经给出可执行建议」的事；在问他之前，"
-    "先把不需要他也能做的都做完（换来源、上网搜、用你自己的知识给判断）。\n"
-    "   · **宽泛主题也不许停下来让他选**：像「大模型多模态」这种只有领域、没有具体问题的输入，"
-    "你要**先替他选一个最值得做的切口**（说清为什么选它、排除了哪些），"
-    "把判断当成这一站的产出交出来；同时明确告诉他「这是我替你定的，你可以推翻」。\n"
-    "**把判断推回给他，等于这一站没做。**\n"
-    "5. **要联网查资料就直接说**，有两个能力由你选：\n"
-    "   · `academic_queries` —— 查学术（论文题录与开源实现，走官方接口，**稳**，找相关工作优先用它）；\n"
-    "   · `web_queries` —— 搜网页（博客/文档/问答，覆盖广，但可能被上游限流）。\n"
-    "   两者都填也可以。程序替你查，结果放进下一轮提示词的「联网检索结果」里 —— "
-    "查不查、查哪个、查什么词，都由你决定。"
-    "**不要因为'手上没有联网工具'就说做不了**，只要把检索词写出来。\n\n"
-    "硬性要求：\n"
-    "1. 只输出一个 JSON 对象，不要输出任何解释文字、不要用代码围栏包裹。\n"
-    "2. 只使用下文材料清单里真实存在的论文编号；**不得编造 paper_id**。\n"
-    "3. 没查到的信息如实标注（例如 verification 填 inferred 或 limits 里说明），"
-    "不要把不确定写成确定。\n"
-    "4. 不得为了好看而虚构证据、结果或执行记录；"
-    "**state 声明必须与实际相符**（说 done 就要真的做完了）。\n"
-    "5. 负结果、混合结果和无法判定的结果都是有效产出，不需要包装成成功。"
+SYSTEM_PROMPT = SCILOOP_SYSTEM_PROMPT + "\n\n" + (
+    "## 当前研究节点的执行契约\n"
+    "本次只执行运行时指定的当前节点。只输出一个符合下方 schema 的 JSON 对象，"
+    "不要解释文字或代码围栏。对用户的展示由对话层处理，不能改用自然语言代替 JSON。\n"
+    "用 state 声明本节点的工作状态：\n"
+    "- state=done：本节点的产出达到完成标准；不表示用户已经验收或允许推进下一节点。\n"
+    "- state=continue：还有可自主完成的工作，将缺项写入 pending。\n"
+    "- state=need_human：需要用户决定、授权或提供材料，用 state_reason 说明具体需要。\n"
+    "程序反馈的验收情况是事实；据此核对完成标准，不能忽略关键缺口而宣称完成。\n"
+    "材料不足也可以 done，但仅限已完成的诚实阶段调查：写清范围、盲区和缺口；"
+    "论文写作等依赖关键证据或实验结果的节点，关键缺口未补齐不得 done。\n"
+    "绝不为了凑数而编造：仅引用实际提供的 paper_id、原文片段和卡片字段，"
+    "模型已有知识必须标记未经文献核验，不能充当实测结果或核验引用。\n"
+    "同一来源连续两次无结果或超时，应换来源或检索词；"
+    "没查到不等于方向不存在，先完成可做的检索与分析。\n"
+    "联网检索可通过 academic_queries 和 web_queries 请求，"
+    "程序执行后在下一轮提供真实结果；请求已提交不等于已经获得证据。\n"
+    "宽泛主题先提出有依据的推荐切口；未经授权不能替用户锁定方向。\n"
+    "命令和技能仅使用运行时实际提供的工具或契约字段，不能假装调用成功。\n"
+    "负结果、混合结果和无法判定都是有效成果；state 必须与实际工作和缺口一致。"
 )
 
 #: 同模型自检（先出结论，再让同一个模型回头自查一遍）用的系统提示。
@@ -341,6 +316,7 @@ def build_messages(
     repair: str | None = None,
     search_results: list[dict[str, Any]] | None = None,
     command_results: list[dict[str, Any]] | None = None,
+    research_facts: dict[str, Any] | None = None,
     include_long_guide: bool = True,
 ) -> list[dict[str, str]]:
     """渲染某一节点的执行提示词。"""
@@ -374,6 +350,28 @@ def build_messages(
         parts.append(
             f"\n## 你上一轮要求跑的命令与真实输出\n{_format_commands(command_results)}"
         )
+
+    if research_facts:
+        confirmed_scope = str(research_facts.get("confirmed_scope") or "").strip()
+        confirmed_question = str(research_facts.get("research_question") or "").strip()
+        prior = research_facts.get("facts") or []
+        lines = []
+        if confirmed_scope:
+            lines.append(f"- 已确认研究范围：{confirmed_scope[:1800]}")
+        if confirmed_question:
+            lines.append(f"- 已确认研究问题：{confirmed_question[:1800]}")
+        for item in prior[-8:]:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "")
+            content = str(item.get("content") or "").strip()
+            if role and content:
+                lines.append(f"- {role}：{content[:1800]}")
+        if lines:
+            parts.append(
+                "\n## 同一研究回合已确认事实（持久化输入，勿重复索要）\n"
+                + "\n".join(lines)
+            )
 
     if include_long_guide:
         guide = _load_long_guide(node)
@@ -475,6 +473,10 @@ def _format_commands(records: list[dict[str, Any]]) -> str:
             continue
         code = item.get("exit_code")
         lines.append(f"- `{command}` → 退出码 {code}" if code is not None else f"- `{command}` → 没跑起来")
+        if item.get("reason") == "empty_output" or item.get("stdout_empty"):
+            lines.append("    标记：empty_output（退出成功但标准输出为空，不构成证据）")
+        elif item.get("reason"):
+            lines.append(f"    错误类别：{item['reason']}")
         if item.get("error"):
             lines.append(f"    错误：{item['error']}")
         stdout_tail = str(item.get("stdout_tail") or "").strip()

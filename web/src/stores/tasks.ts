@@ -26,7 +26,7 @@ import {
   type FetchTaskSummary,
 } from '@/api/papers'
 
-const TERMINAL = ['done', 'failed', 'cancelled']
+const TERMINAL = ['done', 'partial', 'failed', 'cancelled']
 const POLL_INTERVAL_MS = 2500
 const WATCH_INTERVAL_MS = 15000
 
@@ -114,9 +114,29 @@ export const useTaskStore = defineStore('tasks', () => {
   }
 
   /** 提交一轮新的抓取并跟踪它 */
-  async function startFetch(limit = 30): Promise<{ ok: true; taskId: string } | { ok: false; status?: number; message: string }> {
+  async function startFetch(
+    options: {
+      limit?: number
+      fields?: string[]
+      keywords?: string[]
+      date_from?: string | null
+      date_to?: string | null
+      sources?: string[]
+      parse_fulltext?: boolean
+    } = {},
+  ): Promise<{ ok: true; taskId: string } | { ok: false; status?: number; message: string }> {
     try {
-      const task = await triggerFetch({ limit })
+      const task = await triggerFetch({
+        limit: options.limit ?? 30,
+        fields: options.fields,
+        keywords: options.keywords,
+        date_from: options.date_from,
+        date_to: options.date_to,
+        sources: options.sources,
+        download_fulltext: true,
+        parse_fulltext: options.parse_fulltext ?? false,
+        write_knowledge_base: true,
+      })
       await track(task.task_id)
       return { ok: true, taskId: task.task_id }
     } catch (error) {

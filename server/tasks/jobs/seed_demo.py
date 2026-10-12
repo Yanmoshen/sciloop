@@ -28,9 +28,9 @@
 --------------------------------------
 ::
 
-    docker compose exec -T backend python -m tasks.jobs.seed_demo --dry-run
-    docker compose exec -T backend python -m tasks.jobs.seed_demo --run-pipeline
-    docker compose exec -T backend python -m tasks.jobs.seed_demo --verify
+    (cd server && python -m tasks.jobs.seed_demo --dry-run)
+    (cd server && python -m tasks.jobs.seed_demo --run-pipeline)
+    (cd server && python -m tasks.jobs.seed_demo --verify)
 
 ``--run-pipeline`` 需要：项目处于 ``TASKBOOK_LOCKED``（WP08 任务书已锁定）+ LLM 凭据。
 缺失时本任务如实返回 ``status=blocked`` 与具体 blocker，**不会**伪造数据把验收糊过去。
@@ -148,11 +148,20 @@ def _check_six_stages(session: Any, project_id: int | None) -> SeedCheck:
         stages = _rows(
             session,
             """
-            SELECT DISTINCT ON (so.stage) so.stage, so.status, so.attempt, so.pipeline_run_id
-            FROM stage_outputs so
-            JOIN pipeline_runs r ON r.id = so.pipeline_run_id
-            WHERE r.project_id = :pid
-            ORDER BY so.stage, so.attempt DESC
+            SELECT t.stage, t.status, t.attempt, t.pipeline_run_id
+            FROM (
+                SELECT so.stage AS stage, so.status AS status, so.attempt AS attempt,
+                       so.pipeline_run_id AS pipeline_run_id,
+                       row_number() OVER (
+                           PARTITION BY so.stage
+                           ORDER BY COALESCE(so.attempt, 0) DESC
+                       ) AS rn
+                FROM stage_outputs so
+                JOIN pipeline_runs r ON r.id = so.pipeline_run_id
+                WHERE r.project_id = :pid
+            ) t
+            WHERE t.rn = 1
+            ORDER BY t.stage
             """,
             pid=project_id,
         )
@@ -564,7 +573,7 @@ def inspect(project_id: int | None = None, *, project_slug: str = DEFAULT_PROJEC
             "ok": False,
             "job": JOB_NAME,
             "status": "failed",
-            "error": "同步会话工厂不可用（DATABASE_URL / psycopg 未就绪）",
+            "error": "同步会话工厂不可用（DATABASE_URL / sqlite3 未就绪）",
         }
     checks: list[SeedCheck] = []
     try:

@@ -12,9 +12,8 @@
 
 ## 一、为什么代码在 `server/mcp_server/` 而不是这里
 
-硬约束，不是审美：后端镜像构建上下文是 `./server`（`docker-compose.yml:33`），
-容器内 `WORKDIR=/app/server`、`PYTHONPATH=/app/server` → **仓库根的 `tools/` 进不了镜像**，
-`server/` 就 import 不到。而把上下文改成仓库根会把 `web/node_modules`（约 1.9 万文件）塞进构建上下文。
+硬约束，不是审美：后端的导入根是 `server/`（`python -m uvicorn main:app --app-dir server`，
+`PYTHONPATH=server`）→ **仓库根的 `tools/` 不在导入根里**，`server/` 就 import 不到。
 所以代码放后端包内，本目录负责对外说明。
 
 ---
@@ -73,7 +72,7 @@ cd server && ../.learnbuddy/tmp/mcpenv/Scripts/python.exe -m pytest mcp_server/t
 
 # 静态检查（两个版本都要过 —— 宿主 0.15.13 / 镜像 0.16.8，两者会不一致）
 cd server && ruff check mcp_server
-docker run --rm -v "D:/aicoding竞赛/server:/src" -w /src sciloop-backend:latest ruff check mcp_server
+cd server && ruff check mcp_server
 
 # 手工试一次（stdio）
 cd server && SCILOOP_MCP_WORKSPACE=$PWD SCILOOP_MCP_ALLOW_EXEC=1 python -m mcp_server.server
@@ -97,8 +96,8 @@ cd server && SCILOOP_MCP_WORKSPACE=$PWD SCILOOP_MCP_ALLOW_EXEC=1 python -m mcp_s
 
 1. **尚未接进产品**：没有任何 API / 研究节点调用它（`server/` 里引用 0 处）。接线位置（哪个节点、
    谁批、审计落哪张表）需要先定。
-2. **运行中的容器看不到它**：`server/mcp_server/` 是新增顶层包，不在 `docker-compose.override.yml`
-   挂载清单里；且 `mcp` 是新依赖 → 需一次 `docker compose build backend`（**不是** `down`）。
+2. **运行中的后端看不到新代码**：`server/mcp_server/` 是新增顶层包、`mcp` 是新依赖
+   → 需重装依赖并**重启后端**（`python tools/run.py restart`）。
 3. **官方 server 还没接**（filesystem / fetch / git）：需要给镜像装 Node（Debian 13 的 apt 够用），
    且要**构建期预装**官方包 —— 运行时 `npx -y` 会联网下载，评测环境断网就挂。
 4. ~~旧的手写工具层 `server/tools/` 待删除~~ —— **已删除（2026-09-21）**。

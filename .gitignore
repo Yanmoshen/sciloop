@@ -48,8 +48,8 @@ htmlcov/
 .cleanup-todo/
 
 # ===== 宿主侧持久化数据（容器 bind mount 的目标，禁止入库）=====
-# 例：./.data/fulltext-cache —— 归一全文文本缓存，WP01 持久化后让容器重建
-# 不再丢失 offset 校验所需的全文（见 docker-compose.yml 的 backend.volumes）。
+# 例：./.data/fulltext-cache —— 归一全文文本缓存，持久化后重启服务
+# 不再丢失 offset 校验所需的全文。
 .data/
 
 # 宿主机知识库运行时内容（用户论文、上传资料、对话与生成产物）
@@ -99,7 +99,7 @@ scripts/verify/_*
 example.html
 
 # ===== 非运行必需内容（保留在本地，但永不入库）=====
-# 开源仓库只保留「能跑起来的最小集合」：server/ web/ prompts/ docker-compose.yml config/
+# 开源仓库只保留「能跑起来的最小集合」：server/ web/ prompts/ config/
 # .env.example LICENSE README.md。以下目录对运行程序不是必需的，一律不入库：
 #   assets/       项目计划书、附录、任务包（含 WP01–WP17）
 #   docs/         主计划、工程说明、部署手册、决策记录、运行态报告、截图
@@ -118,8 +118,14 @@ example.html
 /deliverables/
 /preview/
 
-
-# ===== 本地开发专用覆盖文件（不入库）=====
-# docker-compose.override.yml 把宿主源码挂进容器并开启热重载，仅供本机开发；
-# 交付/生产验收请显式用 docker compose -f docker-compose.yml up -d --build 绕开它。
-docker-compose.override.yml
+# ===== 本地验收、调试和浏览器运行产物（不入库）=====
+.conv*.json
+.sse-*.txt
+.tmp-*.json
+server-restart.err
+output/
+tmp/
+tmp-sandbox/
+/server/knowledge-base/
+/server/tests/agent_v2/e2e_codex_regression/ACCEPTANCE-REPORT.md
+.codex-finalizer-sciloop/

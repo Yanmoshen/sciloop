@@ -22,7 +22,7 @@
 --------
 
 与 ``app/services/ingest/jobs.py`` 不同的一点：翻译链路**必须**写 ``llm_call_logs``
-（LLM 记账红线），而异步连接池（asyncpg）与事件循环绑定。因此本模块按
+（LLM 记账红线），而异步连接（aiosqlite）与事件循环绑定。因此本模块按
 ``app/services/parsing/card_builder.py`` 的口径，**在 FastAPI 的既有事件循环内**
 用 ``asyncio.create_task`` 调度，把 CPU 密集段（pymupdf 解析/回写/高亮）用
 ``asyncio.to_thread`` 丢到线程里，**避免后台线程与主循环争用同一个异步连接池**。
@@ -323,18 +323,27 @@ def get_task(task_id: str) -> dict[str, Any] | None:
 
 
 def list_tasks() -> list[dict[str, Any]]:
-    """任务列表：优先内存（含进行中）；内存为空时从磁盘 manifest 恢复只读列表。"""
+    """合并磁盘历史与进行中任务；同一任务以内存中的最新状态为准。"""
     with _TASKS_LOCK:
         snapshot = [task.to_dict() for task in _TASKS.values()]
-    if snapshot:
-        return sorted(snapshot, key=lambda item: str(item.get("created_at") or ""), reverse=True)
-    recovered: list[dict[str, Any]] = []
-    for task_id in artifacts.list_task_ids(limit=50):
+    recovered: dict[str, dict[str, Any]] = {}
+    for task_id in artifacts.list_task_ids(limit=10000):
         manifest = artifacts.read_manifest(task_id)
         if manifest is None:
             continue
-        recovered.append(_detail_from_manifest(manifest))
-    return sorted(recovered, key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        recovered[task_id] = _detail_from_manifest(manifest)
+    recovered.update({str(item["task_id"]): item for item in snapshot})
+    return sorted(recovered.values(), key=lambda item: str(item.get("created_at") or ""), reverse=True)
+
+
+def preview_blocks(task_id: str) -> list[dict[str, Any]]:
+    """只公开原译正文和页码，不把排版诊断混入阅读内容。"""
+    task = _get_raw(task_id)
+    rows = _manifest_blocks(task) if task is not None else (artifacts.read_manifest(task_id) or {}).get("blocks", [])
+    return [
+        {"page": row.get("page"), "source_text": row.get("source_text", ""), "target_text": row.get("target_text", "")}
+        for row in rows if isinstance(row, Mapping)
+    ]
 
 
 def cancel(task_id: str) -> tuple[bool, str]:
@@ -807,6 +816,7 @@ def _build_manifest(task: TranslateTask) -> dict[str, Any]:
         "schema_version": artifacts.SCHEMA_VERSION,
         "task_id": task.task_id,
         "paper_id": task.paper_id,
+        "source_filename": task.filename,
         "mode": task.mode,
         "highlight": bool(task.highlight_requested),
         "engine": ENGINE_NAME,
@@ -857,7 +867,7 @@ def _detail_from_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "highlight": bool(manifest.get("highlight")),
         "paper_id": manifest.get("paper_id"),
         "source": {
-            "filename": files.get("source") if isinstance(files, Mapping) else None,
+            "filename": manifest.get("source_filename") or (files.get("source") if isinstance(files, Mapping) else None),
             "pages": manifest.get("pages"),
             "sha256": sha.get("source") if isinstance(sha, Mapping) else None,
         },

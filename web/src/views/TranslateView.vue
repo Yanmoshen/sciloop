@@ -49,13 +49,13 @@ const pickedTitle = ref('')
 const pickedLabel = computed(() => {
   if (!paperId.value) return ''
   const title = pickedTitle.value.trim()
-  if (!title) return `论文 #${paperId.value}`
+  if (!title) return '已选择论文'
   return title.length > 64 ? `${title.slice(0, 64)}…` : title
 })
 const detail = ref<TranslateJob | null>(null)
 const previewBlocks = ref<TranslatePreviewBlock[]>([])
 const previewLoading = ref(false)
-const engine = ref('')
+const previewNotice = ref('')
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
 
@@ -88,7 +88,11 @@ function ensurePolling(): void {
       if (!hasRunning.value) stopPolling()
       if (detail.value) {
         const fresh = jobs.value.find((job) => job.task_id === detail.value?.task_id)
-        if (fresh) detail.value = fresh
+        if (fresh) {
+          const completedNow = detail.value.status !== 'completed' && fresh.status === 'completed'
+          detail.value = fresh
+          if (completedNow) void loadPreview(fresh.task_id)
+        }
       }
     })()
   }, 2500)
@@ -113,7 +117,6 @@ async function loadJobs(): Promise<void> {
   try {
     const result = await listTranslateJobs(30)
     jobs.value = result.items ?? []
-    engine.value = result.engine ?? ''
   } catch {
     /* 拉取失败保留上一份列表 */
   } finally {
@@ -168,9 +171,10 @@ async function createFromFile(event: Event): Promise<void> {
 
 async function openDetail(taskId: string): Promise<void> {
   previewBlocks.value = []
+  previewNotice.value = ''
   detail.value = jobs.value.find((job) => job.task_id === taskId) ?? null
   await refreshDetail(taskId)
-  void loadPreview(taskId)
+  if (detail.value?.status === 'completed') void loadPreview(taskId)
 }
 
 async function refreshDetail(taskId: string): Promise<void> {
@@ -183,13 +187,18 @@ async function refreshDetail(taskId: string): Promise<void> {
 
 async function loadPreview(taskId: string): Promise<void> {
   previewLoading.value = true
+  previewNotice.value = ''
   try {
     const preview = await fetchTranslatePreview(taskId)
+    if (detail.value?.task_id !== taskId) return
     previewBlocks.value = preview.blocks ?? []
   } catch {
-    previewBlocks.value = []
+    if (detail.value?.task_id === taskId) {
+      previewBlocks.value = []
+      previewNotice.value = '对照内容暂时无法加载，请重试。'
+    }
   } finally {
-    previewLoading.value = false
+    if (detail.value?.task_id === taskId) previewLoading.value = false
   }
 }
 
@@ -220,8 +229,7 @@ function jobTitle(job: TranslateJob): string {
   if (title) return title
   const filename = String(job.source?.filename ?? '').trim()
   if (filename) return filename
-  if (job.paper_id) return `论文 #${job.paper_id}`
-  return job.task_id
+  return '翻译文档'
 }
 
 /** 状态文案（用户口径 2026-09-26：已完成 / 正在翻译 / 未完成）。 */
@@ -250,7 +258,15 @@ function download(taskId: string, format: 'mono' | 'dual'): void {
   window.open(translatePdfUrl(taskId, format), '_blank', 'noopener')
 }
 
-const detailWarnings = computed(() => detail.value?.layout_warnings ?? [])
+const hasLayoutWarnings = computed(() => Boolean(detail.value?.layout_warnings?.length))
+
+function stageLabel(stage: string | null | undefined): string {
+  const labels: Record<string, string> = {
+    pending: '等待处理', parsing: '读取原文', rewriting: '翻译正文',
+    rendering: '排版译文', highlighting: '整理重点',
+  }
+  return stage ? labels[stage] ?? '' : ''
+}
 
 /**
  * 带着 `?paper_id=` 进来（从阅读页点「翻译该论文」）→ **直接开跑**，不让研究者再点一次。
@@ -291,7 +307,6 @@ onUnmounted(stopPolling)
   <section class="translator">
     <header class="translator__head">
       <h1>论文翻译</h1>
-      <span v-if="engine" class="chip">{{ engine }}</span>
       <span class="badge" :class="hasRunning ? 'badge--warn' : 'badge--ok'">
         {{ hasRunning ? '有任务进行中' : '空闲' }}
       </span>
@@ -373,7 +388,7 @@ onUnmounted(stopPolling)
               <span class="mono pct">{{ job.percent ?? 0 }}%</span>
             </td>
             <td>{{ job.mode === 'simplify' ? '通俗简化' : '全文翻译' }}</td>
-            <td class="ellipsis">{{ job.source?.filename ?? (job.paper_id ? `论文 #${job.paper_id}` : '—') }}</td>
+            <td class="ellipsis">{{ job.source?.filename ?? (job.paper_id ? '论文库' : '—') }}</td>
             <td class="mono">{{ timeOf(job.created_at) }}</td>
             <td class="ops">
               <button class="link-btn" type="button" @click="openDetail(job.task_id)">详情</button>
@@ -402,7 +417,7 @@ onUnmounted(stopPolling)
                 取消
               </button>
               <button
-                v-else-if="job.status === 'failed'"
+                v-else-if="['failed', 'error', 'cancelled'].includes(job.status)"
                 class="link-btn"
                 type="button"
                 @click="action('retry', job)"
@@ -419,7 +434,7 @@ onUnmounted(stopPolling)
       <div v-if="detail" class="scrim" @click.self="detail = null">
         <div class="dialog" role="dialog" aria-modal="true" aria-label="翻译任务详情">
           <header class="dialog__head">
-            <h2>翻译任务 {{ detail.task_id }}</h2>
+            <h2>{{ jobTitle(detail) }}</h2>
             <span class="tag" :class="statusTag(String(detail.status)).cls">
               <span v-if="statusTag(String(detail.status)).running" class="spin" aria-hidden="true" />
               {{ statusTag(String(detail.status)).text }}
@@ -435,16 +450,12 @@ onUnmounted(stopPolling)
           <div class="dialog__meta">
             <span class="chip">{{ detail.mode === 'simplify' ? '通俗简化' : '全文翻译' }}</span>
             <span class="chip">进度 {{ detail.percent ?? 0 }}%</span>
-            <span v-if="detail.stage" class="chip">{{ detail.stage }}</span>
+            <span v-if="stageLabel(detail.stage)" class="chip">{{ stageLabel(detail.stage) }}</span>
             <span v-if="detail.source?.pages" class="chip">{{ detail.source.pages }} 页</span>
           </div>
 
-          <p v-if="detail.message" class="dialog__line">{{ detail.message }}</p>
-          <p v-if="detail.error" class="dialog__line dialog__line--err">{{ detail.error }}</p>
-
-          <ul v-if="detailWarnings.length" class="warnings scroll-y">
-            <li v-for="(warning, index) in detailWarnings" :key="index">{{ warning }}</li>
-          </ul>
+          <p v-if="['failed', 'error'].includes(detail.status)" class="dialog__line dialog__line--err">翻译未能完成，可以重试或重新上传原文。</p>
+          <p v-if="hasLayoutWarnings" class="dialog__line">部分内容的排版需要检查，请对照原文确认公式、图表和较长段落。</p>
 
           <div class="panel__head">
             <h3>逐块对照</h3>
@@ -457,7 +468,8 @@ onUnmounted(stopPolling)
               <div class="pair__col pair__col--dst">{{ block.target_text ?? '—' }}</div>
             </li>
           </ul>
-          <p v-else class="empty">本次任务没有可预览的对照文件</p>
+          <p v-else-if="previewNotice" class="empty">{{ previewNotice }} <button class="link-btn" type="button" @click="loadPreview(detail.task_id)">重新加载</button></p>
+          <p v-else class="empty">{{ isRunning(detail.status) ? '完成翻译后将在这里显示原译对照。' : '这份文档没有可对照的文字内容。' }}</p>
 
           <footer class="dialog__foot">
             <button
@@ -578,7 +590,7 @@ onUnmounted(stopPolling)
   background: var(--color-bg-hover, var(--color-bg-subtle));
 }
 .pick-btn:focus-visible {
-  outline: 2px solid var(--color-accent);
+  outline: 2px solid var(--color-brand);
   outline-offset: 1px;
 }
 .pick-btn__text {
@@ -590,7 +602,7 @@ onUnmounted(stopPolling)
 }
 /* 还没选时用次要色，和"已选中"区分开（不写解释性小字） */
 .pick-btn__text--empty {
-  color: var(--color-text-tertiary);
+  color: var(--color-text-secondary);
 }
 .pick-btn__hint {
   flex: none;

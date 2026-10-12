@@ -65,7 +65,7 @@ async def _session() -> AsyncIterator[AsyncSession]:
         raise _error(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "database_unavailable",
-            "异步数据库会话工厂不可用（DATABASE_URL / asyncpg 未就绪）",
+            "异步数据库会话工厂不可用（DATABASE_URL / aiosqlite 未就绪）",
         )
     async with AsyncSessionLocal() as session:
         yield session

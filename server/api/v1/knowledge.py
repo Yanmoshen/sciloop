@@ -22,6 +22,12 @@ async def list_entries(q: str = "", bucket: str | None = None, folder: str | Non
     return knowledge_base.snapshot(q=q, bucket=bucket, folder=folder.split("/") if folder else None, project_id=project_id)
 
 
+@router.post("/sync")
+async def sync_knowledge_base(_owner: OwnerDep) -> dict[str, int]:
+    """Import the current knowledge-base directory tree into the manifest."""
+    return knowledge_base.sync_disk_index()
+
+
 @router.post("/entries")
 async def create_entry(_owner: OwnerDep, payload: Annotated[dict, Body(...)]) -> dict:
     return knowledge_base.create(
@@ -57,7 +63,10 @@ async def download_file(entry_id: str):
 
 @router.patch("/entries/{entry_id}")
 async def update_entry(entry_id: str, _owner: OwnerDep, payload: Annotated[dict, Body(...)]) -> dict:
-    result = knowledge_base.update(entry_id, payload)
+    try:
+        result = knowledge_base.update(entry_id, payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"code": "knowledge_name_conflict", "message": str(exc)}) from exc
     if result is None:
         raise HTTPException(status_code=404, detail={"code": "knowledge_not_found", "message": "条目不存在"})
     return result

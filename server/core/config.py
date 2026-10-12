@@ -16,6 +16,8 @@ from typing import Any, Literal
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from core.database import DEFAULT_DATABASE_URL, database_url
+
 AccessMode = Literal["public_demo", "owner_mode"]
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -33,19 +35,13 @@ class Settings(BaseSettings):
     # ===== 应用 =====
     app_env: str = "development"
     app_secret_key: str = "change_me"
-    app_base_url: str = "http://localhost:8080"
+    app_base_url: str = "http://localhost:8000"
     app_access_mode: AccessMode = "public_demo"
     owner_token: str = ""
     public_replay_rate_limit_per_hour: int = 10
 
     # ===== 数据库 =====
-    postgres_host: str = "db"
-    postgres_port: int = 5432
-    postgres_db: str = "sciloop"
-    postgres_user: str = "sciloop"
-    postgres_password: str = "change_me"
-    # 宿主机默认使用仓库内 SQLite；设置 DATABASE_URL 后仍可切回 PostgreSQL/Docker。
-    database_url: str = "sqlite+aiosqlite:///./knowledge-base/sciloop.sqlite3"
+    database_url: str = DEFAULT_DATABASE_URL
 
     # 统一保存论文、上传资料、对话、解析、翻译和 agent 产物的根目录。
     knowledge_base_dir: str = "./knowledge-base"
@@ -90,7 +86,7 @@ class Settings(BaseSettings):
         default="./knowledge-base/parses/fulltext-cache",
         description=(
             "归一全文文本缓存目录（WP01 收尾新增）。空 = 沿用 text_cache 的临时目录默认值。"
-            "宿主机与 Docker 均使用仓库 knowledge-base/parses/fulltext-cache，避免容器重建后 offset 校验退化。"
+            "统一使用仓库 knowledge-base/parses/fulltext-cache，避免重建服务后 offset 校验退化。"
             "注意：services.fulltext.text_cache 直接读同名环境变量（不经过本设置），"
             "此处提供设置项供后续服务/脚本按配置访问同一目录。"
         ),
@@ -100,7 +96,7 @@ class Settings(BaseSettings):
         default="./knowledge-base/projects/tasks",
         description=(
             "抓取/同步任务历史目录（任务监控用）。空 = 默认 <backend>/.cache/tasks；"
-            "宿主机与 Docker 均使用仓库 knowledge-base/projects/tasks，"
+            "统一使用仓库 knowledge-base/projects/tasks，"
             "以便容器重建后历史记录仍可查询（任务登记本身只存在进程内存里）。"
         ),
     )
@@ -111,6 +107,8 @@ class Settings(BaseSettings):
         description="1 = backend 启动时注册 fetch_papers / score_papers / parse_fulltext；默认关闭",
     )
     scheduler_fetch_interval_hours: int = Field(default=24, ge=1)
+    scheduler_fetch_time: str = Field(default="02:00", description="每日自动抓取时间（HH:MM，仅一条规则）")
+    scheduler_timezone: str = Field(default="Asia/Shanghai")
     scheduler_score_interval_hours: int = Field(default=12, ge=1)
     scheduler_parse_interval_hours: int = Field(default=12, ge=1)
     scheduler_job_limit: int = Field(default=50, ge=1, description="每轮任务的默认处理上限")
@@ -175,6 +173,11 @@ class Settings(BaseSettings):
     vite_api_base: str = "/api/v1"
     vite_default_theme: str = "light"
 
+    @field_validator("database_url")
+    @classmethod
+    def _validate_database_url(cls, value: str) -> str:
+        return database_url(value)
+
     # ------------------------------------------------------------------ #
     @field_validator("app_access_mode", mode="before")
     @classmethod
@@ -208,21 +211,8 @@ class Settings(BaseSettings):
 
     @property
     def sync_database_url(self) -> str:
-        """同步驱动 URL（alembic 同步迁移与批量任务使用）。
-
-        ``postgresql://`` 在 SQLAlchemy 中默认解析到 psycopg2，而本项目只装 psycopg3，
-        因此这里显式改写为 ``postgresql+psycopg://``。
-        """
-        url = (self.database_url or "").strip()
-        if url.startswith("postgres://"):
-            url = "postgresql://" + url[len("postgres://") :]
-        if url.startswith("sqlite+aiosqlite:///"):
-            return url.replace("sqlite+aiosqlite", "sqlite", 1)
-        if "+asyncpg" in url:
-            return url.replace("+asyncpg", "+psycopg")
-        if url.startswith("postgresql://"):
-            return "postgresql+psycopg://" + url[len("postgresql://") :]
-        return url
+        """批量任务使用与异步服务相同的 SQLite 文件。"""
+        return database_url(self.database_url, asynchronous=False)
 
 
 @lru_cache(maxsize=1)

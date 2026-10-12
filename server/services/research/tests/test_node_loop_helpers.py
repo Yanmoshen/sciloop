@@ -539,3 +539,9 @@ def test_queries_are_read_from_the_two_fields() -> None:
     assert len(orchestrator._query_list(candidate, "web_queries")) == orchestrator.MAX_SEARCH_QUERIES
     assert orchestrator._query_list({}, "academic_queries") == []
     assert orchestrator._query_list({"academic_queries": "不是数组"}, "academic_queries") == []
+
+
+def test_research_turn_budget_has_explicit_boundaries() -> None:
+    assert orchestrator._budget_stop_reason(0, 0) is None
+    assert orchestrator._budget_stop_reason(orchestrator.NODE_MAX_LLM_CALLS, 0) == "llm_calls"
+    assert orchestrator._budget_stop_reason(0, orchestrator.NODE_MAX_SEARCH_BATCHES) == "search_batches"

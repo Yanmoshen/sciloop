@@ -77,39 +77,9 @@ _INFLUENCE_DIM_TEMPLATE: dict[str, dict[str, Any]] = {
 # --------------------------------------------------------------------------------------
 _SESSION_FACTORY_NAMES = ("SessionLocal", "SyncSessionLocal", "session_factory", "sync_session_factory")
 _ENGINE_NAMES = ("engine", "sync_engine")
-_MODULE_CACHE: dict[str, bool] = {}
-
-
-def _module_available(name: str) -> bool:
-    if name not in _MODULE_CACHE:
-        try:
-            importlib.import_module(name)
-            _MODULE_CACHE[name] = True
-        except Exception:  # noqa: BLE001
-            _MODULE_CACHE[name] = False
-    return _MODULE_CACHE[name]
-
-
-def _sync_database_url() -> str | None:
-    """取同步驱动 URL（alembic/任务队列同样需要同步驱动，故此处复用同一份配置）。"""
-    url: str | None = None
-    try:
-        from core.config import settings  # WP01 配置中心
-
-        url = settings.sync_database_url
-    except Exception:  # noqa: BLE001 - 配置中心未就绪时退回环境变量
-        url = os.getenv("DATABASE_URL") or os.getenv("SYNC_DATABASE_URL")
-    if not url:
-        return None
-    if "+asyncpg" in url:
-        driver = "psycopg" if _module_available("psycopg") else "psycopg2"
-        url = url.replace("+asyncpg", f"+{driver}")
-    elif url.startswith("postgresql://"):
-        if _module_available("psycopg"):
-            url = url.replace("postgresql://", "postgresql+psycopg://", 1)
-        elif _module_available("psycopg2"):
-            url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    return url
+def _sync_database_url() -> str:
+    from core.config import settings
+    return settings.sync_database_url
 
 
 def _wp01_session_factory() -> sessionmaker | None:

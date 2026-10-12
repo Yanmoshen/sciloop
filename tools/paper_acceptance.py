@@ -3,7 +3,7 @@
 The command keeps generated manuscripts below ``knowledge-base/projects`` and
 reports external material below ``knowledge-base/literature`` or ``uploads``.
 It delegates compilation to the pinned, project-local Tectonic bootstrapper.
-Docker is available only as an explicit compatibility fallback.
+No container runtime is required.
 """
 
 from __future__ import annotations
@@ -102,38 +102,6 @@ def compile_native(paper_dir: Path, engine: str) -> list[dict]:
     return steps
 
 
-def docker_available() -> bool:
-    if not shutil.which("docker"):
-        return False
-    result = run(["docker", "info", "--format", "{{.ServerVersion}}"], ROOT, timeout=8)
-    return result["ok"]
-
-
-def compile_docker(paper_dir: Path) -> list[dict]:
-    image = os.environ.get("SCILOOP_TEXLIVE_IMAGE", "texlive/texlive:latest")
-    pipeline = (
-        "set -eu; "
-        "xelatex -interaction=nonstopmode -halt-on-error main.tex; "
-        "if [ -f refs.bib ]; then bibtex main; fi; "
-        "xelatex -interaction=nonstopmode -halt-on-error main.tex; "
-        "xelatex -interaction=nonstopmode -halt-on-error main.tex"
-    )
-    command = [
-        "docker",
-        "run",
-        "--rm",
-        "-v",
-        f"{paper_dir}:/work",
-        "-w",
-        "/work",
-        image,
-        "bash",
-        "-lc",
-        pipeline,
-    ]
-    return [run(command, ROOT, timeout=900)]
-
-
 def compile_project(paper_dir: Path) -> dict:
     """Use the repository's pinned compiler and retain bootstrap diagnostics."""
     compiler = ROOT / "tools" / "compile_paper.py"
@@ -171,7 +139,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="SciLoop paper acceptance runner")
     parser.add_argument("--paper-dir", help="manuscript directory; defaults to newest project with main.tex")
     parser.add_argument("--no-compile", action="store_true", help="run static and isolation checks only")
-    parser.add_argument("--docker-fallback", action="store_true", help="use Docker only if project compiler bootstrap fails")
     parser.add_argument("--json", action="store_true", help="print only the JSON result")
     args = parser.parse_args()
 
@@ -185,9 +152,7 @@ def main() -> int:
     if not args.no_compile:
         report["compile"] = compile_project(paper_dir)
         project_ok = any(step.get("ok") for step in report["compile"].get("steps", []))
-        if not project_ok and args.docker_fallback and docker_available():
-            report["compile"] = {"status": "docker", "image": os.environ.get("SCILOOP_TEXLIVE_IMAGE", "texlive/texlive:latest"), "steps": compile_docker(paper_dir)}
-        elif not project_ok:
+        if not project_ok:
             failure = report["compile"].get("steps", [{}])[-1]
             report["compile"] = {
                 **report["compile"],

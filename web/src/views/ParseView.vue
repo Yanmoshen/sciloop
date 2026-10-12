@@ -274,6 +274,20 @@ function entriesOf(def: CardFieldDef): CardEntry[] {
   return Array.isArray(value) ? (value as CardEntry[]) : []
 }
 
+/**
+ * 这些字段是卡片层面的结构化整理，当前契约不要求为每个条目生成 paper_span。
+ * 空 evidence_span 在这里表示能力边界，不表示一次定位失败；其它 entries 字段仍按
+ * 真实 evidence_span 判断，避免掩盖关键创新、主要结论和局限性的定位问题。
+ */
+const NON_LOCATABLE_ENTRY_FIELDS = new Set<CardFieldDef['key']>([
+  'technical_route',
+  'transferable',
+])
+
+function isEntryLocationUnavailable(def: CardFieldDef): boolean {
+  return NON_LOCATABLE_ENTRY_FIELDS.has(def.key)
+}
+
 /** 字段定位状态（优先用后端 by_field 统计，缺失则本地统计）；无可说状态时返回空文本，模板不渲染 */
 function fieldStatus(def: CardFieldDef): {
   text: string
@@ -287,6 +301,13 @@ function fieldStatus(def: CardFieldDef): {
       detail: '该字段为卡片聚合字段，未附行内引用条目 → 以卡片文本为准，无定位区间',
     }
   }
+  if (isEntryLocationUnavailable(def)) {
+    return {
+      text: '不可逐条定位',
+      tone: 'muted',
+      detail: '该字段按卡片结构整理，暂不提供逐条原文定位 → 请以卡片文本为准',
+    }
+  }
   const stats = card.value?.by_field?.[def.key as string]
   const entries = entriesOf(def)
   const total = stats?.total ?? entries.length
@@ -295,9 +316,9 @@ function fieldStatus(def: CardFieldDef): {
   if (total === 0) return { text: '', tone: 'muted', detail: '卡片未产出该字段条目' }
   if (located === 0) {
     return {
-      text: `未定位 0/${total}`,
+      text: `定位失败 0/${total}`,
       tone: 'warn',
-      detail: '所有条目未在原文中找到（证据范围受限）→ 以引用文本为准',
+      detail: '该字段支持逐条原文定位，但当前没有可用片段（可能是证据范围受限）→ 请以引用文本为准',
     }
   }
   if (unlocated > 0) {
@@ -338,7 +359,8 @@ function verdictReason(span: PaperSpan): string {
   }
 }
 
-function verdictLabel(entry: CardEntry): string {
+function verdictLabel(entry: CardEntry, def: CardFieldDef): string {
+  if (!entry.evidence_span) return isEntryLocationUnavailable(def) ? '以卡片文本为准' : '定位失败'
   const verdict = entry.evidence_span?.verification?.verdict
   if (!verdict) return '未校验'
   switch (verdict) {
@@ -355,7 +377,9 @@ async function locate(def: CardFieldDef, entry: CardEntry, index: number): Promi
   const span = entry.evidence_span
   if (!span) {
     target.value = null
-    notice.value = '该条目未定位，请以引用文本为准'
+    notice.value = isEntryLocationUnavailable(def)
+      ? '该字段不可逐条定位，请以卡片文本为准'
+      : '该条目定位失败，请以引用文本为准'
     return
   }
   if (span.document_version !== selectedVersion.value) {
@@ -501,7 +525,7 @@ async function rebuild(): Promise<void> {
   rebuildError.value = null
   try {
     const job = await rebuildCard(paperId.value, true)
-    rebuildMessage.value = `已提交重解析任务 task_id=${job.task_id}（长任务：结果以卡片接口为准，不用响应体冒充结果）`
+    rebuildMessage.value = '已提交重解析任务，正在等待解析结果。'
     let finished = false
     for (let attempt = 0; attempt < 20 && !finished; attempt += 1) {
       await sleep(1500)
@@ -509,7 +533,9 @@ async function rebuild(): Promise<void> {
         const jobStatus = await fetchCardJob(paperId.value, job.task_id)
         if (jobStatus.status === 'done' || jobStatus.status === 'failed') {
           finished = true
-          rebuildMessage.value = `${rebuildMessage.value}；任务状态=${jobStatus.status}`
+          rebuildMessage.value = jobStatus.status === 'done'
+            ? '解析已完成。'
+            : '解析未完成，请稍后重试。'
         }
       } catch {
         // 任务登记在进程内，重启会丢失：直接以卡片接口为准，不阻塞用户
@@ -522,7 +548,7 @@ async function rebuild(): Promise<void> {
       rebuildError.value =
         '重新解析需要研究者身份：当前是只读浏览模式，写操作会被服务端拒绝。'
     } else if (error instanceof ApiError) {
-      rebuildError.value = `重新解析失败（${error.code}）：${error.message}`
+      rebuildError.value = `重新解析失败：${error.message}`
     } else {
       rebuildError.value = `重新解析失败：${(error as Error).message}`
     }
@@ -647,7 +673,7 @@ onMounted(() => {
       type="error"
       :closable="false"
       show-icon
-      :title="`解析卡片未获取（${cardError?.code ?? 'unknown_error'}）：${cardErrorText}`"
+      :title="`解析卡片未获取：${cardErrorText}`"
     >
       <template #default>
         <span class="parse__alert-body">
@@ -784,13 +810,19 @@ onMounted(() => {
                   </button>
                   <div class="entry-item__meta">
                     <span class="verdict" :class="`verdict--${entry.evidence_span?.verification?.verdict ?? 'none'}`">
-                      {{ verdictLabel(entry) }}
+                      {{ verdictLabel(entry, def) }}
                     </span>
                     <span v-if="entry.evidence_span" class="sl-source-tag">
                       {{ entry.evidence_span.section_name ?? '章节未获取' }} · 页
                       {{ entry.evidence_span.page_number ?? '未获取' }}
                     </span>
-                    <span v-else class="missing">未定位</span>
+                    <span
+                      v-else
+                      class="missing"
+                      :class="{ 'missing--muted': isEntryLocationUnavailable(def) }"
+                    >
+                      {{ isEntryLocationUnavailable(def) ? '以卡片文本为准' : '定位失败' }}
+                    </span>
                   </div>
                 </li>
               </ol>
@@ -1298,5 +1330,9 @@ onMounted(() => {
 
 .missing {
   color: var(--color-warning);
+}
+
+.missing--muted {
+  color: var(--color-text-secondary);
 }
 </style>

@@ -4,42 +4,14 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""ORM 模型汇总入口。
-
-**导入本模块即注册全部 30 张表**（附录 A.0 顺序），alembic 的 ``env.py``
-与任何需要完整 ``Base.metadata`` 的场景都必须先 ``import db.models``。
-
-补充（全文阅读器，迁移 ``0003_reader_library``）
-------------------------------------------------
-``reader_documents`` / ``reader_versions`` / ``reader_states`` / ``reader_annotations``
-四张表由 ``app/db/models/reader.py`` 定义，**不属于附录 A.0 的 30 张表**，因此
-``TABLE_BUILD_ORDER`` 保持原样（该常量是附录 A.0 的权威顺序，已被
-``scripts/verify/empty_db_migration.sh`` 与既有工作包依赖，不随新模块变动）。
-新表由 alembic 迁移独立建/删，导入顺序与外键依赖为
-``reader_documents → （papers）``、``reader_versions → reader_documents``、
-``reader_annotations → reader_documents, reader_versions``。
-
-补充（全局设置，迁移 ``0005_app_settings``）
---------------------------------------------
-``app_settings``（``scope`` 主键 + ``value`` JSONB）由 ``app/db/models/settings.py`` 定义，
-同样**不属于附录 A.0 的 30 张表**，``TABLE_BUILD_ORDER`` 保持原样不变。
-该表**没有任何外键**，建/删顺序无依赖。
-
-补充（研究节点编排层，迁移 ``0008_research_nodes``）
----------------------------------------------------
-``research_node_runs`` / ``research_node_transitions`` 由
-``app/db/models/research.py`` 定义，同样**不属于附录 A.0 的 30 张表**，
-``TABLE_BUILD_ORDER`` 保持原样不变。两表都只依赖 ``projects``，
-建表顺序为 ``research_node_runs`` → ``research_node_transitions``（互不依赖）。
-本层**不新增业务实体表**：证据落 ``evidences``、假设落 ``ideas``、
-可行性落 ``feasibilities``、实验协议落 ``taskbooks``。
-"""
+"""导入本模块注册全部 ORM 模型，供 SQLite 启动初始化使用。"""
 
 from __future__ import annotations
 
 from db.base import Base
 from db.models.aggregation import Aggregation, Evidence, Gap, Idea
 from db.models.feasibility import Feasibility, Taskbook
+from db.models.idea_pipeline import IdeaPipelineCandidate, IdeaPipelineExpertRun, IdeaPipelineRun
 from db.models.paper import (
     Paper,
     PaperCard,
@@ -100,6 +72,9 @@ TABLE_BUILD_ORDER: tuple[str, ...] = (
     "aggregations",
     "gaps",
     "ideas",
+    "idea_pipeline_runs",
+    "idea_pipeline_experts",
+    "idea_pipeline_candidates",
     "feasibilities",
     "taskbooks",
     "pipeline_runs",
@@ -150,6 +125,9 @@ __all__ = [
     "ExperimentPassport",
     "ExperimentRun",
     "Feasibility",
+    "IdeaPipelineCandidate",
+    "IdeaPipelineExpertRun",
+    "IdeaPipelineRun",
     "Gap",
     "Idea",
     "Intervention",

@@ -67,3 +67,24 @@ def test_update_agent_state_persists_compaction_checkpoint_and_snapshot(tmp_path
     assert restored is not None
     assert restored["compaction_checkpoints"][0]["trigger"] == "manual"
     assert restored["agent_history_snapshots"][0]["messages"][0]["content"] == "原始问题"
+
+
+def test_non_agent_branch_enters_existing_protocol_history(tmp_path, monkeypatch):
+    record = _record(tmp_path, monkeypatch)
+    conversations.update_agent_state(record, [{"role": "user", "content": "研究排序算法"}])
+    conversations.append_turns(record, [
+        {"role": "user", "content": "一次预热、七次计时、报告中位数和四分位距"},
+        {"role": "assistant", "content": "记住这个统计约定"},
+    ])
+    restored = conversations.read(record["id"])
+    assert [m["content"] for m in conversations.context_messages(restored)] == [
+        "研究排序算法", "一次预热、七次计时、报告中位数和四分位距", "记住这个统计约定",
+    ]
+
+
+def test_runtime_append_does_not_duplicate_its_protocol_state(tmp_path, monkeypatch):
+    record = _record(tmp_path, monkeypatch)
+    messages = [{"role": "user", "content": "你好"}, {"role": "assistant", "content": "欢迎"}]
+    conversations.update_agent_state(record, messages)
+    conversations.append_turns(record, messages, sync_history=False)
+    assert conversations.context_messages(record) == messages

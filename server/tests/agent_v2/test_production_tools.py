@@ -52,8 +52,13 @@ def test_bundle_exposes_real_tools_and_file_operations(tmp_path: Path) -> None:
 
 def test_host_command_uses_process_manager_and_emits_incremental_events(tmp_path: Path) -> None:
     repo, thread, bundle = _bundle(tmp_path)
-    command = _call(thread.thread_id, "host.command", {"argv": ["python", "-c", "print('ok')"]})
-    # A harmless command is allowed by the risk policy.
+    turn = repo.start_turn(thread.thread_id, inputs=[{"text": "run it"}])
+    command = _call(thread.thread_id, "host.command", {"argv": ["python", "-c", "print('ok')"]}, turn_id=turn.turn_id)
+    # Production has no process-level isolation, so host execution is explicit.
+    assert bundle.approval_gate(command) == "require"
+    approval = repo.wait_for_approval(thread.thread_id, turn.turn_id,
+        action={"tool": command.name, "arguments": command.arguments}, call_id=command.call_id)
+    assert bundle.resolve_approval(approval.approval_id, "approve_once")["ok"]
     assert bundle.approval_gate(command) == "allow"
     result = asyncio.run(bundle.execute(command))
     assert result.status is ToolCallStatus.SUCCEEDED
@@ -66,7 +71,7 @@ def test_approval_id_is_adopted_and_denial_is_fed_back_once(tmp_path: Path) -> N
     repo, thread, bundle = _bundle(tmp_path)
     turn = repo.start_turn(thread.thread_id, inputs=[{"text": "run it"}])
     call = _call(thread.thread_id, "host.command", {"argv": ["python", "-c", "print('x')"]}, turn_id=turn.turn_id)
-    assert bundle.approval_gate(call) == "allow"
+    assert bundle.approval_gate(call) == "require"
 
     # A destructive command is suspended by the gate.  Simulate Agent 1's
     # repository approval creation, then resolve it through the production

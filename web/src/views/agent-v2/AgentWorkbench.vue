@@ -5,9 +5,8 @@
  * 本页**不自带路由**：全局路由由协调 Agent 集成（见 `web/src/agent-v2/README.md`）。
  * 页面只负责编排：状态来自 store，规则在 reducer，组件只管画。
  *
- * 两条产品口径：
- * - 研究意图先弹确认卡，确认前不显示任何执行进度；
- * - 停止按钮按下后，三点/计时/「生成中」立刻收束。
+ * 产品口径：明确的研究执行指令直接进入回合；停止按钮按下后，
+ * 三点、计时和「生成中」立刻收束。
  */
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 
@@ -18,7 +17,6 @@ import ConversationShell from '../../components/agent-v2/ConversationShell.vue'
 import MemoryPanel from '../../components/agent-v2/MemoryPanel.vue'
 import PlanPanel from '../../components/agent-v2/PlanPanel.vue'
 import ThreadRail from '../../components/agent-v2/ThreadRail.vue'
-import { looksLikeResearch, type ResearchIntent } from '../../components/agent-v2/blocks'
 import { METHOD, type ApprovalDecision, type ApprovalView } from '../../agent-v2/protocol'
 import { useAgentV2Store } from '../../stores/agent-v2'
 
@@ -34,7 +32,6 @@ const props = withDefaults(
 
 const store = useAgentV2Store()
 const scenarios = ref<string[]>([])
-const pendingResearch = ref<ResearchIntent | null>(null)
 
 const wsUrl = computed(() => {
   if (props.wsUrl) return props.wsUrl
@@ -74,7 +71,12 @@ onMounted(async () => {
   const result = described?.ok ? (described.result ?? {}) : {}
   scenarios.value = (result.scenarios as string[]) ?? []
   const first = store.threads[0]
-  if (first) await store.selectThread(first.thread_id)
+  if (first) {
+    await store.selectThread(first.thread_id)
+    // MemoryPanel 的 immediate watch 可能早于父组件 onMounted；连接完成后
+    // 主动补一次当前对话记忆，避免把“尚未连接”暴露成未处理前端异常。
+    await onMemoryLoad({ scope: 'conversation', scopeId: first.thread_id, includeDeleted: false })
+  }
   window.addEventListener('beforeunload', store.persistNow)
 })
 
@@ -85,32 +87,15 @@ onBeforeUnmount(() => {
 })
 
 async function onCreate(payload: { name: string; scenario?: string }): Promise<void> {
-  await store.createThread(payload.name, { scenario: payload.scenario })
+  const thread = await store.createThread(payload.name, { scenario: payload.scenario })
   await store.listThreads()
+  await store.selectThread(thread.thread_id)
 }
 
-/** 提交：研究意图先确认；普通问候直接进入对话。 */
+/** 提交：研究判断只用于记录入口语义，实际执行仍走同一个回合协议。 */
 async function onSubmit(text: string): Promise<void> {
   if (!currentThreadId.value) return
-  if (looksLikeResearch(text)) {
-    pendingResearch.value = { question: text, sources: ['arXiv', 'Semantic Scholar', 'OpenAlex'] }
-    return
-  }
   await store.startTurn(currentThreadId.value, text)
-}
-
-async function onConfirmResearch(intent: ResearchIntent): Promise<void> {
-  const threadId = currentThreadId.value
-  if (!threadId) return
-  const parts = [intent.question]
-  if (intent.scope) parts.push(`范围与约束：${intent.scope}`)
-  if (intent.sources?.length) parts.push(`优先检索源：${intent.sources.join('、')}`)
-  pendingResearch.value = null
-  await store.startTurn(threadId, parts.join('\n'))
-}
-
-function onCancelResearch(): void {
-  pendingResearch.value = null
 }
 
 async function onResolve(payload: { approval: ApprovalView; decision: ApprovalDecision }): Promise<void> {
@@ -127,6 +112,8 @@ async function onMemoryLoad(payload: {
   scopeId: string
   includeDeleted: boolean
 }): Promise<void> {
+  // 面板初次挂载可能早于 WebSocket 建连；这次加载由 onMounted 在连接后补齐。
+  if (!store.client || store.connection.status !== 'connected') return
   await store.listMemories(payload.scope, payload.scopeId, payload.includeDeleted)
 }
 
@@ -172,6 +159,7 @@ async function onMemorySave(payload: {
           :active-turn="activeTurn"
           :stream-text="liveText"
           :stream-reasoning="liveReasoning"
+          :turn-status="selectedTurn?.status ?? null"
           :approvals="store.approvals"
           :tool-call-of="store.toolCall"
           :tool-output-of="store.toolOutput"
@@ -179,7 +167,6 @@ async function onMemorySave(payload: {
           :busy="store.busy"
           :stopped="stopped"
           :read-only="store.readOnly"
-          :pending-research="pendingResearch"
           @submit="onSubmit"
           @steer="(text) => currentThreadId && activeTurn && store.steerTurn(currentThreadId, activeTurn.turn_id, text)"
           @continue="(text) => currentThreadId && activeTurn && store.continueTurn(currentThreadId, activeTurn.turn_id, text)"
@@ -187,8 +174,6 @@ async function onMemorySave(payload: {
           @recover="currentThreadId && activeTurn && store.recoverTurn(currentThreadId, activeTurn.turn_id)"
           @retry="currentThreadId && store.startTurn(currentThreadId, liveText || '重试上一轮')"
           @resolve="onResolve"
-          @confirm-research="onConfirmResearch"
-          @cancel-research="onCancelResearch"
         />
       </main>
 

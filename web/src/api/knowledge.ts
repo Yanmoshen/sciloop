@@ -191,6 +191,8 @@ export interface KnowledgeEntry {
   project_id: number | null
   source_label: string
   source_route: string | null
+  /** 文件来源：自产、外部导入或解析翻译衍生；不以文件名猜测归属。 */
+  provenance?: 'generated' | 'external' | 'derived' | 'disk' | 'unknown'
   /** 真实文件地址（接后端后才有；demo 里二进制文件为 null） */
   file_url: string | null
   /**
@@ -269,6 +271,12 @@ export function folderPath(folder: string[] | string | null | undefined): string
   if (Array.isArray(folder)) return folder.join('/')
   if (typeof folder === 'string') return folder
   return ''
+}
+
+/** 面向用户显示的物理知识库路径；API 查询仍使用不带根目录的相对路径。 */
+export function knowledgeBasePath(folder: string[] | string | null | undefined): string {
+  const path = folderPath(folder)
+  return path ? `knowledge-base/${path}` : 'knowledge-base/'
 }
 
 /**
@@ -422,6 +430,19 @@ export async function refreshSnapshot(): Promise<KnowledgeSnapshot> {
   return data
 }
 
+/** 将磁盘上的真实目录和文件导入 manifest，再由调用方读取最新快照。 */
+export function syncDiskIndex(): Promise<{
+  files_scanned: number
+  files_added: number
+  files_updated: number
+  folders_found: number
+  folders_added: number
+  folders_removed: number
+  skipped: number
+}> {
+  return post('/knowledge/sync', { timeoutMs: 120_000 })
+}
+
 export function loadSnapshot(): Promise<KnowledgeSnapshot> {
   return refreshSnapshot()
 }
@@ -505,11 +526,11 @@ export function exportJson(entries: KnowledgeEntry[]): string {
 export function exportMarkdown(entries: KnowledgeEntry[]): string {
   const lines: string[] = ['# 知识库导出', '', `共 ${entries.length} 条。`, '']
   for (const entry of entries) {
-    const location = folderPath(entry.folder)
+    const location = knowledgeBasePath(entry.folder)
     lines.push(`## ${entry.name}`, '')
     lines.push(
       `- 分类：${BUCKET_LABELS[entry.bucket]}`,
-      `- 位置：知识库${location ? ` / ${location.split('/').join(' / ')}` : ''}`,
+      `- 位置：${location}`,
       `- 来源：${entry.source_label}`,
       `- 导入：${formatDateTime(entry.imported_at)}`,
     )

@@ -199,15 +199,32 @@ class ExportRepository:
     ) -> dict[int, dict[str, Any]]:
         grouped: dict[int, dict[str, Any]] = {}
         for chunk in _chunks(paper_ids):
+            # 每篇论文取 version 最大的那张卡片。
+            # 2026-10-12：原实现用 `SELECT DISTINCT ON (paper_id)`（PostgreSQL 专有语法），
+            # 在 SQLite 上直接报 `near "ON": syntax error` → 三个导出端点全部 500。
+            # 改用窗口函数表达（SQLite 3.25+ 与 PostgreSQL 都支持），语义不变。
             rows = await self._fetch(
                 """
-                SELECT DISTINCT ON (paper_id)
-                       id, paper_id, version, research_problem, core_method, key_innovation,
-                       technical_route, experimental_setup, main_conclusions, limitations,
-                       transferable, llm_call_log_id, created_at
-                  FROM paper_cards
-                 WHERE paper_id IN :ids
-                 ORDER BY paper_id, version DESC
+                SELECT t.id, t.paper_id, t.version, t.research_problem, t.core_method,
+                       t.key_innovation, t.technical_route, t.experimental_setup,
+                       t.main_conclusions, t.limitations, t.transferable,
+                       t.llm_call_log_id, t.created_at
+                  FROM (
+                        SELECT pc.id AS id, pc.paper_id AS paper_id, pc.version AS version,
+                               pc.research_problem AS research_problem, pc.core_method AS core_method,
+                               pc.key_innovation AS key_innovation, pc.technical_route AS technical_route,
+                               pc.experimental_setup AS experimental_setup,
+                               pc.main_conclusions AS main_conclusions, pc.limitations AS limitations,
+                               pc.transferable AS transferable, pc.llm_call_log_id AS llm_call_log_id,
+                               pc.created_at AS created_at,
+                               row_number() OVER (
+                                   PARTITION BY pc.paper_id ORDER BY pc.version DESC
+                               ) AS rn
+                          FROM paper_cards pc
+                         WHERE pc.paper_id IN :ids
+                       ) t
+                 WHERE t.rn = 1
+                 ORDER BY t.paper_id
                 """,
                 {"ids": list(chunk)},
                 expanding=("ids",),

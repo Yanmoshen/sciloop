@@ -4,7 +4,7 @@
 #
 # 把「本机执行环境」装成开机自启（macOS / Linux）—— **跑一次，以后不用管**。
 #
-# 不装也能用：`docker compose up` 自带容器执行环境，只是它只能碰挂进去的目录。
+# 2026-10-11 起本项目不再使用 Docker：这个执行器就是默认（也是唯一）的执行环境。
 # 装了这个之后，后端会**自动优先用你本机**（能碰这台机器的任何目录、用你装的 Python）。
 #
 # 用法：
@@ -100,4 +100,4 @@ esac
 
 echo ""
 echo "验证："
-echo "  docker compose exec backend python -c \"import asyncio; from services.agent import host_runner; print(asyncio.run(host_runner.health()))\""
+echo "  cd server && ../.venv/bin/python -c \"import asyncio; from services.agent import host_runner; print(asyncio.run(host_runner.health()))\""

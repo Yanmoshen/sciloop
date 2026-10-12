@@ -65,8 +65,7 @@ def default_library_dir() -> Path:
     """默认库根：``<server_root>/.cache/reader-library``。
 
     ``services/reader/storage.py`` → ``parents[2]`` == ``<server_root>``，
-    容器内即 ``/app/server``（与 docker-compose 的 bind mount 完全对应：
-    宿主 ``./.data/reader-library``）。可用 ``READER_LIBRARY_DIR`` 覆盖（测试/离线验证）。
+    即仓库 ``server/``。可用 ``READER_LIBRARY_DIR`` 覆盖（测试/离线验证）。
     """
     override = os.environ.get("READER_LIBRARY_DIR")
     if override:

@@ -184,7 +184,7 @@ def to_float(value: Any) -> float | None:
 
 
 def decode_json(value: Any, default: Any) -> Any:
-    """JSONB 列解码：asyncpg 下可能返回 ``str``，psycopg 下已解析。"""
+    """JSON 列解码：兼容文本与已解析对象。"""
     if value is None:
         return default
     if isinstance(value, str):

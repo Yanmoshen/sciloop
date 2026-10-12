@@ -16,7 +16,7 @@
 
   接口
   ----
-  - 供应商 / 按环节路由 / 成本双线 / 数据源健康：既有 `stores/settings`（WP02），逻辑未改
+  - 供应商 / 按环节路由 / 调用费用 / 数据源健康：既有 `stores/settings`（WP02），逻辑未改
   - 阅读设置：`GET /settings/reading`（公开只读）/ `PUT /settings/reading`（Owner）
     默认值一律取服务端返回的 `defaults`，前端不抄副本；写入只提交**改动的键**（部分更新）
 
@@ -118,7 +118,7 @@
       </header>
 
       <p v-if="store.error" class="state state--error">
-        {{ store.errorCode ?? 'unknown_error' }}：{{ store.error }}
+        {{ store.error }}
         <button class="btn--link" type="button" @click="refresh">重试读取设置</button>
       </p>
       <p v-else-if="store.notice" class="state"><span class="pill pill--ok">{{ store.notice }}</span></p>
@@ -140,7 +140,7 @@
           <span class="foot__label">最近一次连通性测试</span>
           <span class="tag-mono">{{ store.lastTestResult.model_ref ?? '未指定模型' }}</span>
           <span class="pill" :class="store.lastTestResult.ok ? 'pill--ok' : 'pill--warn'">
-            {{ store.lastTestResult.ok ? '成功' : store.lastTestResult.error_kind ?? '失败' }}
+            {{ store.lastTestResult.ok ? '成功' : '失败' }}
           </span>
           <span class="pill pill--quiet">{{ store.lastTestResult.latency_ms ?? '—' }} ms</span>
           <span
@@ -160,7 +160,7 @@
         <div class="card__head">
           <span class="card__title">按环节路由</span>
           <span v-if="store.error" class="pill pill--warn">
-            {{ store.errorCode ?? 'failed' }}：{{ store.error }}
+            {{ store.error }}
           </span>
           <span v-else-if="store.notice" class="pill pill--ok">{{ store.notice }}</span>
           <div class="card__actions">
@@ -192,14 +192,11 @@
               <th>环节</th>
               <th>供应商</th>
               <th>模型</th>
-              <th class="cell-narrow">temperature</th>
-              <th class="cell-narrow">max_tokens</th>
-              <th class="cell-narrow">生效来源</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="row in routingRows" :key="row.stage">
-              <td>{{ STAGE_LABELS[row.stage] ?? row.stage }}</td>
+              <td>{{ stageLabel(row.stage) }}</td>
               <td>
                 <PsSelect
                   block
@@ -220,34 +217,6 @@
                   @change="onModelPick(row, $event)"
                 />
               </td>
-              <td>
-                <input
-                  class="input input--sm"
-                  type="number"
-                  min="0"
-                  max="2"
-                  step="0.1"
-                  placeholder="未设"
-                  :value="row.temperature ?? ''"
-                  :disabled="!canWrite"
-                  @change="onNumberInput(row, 'temperature', $event)"
-                />
-              </td>
-              <td>
-                <input
-                  class="input input--sm"
-                  type="number"
-                  min="1"
-                  step="128"
-                  placeholder="未设"
-                  :value="row.max_tokens ?? ''"
-                  :disabled="!canWrite"
-                  @change="onNumberInput(row, 'max_tokens', $event)"
-                />
-              </td>
-              <td>
-                <span class="pill pill--quiet">{{ sourceLabel(row.source) }}</span>
-              </td>
             </tr>
           </tbody>
         </table>
@@ -255,10 +224,10 @@
         <p v-if="routingError" class="state state--error card__foot">{{ routingError }}</p>
       </div>
 
-      <!-- 成本双线 -->
+      <!-- 调用费用 -->
       <div class="card">
         <div class="card__head">
-          <span class="card__title">成本双线</span>
+          <span class="card__title">调用费用</span>
           <div class="card__actions">
             <span
               v-if="store.costSummary?.warning"
@@ -274,7 +243,7 @@
             >
               {{ nonUsdSummary }}
             </span>
-            <span class="pill pill--quiet">护栏优先于配额</span>
+            <span class="pill pill--quiet">达到费用上限后暂停新调用</span>
             <button class="btn btn--sm" type="button" :disabled="store.loading" @click="reloadCost">刷新成本</button>
           </div>
         </div>
@@ -282,7 +251,7 @@
         <template v-if="store.costSummary">
           <div class="rows">
             <div class="row">
-              <span class="row__label">硬护栏</span>
+              <span class="row__label">费用上限</span>
               <div class="row__body">
                 <div class="bar">
                   <div class="bar__fill" :style="{ width: `${limitRatio}%` }" />
@@ -296,7 +265,7 @@
               </div>
             </div>
             <div class="row">
-              <span class="row__label">演示配额</span>
+              <span class="row__label">费用预算</span>
               <div class="row__body">
                 <div class="bar">
                   <div
@@ -321,14 +290,6 @@
               <div class="metric__value">{{ usd(store.costSummary.used_usd) }} USD</div>
             </div>
             <div class="metric">
-              <div class="metric__label">桩调用（不计费）</div>
-              <div class="metric__value">{{ usd(store.costSummary.stub_saved_usd) }} USD</div>
-            </div>
-            <div class="metric">
-              <div class="metric__label">回放（不计费）</div>
-              <div class="metric__value">{{ usd(store.costSummary.replay_saved_usd) }} USD</div>
-            </div>
-            <div class="metric">
               <div class="metric__label">调用总数 / 失败</div>
               <div class="metric__value">
                 {{ store.costSummary.calls.toLocaleString() }} / {{ store.costSummary.failed_calls }}
@@ -340,14 +301,12 @@
             <thead>
               <tr>
                 <th>环节</th>
-                <th>stage 标识</th>
                 <th class="cell-narrow">成本（USD）</th>
               </tr>
             </thead>
             <tbody>
               <tr v-for="row in stageCostRows" :key="row.stage">
-                <td>{{ STAGE_LABELS[row.stage] ?? row.stage }}</td>
-                <td class="mono">{{ row.stage }}</td>
+                <td>{{ stageLabel(row.stage) }}</td>
                 <td>{{ usd(row.cost, 4) }}</td>
               </tr>
             </tbody>
@@ -367,41 +326,66 @@
     <section v-show="activeTab === 'fetch'" class="pane" aria-label="拉取设置">
       <header class="page-head">
         <h1 class="page-title">拉取设置</h1>
+        <div class="head-actions">
+          <span v-if="fetchSaved" class="pill pill--ok">已保存</span>
+          <button class="btn btn--primary" type="button" :disabled="!canWrite || fetchSaving || !fetchDraft" @click="saveFetchSettings">
+            {{ fetchSaving ? '保存中…' : '保存抓取规则' }}
+          </button>
+        </div>
       </header>
 
-      <div class="card card--flush">
+      <p v-if="fetchError" class="state state--error">{{ fetchError }}</p>
+      <div v-if="fetchDraft" class="card">
         <div class="card__head">
-          <span class="card__title">数据源健康</span>
+          <span class="card__title">定时抓取（仅一条规则）</span>
           <div class="card__actions">
-            <router-link class="btn--link" to="/papers/feed">前往论文库查看健康条</router-link>
-            <button class="btn btn--sm" type="button" :disabled="store.loading" @click="store.loadSourceHealth()">
-              立即自检
-            </button>
+            <span v-if="schedulerNotice" class="pill" :class="`pill--${schedulerNotice.tone}`" :title="schedulerNotice.detail">
+              {{ schedulerNotice.text }}
+            </span>
           </div>
         </div>
-
-        <table v-if="store.sourceHealth.length" class="table">
-          <thead>
-            <tr>
-              <th>数据源</th>
-              <th class="cell-narrow">状态</th>
-              <th>详情</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="item in store.sourceHealth" :key="item.name">
-              <td>{{ item.name }}</td>
-              <td>
-                <span v-if="item.ok === true" class="pill pill--ok"><i class="dot" />ok</span>
-                <span v-else-if="item.ok === false" class="pill pill--warn"><i class="dot" />降级</span>
-                <span v-else class="pill pill--quiet">未知</span>
-              </td>
-              <td class="detail-cell">{{ sourceDetail(item) }}</td>
-            </tr>
-          </tbody>
-        </table>
-        <p v-else class="state card__foot">暂无数据</p>
+        <div class="rows">
+          <div class="row">
+            <span class="row__label">启用定时抓取</span>
+            <div class="row__body">
+              <el-switch v-model="fetchDraft.enabled" :disabled="!canWrite" />
+            </div>
+          </div>
+          <div class="row">
+            <span class="row__label">每天执行时间</span>
+            <div class="row__body">
+              <div class="time-pair">
+                <PsSelect
+                  :model-value="fetchHour"
+                  :options="HOUR_OPTIONS"
+                  :disabled="!canWrite"
+                  aria-label="选择小时"
+                  @change="setFetchHour"
+                />
+                <span class="time-pair__unit">时</span>
+                <PsSelect
+                  :model-value="fetchMinute"
+                  :options="MINUTE_OPTIONS"
+                  :disabled="!canWrite"
+                  aria-label="选择分钟"
+                  @change="setFetchMinute"
+                />
+                <span class="time-pair__unit">分</span>
+              </div>
+            </div>
+            <div class="row__end">
+              <span class="pill pill--quiet">{{ fetchDraft.daily_time }}</span>
+            </div>
+          </div>
+        </div>
+        <p class="state">系统会从上次成功抓取时间到当前时间做增量抓取，并在任务记录中展示本次时间窗。</p>
       </div>
+
+      <!-- 手动抓取：与「文献总览 → 导入 → 按条件抓取」共用同一组件与同一份参数 -->
+      <PaperFetchPanel :can-fetch="canWrite" show-links title="手动抓取" />
+
+      <!-- 数据源健康：与文献总览同一组件，两个页面语义完全一致 -->
+      <SourceHealthBar />
     </section>
 
     <!-- ================= 3 阅读设置 ================= -->
@@ -667,19 +651,24 @@ import {
   type ModelEntry,
   type RoutingEntry,
   type RoutingStage,
-  type SourceHealthItem,
 } from '@/api/models'
 import {
+  getFetchSettings,
+  putFetchSettings,
   getReadingSettings,
   putReadingSettings,
+  type FetchSchedulerStatus,
   type LineHeight,
   type MissingVersionAction,
   type ReadingKind,
   type ReadingSettings,
+  type FetchSettings,
   type SettingsScope,
 } from '@/api/settings'
+import PaperFetchPanel from '@/components/PaperFetchPanel.vue'
 import ProviderSettingsPane from '@/components/settings/ProviderSettingsPane.vue'
 import PsSelect, { type PsOption } from '@/components/settings/PsSelect.vue'
+import SourceHealthBar from '@/components/SourceHealthBar.vue'
 import VendorDialog from '@/components/settings/VendorDialog.vue'
 import { useSessionStore } from '@/stores/session'
 import { useSettingsStore } from '@/stores/settings'
@@ -783,12 +772,11 @@ const quotaRatio = computed(() => {
 const isolationTitle = computed(() => {
   const isolation = store.isolation
   if (!isolation) return ''
-  const generator = STAGE_LABELS[isolation.generator_stage] ?? isolation.generator_stage
-  const reviewer = STAGE_LABELS[isolation.reviewer_stage] ?? isolation.reviewer_stage
-  const pair = `${generator} ${isolation.generator?.model_ref ?? '—'} ≠ ${reviewer} ${
-    isolation.reviewer?.model_ref ?? '—'
-  }`
-  return isolation.isolated ? pair : (isolation.message ?? `同一模型：${pair}`)
+  const generator = stageLabel(isolation.generator_stage)
+  const reviewer = stageLabel(isolation.reviewer_stage)
+  return isolation.isolated
+    ? `${generator}与${reviewer}使用不同的模型。`
+    : `${generator}与${reviewer}尚未使用独立模型，不能视为独立评审。`
 })
 
 function ratio(used: number, cap: number): number {
@@ -821,26 +809,8 @@ function usd(value: number | null | undefined, digits = 2): string {
   return (value ?? 0).toFixed(digits)
 }
 
-function sourceLabel(source: string): string {
-  switch (source) {
-    case 'project':
-      return '项目级'
-    case 'global':
-      return '全局'
-    case 'env_default':
-      return '环境兜底'
-    case 'env_fallback':
-      return '备用兜底'
-    case 'explicit':
-      return '显式指定'
-    default:
-      return '未配置'
-  }
-}
-
-function sourceDetail(item: SourceHealthItem): string {
-  const detail = item.detail ?? item.message
-  return typeof detail === 'string' && detail.length > 0 ? detail : '—'
+function stageLabel(stage: string): string {
+  return STAGE_LABELS[stage] ?? ({ agent: '对话助手', literature_review: '文献调研', unassigned: '其他任务' }[stage] ?? '其他任务')
 }
 
 function modelsOf(configId?: number | null): ModelEntry[] {
@@ -902,10 +872,7 @@ function onModelPick(row: RoutingRow, value: string): void {
   row.model_id = value === '' ? null : value
 }
 
-function onNumberInput(row: RoutingRow, field: 'temperature' | 'max_tokens', event: Event): void {
-  const raw = (event.target as HTMLInputElement).value.trim()
-  row[field] = raw === '' ? null : Number(raw)
-}
+
 
 /** 「模型服务」左栏底部的「+ 添加服务商」：新建走 Cherry 式最小表单（名称/类型/地址/密钥） */
 function openCreate(): void {
@@ -957,6 +924,100 @@ const readingSaving = ref(false)
 const readingSaved = ref(false)
 const readingError = ref('')
 let savedTimer: number | null = null
+
+const fetchSettings = ref<SettingsScope<FetchSettings> | null>(null)
+const fetchDraft = ref<FetchSettings | null>(null)
+const fetchSaving = ref(false)
+const fetchSaved = ref(false)
+const fetchError = ref('')
+const scheduler = ref<FetchSchedulerStatus | null>(null)
+
+/**
+ * 每天执行时间：拆成两个项目风格下拉（时 / 分）。
+ * 原生 `<select>` 会渲染 24×60=1440 个 `<option>`（无障碍树巨大、滚动很长），
+ * 且弹层外观与 `PsSelect` 不一致 —— 这里内部仍拼回后端契约要求的 `HH:MM` 字符串。
+ */
+const HOUR_OPTIONS: PsOption[] = Array.from({ length: 24 }, (_, index) => {
+  const value = String(index).padStart(2, '0')
+  return { value, label: value }
+})
+const MINUTE_OPTIONS: PsOption[] = Array.from({ length: 60 }, (_, index) => {
+  const value = String(index).padStart(2, '0')
+  return { value, label: value }
+})
+
+function splitTime(value: string | null | undefined): { hour: string; minute: string } {
+  const [rawHour = '02', rawMinute = '00'] = String(value ?? '').split(':')
+  const hour = Number.parseInt(rawHour, 10)
+  const minute = Number.parseInt(rawMinute, 10)
+  return {
+    hour: String(Number.isNaN(hour) ? 2 : Math.min(23, Math.max(0, hour))).padStart(2, '0'),
+    minute: String(Number.isNaN(minute) ? 0 : Math.min(59, Math.max(0, minute))).padStart(2, '0'),
+  }
+}
+
+const fetchHour = computed(() => splitTime(fetchDraft.value?.daily_time).hour)
+const fetchMinute = computed(() => splitTime(fetchDraft.value?.daily_time).minute)
+
+function setFetchHour(value: string): void {
+  const draft = fetchDraft.value
+  if (draft) draft.daily_time = `${value}:${splitTime(draft.daily_time).minute}`
+}
+
+function setFetchMinute(value: string): void {
+  const draft = fetchDraft.value
+  if (draft) draft.daily_time = `${splitTime(draft.daily_time).hour}:${value}`
+}
+
+/** 定时规则是否真的会被执行：状态一律取后端调度器的真实状态，不由前端乐观假设 */
+const schedulerNotice = computed<{ text: string; tone: 'ok' | 'warn'; detail: string } | null>(() => {
+  const info = scheduler.value
+  if (!info) return null
+  if (info.applied === 'immediate') {
+    return { text: '已保存并生效', tone: 'ok', detail: info.note ?? '定时规则已即时更新' }
+  }
+  if (info.applied === 'restart_required' || !info.running) {
+    return {
+      text: '重启后生效',
+      tone: 'warn',
+      detail: info.note ?? '当前进程的调度器未运行，定时规则需重启服务后才会生效',
+    }
+  }
+  return {
+    text: fetchDraft.value?.enabled ? '调度器运行中' : '规则已关闭',
+    tone: fetchDraft.value?.enabled ? 'ok' : 'warn',
+    detail: '状态来自后端调度器',
+  }
+})
+
+async function loadFetchSettings(): Promise<void> {
+  try {
+    const payload = await getFetchSettings()
+    fetchSettings.value = payload
+    fetchDraft.value = { ...payload.settings }
+    scheduler.value = payload.scheduler ?? null
+  } catch (error) {
+    fetchError.value = describe(error)
+  }
+}
+
+async function saveFetchSettings(): Promise<void> {
+  if (!fetchDraft.value) return
+  fetchSaving.value = true
+  fetchError.value = ''
+  try {
+    const payload = await putFetchSettings(fetchDraft.value)
+    fetchSettings.value = payload
+    fetchDraft.value = { ...payload.settings }
+    scheduler.value = payload.scheduler ?? null
+    fetchSaved.value = true
+    window.setTimeout(() => { fetchSaved.value = false }, 1400)
+  } catch (error) {
+    fetchError.value = describe(error)
+  } finally {
+    fetchSaving.value = false
+  }
+}
 
 const KIND_OPTIONS: ReadonlyArray<{ value: ReadingKind; label: string }> = [
   { value: 'original', label: '原文' },
@@ -1135,6 +1196,7 @@ function removeTerm(term: string): void {
 /* ------------------------------------------------------------------ */
 onMounted(async () => {
   await refresh()
+  void loadFetchSettings()
   void loadReading()
 })
 
@@ -1487,6 +1549,21 @@ onUnmounted(() => {
   gap: 8px;
 }
 
+/* 每天执行时间：时 / 分两个并排的项目风格下拉（内部仍拼回 HH:MM） */
+.time-pair {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.time-pair :deep(.ps-select) {
+  min-width: 74px;
+}
+
+.time-pair__unit {
+  color: var(--h-fg-muted);
+}
+
 .grid2 {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1680,11 +1757,6 @@ onUnmounted(() => {
 .table th.cell-narrow {
   width: 1%;
   white-space: nowrap;
-}
-
-.detail-cell {
-  color: var(--h-fg-muted);
-  overflow-wrap: anywhere;
 }
 
 /* ---------- 术语收藏 ---------- */

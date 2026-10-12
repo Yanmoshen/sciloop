@@ -23,8 +23,8 @@ from .context import (
 )
 from .instructions import build_base_instructions
 
-#: 默认总预算（字符）。base instructions 约占 500，其余留给事实。
-DEFAULT_BUDGET = 6000
+#: 默认总预算（字符），为完整科研指令及动态工具、任务事实留出空间。
+DEFAULT_BUDGET = 16000
 
 
 @dataclass

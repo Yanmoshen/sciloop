@@ -48,6 +48,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
     func,
     text,
 )
@@ -149,7 +150,7 @@ class ReaderVersion(Base):
     #: ``manifest.sha256.mono`` / ``manifest.sha256.dual`` 原样保存
     pdf_sha256: Mapped[str | None] = mapped_column(CHAR(64))
     hash_verified: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default="false"
+        Boolean, nullable=False, server_default=false()
     )
     #: 页面对应关系（``identity`` / ``unavailable`` + 逐页映射）
     page_map: Mapped[Any] = mapped_column(JSONB, nullable=False)
@@ -253,7 +254,7 @@ class ReaderAnnotation(Base):
     anchor_sha256: Mapped[str] = mapped_column(CHAR(64), nullable=False)
     #: 锚点是否在源版本中真实命中某 block（未命中时如实置 false，供前端提示）
     anchor_resolved: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, server_default="false"
+        Boolean, nullable=False, server_default=false()
     )
     kind: Mapped[str] = mapped_column(String(16), nullable=False, server_default="highlight")
     note: Mapped[str | None] = mapped_column(Text)

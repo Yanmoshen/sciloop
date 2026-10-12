@@ -32,10 +32,10 @@
 每个任务模块都必须提供 ``main(argv) -> int`` 并带 ``if __name__ == "__main__"`` 守卫，
 因此统一用模块方式执行（**不要**用 ``python app/tasks/jobs/x.py``，那样会丢包上下文）::
 
-    docker compose exec backend python -m tasks.jobs.fetch_papers --limit 50
-    docker compose exec backend python -m tasks.jobs.score_papers 200 --force
-    docker compose exec backend python -m tasks.jobs.parse_fulltext --limit 50
-    docker compose exec backend python -m tasks.jobs.seed_demo --help
+    (cd server && python -m tasks.jobs.fetch_papers --limit 50)
+    (cd server && python -m tasks.jobs.score_papers 200 --force)
+    (cd server && python -m tasks.jobs.parse_fulltext --limit 50)
+    (cd server && python -m tasks.jobs.seed_demo --help)
 
 本包的 ``__init__`` **不** eager import 任何任务模块：任务模块会拉起 httpx / pymupdf /
 LLM 适配层等重依赖，任何一个缺依赖都不应该让 ``import tasks.jobs`` 失败

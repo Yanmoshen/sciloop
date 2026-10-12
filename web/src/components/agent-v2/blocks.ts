@@ -6,6 +6,7 @@
  */
 
 import type { ApprovalView, ItemView, PlanStepView, PlanView, ToolCallView } from '../../agent-v2/protocol'
+import { sanitizeAssistantText } from '../../utils/messages'
 
 /** 研究意图（确认卡的数据形状，WP-05）。 */
 export interface ResearchIntent {
@@ -16,31 +17,18 @@ export interface ResearchIntent {
 }
 
 /**
- * 研究意图的关键词（**只用于决定要不要先弹确认卡**，不用于拦截）。
- *
- * 两个口径必须守住：
- * 1. 它不阻止任何请求——取消后用户仍可把原话直接发出去，跑不跑由模型决定；
- * 2. 确认前不得显示任何「检索中」进度，因为那时确实还没有任何动作发生。
+ * 只有明确的执行表达才进入研究路径。
+ * 单独提到「文献」「研究」「分析」仍是普通对话，不能在前端擅自
+ * 弹出确认卡或改变提交路径。
  */
-const RESEARCH_HINTS = [
-  '调研',
-  '检索',
-  '文献',
-  '综述',
-  '综述一下',
-  '找论文',
-  '查文献',
-  '相关研究',
-  '研究现状',
-  '复现',
-  '实验设计',
-  '创新点',
-]
-
 export function looksLikeResearch(text: string): boolean {
-  const value = text.trim()
+  const value = text.trim().replace(/[？?。！!]+$/u, '')
   if (value.length < 4) return false
-  return RESEARCH_HINTS.some((hint) => value.includes(hint))
+  const topic = '(?:调研|检索|查找|搜索|研究|综述|找论文|查文献|实验设计|复现)'
+  return new RegExp(
+    `^(?:开始|启动|进行|执行)\\s*(?:文献|论文|研究|${topic})|^从(?:文献|论文|研究)${topic}开始|^(?:帮我|请(?:你)?|现在(?:就)?|直接)\\s*(?:开始|启动|进行|执行)?\\s*${topic}`,
+    'u',
+  ).test(value)
 }
 
 export type Block =
@@ -61,6 +49,16 @@ export interface BlockLookups {
 
 function asText(value: unknown, fallback = ''): string {
   return typeof value === 'string' ? value : fallback
+}
+
+/**
+ * 思考区只接受模型明确标记的短摘要。
+ * `payload.text` 可能是供应商返回的完整 reasoning_content，它只用于
+ * 服务端继续生成，不能在浏览器里展开。旧事件没有摘要字段时直接隐藏。
+ */
+function reasoningSummary(payload: Record<string, unknown>): string {
+  const summary = payload.summary ?? payload.reasoning_summary ?? payload.display_summary
+  return typeof summary === 'string' ? summary.trim() : ''
 }
 
 export function planOf(item: ItemView): PlanView {
@@ -88,11 +86,13 @@ export function toBlocks(items: ItemView[], lookups: BlockLookups): Block[] {
       case 'user_input':
         out.push({ kind: 'user', key, text: asText(item.payload.text) })
         break
-      case 'reasoning':
-        out.push({ kind: 'reasoning', key, text: asText(item.payload.text) })
+      case 'reasoning': {
+        const summary = reasoningSummary(item.payload)
+        if (summary) out.push({ kind: 'reasoning', key, text: summary })
         break
+      }
       case 'assistant_text':
-        out.push({ kind: 'assistant', key, text: asText(item.payload.text) })
+        out.push({ kind: 'assistant', key, text: sanitizeAssistantText(asText(item.payload.text)) })
         break
       case 'tool_call': {
         const call = lookups.toolCallOf(item.call_id)
@@ -137,4 +137,15 @@ export function landedAssistantText(blocks: Block[]): string {
     .filter((block): block is Extract<Block, { kind: 'assistant' }> => block.kind === 'assistant')
     .map((block) => block.text)
     .join('')
+}
+
+/** 将流式缓冲与已落地正文对齐，只显示尚未落地的后缀。 */
+export function pendingAssistantText(blocks: Block[], streamText: string): string {
+  const safeStream = sanitizeAssistantText(streamText)
+  if (!safeStream) return ''
+  const landed = landedAssistantText(blocks)
+  if (!landed) return safeStream
+  if (landed === safeStream || landed.includes(safeStream)) return ''
+  if (safeStream.startsWith(landed)) return safeStream.slice(landed.length)
+  return safeStream
 }

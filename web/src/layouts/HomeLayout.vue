@@ -23,7 +23,7 @@
  * 进入项目后由 ShellLayout（模块壳层）接管，7 个模块页保持原样。
  */
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { writeDenied } from '@/utils/messages'
+import { safeErrorMessage, writeDenied } from '@/utils/messages'
 import { RouterLink, RouterView, useRoute, useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 
@@ -34,7 +34,6 @@ import ConfirmDialog from '@/components/home/ConfirmDialog.vue'
 import GlobalSearch from '@/components/home/GlobalSearch.vue'
 import SciLoopMark from '@/components/SciLoopMark.vue'
 import ConversationRenameDialog from '@/components/ConversationRenameDialog.vue'
-import MoveConversationDialog from '@/components/home/MoveConversationDialog.vue'
 // 2026-09-26：左栏「项目」的 ＋ 与首页「新建研究项目」统一成**同一个**弹窗。
 // 旧的 ProjectNameDialog（只手填项目名）退役：文件保留在仓库里，不再被引用。
 import ProjectCreateDialog from '@/components/ProjectCreateDialog.vue'
@@ -87,7 +86,6 @@ const HOME_NAV: HomeNavItem[] = [
   // 位置在「文献调研」与「知识库」之间。
   { key: 'ideas', label: '研究构想', path: '/ideas' },
   { key: 'knowledge', label: '知识库', path: '/knowledge' },
-  { key: 'agent-v2', label: 'Agent 工作台', path: '/agent-v2' },
 ]
 
 
@@ -101,8 +99,20 @@ const HOME_NAV: HomeNavItem[] = [
  */
 const RAIL_COLLAPSED_KEY = 'sciloop.railCollapsed'
 const railCollapsed = ref(localStorage.getItem(RAIL_COLLAPSED_KEY) === '1')
+const narrowNavigation = window.matchMedia('(max-width: 900px)')
+const narrowScreen = ref(narrowNavigation.matches)
+const mobileRailOpen = ref(false)
+function updateNavigationWidth(): void {
+  narrowScreen.value = narrowNavigation.matches
+  mobileRailOpen.value = false
+}
+watch(() => route.fullPath, () => { mobileRailOpen.value = false })
 
 function toggleRail(): void {
+  if (narrowScreen.value) {
+    mobileRailOpen.value = !mobileRailOpen.value
+    return
+  }
   railCollapsed.value = !railCollapsed.value
   localStorage.setItem(RAIL_COLLAPSED_KEY, railCollapsed.value ? '1' : '0')
 }
@@ -402,35 +412,30 @@ function toggleProject(projectId: number): void {
 }
 
 // --------------------------------------------------------------------------- //
-// 对话：新建 / 打开 / 归档 / 移入项目
+// 对话：新建 / 打开 / 归档
 // --------------------------------------------------------------------------- //
 const createProjectOpen = ref(false)
-const moveOpen = ref(false)
-const moveTarget = ref<ConversationBrief | null>(null)
 
 /** 「开始使用」右侧的 ＋：**始终未分组**（在项目里点也一样） */
 function startNewConversation(): void {
-  void router.push({ path: '/' })
+  void router.push({ path: '/', query: { draft: crypto.randomUUID() } })
 }
 
 /** 项目行右侧的 ＋：在这条项目内新建对话（只有这个 ＋ 才是项目内新建） */
 function startConversationIn(projectId: number): void {
   if (!isExpanded(projectId)) expandedProjects.value = [...expandedProjects.value, projectId]
-  void router.push({ path: '/', query: { project: String(projectId) } })
+  void router.push({ path: '/', query: { project: String(projectId), draft: crypto.randomUUID() } })
 }
 
 function openConversation(conversation: ConversationBrief): void {
-  void router.push({ name: 'conversation', params: { conversationId: conversation.id } })
+  const id = String(conversation.id || '').trim()
+  if (!id) return
+  void router.push({ path: `/c/${encodeURIComponent(id)}` })
 }
 
 /** 当前正在看的那条对话（左栏据此高亮 —— 对话页顶栏标题已去掉，这里成了唯一的方位标识） */
 function isCurrentConversation(id: string): boolean {
   return route.name === 'conversation' && String(route.params.conversationId ?? '') === id
-}
-
-function openMove(conversation: ConversationBrief): void {
-  moveTarget.value = conversation
-  moveOpen.value = true
 }
 
 /** 归档：悬停行才出图标 + **一次确认弹窗**（归档后仍可继续聊） */
@@ -444,7 +449,7 @@ function askArchive(conversation: ConversationBrief): void {
 }
 
 /* ---------- 对话行的「更多」菜单 + 重命名（2026-09-21）----------
-   行内动作固定为两个：① 移入项目（未分组对话才有）② 更多（⋯ = 重命名 / 归档）。
+   行内动作只有更多（⋯ = 重命名 / 归档）。
    菜单与项目行同一套做法：**行内 .fold 块**，不做绝对定位浮层（左栏滚动区会裁掉浮层）。 */
 const convMoreOpen = ref<string | null>(null)
 
@@ -507,11 +512,7 @@ function messageOf(error: unknown): string {
   if (status === 403) {
     return writeDenied('修改对话')
   }
-  return error instanceof Error ? error.message : String(error)
-}
-
-async function onMoved(): Promise<void> {
-  await conversations.load()
+  return safeErrorMessage(error)
 }
 
 /**
@@ -585,7 +586,7 @@ async function unarchiveProject(projectId: number): Promise<void> {
 function projectMessageOf(error: unknown): string {
   const status = (error as { status?: number } | undefined)?.status
   if (status === 403) return writeDenied('修改项目')
-  return error instanceof Error ? error.message : String(error)
+  return safeErrorMessage(error)
 }
 
 // ---- 任务：顶栏按钮 → 历史 → 打开某一条的完整监控窗口 ----
@@ -604,7 +605,7 @@ async function controlTask(kind: 'pause' | 'resume' | 'cancel'): Promise<void> {
 
 /** 监控窗口里的「重新同步」：再跑一轮并跟踪它（Owner 面，403 如实提示） */
 async function retryFetch(): Promise<void> {
-  const result = await tasks.startFetch(30)
+  const result = await tasks.startFetch({ limit: 30 })
   if (!result.ok) {
     ElMessage.warning(
       result.status === 403
@@ -615,6 +616,7 @@ async function retryFetch(): Promise<void> {
 }
 
 onMounted(() => {
+  narrowNavigation.addEventListener('change', updateNavigationWidth)
   void session.loadProjects()
   void session.loadHealth()
   void conversations.load()
@@ -628,6 +630,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  narrowNavigation.removeEventListener('change', updateNavigationWidth)
   document.removeEventListener('click', onDocumentClick)
   document.removeEventListener('keydown', onDocumentKeydown)
   tasks.stopWatch()
@@ -637,14 +640,15 @@ onUnmounted(() => {
 
 <template>
   <div class="sl-home" :class="{ 'sl-home--resizing': railResizing }">
+    <button v-if="narrowScreen && mobileRailOpen" class="rail-backdrop" type="button" aria-label="关闭导航" @click="mobileRailOpen = false" />
     <!-- `inert`：折叠后左栏整体滑出可视区，但里面的几十个链接仍会拦键盘 Tab，
          所以折叠时把它整块对键盘/读屏关掉（`:inert` 传 undefined 才会真正摘掉属性）。 -->
     <aside
       id="rail"
       class="rail"
-      :class="{ 'rail--collapsed': railCollapsed, 'rail--dragging': railResizing }"
+      :class="{ 'rail--collapsed': railCollapsed, 'rail--dragging': railResizing, 'rail--mobile-open': mobileRailOpen }"
       :style="{ '--rail-w': `${railWidth}px` }"
-      :inert="railCollapsed || undefined"
+      :inert="(narrowScreen ? !mobileRailOpen : railCollapsed) || undefined"
     >
       <div class="brand">
         <SciLoopMark class="brand__mark" />
@@ -844,23 +848,6 @@ onUnmounted(() => {
               {{ c.title || '未命名对话' }}
             </button>
             <span class="crow__acts">
-              <button
-                class="icon-btn"
-                type="button"
-                title="移入项目"
-                aria-label="移入项目"
-                @click.stop="openMove(c)"
-              >
-                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                  <path
-                    d="M2.4 4.4h3.6l1.2 1.5h6.4v6.1a.8.8 0 0 1-.8.8H3.2a.8.8 0 0 1-.8-.8V4.4Z"
-                    stroke="currentColor"
-                    stroke-width="1.3"
-                    stroke-linejoin="round"
-                  />
-                  <path d="M8 8.4v3.4M6.4 10h3.2" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
-                </svg>
-              </button>
               <button
                 class="icon-btn"
                 type="button"
@@ -1362,13 +1349,13 @@ onUnmounted(() => {
       <header class="topbar">
         <!-- 折叠后，同一个开关挪到这里：搜索框左边。展开时它回左栏品牌行右侧。 -->
         <button
-          v-if="railCollapsed"
+          v-if="railCollapsed || narrowScreen"
           class="rail-toggle pop-in"
           type="button"
           title="展开左栏"
           aria-label="展开左栏"
           aria-controls="rail"
-          :aria-expanded="!railCollapsed"
+          :aria-expanded="narrowScreen ? mobileRailOpen : !railCollapsed"
           @click="toggleRail"
         >
           <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
@@ -1508,13 +1495,6 @@ onUnmounted(() => {
       @renamed="onConversationRenamed"
     />
     <ProjectCreateDialog v-model="createProjectOpen" @created="onProjectCreated" />
-    <MoveConversationDialog
-      v-model="moveOpen"
-      :conversation-id="moveTarget?.id ?? null"
-      :current-project-id="moveTarget?.project_id ?? null"
-      :projects="session.projects"
-      @moved="onMoved"
-    />
     <ConfirmDialog
       v-model="archiveOpen"
       title="归档对话"
@@ -1574,8 +1554,16 @@ onUnmounted(() => {
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18); /* ui-polish-allow: 浮层投影 */
 }
 
+/* 悬停卡片：鼠标悬停，或**键盘**聚焦时显示。
+   ⚠️ 这里刻意**不用 `:focus-within`**：条件里那个按钮 `crow__item--project` 是 `.crow--project` 的子元素，
+   用鼠标点它同样会聚焦，于是 `:focus-within` 一直成立 —— 症状是"点开项目、鼠标移走，悬停卡片还挂着，
+   必须点一下空白处（失焦）才消失"（2026-10-11 研究者报）。
+   改用 `:focus-visible`（只在键盘导航时命中）后：鼠标点击不再钉住卡片，Tab 键仍能看到卡片。
+   注：`:has()` 不被支持时该条选择器会被整条忽略（现代 Chromium/Electron 均支持），
+   退化结果只是"键盘聚焦子元素时不显示卡片"，不影响鼠标路径。 */
 .crow--project:hover .pcard,
-.crow--project:focus-within .pcard {
+.crow--project:focus-visible .pcard,
+.crow--project:has(:focus-visible) .pcard {
   display: flex;
 }
 
@@ -2394,7 +2382,23 @@ onUnmounted(() => {
 
 @media (max-width: 900px) {
   .rail {
-    display: none;
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 101;
+    width: min(var(--rail-w), 85vw);
+    margin-left: 0;
+    transform: translateX(-100%);
+    transition: transform var(--motion-dur) var(--motion-ease);
+  }
+  .rail--mobile-open {
+    transform: translateX(0);
+  }
+  .rail-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 100;
+    background: rgb(0 0 0 / 45%);
+    border: 0;
   }
 }
 </style>

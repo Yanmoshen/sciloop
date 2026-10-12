@@ -14,6 +14,7 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 
 import { ApiError, clearOwnerToken, get, getOwnerToken, setOwnerToken } from '@/api/client'
+import { safeErrorMessage } from '@/utils/messages'
 
 export type AccessMode = 'public_demo' | 'owner_mode'
 export type ThemeMode = 'light' | 'dark'
@@ -182,7 +183,7 @@ export const useSessionStore = defineStore('session', () => {
     try {
       const data = await get<HealthPayload>('/health', { timeoutMs: 5_000 })
       health.value = data
-      healthError.value = data.db.ok ? '' : data.db.detail
+      healthError.value = data.db.ok ? '' : safeErrorMessage({ message: data.db.detail })
       accessMode.value = data.app.access_mode
     } catch (error) {
       health.value = null
@@ -204,7 +205,7 @@ export const useSessionStore = defineStore('session', () => {
   }
 
   function message(error: unknown): string {
-    return error instanceof Error ? error.message : String(error)
+    return safeErrorMessage(error)
   }
 
   return {

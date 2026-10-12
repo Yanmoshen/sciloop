@@ -18,7 +18,6 @@ const emit = defineEmits<{
 }>()
 
 const name = ref('')
-const scenario = ref('')
 
 const sorted = computed(() =>
   [...props.threads].sort((a, b) => (b.updated_at ?? '').localeCompare(a.updated_at ?? '')),
@@ -32,7 +31,7 @@ function runningLabel(thread: ThreadView): string {
 function create(): void {
   const value = name.value.trim()
   if (!value) return
-  emit('create', { name: value, scenario: scenario.value || undefined })
+  emit('create', { name: value })
   name.value = ''
 }
 </script>
@@ -46,10 +45,6 @@ function create(): void {
 
     <form class="rail__create" @submit.prevent="create">
       <input v-model="name" class="rail__input" type="text" placeholder="新建会话名称" />
-      <select v-if="scenarios && scenarios.length" v-model="scenario" class="rail__select">
-        <option value="">默认场景</option>
-        <option v-for="item in scenarios" :key="item" :value="item">{{ item }}</option>
-      </select>
       <button type="submit" class="rail__add" :disabled="busy || !name.trim()">新建</button>
     </form>
 

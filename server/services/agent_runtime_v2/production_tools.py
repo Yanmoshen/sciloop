@@ -16,7 +16,9 @@ approval id.
 from __future__ import annotations
 
 import contextlib
+import copy
 import inspect
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -99,6 +101,33 @@ def _emit_repo(repo: ThreadRepository, call: ToolCall, chunk: str) -> None:
     )
 
 
+def _approval_matches(call: ToolCall, approval: Any, cwd: str) -> bool:
+    """Approval authorizes one exact operation, never a whole thread policy."""
+    if (approval.thread_id, approval.turn_id, approval.call_id) != (call.thread_id, call.turn_id, call.call_id):
+        return False
+    action = approval.action or {}
+    tool = action.get("tool") or action.get("tool_name")
+    arguments = action.get("arguments")
+    if tool != call.name or not isinstance(arguments, dict):
+        return False
+    if json.dumps(arguments, sort_keys=True, ensure_ascii=False) != json.dumps(call.arguments or {}, sort_keys=True, ensure_ascii=False):
+        return False
+    expected_cwd = arguments.get("cwd") or approval.cwd or cwd
+    actual_cwd = (call.arguments or {}).get("cwd") or cwd
+    return Path(str(expected_cwd)).resolve() == Path(str(actual_cwd)).resolve()
+
+
+def _command_granted(call: ToolCall, approvals: ApprovalManager, cwd: str) -> bool:
+    if call.name != "host.command":
+        return False
+    assessment = approvals.assess_command(
+        (call.arguments or {}).get("argv") or [],
+        cwd=(call.arguments or {}).get("cwd") or cwd,
+        thread_id=call.thread_id, tool=call.name,
+    )
+    return bool(assessment.matched_grant)
+
+
 async def _run_host_command(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """Production command handler with incremental event emission."""
     argv = [str(item) for item in args.get("argv") or []]
@@ -145,6 +174,7 @@ async def _run_host_command(args: dict[str, Any], ctx: ToolContext) -> dict[str,
         cancel=ctx.service("cancel_token"),
         on_output=output,
         sandbox_check=False,
+        policy="user-approved-host" if ctx.service("call_authorized") else None,
     )
     result = record.to_tool_output()
     if record.status.value not in {"succeeded"}:
@@ -289,7 +319,13 @@ class ProductionToolBundle:
         The API facade owns the authoritative Turn transition.  Production host
         calls set ``sync_repository=False`` so that the same approval cannot be
         resolved twice when the facade resumes the turn.
+
+        The public v2 protocol uses ``approve_conversation`` and ``full_access``;
+        the approval manager keeps the more explicit internal names. Normalize
+        at this boundary so the production adapter accepts the same decisions as
+        the API and fake host.
         """
+        decision = self._public_decision(decision)
         view = self.approvals.view(approval_id)
         if view is None:
             # Agent 1 creates the repository approval after the gate returns
@@ -350,6 +386,13 @@ class ProductionToolBundle:
                 pass
         return {"ok": True, "approval": updated.to_dict(), "decision": decision}
 
+    @staticmethod
+    def _public_decision(decision: str) -> str:
+        return {
+            "approve_conversation": "approve_for_thread",
+            "full_access": "escalate_full_access",
+        }.get(decision, decision)
+
 
 class _ProductionExecutor:
     """ToolExecutor adapter adding denial feed-back and cancel-token context."""
@@ -365,6 +408,14 @@ class _ProductionExecutor:
         return self.registry.spec(name)
 
     async def execute(self, call: ToolCall, cancel: CancelToken | None = None) -> ToolResult:
+        if call.thread_id != self.bundle._thread_id:  # type: ignore[attr-defined]
+            return ToolResult(
+                call_id=call.call_id, name=call.name, status=ToolCallStatus.FAILED,
+                error={"code": "approval_mismatch", "message": "操作不属于当前对话"},
+            )
+        # Adopt repository decisions before looking at local authorization.
+        # Direct callers and rebuilt bundles must respect denials as well.
+        decision = self.bundle.approval_gate(call)
         denied = self.bundle._denied_calls  # type: ignore[attr-defined]
         if call.call_id in denied:
             return ToolResult(
@@ -373,9 +424,36 @@ class _ProductionExecutor:
                 status=ToolCallStatus.FAILED,
                 error={"code": "approval_denied", "message": "研究者拒绝了该操作"},
             )
-        services = self.registry.services
-        services["cancel_token"] = cancel
-        return await self.registry.execute(call, cancel)
+        # Context is call-scoped: never toggle a shared sandbox or full_access
+        # while sibling tools run. A granted action can use the same OS access
+        # as full mode, but other calls still pass their own approval gate.
+        approval = self.bundle.approvals.by_call(call.call_id)
+        if approval is not None and approval.status == ApprovalStatus.GRANTED.value and not _approval_matches(
+            call, approval, str(self.registry.default_cwd),
+        ):
+            return ToolResult(call_id=call.call_id, name=call.name, status=ToolCallStatus.FAILED,
+                              error={"code": "approval_mismatch", "message": "操作内容已变化，需要重新批准"})
+        authorized = self.bundle.approvals.full_access or _command_granted(
+            call, self.bundle.approvals, str(self.registry.default_cwd),
+        ) or (
+            approval is not None
+            and approval.status == ApprovalStatus.GRANTED.value
+            and _approval_matches(call, approval, str(self.registry.default_cwd))
+        )
+        if not authorized and decision == "require":
+            return ToolResult(call_id=call.call_id, name=call.name, status=ToolCallStatus.FAILED,
+                              error={"code": "approval_required", "message": "该操作尚未获得批准"})
+        registry = copy.copy(self.registry)
+        registry.services = {**self.registry.services, "cancel_token": cancel, "call_authorized": authorized}
+        if authorized:
+            registry.sandbox = copy.copy(self.bundle.sandbox)
+            registry.sandbox.set_policy(SandboxPolicy.DANGER_FULL_ACCESS)
+        runner = registry.services.get("skill_run_scoped")
+        if runner is not None:
+            async def run_skill(name: str, args: list[str], cwd: str | None = None) -> dict[str, Any]:
+                return await runner(name, args, cwd, registry._context_for(call))
+            registry.services["skill_run"] = run_skill
+        return await registry.execute(call, cancel)
 
 
 def build_tool_bundle(
@@ -413,7 +491,7 @@ def build_tool_bundle(
     services["search"] = _default_search
     services["fetch"] = _default_fetch
 
-    async def skill_run(name: str, args: list[str], skill_cwd: str | None = None) -> dict[str, Any]:
+    async def skill_run(name: str, args: list[str], skill_cwd: str | None = None, ctx: ToolContext | None = None) -> dict[str, Any]:
         from services.skills.registry import scan
 
         pack = next((item for item in scan() if item.name == name), None)
@@ -422,15 +500,24 @@ def build_tool_bundle(
         if not pack.steps:
             return {"name": name, "runnable": False, "message": "该技能是说明型技能，没有可执行脚本"}
         script = pack.path / pack.steps[0].script
+        if ctx is not None and ctx.sandbox is not None:
+            verdict = ctx.sandbox.check_command_paths([str(script), *args], cwd=skill_cwd or str(cwd)).verdict
+            if verdict.denied or verdict.needs_approval:
+                return {"__error__": {"code": "approval_required", "message": verdict.reason}}
         record = await host.execute(
             [str(script), *args],
             thread_id=thread_id,
+            turn_id=ctx.turn_id if ctx else None,
+            call_id=ctx.call_id if ctx else None,
             cwd=skill_cwd or str(cwd),
-            sandbox_check=True,
+            cancel=ctx.service("cancel_token") if ctx else None,
+            sandbox_check=ctx is None,
+            policy="user-approved-host" if ctx and ctx.service("call_authorized") else None,
         )
         return record.to_tool_output()
 
     services["skill_run"] = skill_run
+    services["skill_run_scoped"] = skill_run
     mcp = _service_from(host, "mcp_call", "call_mcp") or _service_from(repo, "mcp_call", "call_mcp")
     if mcp is not None:
         services["mcp_call"] = mcp
@@ -482,14 +569,21 @@ def build_tool_bundle(
                     # correctly scoped grant.
                     adopted = replace(adopted, cwd=str(cwd))
                     approvals.adopt(adopted)
-                if adopted.status == ApprovalStatus.DENIED.value:
+                if adopted.status in {ApprovalStatus.DENIED.value, ApprovalStatus.EXPIRED.value}:
                     denied_calls.add(call.call_id)
                     return "allow"
                 if adopted.status == ApprovalStatus.GRANTED.value:
-                    return "allow"
+                    return "allow" if _approval_matches(call, adopted, str(cwd)) else "require"
         except Exception:
             pass
-        return registry.approval_gate(thread_id)(call)
+        if approvals.full_access:
+            return "allow"
+        # No implemented process sandbox can constrain inline code. Ask for
+        # host execution authorization instead of allowing and then failing.
+        if call.name in {"host.command", "skill.run"}:
+            return "allow" if _command_granted(call, approvals, str(cwd)) else "require"
+        assessment = registry.approval_requirement(call, thread_id=thread_id)
+        return "require" if assessment.get("required") or assessment.get("denied") else "allow"
 
     bundle.approval_gate = gate
     bundle.executor = _ProductionExecutor(registry, bundle)
@@ -507,6 +601,24 @@ def build_tool_bundle(
         return {"status": "scheduled", "thread_id": child_thread_id, "turn_id": turn.turn_id}
 
     registry.bind(agent_runner=agent_runner)
+    from services.agent_tree_tools_v2.entrypoints import run_send, send_definition
+
+    async def send_and_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+        result = await run_send(args, ctx)
+        if result.get("__error__"):
+            return result
+        child_id = str(args["agent_id"])
+        child_state = repo.state(child_id)
+        if child_state.active_turn is None:
+            runner = ctx.service("agent_runner")
+            if runner is not None:
+                scheduled = runner(child_id, str(args["content"]))
+                if _awaitable(scheduled):
+                    await scheduled
+                result["status"] = "scheduled"
+        return result
+
+    registry.register(send_definition().with_handler(send_and_schedule), replace=True)
     return bundle
 
 

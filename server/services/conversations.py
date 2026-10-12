@@ -11,7 +11,7 @@
 -------------------------------------
 仓库 ``knowledge-base/conversations/<项目id>/<会话id>.json``；
 **未分组**的对话放 ``conversations/_ungrouped/<会话id>.json``。
-Docker 模式下由 docker-compose.yml 挂载同一个仓库目录。
+后端直接读写仓库内同一目录（宿主部署，无需挂载）。
 
 历史遗留的**平铺文件**（``conversations/<会话id>.json``）仍可读，视为未分组；
 下一次写入会自动把它落进 ``_ungrouped/``。
@@ -40,6 +40,9 @@ import json
 import logging
 import os
 import re
+import threading
+import time
+import uuid
 from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
@@ -65,8 +68,44 @@ AGENT_HISTORY_KEY = "agent_history"
 AGENT_HISTORY_SNAPSHOTS_KEY = "agent_history_snapshots"
 COMPACTION_CHECKPOINTS_KEY = "compaction_checkpoints"
 
+# Windows refuses to replace a file while another writer still has the target
+# open.  Conversation writes are synchronous, but several request handlers can
+# reach this module at once (stream finalization, title updates, approvals).
+# Serialize writes in this process and use a unique temporary path so one
+# request can never replace or delete another request's temporary file.
+_WRITE_LOCK = threading.RLock()
+_REPLACE_RETRIES = 8
+_REPLACE_RETRY_DELAY_SECONDS = 0.05
+
 #: 未分组对话所在子目录名（不是数字，因此不会与任何真实项目 id 冲突）
 UNGROUPED_KEY = "_ungrouped"
+
+
+def _normalize_approval_markers(record: dict[str, Any]) -> dict[str, Any]:
+    """Drop stale ``awaiting_approval`` markers after a request is closed.
+
+    A streamed approval is written once while waiting and again after the
+    decision.  Older records can therefore contain the request id even though
+    its approval is already approved, denied, or consumed.  Keeping that id
+    makes a resumed conversation look blocked.  Only a request whose current
+    status is still ``pending`` may keep the marker.
+    """
+
+    for turn in record.get("turns") or []:
+        if not isinstance(turn, dict) or not turn.get("awaiting_approval"):
+            continue
+        request_id = str(turn.get("awaiting_approval"))
+        request = next(
+            (
+                item
+                for item in (turn.get("approvals") or [])
+                if isinstance(item, dict) and str(item.get("id") or "") == request_id
+            ),
+            None,
+        )
+        if not request or str(request.get("status") or "pending") != "pending":
+            turn["awaiting_approval"] = None
+    return record
 
 
 def conversations_dir() -> Path:
@@ -129,16 +168,31 @@ def locate(conversation_id: str) -> Path | None:
 def write(record: dict[str, Any]) -> None:
     """原子落盘：先写临时文件再替换，避免读到半截 JSON。
 
-    目标目录由 ``record['project_id']`` 决定；若该会话此前落在别的目录（例如刚「移入项目」），
+    目标目录由创建时的 ``record['project_id']`` 决定；兼容历史平铺文件时，
     旧文件会被清掉，保证一个会话在磁盘上只存在一份。
     """
     conversation_id = str(record["id"])
     target = _path(conversation_id, record.get("project_id"))
     target.parent.mkdir(parents=True, exist_ok=True)
     previous = locate(conversation_id)
-    tmp = target.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(target)
+    tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with _WRITE_LOCK:
+            _normalize_approval_markers(record)
+            tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+            for attempt in range(_REPLACE_RETRIES):
+                try:
+                    tmp.replace(target)
+                    break
+                except PermissionError:
+                    if attempt == _REPLACE_RETRIES - 1:
+                        raise
+                    time.sleep(_REPLACE_RETRY_DELAY_SECONDS)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("会话临时文件清理失败：%s", tmp)
     if previous is not None and previous != target:
         try:
             previous.unlink()
@@ -151,7 +205,7 @@ def read(conversation_id: str) -> dict[str, Any] | None:
     if path is None:
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return _normalize_approval_markers(json.loads(path.read_text(encoding="utf-8")))
     except (json.JSONDecodeError, OSError):
         logger.warning("会话文件读取失败（按不存在处理）：%s", path.name)
         return None
@@ -164,8 +218,13 @@ def create(
     project_id: Any = None,
     conversation_id: str | None = None,
     workspace_dir: str | None = None,
+    persist: bool = True,
 ) -> dict[str, Any]:
-    """新建会话记录（尚未有任何轮次）。``conversation_id`` 可在流式开场时先占位。"""
+    """新建会话记录（尚未有任何轮次）。
+
+    ``persist=False`` 供流式入口使用：请求若在流开始前就被客户端切走，
+    不会留下没有任何轮次的空会话；真正开始发送流时由调用方显式写入。
+    """
     stamp = _now()
     chosen_id = conversation_id or time_id()
     if conversation_id is None:
@@ -175,7 +234,7 @@ def create(
             suffix += 1
     record: dict[str, Any] = {
         "id": chosen_id,
-        "title": readable_name(title, identifier=chosen_id[:10], max_length=120),
+        "title": readable_name(title, max_length=120),
         "model_ref": model_ref,
         "project_id": normalize_project_id(project_id),
         "workspace_dir": workspace_dir,
@@ -187,12 +246,32 @@ def create(
         AGENT_HISTORY_SNAPSHOTS_KEY: [],
         COMPACTION_CHECKPOINTS_KEY: [],
     }
-    write(record)
+    if persist:
+        write(record)
     return record
 
 
-def append_turns(record: dict[str, Any], new_turns: list[dict[str, Any]]) -> dict[str, Any]:
-    record["turns"] = [*(record.get("turns") or []), *new_turns]
+def append_turns(
+    record: dict[str, Any], new_turns: list[dict[str, Any]], *, sync_history: bool = True
+) -> dict[str, Any]:
+    stamped_turns: list[dict[str, Any]] = []
+    for turn in new_turns:
+        item = dict(turn)
+        if item.get("role") in {"user", "assistant"} and not item.get("ts"):
+            item["ts"] = _now()
+        stamped_turns.append(item)
+    if sync_history:
+        # Non-agent branches (guide/query/fast replies) must enter the same
+        # model history. Otherwise a pre-existing agent_history hides them.
+        prior = context_messages(record)
+        visible = [
+            {"role": turn["role"], "content": turn["content"]}
+            for turn in stamped_turns
+            if turn.get("role") in {"user", "assistant"}
+            and turn.get("content") and not turn.get("note_only")
+        ]
+        record[AGENT_HISTORY_KEY] = protocol_messages([*prior, *visible])
+    record["turns"] = [*(record.get("turns") or []), *stamped_turns]
     record["updated_at"] = _now()
     write(record)
     return record
@@ -214,17 +293,6 @@ def truncate_from(record: dict[str, Any], index: int) -> dict[str, Any]:
     return record
 
 
-def move(conversation_id: str, project_id: Any) -> dict[str, Any] | None:
-    """把会话移入某项目（``project_id=None`` 即移回未分组）。"""
-    record = read(conversation_id)
-    if record is None:
-        return None
-    record["project_id"] = normalize_project_id(project_id)
-    record["updated_at"] = _now()
-    write(record)
-    return record
-
-
 def set_archived(conversation_id: str, archived: bool) -> dict[str, Any] | None:
     record = read(conversation_id)
     if record is None:
@@ -239,7 +307,7 @@ def rename(conversation_id: str, title: str) -> dict[str, Any] | None:
     record = read(conversation_id)
     if record is None:
         return None
-    record["title"] = readable_name(title, identifier=conversation_id[:10], max_length=120)
+    record["title"] = readable_name(title, max_length=120)
     record["updated_at"] = _now()
     write(record)
     return record
@@ -293,20 +361,22 @@ def iter_records() -> list[dict[str, Any]]:
     seen: set[str] = set()
     for path in sorted(conversations_dir().glob("*.json")):
         record = _load(path)
-        if record is not None and str(record.get("id")) not in seen:
-            seen.add(str(record.get("id")))
+        record_id = str(record.get("id") or "") if record is not None else ""
+        if record is not None and ID_PATTERN.match(record_id) and record_id not in seen:
+            seen.add(record_id)
             records.append(record)
     for path in sorted(conversations_dir().glob("*/*.json")):
         record = _load(path)
-        if record is not None and str(record.get("id")) not in seen:
-            seen.add(str(record.get("id")))
+        record_id = str(record.get("id") or "") if record is not None else ""
+        if record is not None and ID_PATTERN.match(record_id) and record_id not in seen:
+            seen.add(record_id)
             records.append(record)
     return records
 
 
 def _load(path: Path) -> dict[str, Any] | None:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return _normalize_approval_markers(json.loads(path.read_text(encoding="utf-8")))
     except (json.JSONDecodeError, OSError):
         logger.warning("跳过损坏的会话文件：%s", path.name)
         return None
@@ -486,7 +556,6 @@ __all__ = [
     "latest",
     "list_all",
     "locate",
-    "move",
     "normalize_project_id",
     "purge_flat_test_files",
     "read",

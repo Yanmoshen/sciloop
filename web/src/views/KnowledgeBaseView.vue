@@ -32,11 +32,13 @@ import {
   formatSize,
   formatTime,
   hasContent,
+  knowledgeBasePath,
   KB_BUCKETS,
   loadEntries,
   loadEntry,
   peekSnapshot,
   refreshSnapshot,
+  syncDiskIndex,
   invalidateSnapshot,
   moveEntries,
   restoreEntries,
@@ -133,6 +135,7 @@ const sortOrder = computed<SortOrder>({
   set: (value) => setKnowledgeQuery({ order: value === 'desc' ? null : value }),
 })
 const selected = ref<string[]>([])
+const originFilter = ref('')
 
 /** 搜索词：打字频繁，**防抖 300ms** 再写回 URL（别每敲一个字就 replace 一次） */
 let keywordTimer: ReturnType<typeof setTimeout> | null = null
@@ -253,7 +256,7 @@ const visibleEntries = computed(() =>
       folder: isBrowsing.value ? folder.value : undefined,
       projectId: projectFilter.value,
       timeRange: timeRange.value,
-    }),
+    }).filter((entry) => !originFilter.value || entry.provenance === originFilter.value),
     sortField.value,
     sortOrder.value,
   ),
@@ -274,7 +277,7 @@ const childFolders = computed(() => {
 })
 
 const breadcrumb = computed(() => [
-  { label: '知识库', path: [] as string[] },
+  { label: 'knowledge-base/', path: [] as string[] },
   ...folder.value.map((segment, index) => ({
     label: segment,
     path: folder.value.slice(0, index + 1),
@@ -350,8 +353,7 @@ function badgeOf(entry: KnowledgeEntry): { label: string; tone: string } {
 }
 
 function folderOf(entry: KnowledgeEntry): string {
-  const path = folderPath(entry.folder)
-  return path ? `知识库 / ${path.split('/').join(' / ')}` : '知识库'
+  return knowledgeBasePath(entry.folder)
 }
 
 /* ---------------- 读写 ---------------- */
@@ -405,6 +407,12 @@ async function refreshQuietly(): Promise<void> {
   if (refreshing.value) return
   refreshing.value = true
   try {
+    // 同步是 Owner 写操作；只读浏览模式仍应能读取已有快照。
+    try {
+      await syncDiskIndex()
+    } catch {
+      /* 继续读取 manifest，避免权限或旧后端导致知识库空白 */
+    }
     const snapshot = await refreshSnapshot()
     items.value = snapshot.items
     folders.value = snapshot.folders
@@ -435,6 +443,12 @@ async function reload(): Promise<void> {
   if (!hadContent) loading.value = true
   loadError.value = ''
   try {
+    // 同步失败不应阻断只读用户读取已有 manifest。
+    try {
+      await syncDiskIndex()
+    } catch {
+      /* 兼容 public_demo 和尚未重启的旧后端 */
+    }
     const snapshot = await refreshSnapshot()
     items.value = snapshot.items
     folders.value = snapshot.folders
@@ -506,13 +520,21 @@ onUnmounted(() => {
 })
 
 function selectScope(next: KnowledgeScope): void {
-  scope.value = next
-  selected.value = []
-  folder.value = []
-  if (next === 'recent') {
-    sortField.value = 'modified'
-    sortOrder.value = 'desc'
+  originFilter.value = ''
+  // 分类切换需要同时清掉当前文件夹。分别写入多个 computed setter 会让
+  // router.replace 都基于同一份旧 query，后一次导航可能覆盖前一次的 scope，
+  // 表现为第一次点击只回到知识库根目录、第二次才真正切换分类。
+  const patch: Record<string, string | number | null> = {
+    scope: next === 'all' ? null : next,
+    folder: null,
   }
+  if (next === 'recent') {
+    // 最近视图固定按修改时间倒序；默认值不写入 URL，避免产生冗余参数。
+    patch.sort = null
+    patch.order = null
+  }
+  setKnowledgeQuery(patch)
+  selected.value = []
 }
 
 function enterFolder(path: string[]): void {
@@ -840,7 +862,7 @@ onMounted(async () => {
         <!-- 第 1 行：面包屑 + 操作 -->
         <div v-else class="kb__actions">
           <nav class="kb__crumbs" aria-label="当前位置">
-            <template v-for="(crumb, index) in breadcrumb" :key="crumb.label">
+            <template v-for="(crumb, index) in breadcrumb" :key="`${crumb.path.join('/')}:${index}`">
               <button class="kb__crumb" type="button" @click="enterFolder(crumb.path)">{{ crumb.label }}</button>
               <span v-if="index < breadcrumb.length - 1" class="kb__crumb-sep">/</span>
             </template>
@@ -874,6 +896,12 @@ onMounted(async () => {
         <!-- 第 2 行：搜索 + 筛选 -->
         <div class="kb__filters">
           <el-input v-model="keyword" size="small" class="kb__search" placeholder="搜索全部条目（跨文件夹）" clearable />
+          <el-select v-model="originFilter" size="small" class="kb__select" clearable placeholder="全部来源" aria-label="资料来源">
+            <el-option label="自产内容" value="generated" />
+            <el-option label="外部导入" value="external" />
+            <el-option label="解析与翻译产物" value="derived" />
+            <el-option label="磁盘索引" value="disk" />
+          </el-select>
           <el-select v-model="projectFilter" size="small" class="kb__select" clearable placeholder="全部项目">
             <el-option v-for="project in projects" :key="project.id" :label="project.name" :value="project.id" />
           </el-select>
@@ -970,8 +998,8 @@ onMounted(async () => {
 
             <!-- 条目（分块上屏：renderLimit 之前的先渲染，其余按帧补齐，见 scheduleGrow） -->
             <div
-              v-for="entry in renderedEntries"
-              :key="entry.id"
+              v-for="(entry, entryIndex) in renderedEntries"
+              :key="`${entry.id}:${entryIndex}`"
               class="kb__row"
               :class="{ 'kb__row--on': selected.includes(entry.id) }"
             >
@@ -1061,9 +1089,9 @@ onMounted(async () => {
           <h2 class="kb__dialog-title">移到文件夹</h2>
           <p class="kb__count">{{ moveTarget.label }}</p>
           <div class="kb__dialog-body scroll-y">
-            <button class="kb__dest" type="button" @click="doMove([])">知识库（根目录）</button>
+            <button class="kb__dest" type="button" @click="doMove([])">knowledge-base/</button>
             <button v-for="path in folders" :key="path" class="kb__dest" type="button" @click="doMove(path.split('/'))">
-              {{ path }}
+              {{ knowledgeBasePath(path) }}
             </button>
           </div>
           <div class="kb__dialog-foot">
@@ -1294,7 +1322,7 @@ onMounted(async () => {
 .kb__spinner {
   width: 13px;
   height: 13px;
-  border: 1.5px solid var(--color-border-secondary);
+  border: 1.5px solid var(--color-border);
   border-top-color: var(--color-text-secondary);
   border-radius: 50%;
   animation: kb-spin 0.7s linear infinite;
@@ -1324,7 +1352,7 @@ onMounted(async () => {
   z-index: 2201;
   padding: 4px;
   background-color: var(--color-bg-elevated);
-  border: 1px solid var(--color-border-tertiary);
+  border: 1px solid var(--color-border);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-popover);
 }
@@ -1354,7 +1382,7 @@ onMounted(async () => {
 
 .kb__rowmenu-item--divided {
   margin-top: 4px;
-  border-top: 1px solid var(--color-border-tertiary);
+  border-top: 1px solid var(--color-border);
   padding-top: 8px;
 }
 

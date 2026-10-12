@@ -42,6 +42,7 @@ from core.security import require_owner
 from db.models.paper import Paper
 from db.session import SessionLocal
 from services.paper_source import arxiv_client, github_client, identity, openalex_client
+from services.paper_source import probe_state as probe_store
 from services.paper_source import s2_client as s2_module
 from services.paper_source import source_records as sr
 from services.paper_source.cache import cache_stats
@@ -65,7 +66,7 @@ def _session() -> Iterator[Session]:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={
                 "code": "database_unavailable",
-                "message": "数据库会话工厂不可用（DATABASE_URL / psycopg 未就绪）",
+                "message": "数据库会话工厂不可用（DATABASE_URL / sqlite3 未就绪）",
                 "detail": None,
             },
         )
@@ -231,12 +232,13 @@ def search_papers(
         )
     if field:
         category = field.strip()
+        categories = func.json_each(Paper.raw, "$.arxiv.categories").table_valued("value")
         conditions.append(
             or_(
-                func.jsonb_extract_path_text(Paper.raw, "arxiv", "primary_category") == category,
-                func.jsonb_exists(
-                    func.jsonb_extract_path(Paper.raw, "arxiv", "categories"), category
-                ),
+                func.json_extract(Paper.raw, "$.arxiv.primary_category") == category,
+                select(1).select_from(categories).where(
+                    categories.c.value == category
+                ).correlate(Paper).exists(),
             )
         )
     if source and source.strip():
@@ -287,12 +289,20 @@ class FetchRequest(BaseModel):
     """``POST /papers/fetch`` 请求体（附录 B.1）。"""
 
     fields: list[str] | None = Field(default=None, description="arXiv 分类，默认 ARXIV_FIELDS")
+    keywords: list[str] | None = Field(
+        default=None,
+        description="关键词（建议 2–5 个英文关键词或短语；多个关键词按 AND 组合）",
+        max_length=10,
+    )
     date_from: str | None = Field(default=None, description="增量起点（YYYY-MM-DD）")
     date_to: str | None = Field(
         default=None, description="时间窗终点（YYYY-MM-DD）；与 date_from 合用可做历史窗口回填"
     )
     limit: int | None = Field(default=None, ge=1, le=1000, description="本轮抓取上限")
     sources: list[str] | None = Field(default=None, description="启用哪些富化源")
+    download_fulltext: bool = Field(default=True, description="自动下载全文；下载失败计为抓取失败")
+    parse_fulltext: bool = Field(default=False, description="下载后是否立即解析全文（默认关闭，可之后单独解析）")
+    write_knowledge_base: bool = Field(default=True, description="下载全文写入知识库（默认开启）")
 
 
 def _parse_date(value: Any) -> Any:
@@ -326,14 +336,25 @@ def trigger_fetch(body: FetchRequest | None = None) -> dict[str, Any]:
             )
     limit_value = int(request.limit or fetch_papers.DEFAULT_LIMIT)
 
+    keywords = [str(item).strip() for item in (request.keywords or []) if str(item).strip()]
+    if len(keywords) > 5:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "too_many_keywords", "message": "关键词建议填写 2–5 个英文关键词或短语", "detail": None},
+        )
+
     date_from = _parse_date(request.date_from)
     date_to = _parse_date(request.date_to)
     result = fetch_papers.submit_fetch(
         fields=request.fields or None,
+        keywords=keywords or None,
         date_from=date_from,
         date_to=date_to,
         limit=limit_value,
         sources=sources or None,
+        download_fulltext=request.download_fulltext,
+        parse_fulltext=request.parse_fulltext,
+        write_knowledge_base=request.write_knowledge_base,
     )
     logger.info(
         "fetch_task_submitted task_id=%s fields=%s limit=%s sources=%s",
@@ -415,7 +436,7 @@ def fetch_job_status(task_id: str) -> dict[str, Any]:
     return task
 
 
-TERMINAL_STATUSES = {"done", "failed", "cancelled"}
+TERMINAL_STATUSES = {"done", "partial", "failed", "cancelled"}
 
 
 def _control_task(task_id: str, *, pause: bool | None = None, cancel: bool | None = None) -> dict[str, Any]:
@@ -591,14 +612,14 @@ def paper_trends(
 
     # 逐日新增论文（按入库时间）
     new_stmt = (
-        select(func.date_trunc("day", Paper.created_at).label("day"), func.count().label("n"))
+        select(func.date(Paper.created_at).label("day"), func.count().label("n"))
         .where(Paper.created_at.isnot(None))
         .group_by("day")
         .order_by("day")
     )
     if since is not None:
         new_stmt = new_stmt.where(Paper.created_at >= since)
-    new_by_day = {row.day.date(): int(row.n) for row in session.execute(new_stmt).all()}
+    new_by_day = {date.fromisoformat(str(row.day)[:10]): int(row.n) for row in session.execute(new_stmt).all()}
 
     # 逐日新增"已解析"（有卡片 且 有解析成功全文）
     ok_docs = (
@@ -616,7 +637,7 @@ def paper_trends(
         .subquery()
     )
     parsed_stmt = (
-        select(func.date_trunc("day", first_card.c.parsed_at).label("day"), func.count().label("n"))
+        select(func.date(first_card.c.parsed_at).label("day"), func.count().label("n"))
         .select_from(first_card)
         .join(ok_docs, ok_docs.c.paper_id == first_card.c.paper_id)
         .where(first_card.c.parsed_at.isnot(None))
@@ -625,7 +646,7 @@ def paper_trends(
     )
     if since is not None:
         parsed_stmt = parsed_stmt.where(first_card.c.parsed_at >= since)
-    parsed_by_day = {row.day.date(): int(row.n) for row in session.execute(parsed_stmt).all()}
+    parsed_by_day = {date.fromisoformat(str(row.day)[:10]): int(row.n) for row in session.execute(parsed_stmt).all()}
 
     # 窗口之前的基数（累计线的起点）。
     # ⚠️ days=0（全部历史）时**没有窗口之外的数据**，基数必须是 0 ——
@@ -801,6 +822,13 @@ async def _probe_arxiv() -> ProbeOutcome:
 
 async def _probe_s2() -> ProbeOutcome:
     client = s2_module.S2Client()
+    if not client.configured:
+        return ProbeOutcome(
+            ok=True,
+            http_status=None,
+            detail="not_configured",
+            extra={"configured": False, "skipped": True},
+        )
     try:
         item = await client.get_paper(arxiv_id="1706.03762", use_cache=False)
     except s2_module.S2Unavailable as exc:
@@ -950,17 +978,24 @@ async def sources_health(
 ) -> dict[str, Any]:
     """返回 arxiv / semantic_scholar / openalex / github 四源状态。
 
-    - 默认（``probe=false``）：只读 ``paper_source_records`` 的历史留痕（快、零外部调用）；
-    - ``probe=true``：各发一次真实请求，给出实时 ``ok / http_status / latency_ms``。
-    任一源不可用 → 顶层 ``status='degraded'`` 并列出 ``degraded_sources``。
+    - 默认（``probe=false``）：只读**已持久化**的探活留痕 + 库内抓取留痕（快、零外部调用）；
+    - ``probe=true``：对**已配置**的源各发一次真实请求，逐来源写入
+      ``last_probe_at / last_probe_ok / last_probe_http_status / last_probe_latency_ms /
+      last_probe_detail``（成功时另外更新 ``last_probe_success_at``）。
+    未配置凭证的必需源（如无 key 的 Semantic Scholar）返回 ``status='disabled'`` /
+    ``degraded_reason='not_configured'``，**不发起请求**，也不算成功或降级。
+    任一已配置源不可用 → 顶层 ``status='degraded'`` 并列出 ``degraded_sources``。
     """
+    persisted_state = probe_store.load_state()
     stats = sr.source_stats(session)
     configured = _configured_flags()
     payload_sources: dict[str, Any] = {}
+    checked_at: str | None = persisted_state.get("checked_at")
 
     for name in SOURCE_NAMES:
         node = dict(stats.get(name) or {})
         conf = configured.get(name, {})
+        persisted = dict(persisted_state["sources"].get(name) or {})
         node.update(
             {
                 "source": name,
@@ -973,78 +1008,121 @@ async def sources_health(
                     if name in sr.CONFIDENCE_BY_SOURCE
                     else None
                 ),
-                "ok": True,
-                "status": "ok",
-                "degraded_reason": None,
             }
         )
+        # 逐来源探活留痕（独立于论文抓取时间，见 services/paper_source/probe_state.py）
+        node.update({key: persisted.get(key) for key in probe_store.FIELDS})
         credentials_required = bool(
             conf.get("credentials_required", name in ("semantic_scholar", "openalex"))
         )
         node["credentials_required"] = credentials_required
-        # 只有"必需凭证缺失"才算降级；GitHub 缺 token 只是匿名限额（仍可用）
+        has_probe = node.get("last_probe_at") is not None
+        has_records = bool(node.get("total_records")) or node.get("last_success_at") is not None
+
         if not node["configured"] and credentials_required:
-            node["ok"] = False
-            node["status"] = "degraded"
+            # 未配置的源一律 disabled/not_configured：不发请求，既不算成功也不算降级
+            node["ok"] = None
+            node["status"] = "disabled"
             node["degraded_reason"] = "not_configured"
-        last_status = node.get("last_http_status")
-        if last_status is not None and int(last_status) >= 400:
-            node["ok"] = False
-            node["status"] = "degraded"
-            node["degraded_reason"] = f"last_http_status={last_status}"
+        else:
+            node["ok"] = True
+            node["status"] = "ok"
+            node["degraded_reason"] = None
+            last_status = node.get("last_http_status")
+            if last_status is not None and int(last_status) >= 400:
+                node["ok"] = False
+                node["status"] = "degraded"
+                node["degraded_reason"] = f"last_http_status={last_status}"
+            elif not has_probe and not has_records:
+                # 从未探过、也没有任何取数留痕：如实显示"未检测"，不假装可用
+                node["ok"] = None
+                node["status"] = "unknown"
+                node["degraded_reason"] = "not_checked"
         payload_sources[name] = node
 
     if probe:
-        names = list(SOURCE_NAMES)
+        # 未配置的来源不发起任何上游请求（语义与 probe=false 的 disabled 判定一致）
+        names = [name for name in SOURCE_NAMES if payload_sources[name]["status"] != "disabled"]
+        skipped = [name for name in SOURCE_NAMES if payload_sources[name]["status"] == "disabled"]
         outcomes = await asyncio.gather(
             *(_PROBES[name]() for name in names), return_exceptions=True
         )
+        probe_results: dict[str, dict[str, Any]] = {}
         for name, outcome in zip(names, outcomes, strict=True):
             node = payload_sources[name]
             if isinstance(outcome, BaseException):
-                node.update(
-                    {
-                        "probe": {
-                            "ok": False,
-                            "http_status": None,
-                            "detail": f"{type(outcome).__name__}: {outcome}",
-                            "request_url": None,
-                            "latency_ms": None,
-                        }
-                    }
-                )
-                node["ok"] = False
-                node["status"] = "degraded"
-                node["degraded_reason"] = "probe_failed"
-                continue
-            probe_payload = asdict(outcome)
+                probe_payload: dict[str, Any] = {
+                    "ok": False,
+                    "http_status": None,
+                    "detail": f"{type(outcome).__name__}: {outcome}",
+                    "request_url": None,
+                    "latency_ms": None,
+                }
+            else:
+                probe_payload = asdict(outcome)
             node["probe"] = probe_payload
             # 探活是实时结论，优先于库内历史留痕
-            if outcome.ok:
+            if probe_payload.get("ok"):
                 node["ok"] = True
                 node["status"] = "ok"
                 node["degraded_reason"] = None
             else:
                 node["ok"] = False
                 node["status"] = "degraded"
-                node["degraded_reason"] = outcome.detail or "probe_failed"
+                node["degraded_reason"] = probe_payload.get("detail") or "probe_failed"
+            probe_results[name] = {
+                "ok": probe_payload.get("ok"),
+                "http_status": probe_payload.get("http_status"),
+                "latency_ms": probe_payload.get("latency_ms"),
+                "detail": probe_payload.get("detail"),
+            }
+        for name in skipped:
+            node = payload_sources[name]
+            node["probe"] = {
+                "ok": None,
+                "http_status": None,
+                "detail": "not_configured",
+                "request_url": None,
+                "latency_ms": None,
+            }
+            probe_results[name] = {
+                "ok": None,
+                "http_status": None,
+                "latency_ms": None,
+                "detail": "not_configured",
+            }
 
-    degraded = [name for name, node in payload_sources.items() if not node["ok"]]
-    return {
+        checked_at = datetime.now(UTC).isoformat()
+        written = probe_store.record_probe(probe_results, checked_at=checked_at)
+        # 把刚落盘的逐来源字段回填到响应，保证"响应里看到的就是已持久化的"
+        for name in SOURCE_NAMES:
+            node = payload_sources[name]
+            saved = dict(written["sources"].get(name) or {})
+            for key in probe_store.FIELDS:
+                node[key] = saved.get(key)
+
+    degraded = [name for name, node in payload_sources.items() if node["status"] == "degraded"]
+    disabled = [name for name, node in payload_sources.items() if node["status"] == "disabled"]
+    unchecked = [name for name, node in payload_sources.items() if node["status"] == "unknown"]
+    payload = {
         "status": "ok" if not degraded else "degraded",
         "degraded_sources": degraded,
+        "disabled_sources": disabled,
+        "unchecked_sources": unchecked,
         "sources": payload_sources,
-        "checked_at": datetime.now(UTC).isoformat(),
+        "checked_at": checked_at,
         "probe_enabled": bool(probe),
         "cache": cache_stats(),
         "notes": [
-            "默认只读库内留痕；probe=true 才会真实探活",
-            "semantic_scholar 必须带 key：未配置时官方返回 429，状态会显示 degraded 并降级 OpenAlex",
-            "openalex 必须带 mailto：未配置时状态 degraded 且不发起请求",
+            "默认只读已持久化的探活留痕（probe=false，零外部调用）；probe=true 才会真实探活并落盘",
+            "checked_at 只表示最近一轮探活完成时间；每个来源各自的检测/成功时间见 last_probe_at / last_probe_success_at",
+            "semantic_scholar 必须带 key：未配置时为 disabled/not_configured，不发起请求，也不计入成功或降级",
+            "openalex 必须带 mailto：未配置时同样为 disabled/not_configured 且不发起请求",
             "github 的 token 可选：匿名 60 次/小时，缺 token 只影响额度不影响可用性",
             "credentials_required=false 的源即使未配置凭证也不会被判为 degraded",
         ],
     }
+    return payload
 
 
 

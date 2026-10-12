@@ -221,7 +221,7 @@ export const useSettingsStore = defineStore('settings', () => {
       lastTestResult.value = result
       notice.value = result.ok
         ? `连通性测试通过（${result.latency_ms ?? '-'} ms，模型 ${result.model_ref}）`
-        : `连通性测试失败：${result.message ?? result.error_kind}`
+        : `连通性测试失败：${result.message ?? '暂时无法连接服务'}`
       await loadConfigs()
       return result
     } catch (err) {

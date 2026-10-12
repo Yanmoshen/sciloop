@@ -105,14 +105,14 @@ const headline = computed(() => {
 /** 补充说明：明确告诉评委数据来自哪里、为什么不等于实时 */
 const detail = computed(() => {
   if (!known.value) {
-    return session.error ? `演示开关状态读取失败：${session.error}` : '正在读取演示开关状态'
+    return '演示状态暂时无法读取'
   }
   const parts: string[] = []
   if (effective.value.snapshot) {
-    parts.push('论文库读取演示前固化的 paper_feed_snapshots 快照，不是本次实时抓取')
+    parts.push('论文库读取预先保存的演示快照，不是本次实时抓取')
   }
   if (effective.value.replay) {
-    parts.push('模型响应来自 demo_fixtures 预录 fixture，标记 is_replay=true，不是本次实时模型输出')
+    parts.push('模型响应来自预先录制的演示内容，不是本次实时模型输出')
   }
   if (!parts.length) {
     parts.push('数据来自服务端实时请求，未经快照或回放固化')

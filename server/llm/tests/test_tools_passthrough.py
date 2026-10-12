@@ -25,7 +25,7 @@ from llm.adapter import (
     _merge_tool_call_deltas,
     _normalize_messages,
 )
-from llm.http_client import extract_tool_call_deltas
+from llm.http_client import extract_reasoning_summary, extract_tool_call_deltas
 from llm.types import LLMResult, ResolvedModel
 
 MODEL = ResolvedModel(
@@ -195,6 +195,20 @@ def test_stream_tolerates_gapped_and_missing_index() -> None:
 
     _merge_tool_call_deltas(acc, [{"function": {"name": "noidx"}}])
     assert acc[-1]["function"]["name"] == "noidx"
+
+
+def test_reasoning_summary_requires_an_explicit_summary_field() -> None:
+    """Raw reasoning must never be mistaken for a user-facing summary."""
+
+    assert extract_reasoning_summary(
+        {"choices": [{"delta": {"reasoning_content": "private thought"}}]}
+    ) == ""
+    assert extract_reasoning_summary(
+        {"choices": [{"delta": {"reasoning_summary": "Checking the result"}}]}
+    ) == "Checking the result"
+    assert extract_reasoning_summary(
+        {"choices": [{"delta": {"reasoning": {"summary": "Short summary"}}}]}
+    ) == "Short summary"
 
 
 def test_stream_merge_ignores_garbage() -> None:

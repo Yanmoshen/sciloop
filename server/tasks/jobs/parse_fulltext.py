@@ -181,7 +181,7 @@ def _update_task(task_id: str, **changes: Any) -> None:
 # 执行
 # --------------------------------------------------------------------------------------
 def _open_session() -> Any:
-    """同步会话（``psycopg``）；工厂不可用时返回 ``None``（由调用方如实报错）。"""
+    """同步会话（``sqlite3``）；工厂不可用时返回 ``None``（由调用方如实报错）。"""
     if SessionLocal is None:
         return None
     return SessionLocal()
@@ -280,7 +280,7 @@ async def run_parse_fulltext(
         report.errors.append(
             {
                 "code": "database_unavailable",
-                "message": "同步会话工厂不可用（DATABASE_URL / psycopg 未就绪）",
+                "message": "同步会话工厂不可用（DATABASE_URL / sqlite3 未就绪）",
             }
         )
         logger.error("parse_fulltext 无法启动：数据库会话工厂不可用")

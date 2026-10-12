@@ -13,6 +13,7 @@ const props = defineProps<{
   turn: TurnView | null
   busy?: boolean
   draft?: string
+  stopped?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -27,7 +28,7 @@ const status = computed(() => props.turn?.status ?? 'idle')
 const canSteer = computed(() => status.value === 'running')
 const canContinue = computed(() => status.value === 'waiting_input')
 const canInterrupt = computed(() =>
-  ['running', 'waiting_approval', 'waiting_input', 'queued'].includes(status.value),
+  !props.stopped && ['running', 'waiting_approval', 'waiting_input', 'queued'].includes(status.value),
 )
 const canRecover = computed(() => status.value === 'interrupted')
 const canRetry = computed(() => status.value === 'failed')

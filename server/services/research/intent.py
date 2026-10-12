@@ -10,18 +10,11 @@
 ------------------------
 ``node``   **明确的执行意图**：「开始/跑/执行/启动 + 节点名」或明显祈使句
            → 直接执行该节点，不再反问。
-``guide``  **模糊的引导性词**（怎么开始 / 开始 / 研究 / 怎么研究 / 怎么文献调研 /
-           文献调研 / 怎么调研）**且本对话还没有研究链** → 输出引导词让用户选一条路，
-           而不是掉进通用回答、也不是擅自开跑。
+``guide``  仅用于明确启动研究但缺少研究主题时的单一追问（兼容旧 SSE 分支）。
 ``query``  查询意图：查本地数据（论文 / 项目 / 产出 / 研究链）。
 ``chat``   其余 → 通用回答。
 
-为什么要把 ``guide`` 单列
--------------------------
-「文献调研」这四个字既可能是提问（「文献调研该怎么做」），也可能是命令（「开始文献调研」）。
-之前两种情况都被当成普通聊天，用户看到的是通用助手式的反问清单。
-现在把**模糊词**导向一段引导语（三个可点出口），把**带节点名的明确命令**直接执行——
-既不擅自花钱，也不把想干活的人挡在门外。
+只有明确的执行表达才会启动研究；单独提到研究或文献时仍留在普通对话，避免把讨论误当成执行。
 """
 
 from __future__ import annotations
@@ -52,6 +45,15 @@ IntentKind = Literal["node", "guide", "query", "chat"]
 
 #: 执行动作词：与节点名组合即视为**明确命令**
 _ACTION_WORDS: tuple[str, ...] = (
+    "帮我",
+    "请你",
+    "请帮",
+    "给我",
+    "替我",
+    "麻烦",
+    "搜索",
+    "检索",
+    "查找",
     "开始",
     "跑",
     "执行",
@@ -211,6 +213,15 @@ def detect_query_topic(text: str) -> str | None:
     """查询主题：需要**同时**出现查询动词与主题词。"""
 
     lowered = (text or "").lower()
+    if _is_filesystem_request(lowered):
+        return None
+    # A mention of papers plus 'statistics/what/is' is not a database request:
+    # scientific discussion must reach the model with its existing context.
+    if not re.search(
+        r"(?:论文库|文献库|知识库|库里|已(?:有|保存|导入)的|我的项目|本地已有|"
+        r"paper library|my projects|saved papers|imported papers)", lowered
+    ):
+        return None
     if not any(action in lowered for action in QUERY_ACTIONS):
         return None
     for topic, words in QUERY_TOPICS.items():
@@ -218,6 +229,24 @@ def detect_query_topic(text: str) -> str | None:
             if word in lowered:
                 return topic
     return None
+
+
+def _is_filesystem_request(text: str) -> bool:
+    """Keep host files and directories out of platform database routing."""
+
+    lowered = (text or "").lower()
+    return bool(
+        re.search(r"(?:[a-z]:[\\/]|(?:^|\s)/(?:home|tmp|users|workspace|mnt)/|\./|\.\./)", lowered)
+        or any(
+            word in lowered
+            for word in (
+                "根目录", "文件夹", "子目录", "磁盘", "本机目录", "本地目录", "工作目录",
+                "项目目录", "项目路径", "目录里", "目录下", "文件系统",
+                "root directory", "root folder", "folders", "subdirectories", "filesystem",
+                "working directory", "project directory", "project folder", "disk path",
+            )
+        )
+    )
 
 
 def strip_command_words(text: str) -> str:
@@ -229,6 +258,9 @@ def strip_command_words(text: str) -> str:
     """
 
     result = text or ""
+    # 这些是礼貌前缀或范围连接词，不是研究问题本身。
+    for word in ("帮我", "请你", "请帮我", "给我", "替我", "麻烦你", "有关", "关于", "主题是"):
+        result = result.replace(word, " ")
     for word in _ACTION_WORDS:
         result = result.replace(word, " ")
     for alias in sorted(NODE_ALIASES, key=len, reverse=True):
@@ -239,6 +271,18 @@ def strip_command_words(text: str) -> str:
     return result.strip()
 
 
+def defers_research(text: str) -> bool:
+    """Explicitly deferred actions must never enter research or lookup routing."""
+    # 'Search now, but do not write the paper yet' authorizes search, not a
+    # blanket deferral. Bind negative language to the action it qualifies.
+    return bool(re.search(
+        r"(?:先别|先不|暂时不|暂不|不要|不需要|不用|不必)"
+        r"(?:开始|进行)?(?:搜索|检索|调研|研究|执行|启动)|"
+        r"先(?:别|不)开始|先(?:帮我)?确认(?:范围|需求)|确认(?:范围|需求).*再(?:开始|搜索|检索)|"
+        r"(?:don't|do not|not yet|before searching)", text, re.IGNORECASE
+    ))
+
+
 def resolve_intent(
     text: str,
     *,
@@ -246,17 +290,34 @@ def resolve_intent(
 ) -> Intent:
     """判定一句话属于哪一类。
 
-    ``has_chain`` = 本对话是否已经开了研究链。只影响 ``guide`` 的触发：
-    已经开了链的对话里再说「开始」这种模糊词，不再反复问，直接当普通对话处理
-    （用户想跑哪个节点会说清楚）。
+    ``has_chain`` 只用于兼容旧调用方；当前消息的明确执行意图优先于历史链状态。
     """
 
     raw = (text or "").strip()
     if not raw:
         return Intent(kind="chat", reason="空输入")
 
+    if defers_research(raw):
+        return Intent(kind="chat", reason="用户要求先讨论或确认，不执行研究")
+    if _is_filesystem_request(raw):
+        return Intent(kind="chat", reason="文件与目录请求由通用助手处理")
+
     found = _find_node(raw)
     action = _has_action(raw)
+
+    # Search/review wording is an explicit literature request even when the
+    # user does not repeat the node label.
+    if (
+        action
+        and re.search(r"(?:搜索|检索|查找).*(?:论文|文献|算法|研究|复杂度)", raw, re.IGNORECASE)
+        and not _looks_like_question(raw)
+    ):
+        return Intent(
+            kind="node",
+            node="literature_review",
+            keyword=action,
+            reason="识别为明确的文献检索执行意图",
+        )
 
     # ① 明确执行意图：动作词 + 节点名（顺序不限），且不是在提问
     if found is not None and action and not _looks_like_question(raw):
@@ -268,15 +329,16 @@ def resolve_intent(
             reason=f"识别为执行意图：准备执行「{graph.NODE_LABELS.get(node, node)}」",
         )
 
-    # ② 模糊引导词 + 还没开链 → 引导
-    #    **必须排在「整句即节点名」之前**：「文献调研」这四个字是模糊词（可能是提问，
-    #    也可能是要开始），不能因为它是节点别名就直接跑起来——用户没让你花钱。
+    # ② 单独提到节点而没有执行动作：保持普通对话。只有“开始”这类明确
+    #    启动表达且缺少主题时，交给调用方生成一条主题追问。
     guide = _is_bare_guide_word(raw)
-    if guide and not has_chain:
+    if guide and guide in {"怎么开始", "怎么研究", "怎么文献调研", "怎么调研", "研究"}:
+        return Intent(kind="chat", keyword=guide, reason="用户在询问研究流程，先按普通对话回答")
+    if guide == "开始":
         return Intent(
             kind="guide",
             keyword=guide,
-            reason=f"「{guide}」既可能是提问也可能是要开始，先问一句想怎么走",
+            reason="用户表达了启动意图，但还没有给出研究主题",
         )
 
     # ③ 整句就是节点名，且本对话**已经在研究模式**里 → 直接执行
@@ -362,6 +424,8 @@ def looks_like_command(text: str) -> bool:
     raw = (text or "").strip()
     if not raw:
         return False
+    if _is_filesystem_request(raw):
+        return False
     if _looks_like_question(raw):
         return False
     lowered = raw.lower()
@@ -424,6 +488,8 @@ async def classify_with_model(
     不认识的节点名直接降级成 chat，绝不让它凭一个字符串把某个流程跑起来。
     """
 
+    if _is_filesystem_request(text):
+        return Intent(kind="chat", reason="文件与目录请求由通用助手处理")
     if not model_ref:
         return None
 

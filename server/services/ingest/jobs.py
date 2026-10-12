@@ -369,7 +369,7 @@ def _delete_papers(paper_ids: Sequence[int]) -> list[int]:
     """按同一口径删论文：``evidences`` 不是级联、要先删，其余靠外键级联清掉。
 
     ⚠️ **必须用同步会话**：导入任务跑在后台线程里（自己一个新事件循环），
-    拿主循环创建的 asyncpg 引擎会炸 ``attached to a different loop``
+    拿主循环创建的 aiosqlite 引擎会炸 ``attached to a different loop``
     （2026-09-24 实测踩到，任务被标成 failed）。``parse_fulltext`` 的 ``_open_session``
     同样是这个道理。
     """

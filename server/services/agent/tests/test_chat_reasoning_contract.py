@@ -20,6 +20,73 @@ import pytest
 from api.v1 import chat as chat_api
 
 
+def test_partial_turn_checkpoint_survives_reentry_without_duplicates(monkeypatch):
+    saved = []
+    monkeypatch.setattr(chat_api.conversations, "write", lambda record: saved.append(dict(record)))
+    record = {"turns": []}
+    base = [{"role": "user", "content": "旧问题"}]
+    state = {
+        "agent_history": [{"role": "user", "content": "写论文"}],
+        "text": ["正在整理实验结果"], "reasoning": [], "pending": None,
+        "partial_text_from": 0,
+    }
+    kwargs = {"base_turns": base, "text": "写论文", "state": state, "rows": [], "approvals": [], "model_id": "model", "duration_ms": 20}
+    chat_api._save_stream_progress(record, **kwargs)
+    state["text"].append("，已有七次计时。")
+    chat_api._save_stream_progress(record, **kwargs)
+    assert len(record["turns"]) == 3
+    assert record["turns"][-1]["content"] == "正在整理实验结果，已有七次计时。"
+    assert record["agent_history"][-1]["content"] == record["turns"][-1]["content"]
+    # A checkpoint is not a terminal connection failure. The durable owner
+    # supplies the real reason only when it reaches interrupted/failed.
+    assert record["turns"][-1]["interruption_reason"] is None
+    assert record["turns"][-1]["interrupted"] is False
+    assert len(saved) == 2
+
+
+def test_stream_checkpoint_preserves_newer_user_access_choice(monkeypatch):
+    monkeypatch.setattr(chat_api.conversations, "read", lambda _id: {"grants": {"full_access": True}})
+    monkeypatch.setattr(chat_api.conversations, "write", lambda _record: None)
+    record = {"id": "c1", "grants": {"full_access": False}}
+    state = {"text": [], "reasoning": [], "pending": None, "agent_history": []}
+    chat_api._save_stream_progress(
+        record, base_turns=[], text="运行实验", state=state, rows=[], approvals=[], model_id="model", duration_ms=1,
+    )
+    assert record["grants"]["full_access"] is True
+
+
+def test_stream_checkpoint_clears_closed_approval_marker(monkeypatch):
+    """A decided approval must not leave the resumed turn waiting forever."""
+
+    monkeypatch.setattr(chat_api.conversations, "write", lambda _record: None)
+    record = {"id": "approval-marker", "turns": []}
+    request = {"id": "req-1", "status": "approved", "consumed_at": "now"}
+    state = {
+        "text": ["命令已完成"],
+        "reasoning": [],
+        "pending": request,
+        "agent_history": [],
+    }
+    chat_api._save_stream_progress(
+        record,
+        base_turns=[
+            {
+                "role": "assistant",
+                "content": "",
+                "approvals": [request],
+                "awaiting_approval": request["id"],
+            }
+        ],
+        text="继续",
+        state=state,
+        rows=[],
+        approvals=[request],
+        model_id="model",
+        duration_ms=1,
+    )
+    assert record["turns"][-1]["awaiting_approval"] is None
+
+
 class _FakeResult:
     def __init__(self, *, content: str, reasoning: str, calls: list[dict[str, Any]] | None) -> None:
         self.content = content
@@ -44,6 +111,8 @@ def _stream_factory(rounds: list[dict[str, Any]], seen: list[list[dict[str, Any]
         seen.append([dict(m) for m in messages])
         index = min(len(seen) - 1, len(rounds) - 1)
         spec = rounds[index]
+        if spec.get("raise"):
+            raise RuntimeError(str(spec["raise"]))
         for piece in spec.get("reasoning_deltas", []):
             yield _FakeUpdate(kind="reasoning", text=piece)
         if spec.get("content"):
@@ -136,6 +205,21 @@ def test_tool_round_carries_reasoning_content(monkeypatch: pytest.MonkeyPatch) -
     assert tool_msgs and tool_msgs[0].get("tool_call_id") == "c1"
 
 
+def test_unclassified_provider_error_retries_inside_agent_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """第三方适配器直接抛异常时，也不能绕过重试把整轮打成中断。"""
+
+    seen = _run(
+        monkeypatch,
+        [
+            {"raise": "temporary transport failure"},
+            {"raise": "temporary transport failure"},
+            {"content": "实验已经完成，结果已整理。"},
+        ],
+    )
+
+    assert len(seen) == 3
+
+
 def test_tool_round_takes_only_this_rounds_reasoning(monkeypatch: pytest.MonkeyPatch) -> None:
     """只带**本轮**的思考过程，不能把前面几轮的累积起来一起塞回去。"""
 
@@ -175,13 +259,8 @@ def test_tool_round_falls_back_to_final_frame_reasoning(monkeypatch: pytest.Monk
     assert with_calls and with_calls[0].get("reasoning_content") == "收尾帧才给的思考"
 
 
-def test_reasoning_is_emitted_as_a_row_before_the_tool_rows(monkeypatch: pytest.MonkeyPatch) -> None:
-    """每轮思考要**落成一行**，而且必须排在这一轮的过程行之前。
-
-    背景（研究者 2026-09-24 要求）：以前整个回合的思考只存在 turn.reasoning 里，
-    界面只能把它整段堆在正文最上方；落成行之后前端才能把它和过程行**交叉展示**。
-    顺序错了（思考跑到自己的动作后面）读起来就是"先干活后想"。
-    """
+def test_reasoning_is_emitted_separately_from_tool_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """思考走独立 SSE 通道，工具 rows 只描述真实工具活动。"""
 
     seen: list[list[dict[str, Any]]] = []
     monkeypatch.setattr(chat_api.adapter, "chat_stream", _stream_factory(
@@ -231,14 +310,42 @@ def test_reasoning_is_emitted_as_a_row_before_the_tool_rows(monkeypatch: pytest.
 
     asyncio.run(_collect())
 
-    reasoning_rows = [e for e in events if '"kind": "reasoning"' in e or '"kind":"reasoning"' in e]
-    assert reasoning_rows, "应当把本轮思考作为一行发出去（kind=reasoning）"
-    assert "先看目录" in reasoning_rows[0]
+    reasoning_events = [e for e in events if "event: reasoning" in e]
+    assert reasoning_events, "应当通过 reasoning SSE 事件发送思考"
+    assert "先看目录" in reasoning_events[0]
 
-    # 顺序：思考行必须出现在这一轮的工具行之前
-    idx_reason = next(i for i, e in enumerate(events) if "reasoning" in e and "row" in e)
-    idx_tool = next(
-        (i for i, e in enumerate(events) if "run_command" in e and "row" in e),
-        len(events),
-    )
-    assert idx_reason < idx_tool, "思考行必须排在本轮过程行之前，否则读起来像先干活后想"
+    # rows 中只允许真实工具活动；思考不能伪装成工具调用。
+    assert not any('"kind": "reasoning"' in e for e in events)
+    tool_rows = [e for e in events if "run_command" in e and "event: row" in e]
+    assert tool_rows
+    assert all('"tool_name": "run_command"' in e for e in tool_rows)
+    assert any('"tool_status": "running"' in e for e in tool_rows)
+    assert any('"tool_status": "completed"' in e for e in tool_rows)
+
+
+def test_soft_provider_failure_does_not_emit_backend_error_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Recovery prose is handled by the caller; the loop must not leak a canned diagnostic."""
+
+    async def _failed_stream(*_args: Any, **_kwargs: Any):
+        raise RuntimeError("temporary provider failure")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(chat_api.adapter, "chat_stream", _failed_stream)
+    state: dict[str, Any] = {"text": [], "reasoning": [], "result": None, "pending": None}
+    rows: list[dict[str, Any]] = []
+
+    async def _collect() -> None:
+        async for _ in chat_api._agent_loop(
+            [{"role": "user", "content": "你好"}],
+            conversation_id="soft-failure-test",
+            ref="fake",
+            tool_defs=[],
+            rows=rows,
+            approvals_out=[],
+            state=state,
+        ):
+            pass
+
+    asyncio.run(_collect())
+    assert state.get("soft_failure")
+    assert not any("本轮未拿到模型" in str(row.get("text")) for row in rows)

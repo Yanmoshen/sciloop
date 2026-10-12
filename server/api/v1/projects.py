@@ -32,8 +32,8 @@ from sqlalchemy import func, select
 from core.security import require_owner
 from db.models import Idea, PipelineRun, Project, Taskbook
 from db.session import AsyncSessionLocal
+from services.naming import readable_name
 from services.pipeline.stages import STAGE_ORDER
-from services.naming import readable_name, time_id
 
 logger = logging.getLogger("sciloop.api.projects")
 
@@ -226,8 +226,8 @@ async def create_project(
 
     允许字段：``name``（必填）、``mode``（``manual``/``auto``，默认 ``manual``）、
     ``idea_id`` / ``taskbook_id``（可选外键）、``settings``（JSONB）、``is_demo``、
-    ``workspace_dir``（可选：这个项目在研究者电脑上的工作目录；不填就落在研究项目根下
-    ``<根>/<项目号>-<名字>``）。目录会真的在你电脑上建出来（走宿主执行器）。
+    ``workspace_dir``（可选：这个项目在研究者电脑上的工作目录；不填则使用
+    ``knowledge-base/projects/<项目名>``，同名目录用项目号消歧）。目录会真的创建。
     """
     name = str(payload.get("name") or "").strip()
     if not name:
@@ -293,7 +293,7 @@ async def create_project(
                 )
 
         project = Project(
-            name=readable_name(name, identifier=time_id()),
+            name=readable_name(name),
             mode=mode,
             status="DRAFT",
             current_iteration=0,
@@ -305,12 +305,12 @@ async def create_project(
         session.add(project)
         await session.flush()
 
-        # 工作目录：研究者选了就按他的，没选就落在研究项目根下。
-        # 目录建在**他的电脑上**（容器看不到宿主路径），所以走宿主执行器；
+        # 工作目录：用户选择优先，默认保存到知识库项目目录。
+        # 统一走宿主执行器，让目录创建与后续文件操作的权限边界一致；
         # 执行器没连上也不拦着建项目，但要如实说明目录没建成。
         chosen = str(payload.get("workspace_dir") or "").strip()
         workspace_dir, workspace_note = await _ensure_workspace(
-            project_id=int(project.id), name=name, chosen=chosen
+            project_id=int(project.id), name=project.name, chosen=chosen
         )
         merged_settings = dict(project.settings) if isinstance(project.settings, dict) else {}
         merged_settings["workspace_dir"] = workspace_dir
@@ -330,42 +330,60 @@ async def create_project(
     return result
 
 
-@router.post("/pick-folder", summary="弹出系统文件夹选择框，返回研究者选的路径（Owner）")
+def _clean_pick_title(raw: Any) -> str:
+    """标题做长度与控制字符过滤（§6.1）：1–80 个可见字符，默认「选择工作目录」。"""
+
+    text = "".join(ch for ch in str(raw or "") if ch.isprintable() and ch not in "\r\n\t").strip()
+    if not text:
+        return "选择工作目录"
+    return text[:80]
+
+
+@router.post(
+    "/pick-folder",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="创建目录选择任务（Owner；立刻返回 request_id）",
+)
 async def pick_project_folder(
     _owner: OwnerDep, payload: Annotated[dict[str, Any] | None, Body()] = None
 ) -> dict[str, Any]:
-    """让**执行环境**在研究者屏幕上弹出系统自带的文件夹选择框，返回真实绝对路径。
+    """请**执行环境**在研究员屏幕上弹出系统自带的文件夹选择框 —— **但不等他选完**。
+
+    返回 202 + `request_id`；前端轮询 `GET /projects/pick-folder/{request_id}` 取结果。
+    这样"研究员挑了几分钟"就只是任务 `pending`，**不会**撞上前端 30 秒默认超时 ✓。
 
     ⚠️ 这条路由必须排在 `/{project_id}` 这类参数路由**之前**（字面路径优先）。
-    ⚠️ 网页自己拿不到本地路径、也调不起系统弹框 —— 所以由执行环境弹（容器执行环境会如实回"弹不出来"）。
+    目录选择由本机服务进程直接弹出原生窗口，返回绝对路径；不会读取或上传目录内容。
     """
 
-    from services.agent import host_runner
+    from services.agent import folder_picker
 
-    title = str((payload or {}).get("title") or "选择一个文件夹作为工作目录")
-    initial = str((payload or {}).get("initial") or "")
-    result = await host_runner.pick_folder(title=title, initial=initial)
-    shown = bool(result.get("shown"))
-    if not result.get("ok"):
-        # 三种情况要分开说：压根弹不出来 / 弹出来没人点（超时）/ 其它错误
-        return {
-            "ok": False,
-            "available": bool(result.get("supported")) and not result.get("auth_failed", False),
-            "shown": shown,
-            "canceled": False,
-            "timed_out": bool(result.get("timed_out")),
-            "path": "",
-            "message": str(result.get("error") or "没能打开系统选择框"),
-        }
-    return {
-        "ok": True,
-        "available": True,
-        "shown": shown,
-        "canceled": bool(result.get("canceled")),
-        "timed_out": bool(result.get("timed_out")),
-        "path": str(result.get("path") or ""),
-        "message": "" if result.get("path") else "你在系统窗口里取消了选择（保持默认）",
-    }
+    body = payload or {}
+    title = _clean_pick_title(body.get("title"))
+    # `initial` 只做规范化：**不能**把宿主路径换算成容器路径再交给执行器 ✗（§4.1）
+    initial = str(body.get("initial") or "").strip()[:500]
+    # The project dialog needs the real local absolute path. Use the local
+    # desktop picker directly; the remote host-runner picker is reserved for
+    # environments without a desktop session.
+    return await folder_picker.get_picker(local=True).create(title=title, initial=initial)
+
+
+@router.get("/pick-folder/{request_id}", summary="读目录选择任务状态（Owner）")
+async def pick_project_folder_status(request_id: str, _owner: OwnerDep) -> dict[str, Any]:
+    """读任务状态：`pending / selected / canceled / unavailable / failed / expired`。"""
+
+    from services.agent import folder_picker
+
+    return await folder_picker.get_picker(local=True).status(request_id)
+
+
+@router.delete("/pick-folder/{request_id}", summary="取消目录选择任务（Owner）")
+async def pick_project_folder_cancel(request_id: str, _owner: OwnerDep) -> dict[str, Any]:
+    """取消任务：让执行器关掉同一个系统窗口；重复取消与迟到结果都幂等 ✓。"""
+
+    from services.agent import folder_picker
+
+    return await folder_picker.get_picker(local=True).cancel(request_id)
 
 
 @router.patch("/{project_id}", summary="重命名 / 归档项目（Owner）")
@@ -434,7 +452,7 @@ async def rename_project(
             )
         previous = project.name
         if name is not None:
-            project.name = readable_name(name, identifier=str(project.name).rsplit("__", 1)[-1])
+            project.name = readable_name(name)
         if archived is not None:
             project.archived = archived
         project.updated_at = func.now()
@@ -465,23 +483,22 @@ __all__ = [
 ]
 
 
-#: 没选文件夹时，项目工作目录相对"研究项目根"的形态：<项目号>-<名字片段>
-WORKSPACE_SLUG_MAX = 40
-
-
 def _slug(name: str) -> str:
-    """把项目名压成一个安全的目录名片段（中文名压不出东西就退回 project）。"""
+    """保留中文可读名称，排除跨目录和 Windows 非法文件名字符。"""
+    import re
 
-    kept = [ch for ch in name.strip().lower() if ch.isascii() and (ch.isalnum() or ch in "-_")]
-    slug = "".join(kept).strip("-_")
-    return slug[:WORKSPACE_SLUG_MAX] or "project"
+    label = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name.strip()).rstrip(' .')
+    label = label[:160].rstrip(' .') or '未命名项目'
+    if label.split('.')[0].upper() in {'CON', 'PRN', 'AUX', 'NUL', *(f'COM{i}' for i in range(1, 10)), *(f'LPT{i}' for i in range(1, 10))}:
+        label = '_' + label
+    return label
 
 
 async def _ensure_workspace(*, project_id: int, name: str, chosen: str) -> tuple[str | None, str | None]:
     """确定并创建项目的工作目录，返回 `(目录, 如实说明或 None)`。
 
-    - 研究者给了路径 → 用它（**任意路径都支持**：执行器跑在他人电脑上）；
-    - 没给 → 落在研究项目根下 `<根>/<项目号>-<名字片段>`；
+    - 用户给了路径 → 创建并使用该宿主目录；
+    - 没给 → 落在知识库 `projects/<项目名>`；同名目录用项目号消歧；
     - 建目录走宿主执行器；连不上就返回说明，**不让建项目失败**。
     """
 
@@ -490,13 +507,14 @@ async def _ensure_workspace(*, project_id: int, name: str, chosen: str) -> tuple
     if chosen:
         target = chosen
     else:
-        root = await host_runner.default_cwd()
-        if not root:
-            return None, "还没连上你电脑上的执行器，工作目录没建成；连上后可以再设置一次。"
-        # 容器里跑的是 Python 3.11：**f-string 里不能出现反斜杠转义**
-        # （3.12 才放开），所以先把分隔符处理干净再拼。
-        base = str(root).rstrip("/").rstrip("\\")
-        target = f"{base}/{project_id}-{_slug(name)}"
+        from services.storage import knowledge_root
+
+        # 默认目录保留项目名称；同名目录用项目号消歧。
+        directory_name = _slug(readable_name(name))
+        target_path = knowledge_root() / 'projects' / directory_name
+        if target_path.exists():
+            target_path = target_path.with_name(f'{directory_name}-{project_id}')
+        target = str(target_path)
 
     # 统一成正斜杠再存：Windows 上两种都认，但混着显示（D:\a\b/96-demo）会让人以为路径不对。
     target = target.replace("\\", "/")

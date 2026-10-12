@@ -59,9 +59,12 @@ __all__ = [
 ]
 
 # --------------------------------------------------------------------------- #
-# 搜索服务（SearXNG）
+# 搜索服务（内置引擎；这里的 HTTP 适配器只服务于"自建 SearXNG 实例"的兼容场景）
 # --------------------------------------------------------------------------- #
-DEFAULT_URL = "http://searxng:8080"
+#: 2026-10-11：原默认值是 compose 服务名 `http://searxng:8080`（容器网络内才解析得到）。
+#: Docker 下线后改为本机地址——默认路径是内置引擎，本适配器只在 `SCILOOP_SEARXNG_URL` 被
+#: 显式配置时才用得上。
+DEFAULT_URL = "http://127.0.0.1:8080"
 SEARXNG_URL_ENV = "SCILOOP_SEARXNG_URL"  # legacy HTTP adapter only
 #: 可选代理。**默认为空 = 直连**（研究者明确要"直连为主"，代理只在需要时配）。
 PROXY_ENV = "SCILOOP_SEARCH_PROXY"
@@ -153,7 +156,6 @@ SOURCE_LABELS: dict[str, str] = {
     "wikidata": "Wikidata",
     "bing_news": "Bing News",
     "wikimedia_images": "Wikimedia Commons",
-    "wikidata": "Wikidata",
     "superuser": "Super User",
     "askubuntu": "Ask Ubuntu",
 }

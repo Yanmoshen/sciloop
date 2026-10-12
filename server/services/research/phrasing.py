@@ -13,19 +13,17 @@ from __future__ import annotations
 import logging
 
 from llm import adapter
+from services.system_prompt import SCILOOP_SYSTEM_PROMPT
 
 logger = logging.getLogger("sciloop.phrasing")
 
 __all__ = ["PHRASING_SYSTEM", "say"]
 
 #: 通用措辞提示词。两条硬要求：不许编造、**严禁内部术语**。
-PHRASING_SYSTEM = (
-    "你是 SciLoop 的科研助手，正在对研究者说话。"
-    "只能用给你的事实，不要编造没有被记录的产出、数字或结论。"
-    "**严禁内部术语**：不要出现「校验」「重试」「策略层」「节点」「流水线」「熔断」「落库」"
-    "这类词，也不要用机器状态名（例如 waiting_human）；"
-    "一切用研究者能听懂的说法，例如「这一步」「跑」这个版本」「需要你定」。"
-    "不要用 Markdown 标题，正常分段把话说清楚就行。"
+PHRASING_SYSTEM = SCILOOP_SYSTEM_PROMPT + "\n\n" + (
+    "## 本轮措辞任务\n"
+    "根据提供的真实事实撰写给研究者看的说明；不调用工具，不改变研究状态，"
+    "不编造产物或结论。按用户熟悉程度解释必要术语，避免无关调试细节。"
 )
 
 

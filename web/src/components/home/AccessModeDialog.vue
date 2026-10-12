@@ -7,8 +7,7 @@
  * 关掉不弹（收紧权限不需要再确认一次）。
  *
  * 文案两句话都按后端 `server/services/agent/policy.py` 的真实口径写，不是宣传语：
- * 开着完全访问时普通动手操作放行，而**四类高危（删除或覆盖文件 / 改系统与权限 /
- * 数据库破坏性操作 / 下载即执行）仍然要点批准卡**。
+ * 完全访问自动批准所有可执行操作；普通模式人工批准后有同样执行范围。
  *
  * 视觉规格与 `components/home/ConfirmDialog.vue` 保持一致（遮罩 0.55 + 8px 毛玻璃、
  * 卡片 min(420px)、圆角 20、品牌色主按钮），免得站里两种弹窗长得不一样。
@@ -33,7 +32,7 @@ function close(): void {
     <div v-if="modelValue" class="overlay sl-home" @click.self="close">
       <div class="dialog" role="dialog" aria-modal="true" aria-label="完全访问模式">
         <h2 class="dialog__title">完全访问模式</h2>
-        <p class="dialog__message">在本对话内，普通命令无需批准，高危命令仍需批准。</p>
+        <p class="dialog__message">在本对话内，所有可执行操作自动批准。普通模式也能执行相同操作，但需要你确认。</p>
         <p class="dialog__note">
           <b>免责声明</b>
           模型可能出错，开启后它会直接改动你的文件和本机环境，请自行核验。

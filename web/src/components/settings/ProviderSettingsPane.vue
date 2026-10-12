@@ -268,14 +268,14 @@ async function runTest(): Promise<void> {
   errorNotice.value = ''
   const result = await store.testConnection(config.id)
   testResult.value = result
-  if (!result) errorNotice.value = `${store.errorCode ?? 'unknown_error'}：${store.error ?? '检测失败'}`
+  if (!result) errorNotice.value = store.error ?? '检测失败'
 }
 
 const testPill = computed(() => {
   const result = testResult.value
   if (!result) return null
   if (result.ok) return { cls: 'pill--ok', text: `检测通过 · ${result.latency_ms ?? '—'} ms` }
-  return { cls: 'pill--warn', text: `检测失败 · ${result.error_kind ?? 'unknown'}` }
+  return { cls: 'pill--warn', text: '检测失败' }
 })
 
 /* ------------------------------------------------------------------ *
@@ -295,10 +295,6 @@ const filteredModels = computed(() => {
       (model.label ?? '').toLowerCase().includes(keyword),
   )
 })
-
-const missingPriceCount = computed(
-  () => models.value.filter((model) => priceView(model).missing).length,
-)
 
 const nonUsdCount = computed(() => models.value.filter((model) => priceView(model).nonUsd).length)
 
@@ -438,7 +434,7 @@ async function removeProvider(): Promise<void> {
   if (!config) return
   pendingDelete.value = false
   const ok = await store.removeConfig(config.id)
-  if (!ok) errorNotice.value = `${store.errorCode ?? 'unknown_error'}：${store.error ?? '删除失败'}`
+  if (!ok) errorNotice.value = store.error ?? '删除失败'
   else store.clearMessages()
 }
 </script>

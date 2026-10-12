@@ -128,14 +128,14 @@ class ResearchNodeRun(Base):
 
     __table_args__ = (
         # 部分唯一索引（WHERE conversation_id IS NOT NULL）由迁移 0009 建立：
-        # 声明式 UniqueConstraint 无法表达部分索引，所以这里用 Index + postgresql_where。
+        # 声明式 UniqueConstraint 无法表达部分索引，所以这里用 Index + sqlite_where。
         Index(
             "uq_node_run_once",
             "conversation_id",
             "node",
             "entry_index",
             unique=True,
-            postgresql_where=text("conversation_id IS NOT NULL"),
+            sqlite_where=text("conversation_id IS NOT NULL"),
         ),
         Index("idx_node_runs_chain", "conversation_id", "node"),
     )

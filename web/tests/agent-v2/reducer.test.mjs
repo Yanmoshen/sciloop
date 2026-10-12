@@ -14,6 +14,7 @@ import {
   childList,
   createAgentState,
   latestPlan,
+  markTurnInterrupted,
   orderedItems,
   pendingApprovals,
   reasoningTextFor,
@@ -380,7 +381,8 @@ export function register() {
     assertEqual(state.toolCalls[CALL].status, 'failed')
     assertEqual(state.toolCalls[CALL].error.code, 'approval_denied')
     assertEqual(state.toolCalls[CALL].duration_ms, 42)
-    assert(state.notices.some((notice) => notice.level === 'error' && notice.text.includes('approval_denied')))
+    assert(state.notices.some((notice) => notice.level === 'error' && notice.text.includes('拒绝了该操作')))
+    assert(state.notices.every((notice) => !notice.text.includes('approval_denied')))
   })
 
   test('审批：请求 -> 待办列表 -> 结论后移出待办', () => {
@@ -504,7 +506,7 @@ export function register() {
     assertEqual(state.summaries[THREAD][0].text, '研究者修订')
     assertEqual(state.summaries[THREAD][0].edited, true)
     state = applyNotification(state, eventNote(5, 'compaction/failed', { error: { code: 'summarize_failed', message: '上游不可用' } }))
-    assert(state.notices.some((notice) => notice.level === 'error' && notice.text.includes('原上下文保持不变')))
+    assert(state.notices.some((notice) => notice.level === 'error' && notice.text.includes('之前的内容已保留')))
   })
 
   test('applyEvent 与 applyNotification 等价', () => {
@@ -562,6 +564,16 @@ export function register() {
     assert(state.lateDropped > before, '被丢弃的迟到事件要计数，便于验收取证')
     assertEqual(state.stream[`${THREAD}:${TURN}`] ?? '', '', '迟到增量不得进入正文缓冲')
     assertEqual(state.cursors[THREAD], 5, '游标仍必须前进，否则缺口永远补不平')
+  })
+
+  test('停止请求先本地收束回合，不等待服务端往返', () => {
+    let state = applyNotification(createAgentState(), threadCreated())
+    state = applyNotification(state, turnStarted())
+    state = markTurnInterrupted(state, THREAD, TURN)
+    assertEqual(state.turns[TURN].status, 'interrupted')
+    assertEqual(state.turns[TURN].cancel_reason, '用户停止')
+    assertEqual(state.threads[THREAD].active_turn_id, null)
+    assertEqual(state.cursors[THREAD], 2, '本地收束不得伪造事件或推进游标')
   })
 
   test('中断后忽略迟到的正文与工具增量，但仍接受终态与审批（规则 5）', () => {

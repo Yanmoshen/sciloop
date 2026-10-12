@@ -94,6 +94,19 @@ class ToolScheduler:
         by_id: dict[str, ToolResult] = {}
         lock = asyncio.Lock()
 
+        # Codex's executed-tool registry treats call ids as stable execution
+        # identities.  De-duplicate the batch before scheduling so two copies
+        # of one call id cannot race and trigger the side effect twice.
+        unique_calls: list[ToolCall] = []
+        duplicate_calls: list[ToolCall] = []
+        seen_ids: set[str] = set()
+        for call in calls:
+            if call.call_id in seen_ids:
+                duplicate_calls.append(call)
+                continue
+            seen_ids.add(call.call_id)
+            unique_calls.append(call)
+
         async def run(call: ToolCall) -> ToolResult:
             kind = self.kind_of(call.name)
             cached = store.get(call.call_id)
@@ -133,8 +146,8 @@ class ToolScheduler:
                 on_result(call, result, False)
             return result
 
-        parallel = [c for c in calls if self.kind_of(c.name) is ToolKind.READ_ONLY]
-        serial = [c for c in calls if self.kind_of(c.name) is not ToolKind.READ_ONLY]
+        parallel = [c for c in unique_calls if self.kind_of(c.name) is ToolKind.READ_ONLY]
+        serial = [c for c in unique_calls if self.kind_of(c.name) is not ToolKind.READ_ONLY]
 
         gathered: list[ToolResult] = []
         if parallel:
@@ -144,8 +157,13 @@ class ToolScheduler:
         for call in serial:
             gathered.extend([await run(call)])
 
-        for call in calls:
+        for call in unique_calls:
             by_id[call.call_id] = store[call.call_id]
+        for call in duplicate_calls:
+            report.duplicates.append(call.call_id)
+            result = by_id[call.call_id]
+            if on_result is not None:
+                on_result(call, result, True)
         report.results = [by_id[c.call_id] for c in calls]
         self.report = report
         return report

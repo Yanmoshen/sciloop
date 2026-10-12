@@ -159,7 +159,7 @@ class Experiment(SciLoopModel):
 
 
 class ExperimentRun(SciLoopModel):
-    """``experiment_runs``：单次执行（进程内执行器，无 Docker 沙箱）。"""
+    """``experiment_runs``：单次执行（进程内执行器）。"""
 
     id: int | None = None
     experiment_id: int

@@ -213,7 +213,7 @@ _ROUTING_COLUMNS = (
 
 
 class SqlModelRegistry:
-    """PostgreSQL 实现。"""
+    """SQLite 实现。"""
 
     def __init__(self, engine: Any | None = None, dsn: str | None = None) -> None:
         self._engine = engine
@@ -263,7 +263,7 @@ class SqlModelRegistry:
         from sqlalchemy import text
 
         engine = self._resolve_engine()
-        json_expr = "json(:models)" if engine.dialect.name == "sqlite" else "CAST(:models AS JSONB)"
+        json_expr = "json(:models)"
         async with engine.begin() as conn:
             result = await conn.execute(
                 text(
@@ -293,7 +293,7 @@ class SqlModelRegistry:
         engine = self._resolve_engine()
         for key, value in fields.items():
             if key == "models":
-                assignments.append("models = json(:models)" if engine.dialect.name == "sqlite" else "models = CAST(:models AS JSONB)")
+                assignments.append("models = json(:models)")
                 params["models"] = json.dumps(value, ensure_ascii=False)
             else:
                 assignments.append(f"{key} = :{key}")
@@ -314,7 +314,7 @@ class SqlModelRegistry:
         from sqlalchemy import text
 
         engine = self._resolve_engine()
-        timestamp_fn = "CURRENT_TIMESTAMP" if engine.dialect.name == "sqlite" else "now()"
+        timestamp_fn = "CURRENT_TIMESTAMP"
         async with engine.begin() as conn:
             await conn.execute(
                 text(
@@ -418,7 +418,7 @@ def _row_to_config(row: dict[str, Any]) -> ModelConfigRecord:
         models=list(models or []),
         is_default=bool(row.get("is_default")),
         last_tested_at=row.get("last_tested_at"),
-        test_ok=row.get("test_ok"),
+        test_ok=bool(row["test_ok"]) if row.get("test_ok") is not None else None,
         created_at=row.get("created_at"),
         type=row.get("type"),
     )

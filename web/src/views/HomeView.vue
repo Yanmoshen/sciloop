@@ -20,12 +20,20 @@
  */
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { humanError, safeErrorMessage, sanitizeAssistantText, writeDenied } from '@/utils/messages'
+import {
+  mergeAssistantContent,
+  safeErrorMessage,
+  sanitizeAssistantText,
+  writeDenied,
+} from '@/utils/messages'
 import { useRoute, useRouter } from 'vue-router'
 
 import {
   compactChat,
   fetchAccessMode,
+  fetchHomeTurn,
+  resumeHomeTurn,
+  interruptResearchNode,
   isApprovalCard,
   setAccessMode,
   streamApprovalDecision,
@@ -40,8 +48,10 @@ import type {
   SearchReport as SearchReportData,
   StreamDone,
   StreamHandlers,
+  HomeTurnSnapshot,
   TurnRow,
 } from '@/api/chat'
+import type { HomeChatAttachment } from '@/api/chat'
 import { ApiError } from '@/api/client'
 import { getConversation } from '@/api/conversations'
 import MarkdownText from '@/components/MarkdownText.vue'
@@ -57,9 +67,12 @@ import { useSettingsStore } from '@/stores/settings'
 import { consumeEntrance } from '@/utils/pageEntrance'
 
 /** `waiting` = 这一轮没有答完，**在等研究者批准**（不是"已完成"） */
-type TurnStatus = 'streaming' | 'waiting' | 'done' | 'interrupted'
+type TurnStatus = 'reconnecting' | 'streaming' | 'waiting' | 'done' | 'interrupted' | 'failed'
 
 interface Turn {
+  turnId?: string
+  eventSequence?: number
+  interruptionReason?: string | null
   role: 'user' | 'assistant'
   content: string
   model?: string
@@ -71,6 +84,8 @@ interface Turn {
   rows?: TurnRow[]
   /** 思考过程：**不是答复**，折叠展示在耗时那一行下面 */
   reasoning?: string
+  /** 供应商明确提供的面向用户摘要；缺省时只显示状态文案 */
+  reasoningSummary?: string
   /** 本轮的判定结果（执行 / 引导 / 查询 / 普通对话），用于角标 */
   routing?: string
   /**
@@ -82,6 +97,8 @@ interface Turn {
   awaiting?: ApprovalCard | null
   /** 正文是**系统说明**而不是模型说的话（`note_only`）→ 有卡时就不重复渲染 */
   noteOnly?: boolean
+  ts?: string | null
+  attachments?: Array<{ name: string; mime_type?: string; size?: number }>
 }
 
 const route = useRoute()
@@ -91,7 +108,15 @@ const settings = useSettingsStore()
 const conversations = useConversationStore()
 
 const prompt = ref('')
-const files = ref<Array<{ name: string }>>([])
+interface LocalAttachment {
+  file: File
+  name: string
+  mimeType: string
+  size: number
+  previewUrl?: string
+}
+
+const files = ref<LocalAttachment[]>([])
 const fileInput = ref<HTMLInputElement | null>(null)
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
 const threadEl = ref<HTMLElement | null>(null)
@@ -112,6 +137,8 @@ const dialogPrefill = ref('')
 
 const pickedRef = ref('')
 const pickerOpen = ref(false)
+/** 模型浮层的根节点：用来判断"点的是不是浮层以外" */
+const mpickEl = ref<HTMLElement | null>(null)
 const copiedIndex = ref<number | null>(null)
 const compactBusy = ref(false)
 
@@ -192,52 +219,93 @@ function fmtDuration(ms: number): string {
 
 function durationText(turn: Turn): string {
   if (turn.role !== 'assistant') return ''
+  if (turn.status === 'reconnecting') return '正在恢复连接…'
+  if (turn.status === 'interrupted') return '已停止'
+  if (turn.status === 'failed') return '本轮未完成'
   if (turn.status === 'streaming') return `${Math.floor(elapsedMs.value / 1000)}s`
-  // 停在批准上**不能说"已完成"**：这一轮其实还没答完，人没裁决之前它不会往前走
-  // 裁决过的那一轮不写状态（研究者 2026-09-26 口径）：只留模型名，刷新前后一致
   if (turn.settled) return ''
   if (turn.status === 'waiting') return '等待研究者批准'
-  // ⚠️ 中断/停止**不能说"已完成"**：原来这条落到下面那行，会拿 durationMs 显示成「已完成 Xs」——
-  // 明明是被停下的（或出错了），却报完成，属于"显示与事实不一致"。
-  if (turn.status === 'interrupted') return '已停止'
   if (turn.durationMs) return `已完成 ${fmtDuration(turn.durationMs)}`
   return ''
 }
 
 /**
- * 过程抽屉（研究者 2026-09-25 口径）：**整轮一行**。
+ * 工具活动只由真正的工具/检索行组成。
  *
- * 演变：先是"按思考段分组、每段一组"，他说还是太占地方 → 现在整轮的思考与工具调用
- * **合成一行「调用工具」**，点开才是按发生顺序的时间线。
- * 连失败/被拒、等待批准、流程节点行也一起收进去（他选的"最省地方"那一档）——
- * 代价是"被拦下了"默认看不见，需要点开才看得到；这是他的取舍，记录在此。
- *
- * 状态只在内存里（默认全收起），刷新回到收起 —— 与「思考过程」折叠同一套做法。
+ * 历史版本把 reasoning、节点状态和批准卡也塞进同一个 rows 数组；这些
+ * 行仍然需要兼容显示，但不能再让它们触发“工具活动”入口。
  */
-const openProcess = ref<Set<number>>(new Set())
-
-function isProcessOpen(turnIndex: number): boolean {
-  return openProcess.value.has(turnIndex)
+function isToolActivityRow(row: TurnRow): row is Exclude<TurnRow, ApprovalCard> {
+  if (isApprovalCard(row)) return false
+  if (row.kind === 'search') return true
+  if (row.kind !== 'tool') return false
+  if (row.tool_name || row.tool_label) return true
+  // Older persisted rows do not carry stable identity fields. Recognize the
+  // tool_row() display forms while excluding approval/grant notices that also
+  // used kind="tool" in historical conversations.
+  return /^(?:调用「[^」]+」|「[^」]+」(?:完成|等待研究者批准|未完成))/.test(
+    String(row.text ?? '').trim(),
+  )
 }
 
-function toggleProcess(turnIndex: number): void {
-  const next = new Set(openProcess.value)
-  if (next.has(turnIndex)) next.delete(turnIndex)
-  else next.add(turnIndex)
-  openProcess.value = next
+interface ToolActivity {
+  row: Exclude<TurnRow, ApprovalCard>
+  name: string
+  status: 'running' | 'completed' | 'failed' | 'waiting_approval' | 'unknown'
 }
 
-/** 这一轮的过程是否还在跑（收起时表头挂三点，否则完全看不出它在干活） */
-function processRunning(turn: Turn): boolean {
-  // A user stop settles the turn immediately. Stale process rows from the
-  // aborted stream must not keep the collapsed header animated.
-  if (turn.status !== 'streaming') return false
-  if (turn.status === 'streaming') return true
-  const rows = turn.rows ?? []
-  for (let i = 0; i < rows.length; i++) {
-    if (rowMotion(rows, i) === 'mo-dots') return true
+function toolActivityRows(turn: Turn): ToolActivity[] {
+  const activities: ToolActivity[] = []
+  const pendingByCallId = new Map<string, number>()
+  const pendingLegacyByName = new Map<string, number[]>()
+  for (const row of (turn.rows ?? []).filter(isToolActivityRow)) {
+    const name = toolActivityName(row)
+    const status = toolActivityState(row)
+    const callId = String(row.call_id ?? '').trim()
+    if (status === 'running') {
+      if (callId) pendingByCallId.set(callId, activities.length)
+      else {
+        const indexes = pendingLegacyByName.get(name) ?? []
+        indexes.push(activities.length)
+        pendingLegacyByName.set(name, indexes)
+      }
+      activities.push({ row, name, status })
+      continue
+    }
+    const indexes = callId ? undefined : pendingLegacyByName.get(name)
+    const pendingIndex = callId ? pendingByCallId.get(callId) : indexes?.shift()
+    if (pendingIndex !== undefined) {
+      const previous = activities[pendingIndex]
+      activities[pendingIndex] = {
+        row: { ...previous.row, ...row },
+        name: toolActivityName({ ...previous.row, ...row }),
+        status,
+      }
+      if (callId) pendingByCallId.delete(callId)
+      else if (indexes?.length === 0) pendingLegacyByName.delete(name)
+    } else {
+      activities.push({ row, name, status })
+    }
   }
-  return false
+  return activities
+}
+
+function statusRows(turn: Turn): Array<Exclude<TurnRow, ApprovalCard>> {
+  return (turn.rows ?? []).filter(
+    (row): row is Exclude<TurnRow, ApprovalCard> =>
+      !isApprovalCard(row) && row.kind !== 'reasoning' && row.kind !== 'system'
+      && !isToolActivityRow(row) && !isSettledApprovalRow(row),
+  )
+}
+
+function hasToolActivity(turn: Turn): boolean {
+  return toolActivityRows(turn).length > 0
+}
+
+/** 只有尚未收到终态的工具行才保持活动动画；停止/完成后立即收束。 */
+function processRunning(turn: Turn): boolean {
+  if (turn.status !== 'streaming') return false
+  return toolActivityRows(turn).some((activity) => activity.status === 'running')
 }
 
 /**
@@ -258,7 +326,7 @@ function rowIcon(row: TurnRow): string {
   // tone 是后端给的权威终态：完成/失败先按它定，别指望标签里一定带"完成"两个字
   if (tone === 'err') return 'x'
   if (tone === 'ok') return 'check'
-  const label = String(row.label ?? '')
+  const label = String('tool_label' in row ? row.tool_label ?? row.label ?? '' : row.label ?? '')
   if (/批准|确认|等待/.test(label)) return 'shield'
   if (/搜索|检索|联网|网络/.test(label)) return 'globe'
   if (/论文库|知识库|文献库|复检|摘录|解析/.test(label)) return 'db'
@@ -274,61 +342,99 @@ const HIDDEN_ROW_LABELS = new Set(['降级说明'])
 
 /** 过程行的药丸标签：空标签与"无信息量标签"都不渲染 —— 否则会剩一个空框 */
 function rowKind(row: TurnRow): string {
-  const label = String(row.label ?? '').trim()
+  const label = String(
+    isApprovalCard(row) ? row.label ?? '' : row.tool_label ?? row.label ?? '',
+  ).trim()
   return HIDDEN_ROW_LABELS.has(label) ? '' : label
 }
 
 /**
- * 这一行现在是不是"还在跑"：只有**开始行**（tone=info）且**后面还没有结果行**才算在跑。
- * 命令一结束（成功或失败）点就消失 —— 否则「调用…」那行会一直转，看着像卡住了。
+ * 思考展示只允许使用模型给出的短摘要。
+ *
+ * 供应商的完整 reasoning 仍需在服务端回传，以便继续多轮请求；它属于
+ * 内部上下文，不应在用户界面或历史正文中展开。旧记录没有摘要时，
+ * 仍保留折叠入口，但不泄露原始推理文本。
  */
-function rowIsRunning(rows: TurnRow[], index: number): boolean {
-  const row = rows[index]
-  if (!row || String(row.tone ?? '') !== 'info') return false
-  const label = String(row.label ?? '')
-  for (let i = index + 1; i < rows.length; i++) {
-    const tone = String(rows[i].tone ?? '')
-    if (tone === 'ok' || tone === 'err' || tone === 'warn') {
-      if (!label || String(rows[i].label ?? '') === label) return false
-    }
-  }
-  return true
+function reasoningText(turn: Turn): string {
+  return String(turn.reasoningSummary ?? '').trim()
 }
 
-/** 运行态动效：等人是呼吸；"在跑"才是三点；其余（完成/失败/静态）什么都不加 */
-function rowMotion(rows: TurnRow[], index: number, active = true): string {
-  if (!active) return ''
-  const row = rows[index]
-  if (!row) return ''
-  if (/等待研究者批准|需要你确认/.test(String(row.text ?? ''))) return 'mo-breathe'
-  return rowIsRunning(rows, index) ? 'mo-dots' : ''
+function hasReasoning(turn: Turn): boolean {
+  return reasoningText(turn).length > 0 || Boolean(turn.reasoningSummary?.trim())
 }
 
-/**
- * **还没落成"行内思考段"的那部分思考** = 累计思考文本减去已提交的片段。
- * 后端把每轮思考按顺序拼进 `turn.reasoning`，同时把每轮以 `row.kind='reasoning'` 落成一行，
- * 所以"总长 - 已提交"就是还在顶部显示的那段（正在想的那一轮）。
- * 用逐段 indexOf 定位（后端每段都 strip 过，直接减长度会差几个空白字符）；
- * 一段都对不上就退回整段显示 —— 宁可重复，也不丢字。
- */
-function liveReasoning(turn: Turn): string {
-  const full = String(turn.reasoning ?? '')
-  const segments = (turn.rows ?? [])
-    .filter((row) => row.kind === 'reasoning')
-    .map((row) => String(row.text ?? ''))
-  if (segments.length === 0) return full
-  let cursor = 0
-  for (const segment of segments) {
-    if (!segment) continue
-    const at = full.indexOf(segment, cursor)
-    if (at === -1) return full
-    cursor = at + segment.length
+function reasoningDetails(turn: Turn): string {
+  return reasoningText(turn)
+}
+
+/** 从工具行恢复后端提供的真实工具名；旧行没有身份字段时兼容解析展示标签。 */
+function toolActivityName(row: Exclude<TurnRow, ApprovalCard>): string {
+  const label = String(row.tool_label ?? row.tool_name ?? row.label ?? '').trim()
+  if (label) return label
+  const match = String(row.text ?? '').match(/[「"]([^」"]+)[」"]/)
+  return match?.[1]?.trim() || '工具'
+}
+
+function toolActivityState(
+  row: Exclude<TurnRow, ApprovalCard>,
+): ToolActivity['status'] {
+  const backendStatus = String(row.tool_status ?? '')
+  if (backendStatus === 'running') return 'running'
+  if (backendStatus === 'completed') return 'completed'
+  if (backendStatus === 'failed') return 'failed'
+  if (backendStatus === 'waiting_approval') return 'waiting_approval'
+  switch (row.tone) {
+    case 'info':
+      return 'running'
+    case 'ok':
+      return 'completed'
+    case 'err':
+      return 'failed'
+    case 'warn':
+      if (/等待|批准|确认/.test(String(row.text ?? ''))) return 'waiting_approval'
+      return /未完成|失败|拒绝/.test(String(row.text ?? '')) ? 'failed' : 'unknown'
+    default:
+      return 'unknown'
   }
-  return full.slice(cursor)
+}
+
+function toolActivityStatus(activity: ToolActivity, turn: Turn): string {
+  switch (activity.status) {
+    case 'running':
+      return turn.status === 'streaming' ? '进行中' : turn.status === 'interrupted' ? '已停止' : '未完成'
+    case 'completed':
+      return '已完成'
+    case 'failed':
+      return '失败'
+    case 'waiting_approval':
+      return '等待确认'
+    default:
+      return '已记录'
+  }
+}
+
+function toolOutputText(value: string | undefined): string {
+  const text = String(value ?? '')
+  const limit = 12000
+  if (text.length <= limit) return text
+  const edge = Math.floor(limit / 2)
+  return `${text.slice(0, edge)}\n… output truncated …\n${text.slice(-edge)}`
+}
+
+function toolActionLabel(row: Exclude<TurnRow, ApprovalCard>): string {
+  const action = String(row.action ?? '').trim()
+  if (action && /^(run_command|run_on_computer)$/.test(row.tool_name ?? '')) {
+    return `$ ${action}`
+  }
+  return action || String(row.text ?? '')
 }
 
 /** 思考过程折叠入口的文案：进行中「思考中…」，结束后「已思考 Ns」 */
 function reasonLabel(turn: Turn): string {
+  const summary = String(turn.reasoningSummary ?? '').trim().replace(/\s+/g, ' ')
+  if (summary && (turn.status === 'streaming' || !/思考中|进行中|thinking/i.test(summary))) {
+    return summary.length > 96 ? `${summary.slice(0, 95)}…` : summary
+  }
   if (turn.status === 'streaming') return '思考中…'
   return turn.durationMs ? `已思考 ${fmtDuration(turn.durationMs)}` : '思考过程'
 }
@@ -338,6 +444,22 @@ function pickModel(value: string): void {
   pickerOpen.value = false
 }
 
+/**
+ * 模型列表：点浮层**以外任何地方**、或按 Esc 都收起来。
+ *
+ * 用文档级 `pointerdown`（捕获阶段）+ `contains` 判定，与 `SmoothSelect`、左栏「更多」浮层同一套口径：
+ * 不依赖 `blur`（合成器/输入法下不可靠），也不要求用户"再点一次按钮"。
+ */
+function onPickerPointerDown(event: PointerEvent): void {
+  if (!pickerOpen.value) return
+  const el = mpickEl.value
+  if (el && !el.contains(event.target as Node)) pickerOpen.value = false
+}
+
+function onPickerKeydown(event: KeyboardEvent): void {
+  if (event.key === 'Escape' && pickerOpen.value) pickerOpen.value = false
+}
+
 function pickFiles(): void {
   fileInput.value?.click()
 }
@@ -345,12 +467,79 @@ function pickFiles(): void {
 function onFiles(event: Event): void {
   const input = event.target as HTMLInputElement
   const picked = Array.from(input.files ?? [])
-  files.value = [...files.value, ...picked.map((f) => ({ name: f.name }))]
+  files.value = [...files.value, ...picked.map((file) => localAttachment(file))]
   input.value = ''
 }
 
+function localAttachment(file: File): LocalAttachment {
+  return {
+    file,
+    name: file.name,
+    mimeType: file.type || 'application/octet-stream',
+    size: file.size,
+    previewUrl: file.type.startsWith('image/') ? URL.createObjectURL(file) : undefined,
+  }
+}
+
+function onPaste(event: ClipboardEvent): void {
+  const items = Array.from(event.clipboardData?.items ?? [])
+  const imageItem = items.find((item) => item.kind === 'file' && item.type.startsWith('image/'))
+  if (!imageItem) return
+  const blob = imageItem.getAsFile()
+  if (!blob) return
+  event.preventDefault()
+  const extension = blob.type.split('/')[1]?.replace('jpeg', 'jpg') || 'png'
+  const file = new File([blob], `clipboard-${Date.now()}.${extension}`, { type: blob.type })
+  files.value = [...files.value, localAttachment(file)]
+}
+
 function removeFile(index: number): void {
+  const removed = files.value[index]
+  if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl)
   files.value = files.value.filter((_, i) => i !== index)
+}
+
+function clearFiles(): void {
+  for (const file of files.value) {
+    if (file.previewUrl) URL.revokeObjectURL(file.previewUrl)
+  }
+  files.value = []
+}
+
+function fileToAttachment(file: LocalAttachment): Promise<HomeChatAttachment> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const value = String(reader.result || '')
+      const comma = value.indexOf(',')
+      resolve({
+        name: file.name,
+        mime_type: file.mimeType,
+        size: file.size,
+        data_base64: comma >= 0 ? value.slice(comma + 1) : value,
+      })
+    }
+    reader.onerror = () => reject(reader.error ?? new Error('附件读取失败'))
+    reader.readAsDataURL(file.file)
+  })
+}
+
+async function encodeAttachments(input: LocalAttachment[]): Promise<HomeChatAttachment[]> {
+  return Promise.all(input.map(fileToAttachment))
+}
+
+function formatTurnTime(ts?: string | null): string {
+  if (!ts) return ''
+  const date = new Date(ts)
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+}
+
+function isLatestUserTurn(index: number): boolean {
+  for (let cursor = turns.value.length - 1; cursor >= 0; cursor -= 1) {
+    if (turns.value[cursor].role === 'user') return cursor === index
+  }
+  return false
 }
 
 /**
@@ -457,6 +646,13 @@ async function resetToNewConversation(): Promise<void> {
   conversationLoadSequence += 1
   loadingConversation.value = false
   clearAutoContinueTimer()
+  detachSubscription()
+  prompt.value = ''
+  clearFiles()
+  editingIndex.value = null
+  editingText.value = ''
+  editPendingIndex.value = null
+  editConfirmOpen.value = false
   turns.value = []
   conversationId.value = null
   conversationTitle.value = ''
@@ -499,26 +695,38 @@ async function loadConversation(id: string): Promise<void> {
       const settledCard = (rows ?? []).some(
         (row) => isApprovalCard(row) && row.status !== 'pending',
       )
-      const status: TurnStatus = pending
-        ? 'waiting'
-        : (turn as { interrupted?: boolean }).interrupted
-          ? 'interrupted'
-          : 'done'
+      const status: TurnStatus = turn.status === 'inProgress' ? 'reconnecting'
+        : turn.status === 'failed' ? 'failed'
+        : turn.status === 'interrupted' ? 'interrupted'
+        : pending || turn.status === 'waitingApproval' ? 'waiting'
+        : turn.interrupted ? (turn.interruption_reason === 'connection' ? 'failed' : 'interrupted') : 'done'
       return {
+        turnId: turn.turn_id,
+        interruptionReason: turn.interruption_reason,
         role: turn.role,
         content: sanitizeAssistantText(turn.content),
+        ts: turn.ts,
+        attachments: turn.attachments,
         model: turn.model_id,
         durationMs: turn.duration_ms,
         status,
         blocks: (turn as { blocks?: ChatBlock[] }).blocks,
         rows,
         reasoning: (turn as { reasoning?: string }).reasoning ?? undefined,
+        reasoningSummary:
+          (turn as { reasoning_summary?: string }).reasoning_summary ?? undefined,
         routing: (turn as { routing?: string }).routing,
         awaiting: pending ?? null,
         settled: settledCard && !pending,
         noteOnly: (turn as { note_only?: boolean }).note_only === true,
       }
     })
+    const activeIndex = turns.value.findIndex((turn) => turn.role === 'assistant' && turn.status === 'reconnecting' && turn.turnId)
+    if (activeIndex >= 0) {
+      const current = turns.value[activeIndex]
+      current.eventSequence = 0
+      void reconnectTurn(activeIndex)
+    }
     loadingConversation.value = false
     await scrollToBottom()
   } catch (error) {
@@ -622,24 +830,51 @@ function upsertApprovalRow(rows: TurnRow[], card: ApprovalCard): TurnRow[] {  co
  * 但卡片必须回到原来那一轮换状态 —— 否则同一张卡会在两轮里各出现一次。
  */
 const userStoppedControllers = new WeakSet<AbortController>()
+const userStoppedTurns = new WeakSet<Turn>()
 
 function streamHandlers(
   assistantIndex: number,
   approvalIndex = assistantIndex,
   requestController?: AbortController,
 ): StreamHandlers {
-  const target = (): Turn | undefined => turns.value[assistantIndex]
+  const ownerIdentity = turns.value[assistantIndex]
+  const target = (): Turn | undefined => turns.value[assistantIndex] === ownerIdentity ? ownerIdentity : undefined
   const cardOwner = (): Turn | undefined => turns.value[approvalIndex]
   // Abort delivery is asynchronous. A frame that was already queued by the
   // browser can still arrive after stopStream() has marked the controller.
   // Treat that request as closed so a late `done` cannot resurrect the turn or
   // schedule an automatic continuation.
   const stopped = (): boolean =>
-    requestController ? userStoppedControllers.has(requestController) : false
+    !target() || (requestController ? userStoppedControllers.has(requestController) : false)
+  // Keep the source buffer separate from its display projection. A diagnostic
+  // split across chunks must not permanently erase or rewrite earlier deltas.
+  let streamedContent = target()?.content ?? ''
   return {
+    onCursor: (turnId, sequence) => {
+      if (stopped()) return
+      const current = target()
+      if (current) { current.turnId = turnId; current.eventSequence = sequence }
+    },
+    onHeartbeat: (heartbeat) => {
+      if (stopped()) return
+      const current = target()
+      if (!current || current.turnId !== heartbeat.turn_id) return
+      current.eventSequence = Math.max(current.eventSequence ?? 0, heartbeat.event_seq)
+      if (current.status === 'reconnecting') current.status = 'streaming'
+    },
+    onTerminal: (terminal) => {
+      if (stopped()) return
+      const current = target()
+      if (current) applyTurnTerminal(current, terminal)
+    },
     onMeta: (meta) => {
       if (stopped()) return
+      if (target() && meta.turn_id) target()!.turnId = meta.turn_id
       conversationId.value = meta.conversation_id
+      if (route.name !== 'conversation') {
+        boundConversationRoute = meta.conversation_id
+        void router.replace({ path: `/c/${encodeURIComponent(meta.conversation_id)}` })
+      }
       projectId.value = meta.project_id
       conversationTitle.value = meta.title ?? ''
       if (meta.turn_count === 0) syncStore()
@@ -650,15 +885,17 @@ function streamHandlers(
       if (stopped()) return
       const current = target()
       if (!current) return
-      current.content = sanitizeAssistantText(`${current.content}${delta}`)
+      streamedContent += delta
+      current.content = sanitizeAssistantText(streamedContent)
       void scrollToBottom()
     },
-    onReasoning: (delta) => {
+    onReasoning: (delta, summary) => {
       if (stopped()) return
       // 思考过程**不拼进正文**：单独累积，渲染时折叠在耗时那一行下面
       const current = target()
       if (!current) return
       current.reasoning = (current.reasoning ?? '') + delta
+      if (summary?.trim()) current.reasoningSummary = `${current.reasoningSummary ?? ''}${summary}`
       void scrollToBottom()
     },
     onRow: (row) => {
@@ -673,7 +910,7 @@ function streamHandlers(
     },
     onApproval: (card) => {
       if (stopped()) return
-      const owner = cardOwner()
+      const owner = turns.value.find((turn) => (turn.rows ?? []).some((row) => isApprovalCard(row) && row.request_id === card.request_id)) ?? cardOwner()
       if (!owner) return
       owner.rows = upsertApprovalRow(owner.rows ?? [], card)
       // 只有 pending 才停在等人；批准/拒绝后同一张卡换成终态，不再拦着界面
@@ -693,13 +930,18 @@ function streamHandlers(
       if (stopped()) return
       const current = target()
       if (!current) return
-      if (done.content) current.content = sanitizeAssistantText(done.content)
+      // `done.content` may be only the final model round (or a short failure
+      // note) while earlier deltas already contain a useful answer. Merge it
+      // instead of replacing the visible buffer, otherwise a late tool error
+      // makes the preceding response appear to disappear.
+      if (done.content) current.content = mergeAssistantContent(current.content, done.content)
       if (done.model_id) current.model = done.model_id
       if (done.duration_ms) current.durationMs = done.duration_ms
       if (done.routing) current.routing = done.routing
       // **等批准 ≠ 答完**：这一轮停在人那里，不能标成"已完成"
       current.awaiting = done.awaiting_approval ?? null
-      current.status = current.awaiting ? 'waiting' : 'done'
+      current.status = done.turn_status === 'failed' ? 'failed' : done.turn_status === 'interrupted' ? 'interrupted' : current.awaiting || done.turn_status === 'waitingApproval' ? 'waiting' : 'done'
+      current.ts = new Date().toISOString()
       void scrollToBottom()
       // 后端此时已把这一轮落盘：整表刷新一次，左栏顺序/轮次数与磁盘一致
       void conversations.load()
@@ -709,18 +951,17 @@ function streamHandlers(
       if (stopped()) return
       conversationTitle.value = payload.title
       syncStore()
-      if (payload.title_source === 'fallback' && payload.title_note) {
-        errorText.value = payload.title_note
-      }
     },
     onError: (streamError) => {
       if (requestController && userStoppedControllers.has(requestController)) {
         return
       }
       const current = target()
-      if (current) current.status = 'interrupted'
+      if (current && current.status !== 'done') current.status = 'reconnecting'
       // 研究者自己按的停止不是故障：本轮照旧标「已停止」，但不弹错误
-      errorText.value = humanError(streamError)
+      // Connection state belongs beside the turn, never in model prose or a
+      // raw transport banner. Already received content stays visible.
+      errorText.value = ''
       void conversations.load()
     },
   }
@@ -739,10 +980,108 @@ function streamHandlers(
  * 用它现有的中断机制）；已产出的内容保留，这一轮标「已停止」。
  */
 let streamAbort: AbortController | null = null
+let boundConversationRoute: string | null = null
 
-function stopStream(): void {
+function applyTurnTerminal(turn: Turn, terminal: HomeTurnSnapshot): void {
+  turn.interruptionReason = terminal.reason
+  if (terminal.status === 'inProgress') turn.status = 'reconnecting'
+  else if (terminal.status === 'completed') turn.status = 'done'
+  else if (terminal.status === 'waitingApproval') turn.status = 'waiting'
+  else turn.status = terminal.status
+  if (terminal.duration_ms) turn.durationMs = terminal.duration_ms
+}
+
+function detachSubscription(): void {
+  if (streamAbort) {
+    userStoppedControllers.add(streamAbort)
+    streamAbort.abort()
+    streamAbort = null
+  }
+  phase.value = 'idle'
+  stopTicker()
+}
+
+async function recoverSubscription(index: number, controller: AbortController): Promise<void> {
+  const identity = turns.value[index]
+  const id = conversationId.value
+  if (!identity?.turnId || !id) { if (identity) identity.status = 'failed'; return }
+  let handlers = streamHandlers(index, index, controller)
+  // A bounded automatic reconnect leaves an explicit action when the host
+  // remains unavailable. Each attempt reads state and attaches the same turn.
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (streamAbort !== controller || turns.value[index] !== identity || controller.signal.aborted) return
+    try {
+      const state = await fetchHomeTurn(id, identity.turnId)
+      if (streamAbort !== controller || turns.value[index] !== identity) return
+      identity.status = 'reconnecting'
+      const replay = (identity.eventSequence ?? 0) === 0
+      let startedReplay = false
+      const checkpoint = { content: identity.content, rows: identity.rows, reasoning: identity.reasoning,
+        reasoningSummary: identity.reasoningSummary, blocks: identity.blocks }
+      const replayHandlers: StreamHandlers = { ...handlers, onCursor: (turnId, sequence) => {
+        if (streamAbort !== controller || turns.value[index] !== identity) return
+        if (replay && !startedReplay) {
+          startedReplay = true
+          identity.content = ''
+          identity.rows = []
+          identity.reasoning = ''
+          identity.reasoningSummary = ''
+          identity.blocks = []
+          handlers = streamHandlers(index, index, controller)
+          Object.assign(replayHandlers, handlers)
+        }
+        handlers.onCursor?.(turnId, sequence)
+      } }
+      await resumeHomeTurn(id, identity.turnId, identity.eventSequence ?? 0, replayHandlers, controller.signal)
+      if (replay && !startedReplay) Object.assign(identity, checkpoint)
+      if (streamAbort !== controller || turns.value[index] !== identity) return
+      if (identity.status !== 'reconnecting') return
+      applyTurnTerminal(identity, state)
+      if (state.status !== 'inProgress') return
+    } catch {
+      if (controller.signal.aborted || streamAbort !== controller) return
+    }
+    await new Promise<void>((resolve) => window.setTimeout(resolve, 300 * (attempt + 1)))
+  }
+  if (streamAbort === controller && turns.value[index] === identity) identity.status = 'failed'
+}
+
+async function reconnectTurn(index: number): Promise<void> {
+  if (phase.value === 'thinking') return
+  const controller = new AbortController()
+  streamAbort = controller
+  phase.value = 'thinking'
+  startTicker()
+  try { await recoverSubscription(index, controller) }
+  finally {
+    if (streamAbort === controller) {
+      streamAbort = null
+      phase.value = 'idle'
+      stopTicker()
+    }
+  }
+}
+
+async function continueTurn(index: number): Promise<void> {
+  const turn = turns.value[index]
+  if (!turn || phase.value === 'thinking') return
+  if (turn.turnId && conversationId.value) {
+    try {
+      const state = await fetchHomeTurn(conversationId.value, turn.turnId)
+      if (turns.value[index] !== turn) return
+      if (state.status === 'inProgress') { await reconnectTurn(index); return }
+      applyTurnTerminal(turn, state)
+    } catch { await reconnectTurn(index); return }
+  }
+  // Explicit user action starts follow-up work from the saved protocol history.
+  prompt.value = '请接着上一轮未完成的工作继续。'
+  await send()
+}
+
+async function stopStream(): Promise<void> {
   clearAutoContinueTimer()
   if (!streamAbort) return
+  const activeConversation = conversationId.value
   const controller = streamAbort
   userStoppedControllers.add(controller)
   // Update the visible state before aborting the fetch. Abort delivery is
@@ -750,9 +1089,10 @@ function stopStream(): void {
   // ticker and loading motion active for an extra frame (or longer).
   for (let index = turns.value.length - 1; index >= 0; index -= 1) {
     const turn = turns.value[index]
-    if (turn.role === 'assistant' && turn.status === 'streaming') {
+    if (turn.role === 'assistant' && (turn.status === 'streaming' || turn.status === 'reconnecting')) {
+      userStoppedTurns.add(turn)
       turn.status = 'interrupted'
-      break
+
     }
   }
   phase.value = 'idle'
@@ -760,6 +1100,16 @@ function stopStream(): void {
   // A pre-existing transport error is no longer actionable once the user has
   // explicitly stopped the turn; do not leave the debug-style banner behind.
   errorText.value = ''
+  if (activeConversation) {
+    try {
+      const current = [...turns.value].reverse().find((turn) => turn.role === 'assistant' && turn.turnId)
+      const result = await interruptResearchNode(activeConversation, current?.turnId)
+      if (current && result.turn) applyTurnTerminal(current, result.turn)
+    } catch {
+      // The local state still settles immediately; the server may already have
+      // closed the turn, in which case there is nothing left to interrupt.
+    }
+  }
   controller.abort()
   streamAbort = null
 }
@@ -769,13 +1119,16 @@ async function runStream(
   model: PickedModel,
   assistantIndex: number,
   replaceFrom?: number,
+  attachments: HomeChatAttachment[] = [],
 ): Promise<void> {
   const controller = new AbortController()
+  const identity = turns.value[assistantIndex]
   streamAbort = controller
   try {
     await streamChatHome(
       {
         text,
+        attachments,
         model_config_id: model.configId,
         model_id: model.modelId,
         conversation_id: conversationId.value ?? undefined,
@@ -785,24 +1138,33 @@ async function runStream(
       streamHandlers(assistantIndex, assistantIndex, controller),
       controller.signal,
     )
+    const current = turns.value[assistantIndex]
+    if (streamAbort === controller && current?.status === 'reconnecting') {
+      await recoverSubscription(assistantIndex, controller)
+    }
   } catch (error) {
+    if (turns.value[assistantIndex] !== identity || streamAbort !== controller) return
     const target = turns.value[assistantIndex]
     // 自己按的停止：**保留已产出的内容**、本轮标「已停止」，不回滚输入框、不报错（2026-09-26 口径）
     if (userStoppedControllers.has(controller)) {
       if (target) target.status = 'interrupted'
       return
     }
-    if (target) {
-      target.status = 'interrupted'
-      // 一个字都没生成：普通发送撤掉这条空回答并把原文放回输入框；
-      // **编辑重开不回滚** —— 后端已把用户改过的正文落盘，本地回滚反而会和磁盘不一致。
-      if (!target.content && replaceFrom === undefined) {
-        turns.value = turns.value.filter((_, index) => index !== assistantIndex)
-        prompt.value = text
+    if (streamAbort !== controller) return
+    if (error instanceof ApiError && error.code === 'turn_in_progress') {
+      const conflict = (error.detail as { detail?: { conversation_id?: string; turn_id?: string } } | undefined)?.detail
+      if (target && conflict?.conversation_id && conflict.turn_id) {
+        conversationId.value = conflict.conversation_id
+        target.turnId = conflict.turn_id
+        target.status = 'reconnecting'
+        await recoverSubscription(assistantIndex, controller)
+        return
       }
     }
-    const withCode = error as { code?: string; message?: string }
-    errorText.value = withCode?.message ? humanError(withCode) : safeErrorMessage(error)
+    if (target) target.status = 'reconnecting'
+    if (target?.turnId) await recoverSubscription(assistantIndex, controller)
+    else if (target) target.status = 'failed'
+    errorText.value = ''
   } finally {
     if (streamAbort === controller) {
       streamAbort = null
@@ -913,6 +1275,7 @@ async function decideApprovalCard(card: ApprovalCard, decision: ApprovalDecision
   await scrollToBottom()
 
   const decideController = new AbortController()
+  const identity = turns.value[assistantIndex]
   try {
     streamAbort = decideController
     await streamApprovalDecision(
@@ -930,14 +1293,31 @@ async function decideApprovalCard(card: ApprovalCard, decision: ApprovalDecision
       ),
       decideController.signal,
     )
+    const current = turns.value[assistantIndex]
+    if (streamAbort === decideController && current?.status === 'reconnecting') {
+      await recoverSubscription(assistantIndex, decideController)
+    }
+    if (streamAbort !== decideController || turns.value[assistantIndex] !== identity) return
+    // Some providers finish the approval continuation without replaying the
+    // original approval row. Close that row locally once the decision stream
+    // succeeds so an already executed call cannot remain visible as pending.
+    const settledStatus: ApprovalStatus = decision === 'deny' ? 'denied' : 'approved'
+    const owner = turns.value.find((turn) =>
+      (turn.rows ?? []).some((row) => isApprovalCard(row) && row.request_id === card.request_id),
+    )
+    if (owner) {
+      owner.rows = (owner.rows ?? []).map((row) =>
+        isApprovalCard(row) && row.request_id === card.request_id
+          ? { ...row, status: settledStatus }
+          : row,
+      )
+      settleApprovalTurn(owner, settledStatus)
+    }
   } catch (error) {
+    if (streamAbort !== decideController || turns.value[assistantIndex] !== identity) return
     const target = turns.value[assistantIndex]
     const withCode = error as { code?: string; message?: string }
-    if (target && !target.content && !(target.rows ?? []).length) {
-      turns.value = turns.value.filter((_, index) => index !== assistantIndex)
-    } else if (target) {
-      target.status = 'interrupted'
-    }
+    if (target) target.status = 'failed'
     // 409 / 404 = 这条请求已经不在待批状态（批过 / 拒过 / 过期）：如实说出来，
     // 同时**按后端的说法把卡片收掉**，免得界面上留着一张永远点不动的卡
     const code = withCode?.code ?? ''
@@ -957,7 +1337,12 @@ async function decideApprovalCard(card: ApprovalCard, decision: ApprovalDecision
     if (userStoppedControllers.has(decideController)) {
       if (target) target.status = 'interrupted'
     } else {
-      errorText.value = withCode?.message ? humanError(withCode) : safeErrorMessage(error)
+      if (streamAbort === decideController && target) {
+        target.status = 'reconnecting'
+        if (target.turnId) await recoverSubscription(assistantIndex, decideController)
+        else target.status = 'failed'
+      }
+      errorText.value = ''
     }
   } finally {
     if (streamAbort === decideController) {
@@ -995,23 +1380,6 @@ function showContent(turn: Turn): boolean {
  * ------------------------------------------------------------------ */
 const reasonOpen = ref<Set<number>>(new Set())
 
-/**
- * 行内思考段（`row.kind === 'reasoning'`）的展开状态 —— 与按"轮"折叠的 reasonOpen 分开存，
- * key 用 `轮下标-行下标`：同一轮里可能有好几段思考，不能共用一个 boolean。
- */
-const inlineReasonOpen = ref<Set<string>>(new Set())
-
-function isInlineReasonOpen(key: string): boolean {
-  return inlineReasonOpen.value.has(key)
-}
-
-function toggleInlineReason(key: string): void {
-  const next = new Set(inlineReasonOpen.value)
-  if (next.has(key)) next.delete(key)
-  else next.add(key)
-  inlineReasonOpen.value = next
-}
-
 function isReasonOpen(index: number): boolean {
   return reasonOpen.value.has(index)
 }
@@ -1032,11 +1400,29 @@ function pickOption(text: string): void {
   void send()
 }
 
+/**
+ * 选择卡只属于当前对话的最后一条助手消息。
+ *
+ * 研究链会把历史消息完整保留，用户选择行动后旧卡仍然会随历史显示；
+ * 如果继续允许点击，旧选项就可能被再次发送，造成用户以为重新触发了
+ * 当前节点。把“是否仍可选”绑定到最后一条助手消息，既保留审计历史，
+ * 也让按钮状态与后端只接受最新选择的规则一致。
+ */
+function choiceBlockDisabled(turnIndex: number): boolean {
+  if (phase.value === 'thinking') return true
+  for (let index = turns.value.length - 1; index >= 0; index -= 1) {
+    if (turns.value[index]?.role === 'assistant') {
+      return index !== turnIndex
+    }
+  }
+  return true
+}
+
 /* ------------------------------------------------------------------ *
  * 完全访问模式（输入栏开关，默认关）
  *
  * 一个开关管两件事：① 节点跑完自动接力下一站；② **普通动手操作不再逐一确认**
- * （跑命令 / 写文件 / 删文件）。高危操作无论开关如何都会先弹批准卡。
+ * （跑命令 / 写文件 / 删文件）。所有可执行操作自动批准。
  * 授权**按对话**存在后端（`/chat/access-mode`），浏览器本地只是"还没有会话时"的暂存。
  * ------------------------------------------------------------------ */
 const FULL_ACCESS_KEY = 'sciloop.fullAccess'
@@ -1168,25 +1554,35 @@ async function send(): Promise<void> {
   if (!canSend.value || phase.value === 'thinking') return
   // 自己发出去的这句话必须看得到 → 重新粘住底部
   followBottom.value = true
-  const text = prompt.value.trim() || files.value.map((file) => file.name).join('、')
-  if (!text) return
+  const text = prompt.value.trim()
+  if (!text && files.value.length === 0) return
   const model = pickedModel()
   if (!model) return
+  let attachmentPayload: HomeChatAttachment[]
+  try {
+    attachmentPayload = await encodeAttachments(files.value)
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '附件读取失败')
+    return
+  }
+  const displayText = text || '已上传附件'
+  const attachmentMetadata = files.value.map(({ name, mimeType, size }) => ({ name, mime_type: mimeType, size }))
 
   errorText.value = ''
   turns.value = [
     ...turns.value,
-    { role: 'user', content: text, status: 'done' },
-    { role: 'assistant', content: '', model: model.modelId, status: 'streaming' },
+    { role: 'user', content: displayText, status: 'done', ts: new Date().toISOString(), attachments: attachmentMetadata },
+    { role: 'assistant', content: '', model: model.modelId, status: 'streaming', ts: new Date().toISOString() },
   ]
   const assistantIndex = turns.value.length - 1
   phase.value = 'thinking'
   prompt.value = ''
+  for (const file of files.value) if (file.previewUrl) URL.revokeObjectURL(file.previewUrl)
   files.value = []
   void autoGrow()
   startTicker()
   await scrollToBottom()
-  await runStream(text, model, assistantIndex)
+  await runStream(text, model, assistantIndex, undefined, attachmentPayload)
 }
 
 // --------------------------------------------------------------------------- //
@@ -1213,6 +1609,7 @@ function onEditInput(event: Event): void {
 
 function startEdit(index: number, content: string): void {
   if (phase.value === 'thinking') return
+  if (!isLatestUserTurn(index)) return
   editingIndex.value = index
   editingText.value = content
   editConfirmOpen.value = false
@@ -1263,15 +1660,17 @@ async function confirmEditRestart(): Promise<void> {
 }
 
 async function performEdit(index: number, text: string): Promise<void> {
+  if (!isLatestUserTurn(index)) return
   const model = pickedModel()
   if (!model) return
+  const priorAttachments = turns.value[index]?.attachments
 
   errorText.value = ''
   // 本地先按同一口径截断：保留 index 之前的轮次，第 index 条换成新正文，再挂一条等待中的回答
   turns.value = [
     ...turns.value.slice(0, index),
-    { role: 'user', content: text, status: 'done' },
-    { role: 'assistant', content: '', model: model.modelId, status: 'streaming' },
+    { role: 'user', content: text, status: 'done', ts: new Date().toISOString(), attachments: priorAttachments },
+    { role: 'assistant', content: '', model: model.modelId, status: 'streaming', ts: new Date().toISOString() },
   ]
   const assistantIndex = index + 1
   editingIndex.value = null
@@ -1309,7 +1708,12 @@ function onCreated(project: CreatedProject): void {
 watch(
   () => route.fullPath,
   () => {
-    if (phase.value === 'thinking' && streamAbort) stopStream()
+    if (boundConversationRoute && String(route.params.conversationId ?? '') === boundConversationRoute) {
+      boundConversationRoute = null
+      return
+    }
+    boundConversationRoute = null
+    detachSubscription()
     clearAutoContinueTimer()
     void init()
   },
@@ -1332,18 +1736,19 @@ onMounted(async () => {
   // 项目名要用来拼开场标题（`/?project=<id>`）：列表空的就先拉一次，避免标题闪成默认文案
   if (!session.projects.length) void session.loadProjects()
   pickedRef.value = modelOptions.value[0]?.value ?? 'auto'
+  // 模型浮层的"点外面收起"：注册一次，卸载时摘掉
+  document.addEventListener('pointerdown', onPickerPointerDown, true)
+  document.addEventListener('keydown', onPickerKeydown)
   await init()
 })
 
 onUnmounted(() => {
   clearAutoContinueTimer()
-  if (streamAbort) {
-    userStoppedControllers.add(streamAbort)
-    streamAbort.abort()
-    streamAbort = null
-  }
+  detachSubscription()
   stopTicker()
   if (entranceTimer !== null) window.clearTimeout(entranceTimer)
+  document.removeEventListener('pointerdown', onPickerPointerDown, true)
+  document.removeEventListener('keydown', onPickerKeydown)
 })
 </script>
 
@@ -1399,12 +1804,6 @@ onUnmounted(() => {
         <symbol id="sl-x" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
           <path d="M4.2 4.2 11.8 11.8M11.8 4.2 4.2 11.8" />
         </symbol>
-        <symbol id="sl-tool" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round">
-          <path d="M2.4 4.4h11.2M2.4 8h11.2M2.4 11.6h11.2" />
-          <circle cx="5.9" cy="4.4" r="1.45" fill="currentColor" stroke="none" />
-          <circle cx="10.2" cy="8" r="1.45" fill="currentColor" stroke="none" />
-          <circle cx="5.4" cy="11.6" r="1.45" fill="currentColor" stroke="none" />
-        </symbol>
       </defs>
     </svg>
 
@@ -1449,8 +1848,16 @@ onUnmounted(() => {
 
           <template v-else>
             <div class="bubble">{{ turn.content }}</div>
+            <div v-if="turn.attachments?.length" class="turn-attachments">
+              <div v-for="(attachment, attachmentIndex) in turn.attachments" :key="`${attachment.name}-${attachmentIndex}`" class="turn-attachment">
+                <span class="turn-attachment__name">{{ attachment.name }}</span>
+                <span v-if="attachment.size" class="turn-attachment__size">{{ Math.max(1, Math.round(attachment.size / 1024)) }} KB</span>
+              </div>
+            </div>
+            <div class="turn-time">{{ formatTurnTime(turn.ts) }}</div>
             <div class="acts acts--right">
               <button
+                v-if="isLatestUserTurn(index)"
                 class="icon-btn"
                 type="button"
                 :title="copiedIndex === index ? '已复制' : '复制'"
@@ -1506,40 +1913,14 @@ onUnmounted(() => {
         <div v-else class="turn turn--assistant">
           <div class="meta">
             <span class="meta__model">{{ turn.model }}</span>
+            <span v-if="formatTurnTime(turn.ts)" class="meta__time">{{ formatTurnTime(turn.ts) }}</span>
             <span class="meta__time">{{ durationText(turn) }}</span>
           </div>
-          <!-- 过程（研究者 2026-09-25 口径）：整轮的**思考 + 工具调用合成一行**抽屉，默认收起 ——
-               连失败/被拒、等待批准、流程节点行也一起收进去（他明确选了"最省地方"这一档）。
-               点开是**按发生顺序的时间线**：思考段各自可折（.reason--inline），工具行平铺。 -->
-          <button
-            v-if="turn.rows?.length || liveReasoning(turn)"
-            class="toolgroup"
-            type="button"
-            :aria-expanded="isProcessOpen(index)"
-            @click="toggleProcess(index)"
-          >
-            <svg
-              class="reason__caret"
-              :class="{ 'reason__caret--open': isProcessOpen(index) }"
-              width="10"
-              height="10"
-              viewBox="0 0 10 10"
-              aria-hidden="true"
-            >
-              <path d="M3 1.5 6.5 5 3 8.5" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round" />
-            </svg>
-            <span class="reason__ico" aria-hidden="true">
-              <svg width="14" height="14"><use href="#sl-tool" /></svg>
-            </span>
-            <span>调用工具</span>
-            <span v-if="processRunning(turn)" class="mo-dots" aria-hidden="true"><i /><i /><i /></span>
-          </button>
-
-          <div v-show="isProcessOpen(index)" class="process">
-            <!-- 思考过程：**只显示"还没落成过程行"的那一段**（正在想的那一轮）。
-               已经结束的各轮思考会跟着过程行一起按顺序出现（见 row.kind === 'reasoning'），
-               不再把所有思考都堆在这一轮的最上方。 -->
-          <div v-if="liveReasoning(turn)" class="reason">
+          <div v-if="turn.status === 'reconnecting' || turn.status === 'failed' || turn.status === 'interrupted'" role="status" aria-live="polite" class="turn-recovery">
+            <span>{{ durationText(turn) }}</span>
+            <button v-if="phase !== 'thinking'" type="button" @click="continueTurn(index)">继续</button>
+          </div>
+          <div v-if="hasReasoning(turn)" class="reason">
             <button
               class="reason__head"
               type="button"
@@ -1563,72 +1944,82 @@ onUnmounted(() => {
               <span v-if="isLiveTurn(index)" class="mo-dots" aria-hidden="true"><i /><i /><i /></span>
             </button>
             <div class="fold" :class="{ 'fold--open': isReasonOpen(index) }">
-              <pre class="reason__body">{{ liveReasoning(turn) }}</pre>
+              <pre class="reason__body">{{ reasoningDetails(turn) }}</pre>
             </div>
           </div>
-          <!-- 过程行：节点执行 / 工具调用 / **批准卡**（先于结论出现） -->
-          <div v-if="turn.rows?.length" class="rows">
-            <template v-for="(row, rowIndex) in turn.rows" :key="rowIndex">
-              <!-- 批准卡**不在正文里显示**：它贴在输入框上方（见 .approval-bar）；
-                   批准/拒绝的过程也不在正文留痕（研究者 2026-09-22 定的）。 -->
-              <!-- 联网检索：折叠面板取代原来那句文字摘要（来源 · 搜索词 · 结果标题与链接） -->
-              <SearchReport
-                v-if="!isApprovalCard(row) && searchReportFor(row)"
-                :report="searchReportFor(row)!"
-              />
-              <!-- 一轮结束后的思考：按顺序落在它之后的过程行**之前**，与过程行交叉展示 -->
-              <div v-else-if="row.kind === 'reasoning'" class="reason reason--inline">
-                <button
-                  class="reason__head"
-                  type="button"
-                  :aria-expanded="isInlineReasonOpen(`${index}-${rowIndex}`)"
-                  @click="toggleInlineReason(`${index}-${rowIndex}`)"
-                >
-                  <svg
-                    class="reason__caret"
-                    :class="{ 'reason__caret--open': isInlineReasonOpen(`${index}-${rowIndex}`) }"
-                    width="10"
-                    height="10"
-                    viewBox="0 0 10 10"
-                    aria-hidden="true"
-                  >
-                    <path d="M3 1.5 6.5 5 3 8.5" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round" />
-                  </svg>
-                  <span class="reason__ico" aria-hidden="true">
-                    <svg width="14" height="14"><use href="#sl-atom" /></svg>
-                  </span>
-                  <span>思考过程</span>
-                </button>
-                <div class="fold" :class="{ 'fold--open': isInlineReasonOpen(`${index}-${rowIndex}`) }">
-                  <pre class="reason__body">{{ row.text }}</pre>
+          <div v-if="hasToolActivity(turn)" class="toolgroup">
+            <span>Ran commands · {{ toolActivityRows(turn).length }}</span>
+            <span v-if="processRunning(turn)" class="mo-dots" aria-hidden="true"><i /><i /><i /></span>
+          </div>
+
+          <div v-if="hasToolActivity(turn)" class="process">
+            <template v-for="(activity, rowIndex) in toolActivityRows(turn)" :key="rowIndex">
+              <details class="tool-disclosure" :class="`tool-disclosure--${activity.status}`">
+                <summary>
+                  <span class="tool-disclosure__status" aria-hidden="true">{{ activity.status === 'completed' ? '✓' : activity.status === 'failed' ? '×' : '›' }}</span>
+                  <code class="tool-disclosure__action">{{ toolActionLabel(activity.row) }}</code>
+                  <span class="tool-disclosure__result">{{ toolActivityStatus(activity, turn) }}</span>
+                </summary>
+                <div class="tool-disclosure__body">
+                  <div v-if="activity.row.action && /^(run_command|run_on_computer)$/.test(activity.row.tool_name ?? '')" class="tool-disclosure__command">
+                    <span class="tool-disclosure__label">Shell</span>
+                    <pre><code>$ {{ activity.row.action }}</code></pre>
+                  </div>
+                  <div v-if="activity.row.workdir" class="tool-disclosure__meta">{{ activity.row.workdir }}</div>
+                  <div v-if="activity.row.children" class="tool-disclosure__output">
+                    <span class="tool-disclosure__label">
+                      目录内容（{{ activity.row.children_count ?? activity.row.children.length }} 项<span v-if="activity.row.children_truncated">，仅显示前 100 项</span>）
+                    </span>
+                    <ul class="tool-disclosure__children">
+                      <li v-for="(child, childIndex) in activity.row.children" :key="`${child.name}-${childIndex}`">
+                        <code>{{ child.name }}</code>
+                        <span v-if="child.kind"> · {{ child.kind }}</span>
+                        <span v-if="child.size !== undefined"> · {{ child.size }} bytes</span>
+                      </li>
+                    </ul>
+                  </div>
+                  <div v-if="activity.row.stdout" class="tool-disclosure__output">
+                    <span class="tool-disclosure__label">Output</span>
+                    <pre>{{ toolOutputText(activity.row.stdout) }}</pre>
+                  </div>
+                  <div v-if="activity.row.stderr" class="tool-disclosure__output tool-disclosure__output--error">
+                    <span class="tool-disclosure__label">Error</span>
+                    <pre>{{ toolOutputText(activity.row.stderr) }}</pre>
+                  </div>
+                  <div v-if="activity.row.error" class="tool-disclosure__output tool-disclosure__output--error">
+                    <span class="tool-disclosure__label">Error</span>
+                    <pre>{{ toolOutputText(activity.row.error) }}</pre>
+                  </div>
+                  <div v-if="activity.row.exit_code !== undefined" class="tool-disclosure__meta">
+                    Process exited with code {{ activity.row.exit_code }}{{ activity.row.timed_out ? ' (timed out)' : '' }}
+                  </div>
+                  <div v-if="activity.row.exit_code !== undefined && !activity.row.stdout && !activity.row.stderr" class="tool-disclosure__empty">
+                    (no output)
+                  </div>
+                  <div v-if="!activity.row.stdout && !activity.row.stderr && !activity.row.error && activity.row.exit_code === undefined" class="tool-disclosure__output">
+                    <span class="tool-disclosure__label">{{ activity.name }}</span>
+                    <pre>{{ activity.row.text }}</pre>
+                  </div>
                 </div>
-              </div>
-              <div
-                v-else-if="!isApprovalCard(row) && !isSettledApprovalRow(row)"
-                class="row"
-                :class="`row--${row.tone ?? 'idle'}`"
-              >
-                <span
-                  class="row__ico"
-                  :class="rowMotion(turn.rows ?? [], rowIndex, turn.status !== 'interrupted' && turn.status !== 'done')"
-                  aria-hidden="true"
-                >
-                  <svg width="16" height="16"><use :href="`#sl-${rowIcon(row)}`" /></svg>
-                </span>
-                <!-- 标签为空时不渲染药丸：否则会剩一个没有内容的空框，看着像个"莫名其妙的块" -->
-                <span v-if="rowKind(row)" class="row__kind">{{ rowKind(row) }}</span>
-                <span
-                  class="row__text"
-                  :class="{ 'mo-shimmer': rowMotion(turn.rows ?? [], rowIndex, turn.status !== 'interrupted' && turn.status !== 'done') === 'mo-dots' }"
-                >{{ row.text }}</span>
-                <span
-                  v-if="rowMotion(turn.rows ?? [], rowIndex, turn.status !== 'interrupted' && turn.status !== 'done') === 'mo-dots'"
-                  class="mo-dots"
-                  aria-hidden="true"
-                ><i /><i /><i /></span>
-              </div>
+              </details>
+              <SearchReport v-if="searchReportFor(activity.row)" :report="searchReportFor(activity.row)!" />
             </template>
           </div>
+
+          <!-- 普通节点状态与批准留痕不属于工具调用，仍在独立区域保留。 -->
+          <div v-if="statusRows(turn).length" class="rows">
+            <div
+              v-for="(row, rowIndex) in statusRows(turn)"
+              :key="rowIndex"
+              class="row"
+              :class="`row--${row.tone ?? 'idle'}`"
+            >
+              <span class="row__ico" aria-hidden="true">
+                <svg width="16" height="16"><use :href="`#sl-${rowIcon(row)}`" /></svg>
+              </span>
+              <span v-if="rowKind(row)" class="row__kind">{{ rowKind(row) }}</span>
+              <span class="row__text">{{ row.text }}</span>
+            </div>
           </div>
           <MarkdownText v-if="showContent(turn)" :content="turn.content" />
           <!-- 等批准时**不要转省略号**：它不是"正在生成"，是停着等人 -->
@@ -1651,7 +2042,7 @@ onUnmounted(() => {
                   class="choice"
                   :class="`choice--${option.tone ?? 'default'}`"
                   type="button"
-                  :disabled="phase === 'thinking'"
+                  :disabled="choiceBlockDisabled(index)"
                   @click="pickOption(option.send)"
                 >
                   {{ option.label }}
@@ -1719,10 +2110,10 @@ onUnmounted(() => {
     <!-- 待批准条：贴着输入框上方（研究者 2026-09-22：不放在内容输出区）。
          四个元素 = 要执行的命令 + 三个选择；批准或拒绝后它自己就没了。
          ⚠️ 三档语义（研究者 2026-09-25 口径，**卡片上要看得见批准的是什么**）：
-           ①「本对话允许「运行命令」」= **按工具**授权：之后同一工具换参数不再问（高危仍会问）
+           ①「批准此次执行」= 只批准当前请求，不扩大后续授权
            ②「本对话默认允许（含高危）」= 最宽一档，连高危也不再弹卡
            ③「拒绝」
-         → 因此第一档按钮必须**写出工具名**，否则研究者会以为批准的只是这一条命令。 -->
+         → 命令预览说明本次批准的操作。 -->
     <div v-if="pendingApprovalBar" class="approval-bar" role="group" aria-label="待批准">
       <code class="approval-bar__cmd">{{ approvalCommand(pendingApprovalBar.card.preview) }}</code>
       <button
@@ -1731,7 +2122,7 @@ onUnmounted(() => {
         :disabled="phase === 'thinking' || !session.isOwner"
         @click="decideApprovalCard(pendingApprovalBar.card, 'approve')"
       >
-        本对话允许「{{ pendingApprovalBar.card.label || pendingApprovalBar.card.tool }}」
+        批准此次执行
       </button>
       <button
         class="approval-bar__action"
@@ -1759,6 +2150,7 @@ onUnmounted(() => {
         :disabled="loadingConversation"
         placeholder="描述你的研究需求，例如：为长上下文问答设计一套可复现的评测方案"
         @keydown.enter.exact.prevent="send"
+        @paste="onPaste"
       />
 
       <div class="bar">
@@ -1768,7 +2160,14 @@ onUnmounted(() => {
               <path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
             </svg>
           </button>
-          <input ref="fileInput" type="file" multiple hidden @change="onFiles" />
+          <input
+            ref="fileInput"
+            type="file"
+            multiple
+            accept="image/*,.txt,.md,.csv,.tsv,.json,.html,.xml,.yaml,.yml,.tex,.log,.py,.js,.ts,.tsx,.jsx,.css,.java,.c,.h,.cpp,.rs,.go,.sh,.sql,.pdf,.docx,.pptx,.xlsx"
+            hidden
+            @change="onFiles"
+          />
           <button
             v-for="(file, index) in files"
             :key="`${file.name}-${index}`"
@@ -1777,7 +2176,8 @@ onUnmounted(() => {
             :title="`移除 ${file.name}`"
             @click="removeFile(index)"
           >
-            {{ file.name.length > 20 ? `${file.name.slice(0, 18)}…` : file.name }}
+            <img v-if="file.previewUrl" class="attachment-preview" :src="file.previewUrl" alt="" />
+            <span>{{ file.name.length > 20 ? `${file.name.slice(0, 18)}…` : file.name }}</span>
           </button>
         </div>
 
@@ -1797,7 +2197,7 @@ onUnmounted(() => {
             </svg>
           </button>
           <!-- 完全访问模式：默认关。开着时①节点跑完自动接力下一站
-               ②普通动手操作（跑命令/写文件）不再逐一确认；**高危操作仍会先弹批准卡**。
+               ②普通动手操作（跑命令/写文件）不再逐一确认；所有可执行操作自动批准。
                转人工 / 失败 / 下一节点是占位都会自动停住。 -->
           <button
             class="autorun"
@@ -1811,7 +2211,7 @@ onUnmounted(() => {
             <span class="autorun__dot" />
             {{ fullAccess ? '完全访问模式' : '逐步确认' }}
           </button>
-          <div class="mpick">
+          <div ref="mpickEl" class="mpick">
             <button
               class="mpick__trigger"
               type="button"
@@ -1820,7 +2220,17 @@ onUnmounted(() => {
               @click="pickerOpen = !pickerOpen"
             >
               <span class="mpick__value">{{ pickedLabel }}</span>
-              <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
+              <!-- 展开时箭头转 180°（与左栏项目行 .crow__caret--open 同一口径）：
+                   面板向上展开，箭头朝上才与"浮层已打开"一致。 -->
+              <svg
+                class="mpick__caret"
+                :class="{ 'mpick__caret--open': pickerOpen }"
+                width="10"
+                height="10"
+                viewBox="0 0 10 10"
+                fill="none"
+                aria-hidden="true"
+              >
                 <path d="M2 4l3 3 3-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
               </svg>
             </button>
@@ -2071,6 +2481,44 @@ onUnmounted(() => {
   overflow-wrap: anywhere;
 }
 
+.turn-time {
+  margin-top: 4px;
+  color: var(--h-fg-muted);
+  font-size: 11px;
+  text-align: right;
+}
+
+.turn-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+  margin-top: 6px;
+}
+
+.turn-attachment {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 260px;
+  padding: 4px 8px;
+  border: 1px solid var(--h-line);
+  border-radius: 8px;
+  color: var(--h-fg-muted);
+  font-size: 11px;
+}
+
+.turn-attachment__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.turn-attachment__size {
+  flex: none;
+  opacity: 0.7;
+}
+
 /* 助手回答：无气泡、无边框，直接输出 */
 .turn--assistant {
   align-items: stretch;
@@ -2142,6 +2590,13 @@ onUnmounted(() => {
      改成展开即全文铺开（overflow 用 .fold > * 的 hidden，收起时该裁掉的部分照样裁掉），
      滚动统一交给外层对话容器 —— 鼠标在内容区任何位置（含左右两侧）都能直接滚上下文。 */
   overflow: hidden;
+}
+
+.reason__empty {
+  display: block;
+  margin: 6px 0 0 24px;
+  color: var(--h-fg-subtle);
+  font-size: var(--font-size-xs);
 }
 
 /* ------------------------------------------------------------------ *
@@ -2233,6 +2688,80 @@ onUnmounted(() => {
 .toolgroup:hover {
   color: var(--h-fg-muted);
 }
+
+.tool-disclosure {
+  margin: 2px 0;
+  color: var(--h-fg-muted);
+  font-size: var(--font-size-sm);
+}
+
+.tool-disclosure summary {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-height: 22px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.tool-disclosure summary::-webkit-details-marker {
+  display: none;
+}
+
+.tool-disclosure__status {
+  width: 14px;
+  flex: none;
+  color: var(--h-fg-subtle);
+  font-size: 15px;
+  text-align: center;
+}
+
+.tool-disclosure--completed .tool-disclosure__status { color: var(--h-ok); }
+.tool-disclosure--failed .tool-disclosure__status { color: var(--h-err); }
+
+.tool-disclosure__action {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--h-fg-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-disclosure__result {
+  flex: none;
+  color: var(--h-fg-subtle);
+  font-size: var(--font-size-xs);
+}
+
+.tool-disclosure__body {
+  margin: 3px 0 8px 22px;
+  padding: 8px 10px;
+  border-left: 1px solid var(--h-line);
+  background: color-mix(in srgb, var(--h-bg-soft) 70%, transparent);
+}
+
+.tool-disclosure__label {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--h-fg-subtle);
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+}
+
+.tool-disclosure__body pre {
+  max-height: 260px;
+  margin: 0 0 8px;
+  overflow: auto;
+  color: var(--h-fg-muted);
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.tool-disclosure__command pre { color: var(--h-fg); }
+.tool-disclosure__output--error pre { color: var(--h-err); }
+.tool-disclosure__meta { margin-bottom: 8px; color: var(--h-fg-subtle); font-size: var(--font-size-xs); }
+.tool-disclosure__empty { margin-bottom: 8px; color: var(--h-fg-subtle); font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
 
 .reason--inline {
   margin: 4px 0 2px;
@@ -2381,7 +2910,8 @@ onUnmounted(() => {
 
 .choice {
   padding: 6px 12px;
-  border: 1px solid var(--h-line);
+  /* 行动选项保持清晰边界；暗色主题下等同于白边，避免 quiet/default 看起来像纯文本。 */
+  border: 1px solid var(--h-fg);
   border-radius: 8px;
   background: transparent;
   color: var(--h-fg);
@@ -2406,6 +2936,11 @@ onUnmounted(() => {
 .choice--primary {
   border-color: var(--h-primary);
   color: var(--h-primary);
+}
+
+.choice--default,
+.choice--quiet {
+  border-color: var(--h-fg);
 }
 
 .rcard {
@@ -2743,6 +3278,13 @@ onUnmounted(() => {
   cursor: pointer;
 }
 
+.attachment-preview {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  object-fit: cover;
+}
+
 .chip:hover {
   border-color: var(--h-line-strong);
   color: var(--h-fg);
@@ -2804,6 +3346,24 @@ onUnmounted(() => {
 /* 模型选择：只有「名字 + ⌄」，无外框；浮层向上展开 */
 .mpick {
   position: relative;
+}
+
+/* 箭头随展开状态翻转（面板向上展开 → 展开时指向上方）。
+   动效刻意与同类交互 SmoothSelect 的 .sselect__caret 对齐（160ms / cubic-bezier(.16,1,.3,1)），
+   避免同一个"下拉箭头"在站内出现两种节奏。 */
+.mpick__caret {
+  flex: none;
+  transition: transform 160ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.mpick__caret--open {
+  transform: rotate(180deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mpick__caret {
+    transition: none;
+  }
 }
 
 .mpick__trigger {

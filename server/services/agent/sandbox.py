@@ -1,14 +1,14 @@
 """OS-enforced workspace writes for host subprocesses.
 
-Windows uses a write-restricted access token and a per-run restricting SID granted
-only on the workspace. Linux uses bubblewrap with a read-only host filesystem.
-No implementation may fall back to an unrestricted process in workspace mode.
+Linux uses bubblewrap with a read-only host filesystem. The legacy Windows
+restricted token did not enforce the boundary and is disabled until a verified
+backend is available. Workspace mode must never silently become full access.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
-import secrets
 import shutil
 import subprocess
 import sys
@@ -24,7 +24,13 @@ def available() -> dict[str, Any]:
             import win32security  # noqa: F401
         except ImportError:
             return {"available": False, "backend": "windows-token", "reason": "请安装后端依赖 pywin32"}
-        return {"available": True, "backend": "windows-token"}
+        # The legacy token included the user's existing groups as restricting
+        # SIDs, which let arbitrary inline code write outside the workspace.
+        # Never advertise or execute that as an enforced boundary. Full access
+        # remains explicit and separate; workspace mode must fail closed until
+        # a Windows isolation backend passes the boundary probes.
+        return {"available": False, "backend": "windows-token", "strong_isolation": False,
+                "reason": "当前 Windows 执行器无法保证所选目录外只读，已暂停受限命令执行。"}
     if sys.platform.startswith("linux"):
         return {"available": bool(shutil.which("bwrap")), "backend": "bubblewrap", "reason": "需要 bubblewrap 和启用用户命名空间"}
     return {"available": False, "backend": None, "reason": "当前系统尚未实现受限执行器"}
@@ -48,6 +54,11 @@ def run(*, argv: list[str] | None = None, command: str | None = None, cwd: str,
     if access_mode != "full" and not workdir.is_relative_to(root):
         return {"ok": False, "error": "只允许在已选择的工作目录内执行命令", "code": "workdir_outside"}
     args = _argv(argv, command)
+    if access_mode != "full":
+        capability = available()
+        if not capability["available"]:
+            return {"ok": False, "code": "sandbox_unavailable", "error": capability["reason"],
+                    "workdir": str(workdir), "strong_isolation": False, "executed": False}
     run_env = dict(env)
     # 子进程仅需要运行环境；移除平台的模型密钥和 Owner 令牌。
     for key in list(run_env):
@@ -96,14 +107,15 @@ def _decode(value: bytes) -> str:
 
 def _windows(args: list[str], cwd: Path, root: Path, env: dict[str, str], timeout: int,
              mode: str) -> tuple[int, bytes, bytes, bool]:
-    import win32api
+    if mode != "full":
+        raise RuntimeError("Windows 受限执行边界尚未验证，命令未执行")
+    import msvcrt
+
+    import pywintypes
     import win32con
     import win32event
     import win32job
     import win32process
-    import win32security
-    import pywintypes
-    import msvcrt
 
     token = None
     job = win32job.CreateJobObject(None, "")
@@ -113,49 +125,7 @@ def _windows(args: list[str], cwd: Path, root: Path, env: dict[str, str], timeou
     buffers = [bytearray(), bytearray()]
     readers: list[threading.Thread] = []
     timed_out = False
-    changed_dacls: list[Path] = []
-    restricting_sid = None
     try:
-        if mode != "full":
-            # WRITE_RESTRICTED 让文件系统同时检查一个临时限制 SID。只给所选目录
-            # 及其现有内容授予这个 SID，目录外没有该 ACE，因此保持只读。
-            restricting_sid = win32security.ConvertStringSidToSid(
-                "S-1-5-21-" + "-".join(str(secrets.randbelow(2**30) + 1) for _ in range(3)) + "-1001"
-            )
-            for path in (root, *root.rglob("*")):
-                if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
-                    continue
-                sd = win32security.GetNamedSecurityInfo(
-                    str(path), win32security.SE_FILE_OBJECT, win32security.DACL_SECURITY_INFORMATION
-                )
-                old_dacl = sd.GetSecurityDescriptorDacl()
-                if old_dacl is None:
-                    raise RuntimeError(f"受限执行不支持空 DACL：{path}")
-                old_dacl.AddAccessAllowedAceEx(
-                    win32security.ACL_REVISION,
-                    win32con.OBJECT_INHERIT_ACE | win32con.CONTAINER_INHERIT_ACE,
-                    win32con.GENERIC_ALL,
-                    restricting_sid,
-                )
-                win32security.SetNamedSecurityInfo(
-                    str(path), win32security.SE_FILE_OBJECT, win32security.DACL_SECURITY_INFORMATION,
-                    None, None, old_dacl, None,
-                )
-                changed_dacls.append(path)
-            original = win32security.OpenProcessToken(win32api.GetCurrentProcess(), win32con.TOKEN_ALL_ACCESS)
-            handles.append(original)
-            user_sid = win32security.GetTokenInformation(original, win32security.TokenUser)[0]
-            groups = win32security.GetTokenInformation(original, win32security.TokenGroups)
-            preserving_sids = [
-                (group_sid, 0)
-                for group_sid, attributes in groups
-                if attributes & win32con.SE_GROUP_ENABLED
-            ]
-            token = win32security.CreateRestrictedToken(
-                original, 8, None, None, [(restricting_sid, 0), (user_sid, 0), *preserving_sids]
-            )
-            handles.append(token)
-
         info = win32job.QueryInformationJobObject(job, win32job.JobObjectExtendedLimitInformation)
         info["BasicLimitInformation"]["LimitFlags"] = win32job.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         win32job.SetInformationJobObject(job, win32job.JobObjectExtendedLimitInformation, info)
@@ -209,28 +179,5 @@ def _windows(args: list[str], cwd: Path, root: Path, env: dict[str, str], timeou
                 else:
                     handle.Close()
         for fd in pipes:
-            try:
+            with contextlib.suppress(OSError):
                 os.close(fd)
-            except OSError:
-                pass
-        cleanup_paths = list(changed_dacls)
-        if restricting_sid is not None and root.exists():
-            cleanup_paths.extend(
-                path for path in (root, *root.rglob("*"))
-                if path not in cleanup_paths and not path.is_symlink()
-            )
-        for path in reversed(cleanup_paths):
-            if path.exists():
-                sd = win32security.GetNamedSecurityInfo(
-                    str(path), win32security.SE_FILE_OBJECT, win32security.DACL_SECURITY_INFORMATION
-                )
-                current_dacl = sd.GetSecurityDescriptorDacl()
-                if current_dacl is None:
-                    continue
-                for index in reversed(range(current_dacl.GetAceCount())):
-                    if current_dacl.GetAce(index)[-1] == restricting_sid:
-                        current_dacl.DeleteAce(index)
-                win32security.SetNamedSecurityInfo(
-                    str(path), win32security.SE_FILE_OBJECT, win32security.DACL_SECURITY_INFORMATION,
-                    None, None, current_dacl, None,
-                )

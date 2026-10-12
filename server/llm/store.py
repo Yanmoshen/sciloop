@@ -124,7 +124,7 @@ class InMemoryLLMStore:
 
 
 # --------------------------------------------------------------------------- #
-# SQL 实现（PostgreSQL / 附录 A.6 表结构）
+# SQL 实现（SQLite / 附录 A.6 表结构）
 # --------------------------------------------------------------------------- #
 _INSERT_LOG_SQL = """
 INSERT INTO llm_call_logs
@@ -152,7 +152,7 @@ GROUP BY stage
 ORDER BY stage NULLS FIRST
 """
 
-# 注意：可空参数必须显式 CAST，否则 asyncpg 无法推断 `$1 IS NULL` 的类型
+# 可空参数显式 CAST，统一过滤条件的类型。
 _RECENT_LOG_SQL = """
 SELECT id, project_id, stage, provider, model, purpose, prompt_tokens,
        completion_tokens, cost_usd, duration_ms, success, is_replay, error, created_at
@@ -165,7 +165,7 @@ LIMIT :limit
 
 
 class SqlLLMStore:
-    """基于 SQLAlchemy 2.x 原生 SQL 的 PostgreSQL 实现。"""
+    """基于 SQLAlchemy 2.x 原生 SQL 的 SQLite 实现。"""
 
     def __init__(self, engine: Any | None = None, dsn: str | None = None) -> None:
         self._engine = engine
@@ -246,7 +246,7 @@ class SqlLLMStore:
         from sqlalchemy import text
 
         engine = self._resolve_engine()
-        json_expr = "json(:payload)" if engine.dialect.name == "sqlite" else "CAST(:payload AS JSONB)"
+        json_expr = "json(:payload)"
         async with engine.begin() as conn:
             await conn.execute(
                 text(
@@ -306,7 +306,7 @@ _default_store: LLMStore | None = None
 
 
 def get_store() -> LLMStore:
-    """获取默认记账存储（生产为 PostgreSQL）。
+    """获取默认记账存储（部署统一使用 SQLite）。
 
     刻意**不做**「DB 不可用就退回内存」的降级：那会让调用变成不留痕的黑洞，
     直接违反「每一次调用都必须写 llm_call_logs」。

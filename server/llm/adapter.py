@@ -42,6 +42,7 @@ from llm.http_client import (
     DEFAULT_TIMEOUT_SECONDS,
     OpenAICompatibleClient,
     extract_delta,
+    extract_reasoning_summary,
     extract_tool_call_deltas,
     extract_usage,
 )
@@ -516,7 +517,34 @@ class StreamUpdate:
 
     kind: str
     text: str = ""
+    summary: str = ""
     result: LLMResult | None = None
+
+
+def _adapted_chunks(text: str, *, size: int = 48) -> list[str]:
+    """Split a one-shot provider response into predictable UI-sized deltas.
+
+    The split is deliberately deterministic and does not alter text. Prefer a
+    nearby sentence/whitespace boundary so the browser never receives a random
+    half of a multi-byte word, then fall back to a fixed size for long tokens.
+    """
+
+    if not text:
+        return []
+    chunks: list[str] = []
+    remaining = text
+    while len(remaining) > size:
+        cut = size
+        for marker in ("。", "！", "？", "\n", " ", "，", "、"):
+            candidate = remaining.rfind(marker, max(1, size // 2), size + 1)
+            if candidate >= max(1, size // 2):
+                cut = candidate + 1
+                break
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:]
+    if remaining:
+        chunks.append(remaining)
+    return chunks
 
 
 async def chat_stream(
@@ -603,11 +631,14 @@ async def chat_stream(
         started = time.perf_counter()
         parts: list[str] = []
         reasoning_parts: list[str] = []
+        reasoning_summary_parts: list[str] = []
         # 工具调用在流式里是**分片**下发的，必须边收边按 index 拼接（见 _merge_tool_call_deltas）
         tool_calls_acc: list[dict[str, Any]] = []
         finish_reason: str | None = None
         usage = Usage()
         model_returned: str | None = None
+        stream_mode = "native"
+        terminal_seen = False
         emitted = False
         payload = base_payload
 
@@ -618,23 +649,38 @@ async def chat_stream(
                         returned = chunk.get("model")
                         if isinstance(returned, str) and returned:
                             model_returned = returned
+                        if chunk.get("_sciloop_stream_mode") == "adapted":
+                            stream_mode = "adapted"
                         chunk_usage = extract_usage(chunk)
                         if chunk_usage is not None:
                             usage = chunk_usage
                         text, reasoning, chunk_finish = extract_delta(chunk)
-                        # 工具增量与正文并行收集：模型可能一边说话一边要求调工具
-                        _merge_tool_call_deltas(tool_calls_acc, extract_tool_call_deltas(chunk))
+                        reasoning_summary = extract_reasoning_summary(chunk)
+                        # Once a provider emits a finish reason, later frames
+                        # (often a duplicate content frame or trailing gateway
+                        # metadata) cannot reopen the turn. Keep usage updates,
+                        # but discard late user-visible deltas and tool calls.
+                        if not terminal_seen:
+                            _merge_tool_call_deltas(tool_calls_acc, extract_tool_call_deltas(chunk))
                         if chunk_finish:
                             finish_reason = chunk_finish
-                        if reasoning:
-                            reasoning_parts.append(reasoning)
+                        if not terminal_seen and (reasoning or reasoning_summary):
+                            if reasoning:
+                                reasoning_parts.append(reasoning)
+                            if reasoning_summary:
+                                reasoning_summary_parts.append(reasoning_summary)
                             # 走独立通道：思考过程不是答复。此前只收集不推送，
                             # 结果它只能在收尾时被塞进 content 冒充正文（见下方 done 分支）。
-                            yield StreamUpdate(kind="reasoning", text=reasoning)
-                        if text:
-                            parts.append(text)
-                            emitted = True
-                            yield StreamUpdate(kind="delta", text=text)
+                            yield StreamUpdate(
+                                kind="reasoning", text=reasoning, summary=reasoning_summary
+                            )
+                        if not terminal_seen and text:
+                            for piece in (_adapted_chunks(text) if stream_mode == "adapted" else [text]):
+                                parts.append(piece)
+                                emitted = True
+                                yield StreamUpdate(kind="delta", text=piece)
+                        if chunk_finish:
+                            terminal_seen = True
                     break
                 except LLMBadRequestError as exc:
                     # 部分供应商不认识 stream_options：去掉它再试一次（属协议适配，不是重试）
@@ -694,6 +740,7 @@ async def chat_stream(
         duration_ms = int((time.perf_counter() - started) * 1000)
         content = "".join(parts)
         reasoning_text = "".join(reasoning_parts)
+        reasoning_summary_text = "".join(reasoning_summary_parts)
         if not content.strip() and reasoning_text.strip():
             # **不再拿思考过程冒充正文**。此前这里把 reasoning 塞进 content，
             # 于是界面上出现的「回答」其实是模型的自述，而调用方以为那是结论。
@@ -762,9 +809,11 @@ async def chat_stream(
                 fallback_from=list(fallback_from),
                 raw={
                     "strategy": "stream",
+                    "streaming_mode": stream_mode,
                     "model_returned": model_returned,
                     # 思考过程走独立字段，调用方据此折叠展示 / 单独落盘
                     "reasoning": reasoning_text,
+                    "reasoning_summary": reasoning_summary_text,
                     "metadata": dict(metadata or {}),
                 },
             ),

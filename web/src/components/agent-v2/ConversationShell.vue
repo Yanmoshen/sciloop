@@ -7,10 +7,8 @@
  */
 import ApprovalCard from './ApprovalCard.vue'
 import Composer from './Composer.vue'
-import ResearchConfirmCard from './ResearchConfirmCard.vue'
 import TurnControls from './TurnControls.vue'
 import TurnStream from './TurnStream.vue'
-import type { ResearchIntent } from './blocks'
 import type {
   ApprovalDecision,
   ApprovalView,
@@ -26,6 +24,7 @@ const props = defineProps<{
   activeTurn: TurnView | null
   streamText: string
   streamReasoning: string
+  turnStatus?: string | null
   approvals: ApprovalView[]
   toolCallOf: (callId: string | null) => ToolCallView | null
   toolOutputOf: (callId: string) => string
@@ -33,8 +32,6 @@ const props = defineProps<{
   busy?: boolean
   stopped?: boolean
   readOnly?: boolean
-  /** 待确认的研究意图（存在时只显示确认卡，不显示任何执行进度）。 */
-  pendingResearch?: ResearchIntent | null
 }>()
 
 const emit = defineEmits<{
@@ -45,8 +42,6 @@ const emit = defineEmits<{
   (event: 'recover'): void
   (event: 'retry'): void
   (event: 'resolve', payload: { approval: ApprovalView; decision: ApprovalDecision }): void
-  (event: 'confirm-research', intent: ResearchIntent): void
-  (event: 'cancel-research'): void
 }>()
 
 const composerMode = (): 'new' | 'steer' | 'continue' => {
@@ -66,18 +61,11 @@ const composerMode = (): 'new' | 'steer' | 'continue' => {
     <div v-if="!thread" class="shell__empty">从左侧选择一个会话，或新建一个。</div>
 
     <template v-else>
-      <ResearchConfirmCard
-        v-if="pendingResearch"
-        :intent="pendingResearch"
-        :busy="busy"
-        @confirm="(intent) => emit('confirm-research', intent)"
-        @cancel="emit('cancel-research')"
-      />
-
       <TurnStream
         :items="items"
         :stream-text="streamText"
         :stream-reasoning="streamReasoning"
+        :turn-status="turnStatus"
         :tool-call-of="toolCallOf"
         :tool-output-of="toolOutputOf"
         :approval-of="approvalOf"

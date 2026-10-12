@@ -24,9 +24,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import subprocess
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -40,13 +43,25 @@ from services.skills import runner as runner_mod
 MAX_MODEL_CALLS_PER_TURN = 600
 #: 单次回答里的**工具调用**次数上限（用户口径 2026-09-25：500）。
 MAX_TOOL_CALLS_PER_TURN = 500
+# Capability discovery must never hold a conversation open.  The actual
+# approved host operation keeps its normal execution timeout; this short
+# budget applies only to optional health/path probes used for routing and
+# approval wording.
+HOST_PROBE_TIMEOUT_S = 2.0
 
 #: 摆给模型**自主**调用的工具白名单（**只读**）。写/执行类不在这里，见 APPROVABLE_TOOLS。
 #: 摆给模型**自主**调用的工具白名单（**只读**）。写/执行类不在这里，见 APPROVABLE_TOOLS。
 #: `search_web` 走项目自建的 SearXNG（见 `services/agent/web_search.py`），也是只读。
 #: 只读的联网检索**两个并列能力**（模型自己选）：
 #: `search_academic` 查学术（官方接口，稳）、`search_web` 搜网页（覆盖广，可能被限流）。
-AUTONOMOUS_TOOLS = ("query_library", "search_academic", "search_web", "fetch_url", "load_skill")
+AUTONOMOUS_TOOLS = (
+    "query_library",
+    "search_academic",
+    "search_web",
+    "fetch_url",
+    "load_skill",
+    "clock__curr_time",
+)
 
 #: 摆给模型但**必须研究者批准**才执行的工具（写盘/执行类）。
 APPROVABLE_TOOLS = ("run_command",)
@@ -67,6 +82,20 @@ TOOL_LABELS = {
     "run_command": "执行命令",
     "run_on_computer": "在你的电脑上执行命令",
     "files_on_computer": "在你电脑上读写或整理文件",
+    "clock__curr_time": "读取当前时间",
+}
+
+_CLOCK_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "clock__curr_time",
+        "description": "读取当前设备的本地时间和 UTC 时间。只读，不会修改文件或系统设置。",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
 }
 
 #: 「搜网页」的工具声明（本地声明，不经过 MCP server）。
@@ -296,7 +325,7 @@ def _schemas_signature(default_dir: str | None) -> str:
     return f"{root}={newest}|cwd={default_dir or ''}|hosts={_allowed_hosts()}"
 
 
-async def tool_schemas() -> list[dict[str, Any]]:
+async def tool_schemas(*, workspace_root: str | None = None) -> list[dict[str, Any]]:
     """OpenAI 兼容的工具声明（只含当前允许摆给模型的那两类）。**带 1 小时缓存。**
 
     两类来源：
@@ -311,7 +340,8 @@ async def tool_schemas() -> list[dict[str, Any]]:
     `RuntimeError: asyncio.run() cannot be called from a running event loop`。
     """
 
-    signature = _schemas_signature(await host_runner.default_cwd())
+    host_info = await _host_roots_fast()
+    signature = _schemas_signature(str(host_info.get("default_cwd") or host_info.get("host_root") or ""))
     now = time.monotonic()
     if (
         signature
@@ -319,7 +349,7 @@ async def tool_schemas() -> list[dict[str, Any]]:
         and now - float(_SCHEMAS_CACHE["at"]) < SCHEMAS_TTL_SECONDS
     ):
         # 每次返回**全新副本**：调用方可能改动这份声明，不能让缓存被污染
-        return json.loads(str(_SCHEMAS_CACHE["json"]))
+        return _scoped_schemas(json.loads(str(_SCHEMAS_CACHE["json"])), workspace_root, host_info)
     schemas, mcp_ok = await _build_tool_schemas()
     # ⚠️ **只在 MCP 握手成功时才缓存**：握手瞬时失败若被缓存下来，就会把"工具缺失"
     # 钉住一小时（研究者会看到模型突然什么工具都没有）——宁可那时每次重试。
@@ -327,6 +357,31 @@ async def tool_schemas() -> list[dict[str, Any]]:
         _SCHEMAS_CACHE.update(
             {"signature": signature, "at": now, "json": json.dumps(schemas, ensure_ascii=False)}
         )
+    return _scoped_schemas(schemas, workspace_root, host_info)
+
+
+def _scoped_schemas(
+    schemas: list[dict[str, Any]], workspace_root: str | None,
+    host_info: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    # Scope facts are applied to a private copy, never the shared MCP cache.
+    if workspace_root:
+        for item in schemas:
+            function = item["function"]
+            function["description"] += (
+                f" 当前对话的工作目录是 {workspace_root}。相对路径与未指定 cwd 的命令都以此目录为基准；"
+                "不要扫描或写入其他项目目录。"
+            )
+    python_env = (host_info or {}).get("python_env") or {}
+    executable = python_env.get("executable") if isinstance(python_env, dict) else None
+    if executable:
+        for item in schemas:
+            function = item["function"]
+            if function["name"] in {"run_on_computer", "run_command", "run_skill"}:
+                function["description"] += (
+                    f" 科研 Python 环境为 {executable}。运行实验优先使用此解释器；"
+                    "使用 python 或 python.exe 会自动选择该环境，不要擅自换为系统 Python 的绝对路径。"
+                )
     return schemas
 
 
@@ -341,18 +396,9 @@ async def _build_tool_schemas() -> tuple[list[dict[str, Any]], bool]:
     schemas: list[dict[str, Any]] = _json.loads(_json.dumps(_HOST_TOOL_SCHEMAS))
     schemas.append(_json.loads(_json.dumps(_SEARCH_WEB_TOOL_SCHEMA)))
     schemas.append(_json.loads(_json.dumps(_SEARCH_ACADEMIC_TOOL_SCHEMA)))
+    schemas.append(_json.loads(_json.dumps(_CLOCK_TOOL_SCHEMA)))
     for schema in _SKILL_TOOL_SCHEMAS:
         schemas.append(_json.loads(_json.dumps(schema)))
-
-    # 把"你在这台电脑上的默认工作目录"写进工具描述：模型据此决定要不要显式指定目录，
-    # 也免得它去猜容器里的路径（容器路径在宿主上根本不存在）。
-    default_dir = await host_runner.default_cwd()
-    if default_dir:
-        for item in schemas:
-            function = item["function"]
-            function["description"] = (
-                f"{function['description']} 你在这台电脑上的默认工作目录是 {default_dir}。"
-            )
 
     from mcp_server.client import list_tools
 
@@ -385,6 +431,29 @@ async def _build_tool_schemas() -> tuple[list[dict[str, Any]], bool]:
     return schemas, True
 
 
+async def _host_roots_fast() -> dict[str, Any]:
+    """Best-effort host discovery used before an approval decision."""
+
+    try:
+        return await asyncio.wait_for(
+            host_runner.ensure_host_roots(), timeout=HOST_PROBE_TIMEOUT_S
+        )
+    except (TimeoutError, OSError):
+        return {}
+
+
+async def _default_cwd_fast() -> str | None:
+    """Return the host cwd without delaying the first model response."""
+
+    try:
+        value = await asyncio.wait_for(
+            host_runner.default_cwd(), timeout=HOST_PROBE_TIMEOUT_S
+        )
+    except (TimeoutError, OSError):
+        return None
+    return str(value) if value else None
+
+
 async def judge(call: dict[str, Any]) -> policy.Verdict:
     """逐次裁决一次工具调用该「放行 / 要研究者点头 / 直接拒绝」。
 
@@ -400,7 +469,7 @@ async def judge(call: dict[str, Any]) -> policy.Verdict:
         # 跑技能 = 在研究者电脑上按技能声明的流程真跑脚本。
         # 把**将要执行的命令**逐条送去裁决：有任一条被硬拒 → 整次拒绝；
         # 有任一条不能直接放行 → 弹卡（卡上写明这些命令），批了才跑。
-        await host_runner.ensure_host_roots()
+        await _host_roots_fast()
         skill_name = str(args.get("name") or "").strip()
         from services.skills import service
 
@@ -415,7 +484,7 @@ async def judge(call: dict[str, Any]) -> policy.Verdict:
                 message=f"没有这个技能：{skill_name}",
                 categories=(),
             )
-        info = await host_runner.ensure_host_roots()
+        info = await _host_roots_fast()
         host_dir = runner_mod.host_pack_dir(pack, host_root=str(info.get("host_root") or ""))
         if host_dir is None:
             return policy.Verdict(
@@ -451,14 +520,18 @@ async def judge(call: dict[str, Any]) -> policy.Verdict:
 
     if name == "run_on_computer":
         # 先确保裁决层知道宿主路径（删代码=硬拒要靠它）；拿不到也不拦着走流程
-        await host_runner.ensure_host_roots()
+        info = await _host_roots_fast()
         argv = args.get("argv") if isinstance(args.get("argv"), list) else None
         command = args.get("command") if isinstance(args.get("command"), str) else None
         cwd = args.get("cwd") if isinstance(args.get("cwd"), str) else None
-        return policy.judge_command(argv=argv, command=command, cwd=cwd)
+        verdict = policy.judge_command(argv=argv, command=command, cwd=cwd)
+        capabilities = info.get("execution_capabilities") or {}
+        if verdict.harmless and capabilities.get("workspace_execution") is False:
+            return policy._approve(verdict.layer, "这条命令将在本机执行，请确认后继续", "本机执行")
+        return verdict
 
     if name == "files_on_computer":
-        await host_runner.ensure_host_roots()
+        await _host_roots_fast()
         action = str(args.get("action") or "")
         path = str(args.get("path") or "")
         recursive = bool(args.get("recursive"))
@@ -466,8 +539,16 @@ async def judge(call: dict[str, Any]) -> policy.Verdict:
         # 覆盖已有文件才算高危 → 先问一眼"它现在在不在"，问不到就按"在"处理（宁可多问一次）
         exists: bool | None = None
         if action in ("write", "move", "copy") and path:
-            listing = await host_runner.call_fs(action="list", path=path)
-            exists = bool(listing.get("ok"))
+            # Existence is only a refinement of the approval wording.  A
+            # disconnected host must still produce the approval card quickly.
+            try:
+                listing = await asyncio.wait_for(
+                    host_runner.call_fs(action="list", path=path),
+                    timeout=HOST_PROBE_TIMEOUT_S,
+                )
+                exists = bool(listing.get("ok"))
+            except (TimeoutError, OSError):
+                exists = None
         return policy.judge_fs(
             action=action, path=path, to=to, exists=exists, recursive=recursive
         )
@@ -590,6 +671,8 @@ def tool_row(
     fn = call.get("function") or {}
     name = str(fn.get("name") or "")
     label = TOOL_LABELS.get(name, name or "工具")
+    arguments = _arguments(call)
+    action = _tool_action(name, arguments)
     if phase == "start":
         row = {"kind": "tool", "tone": "info", "text": f"调用「{label}」{detail}".strip()}
     elif phase == "ok":
@@ -600,9 +683,88 @@ def tool_row(
         row = {"kind": "tool", "tone": "warn", "text": f"「{label}」等待研究者批准{detail}"}
     else:
         row = {"kind": "tool", "tone": "warn", "text": f"「{label}」未完成：{_human_error(detail)}"}
+    row["action"] = action
+    call_id = str(call.get("id") or "").strip()
+    if call_id:
+        row["call_id"] = call_id
     if search:
         row["search"] = search
     return row
+
+
+def _tool_action(name: str, arguments: dict[str, Any]) -> str:
+    """Return the concrete, user-readable action represented by a tool call."""
+
+    if name in {"run_command", "run_on_computer"}:
+        command = arguments.get("command")
+        argv = arguments.get("argv")
+        if isinstance(command, str) and command.strip():
+            return command.strip()
+        if isinstance(argv, list):
+            # Preserve argument boundaries in the disclosure exactly as the
+            # host runner receives them.  This is the command-prompt form,
+            # rather than a localized tool summary or an ambiguous join.
+            return subprocess.list2cmdline([str(part) for part in argv])
+    if name == "files_on_computer":
+        action = str(arguments.get("action") or "操作文件")
+        path = str(arguments.get("path") or "")
+        target = str(arguments.get("to") or "")
+        return f"{action} {path}" + (f" → {target}" if target else "")
+    if name in {"search_web", "search_academic"}:
+        query = str(arguments.get("query") or "").strip()
+        return f"搜索：{query}" if query else "搜索"
+    if name == "fetch_url":
+        return str(arguments.get("url") or "抓取网页")
+    if name == "query_library":
+        return str(arguments.get("query") or "查询论文库")
+    if name == "load_skill":
+        return f"读取技能说明：{arguments.get('name') or ''}".rstrip("：")
+    return str(arguments.get("query") or arguments.get("name") or label_for_tool(name))
+
+
+def label_for_tool(name: str) -> str:
+    return TOOL_LABELS.get(name, name or "工具")
+
+
+def tool_execution_details(payload: dict[str, Any]) -> dict[str, Any]:
+    """Expose only execution facts needed by the activity disclosure."""
+
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return {}
+    details: dict[str, Any] = {}
+    for key in ("stdout", "stderr", "exit_code", "timed_out", "duration_ms", "workdir", "path", "to", "action", "error"):
+        value = result.get(key)
+        if value is not None and isinstance(value, (str, int, float, bool)):
+            details[key] = value
+    # Directory listings can contain arbitrary executor metadata. Keep only
+    # the fields needed to identify entries and bound both count and string size.
+    children = result.get("children")
+    if isinstance(children, list):
+        entries: list[dict[str, Any]] = []
+        for child in children[:100]:
+            if isinstance(child, str):
+                name = child
+                item: dict[str, Any] = {"name": name[:240]}
+            elif isinstance(child, dict):
+                name = child.get("name")
+                if not isinstance(name, str):
+                    continue
+                item = {"name": name[:240]}
+                kind = child.get("kind", child.get("type"))
+                if isinstance(kind, str):
+                    item["kind"] = kind[:40]
+                size = child.get("size")
+                if isinstance(size, (int, float)) and not isinstance(size, bool):
+                    item["size"] = size
+            else:
+                continue
+            entries.append(item)
+        details["children"] = entries
+        details["children_count"] = len(children)
+        if len(children) > 100:
+            details["children_truncated"] = True
+    return details
 
 
 #: 批准请求在行里的状态 → 卡片语气（前端只按这个上色，不自己猜）
@@ -685,6 +847,15 @@ async def run_tool_call(
     name = str(fn.get("name") or "")
     arguments = _arguments(call)
 
+    if name == "clock__curr_time":
+        now = datetime.now().astimezone()
+        result = {
+            "local_time": now.isoformat(timespec="seconds"),
+            "timezone": str(now.tzinfo),
+            "utc_time": now.astimezone(UTC).isoformat(timespec="seconds"),
+        }
+        return {"ok": True, "tool": name, "result": result}, "已读取当前时间"
+
     # 「联网搜索」：只读，走自建 SearXNG；连不上就如实回一句人话（不假装搜过）
     if name == "load_skill":
         from services.skills import registry, service
@@ -700,11 +871,18 @@ async def run_tool_call(
     if name == "run_skill":
         from services.skills import service
 
+        if not approval_token:
+            return {"ok": False, "error": "这次操作需要研究者确认后才会执行"}, "等待研究者确认"
+
+        async def approved_executor(**kwargs):
+            return await host_runner.call_exec(**kwargs, access_mode="approved", workspace_root=workspace_root)
+
         result = await service.run(
             str(arguments.get("name") or "").strip(),
             topic=str(arguments.get("topic") or ""),
             task_id=str(arguments.get("task_id") or "manual-run"),
-            project_dir=str(arguments.get("project_dir") or ""),
+            project_dir=str(arguments.get("project_dir") or workspace_root or ""),
+            executor=approved_executor,
         )
         return {"ok": bool(result.get("ok")), "tool": name, "result": result}, _summarize(name, result)
 
@@ -736,33 +914,37 @@ async def run_tool_call(
         verdict = await judge(call)
         if verdict.forbidden:
             return {"ok": False, "error": verdict.message, "refused": True}, verdict.message
-        if verdict.needs_approval and not approval_token:
+        if (verdict.needs_approval or not verdict.harmless) and not approval_token:
             return (
-                {"ok": False, "error": "这一步属于高危操作，需要研究者确认后才会执行"},
+                {"ok": False, "error": "这次操作需要研究者确认后才会执行"},
                 "等待研究者确认",
             )
+        # 人工批准与自动批准支持同样操作范围；批准只授权当前调用，
+        # 不修改会话的完全访问开关，也不声称存在操作系统强隔离。
+        # 模型参数不能指定执行权限：令牌只能由服务端审批链注入。
+        execution_mode = "approved" if approval_token else "workspace"
         if name == "run_on_computer":
             argv = arguments.get("argv") if isinstance(arguments.get("argv"), list) else None
             raw_cwd = arguments.get("cwd") if isinstance(arguments.get("cwd"), str) else None
             # 模型没说在哪儿跑 → 用研究者电脑上的研究项目目录（不是容器里的沙箱）
-            cwd = raw_cwd or await host_runner.default_cwd()
+            cwd = raw_cwd or workspace_root or await host_runner.default_cwd()
             result = await host_runner.call_exec(
                 argv=argv,
                 command=arguments.get("command") if isinstance(arguments.get("command"), str) else None,
                 cwd=cwd,
                 timeout_s=int(arguments.get("timeout_s") or 120),
                 workspace_root=workspace_root or cwd,
-                access_mode=access_mode,
+                access_mode=execution_mode,
             )
         else:
             result = await host_runner.call_fs(
                 action=str(arguments.get("action") or ""),
-                path=str(arguments.get("path") or ""),
-                to=arguments.get("to") if isinstance(arguments.get("to"), str) else None,
+                path=_workspace_path(str(arguments.get("path") or ""), workspace_root),
+                to=_workspace_path(arguments["to"], workspace_root) if isinstance(arguments.get("to"), str) else None,
                 content=arguments.get("content") if isinstance(arguments.get("content"), str) else None,
                 recursive=bool(arguments.get("recursive")),
                 workspace_root=workspace_root,
-                access_mode=access_mode,
+                access_mode=execution_mode,
             )
         summary = _summarize(name, result)
         return {"ok": bool(result.get("ok")), "tool": name, "result": result}, summary
@@ -796,9 +978,21 @@ async def run_tool_call(
     )
 
 
+def _workspace_path(path: str, workspace_root: str | None) -> str:
+    if not workspace_root or not path:
+        return path
+    from pathlib import Path, PureWindowsPath
+
+    if Path(path).is_absolute() or PureWindowsPath(path).is_absolute():
+        return path
+    return str(Path(workspace_root) / path)
+
+
 def _summarize(name: str, data: dict[str, Any]) -> str:
     """摘要只说事实（条数、状态码、字节数、退出码），不替模型解释内容。"""
 
+    if name == "clock__curr_time":
+        return "已读取当前时间"
     if name == "query_library":
         for key in ("papers", "items", "results", "matches"):
             value = data.get(key)
@@ -814,7 +1008,7 @@ def _summarize(name: str, data: dict[str, Any]) -> str:
         code = data.get("exit_code")
         if code is None:
             return "执行完成"
-        return f"退出码 {code}" + ("（成功）" if code == 0 else "（命令返回非零，不是工具失败）")
+        return "执行完成" if code == 0 else "命令未成功完成"
 
     # 宿主工具：摘要会显示在对话里的过程行上（研究者看得到），所以只说人话与事实
     if name == "load_skill":

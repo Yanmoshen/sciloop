@@ -239,8 +239,13 @@ export function fetchPaperSources(
 export interface SourceHealthEntry {
   source: string
   label: string | null
-  status: 'ok' | 'degraded' | string
-  ok: boolean
+  /**
+   * `ok` 已配置且探活成功 / `degraded` 探活失败或降级 / `disabled` 未配置（不发请求） /
+   * `unknown` 从未检测过。**不要只看 `ok` 判绿**：`disabled` 与 `unknown` 在 UI 里都是灰灯。
+   */
+  status: 'ok' | 'degraded' | 'disabled' | 'unknown' | string
+  /** 成功=true / 失败=false / 未配置或未检测=null（**不是** false） */
+  ok: boolean | null
   confidence: number | null
   configured: boolean
   credentials_required: boolean
@@ -248,17 +253,33 @@ export interface SourceHealthEntry {
   success_records: number | null
   empty_records: number | null
   distinct_papers: number | null
+  /** 最近一次**抓取**留痕时间（论文取数，与探活时间不是一回事） */
   last_fetched_at: string | null
+  /** 最近一次**抓取成功**时间（论文取数） */
   last_success_at: string | null
   last_http_status: number | null
   degraded_reason: string | null
+  /** 最近一次探活时间（probe=true 写入并持久化，重启后仍在） */
+  last_probe_at?: string | null
+  /** 最近一次**探活成功**时间（失败时保留上一次成功时间，不被顶掉） */
+  last_probe_success_at?: string | null
+  last_probe_ok?: boolean | null
+  last_probe_http_status?: number | null
+  last_probe_latency_ms?: number | null
+  /** 本次探活/未配置的原因（如 `not_configured`） */
+  last_probe_detail?: string | null
   config?: Record<string, unknown> | null
 }
 
 export interface SourceHealthResponse {
   status: string
   degraded_sources: string[]
+  /** 未配置凭证的必需来源（不发请求、不计成功/降级） */
+  disabled_sources?: string[]
+  /** 从未检测过的来源 */
+  unchecked_sources?: string[]
   sources: Record<string, SourceHealthEntry>
+  /** 只表示「最近一轮探活完成时间」，不是各来源的检测时间 */
   checked_at: string | null
   probe_enabled?: boolean
   notes?: string[]

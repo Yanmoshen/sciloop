@@ -20,6 +20,7 @@ import { apiUrl, get, getOwnerToken, parseError, post } from '@/api/client'
 
 export interface HomeChatInput {
   text: string
+  attachments?: HomeChatAttachment[]
   model_config_id: number
   model_id: string
   /** 不传 = 新建会话；传了 = 接着这个会话继续（后端带上历史轮次） */
@@ -31,6 +32,13 @@ export interface HomeChatInput {
    * 再以 `text` 作为新的第 N 条重问。只接受指向 user 轮次的下标（指到 assistant 会 422）。
    */
   replace_from?: number
+}
+
+export interface HomeChatAttachment {
+  name: string
+  mime_type: string
+  size: number
+  data_base64: string
 }
 
 export interface HomeChatResult {
@@ -97,6 +105,7 @@ export async function chatHome(input: HomeChatInput): Promise<HomeChatResult> {
 }
 
 export interface StreamMeta {
+  turn_id?: string
   conversation_id: string
   project_id: number | null
   model_ref: string
@@ -106,6 +115,7 @@ export interface StreamMeta {
 }
 
 export interface StreamDone {
+  turn_status?: HomeTurnSnapshot["status"]
   conversation_id: string
   /**
    * 完整正文（前端可用它校正自己拼出来的增量文本）。
@@ -233,6 +243,27 @@ export interface SystemRow {
    * 这样它就能和过程行**按顺序交叉展示**，而不是全部堆在一轮的最上方）。
    */
   kind: 'system' | 'tool' | 'search' | 'reasoning'
+  /** Stable backend tool identity added to tool activity rows. */
+  tool_name?: string
+  tool_label?: string
+  tool_status?: 'running' | 'completed' | 'failed' | 'waiting_approval' | string
+  /** Stable pairing id for one tool invocation. */
+  call_id?: string
+  /** Exact command, query, or file action requested by the model. */
+  action?: string
+  /** Safe execution facts retained for the expanded activity disclosure. */
+  stdout?: string
+  stderr?: string
+  exit_code?: number | null
+  timed_out?: boolean
+  duration_ms?: number
+  workdir?: string
+  path?: string
+  to?: string
+  error?: string
+  children?: Array<{ name: string; kind?: string; size?: number }>
+  children_count?: number
+  children_truncated?: boolean
   /** 分类标签（节点过程行有；工具行由后端给的 text 自带工具名） */
   label?: string
   text: string
@@ -359,7 +390,45 @@ export function isApprovalCard(row: TurnRow): row is ApprovalCard {
   return row.kind === 'approval'
 }
 
+export interface HomeTurnSnapshot {
+  conversation_id: string
+  turn_id: string
+  status: 'inProgress' | 'completed' | 'waitingApproval' | 'interrupted' | 'failed'
+  event_seq: number
+  reason?: string | null
+  error?: { code: string } | null
+  started_at?: string
+  completed_at?: string | null
+  duration_ms?: number
+}
+
+export interface HomeTurnHeartbeat {
+  conversation_id: string
+  turn_id: string
+  event_seq: number
+  turn_status: HomeTurnSnapshot['status']
+  last_event_at: string
+  running_ms: number
+}
+
+export function fetchHomeTurn(conversationId: string, turnId: string): Promise<HomeTurnSnapshot> {
+  return get(`/chat/turns/${encodeURIComponent(conversationId)}/${encodeURIComponent(turnId)}`)
+}
+
+export async function resumeHomeTurn(
+  conversationId: string, turnId: string, after: number,
+  handlers: StreamHandlers, signal?: AbortSignal,
+): Promise<void> {
+  const response = await fetch(apiUrl(`/chat/turns/${encodeURIComponent(conversationId)}/${encodeURIComponent(turnId)}/stream?after=${after}`), {
+    headers: { Accept: 'text/event-stream', ...ownerHeader() }, signal,
+  })
+  await consumeSse(response, handlers)
+}
+
 export interface StreamHandlers {
+  onCursor?: (turnId: string, sequence: number) => void
+  onHeartbeat?: (heartbeat: HomeTurnHeartbeat) => void
+  onTerminal?: (turn: HomeTurnSnapshot) => void
   onMeta?: (meta: StreamMeta) => void
   onDelta?: (text: string) => void
   onDone?: (done: StreamDone) => void
@@ -376,7 +445,7 @@ export interface StreamHandlers {
    * **它不是答复**：必须折叠展示（在耗时那一行下面），绝不能拼进正文里——
    * 之前正是因为它被当成正文，界面上出现了模型的自言自语。
    */
-  onReasoning?: (text: string) => void
+  onReasoning?: (text: string, summary?: string) => void
   /** 建连失败或流中途断线；**已收到的增量仍然有效**（后端已把它落盘） */
   onError?: (error: StreamError) => void
 }
@@ -409,6 +478,17 @@ export async function streamChatHome(
     signal,
   })
   await consumeSse(response, handlers)
+}
+
+/** Ask the server to cancel the active research node before closing its stream. */
+export function interruptResearchNode(conversationId: string, turnId?: string): Promise<{
+  ok: boolean
+  requested: boolean
+  status: 'cancel_requested' | 'not_running' | HomeTurnSnapshot['status']
+  turn?: HomeTurnSnapshot
+  conversation_id: string
+}> {
+  return post('/chat/research/interrupt', { body: { conversation_id: conversationId, turn_id: turnId } })
 }
 
 export interface ApprovalDecisionInput {
@@ -457,6 +537,13 @@ async function consumeSse(response: Response, handlers: StreamHandlers): Promise
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
+  let terminal = false
+  const trackedHandlers: StreamHandlers = {
+    ...handlers,
+    onDone: (done) => { terminal = true; handlers.onDone?.(done) },
+    onError: (error) => { terminal = true; handlers.onError?.(error) },
+    onTerminal: (turn) => { terminal = true; handlers.onTerminal?.(turn) },
+  }
 
   try {
     for (;;) {
@@ -468,11 +555,17 @@ async function consumeSse(response: Response, handlers: StreamHandlers): Promise
       while (boundary >= 0) {
         const frame = buffer.slice(0, boundary)
         buffer = buffer.slice(boundary + 2)
-        dispatch(frame, handlers)
+        dispatch(frame, trackedHandlers)
         boundary = buffer.indexOf('\n\n')
       }
     }
-    if (buffer.trim()) dispatch(buffer, handlers)
+    if (buffer.trim()) dispatch(buffer, trackedHandlers)
+    if (!terminal) {
+      handlers.onError?.({ code: 'stream_disconnected', message: '', interrupted: true })
+    }
+  } catch (error) {
+    if ((error as { name?: string }).name === 'AbortError') throw error
+    if (!terminal) handlers.onError?.({ code: 'stream_disconnected', message: '', interrupted: true })
   } finally {
     reader.releaseLock()
   }
@@ -493,7 +586,17 @@ function dispatch(frame: string, handlers: StreamHandlers): void {
   } catch {
     return
   }
+  const cursor = payload as { turn_id?: string; event_seq?: number }
+  if (cursor.turn_id && typeof cursor.event_seq === 'number') {
+    handlers.onCursor?.(cursor.turn_id, cursor.event_seq)
+  }
   switch (event) {
+    case 'terminal':
+      handlers.onTerminal?.(payload as HomeTurnSnapshot)
+      break
+    case 'heartbeat':
+      handlers.onHeartbeat?.(payload as HomeTurnHeartbeat)
+      break
     case 'meta':
       handlers.onMeta?.(payload as StreamMeta)
       break
@@ -518,7 +621,10 @@ function dispatch(frame: string, handlers: StreamHandlers): void {
       handlers.onApproval?.(payload as ApprovalCard)
       break
     case 'reasoning':
-      handlers.onReasoning?.((payload as { text?: string }).text ?? '')
+      handlers.onReasoning?.(
+        (payload as { text?: string }).text ?? '',
+        (payload as { summary?: string }).summary,
+      )
       break
     case 'error':
       handlers.onError?.(payload as StreamError)

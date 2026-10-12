@@ -23,7 +23,6 @@ import {
   createAggregation,
   listAggregations,
   listIdeas,
-  MECHANISM_LABELS,
   type Aggregation,
 } from '@/api/idea'
 import { searchPapers, type PaperSearchItem } from '@/api/papers'

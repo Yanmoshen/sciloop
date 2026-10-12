@@ -50,6 +50,14 @@ class SettingsError(Exception):
 # scope 定义：defaults 即该 scope 的字段白名单
 # --------------------------------------------------------------------------- #
 SCOPES: dict[str, dict[str, Any]] = {
+    "fetch": {
+        "enabled": False,
+        "daily_time": "02:00",
+        "incremental": True,
+        "download_fulltext": True,
+        "parse_fulltext": False,
+        "write_knowledge_base": True,
+    },
     "reading": {
         "default_kind": "original",
         "missing_version_action": "fallback_original",
@@ -64,6 +72,7 @@ SCOPES: dict[str, dict[str, Any]] = {
 
 #: scope 的一句话说明（返回体里带上，便于前端直接渲染，不必在前端重复维护文案）
 SCOPE_TITLES: dict[str, str] = {
+    "fetch": "论文抓取",
     "reading": "阅读设置",
 }
 
@@ -102,6 +111,14 @@ def _coerce(scope: str, key: str, raw: Any) -> Any:
     if key == "default_kind":
         if raw not in READING_KINDS:
             raise _bad(scope, key, raw, list(READING_KINDS))
+        return raw
+    if scope == "fetch" and key in {"enabled", "incremental", "download_fulltext", "parse_fulltext", "write_knowledge_base"}:
+        if not isinstance(raw, bool):
+            raise _bad(scope, key, raw, "布尔值")
+        return raw
+    if scope == "fetch" and key == "daily_time":
+        if not isinstance(raw, str) or not __import__("re").fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", raw):
+            raise _bad(scope, key, raw, "HH:MM（00:00–23:59）")
         return raw
     if key == "missing_version_action":
         if raw not in MISSING_ACTIONS:

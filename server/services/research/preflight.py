@@ -39,6 +39,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from services.storage import knowledge_root, safe_name
+
 logger = logging.getLogger("sciloop.research.preflight")
 
 __all__ = [
@@ -128,16 +130,24 @@ def workdir_key(conversation_id: str, project_id: int | None = None) -> str:
     —— 无项目对话也能跑节点，预检不能因此没有落脚点。
     """
 
-    return str(project_id) if project_id else f"conv-{conversation_id}"
+    if project_id:
+        return safe_name(str(project_id), fallback="project")
+    return safe_name(f"conv-{conversation_id}", fallback="conversation")
 
 
 def preflight_dir(conversation_id: str, project_id: int | None = None) -> Path:
-    """预检产物目录（与 conversations 同样的 .cache 约定）。"""
+    """预检产物目录。
 
-    base = os.environ.get("RESEARCH_PREFLIGHT_DIR") or str(
-        Path(__file__).resolve().parents[2] / ".cache" / "research"
-    )
-    path = Path(base) / workdir_key(conversation_id, project_id)
+    Research runs are part of the durable knowledge-base record.  The old
+    default under ``server/.cache`` was easy to lose on a restart and made
+    paper runs split their logs between two roots.  Keep the explicit
+    ``RESEARCH_PREFLIGHT_DIR`` override for isolated deployments/tests, but
+    place the normal host/deployment output under the knowledge base.
+    """
+
+    base = os.environ.get("RESEARCH_PREFLIGHT_DIR")
+    root = Path(base) if base else knowledge_root() / "projects" / "research-preflight"
+    path = root / workdir_key(conversation_id, project_id)
     path.mkdir(parents=True, exist_ok=True)
     return path
 

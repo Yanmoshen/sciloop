@@ -10,7 +10,7 @@
  * 视图层不直接 fetch（沿用 api/client.ts 的统一请求与错误体解析）。
  */
 
-import { get, patch, post, type ApiError } from './client'
+import { del, get, patch, post, type ApiError } from './client'
 
 export interface CreateProjectInput {
   name: string
@@ -108,18 +108,42 @@ export function isOwnerRequired(error: unknown): boolean {
 }
 
 
-/**
- * 请执行环境在研究者屏幕上弹出**系统自带**的文件夹选择框，返回选中的绝对路径。
- *
- * 网页自己拿不到本地路径、也调不起系统弹框（浏览器安全边界），所以只能由执行环境弹；
- * 容器执行环境没有屏幕 → 会回 `available: false` + `message`（界面据此把按钮置灰并说明原因）。
- */
-export function pickFolder(title?: string): Promise<{
-  ok: boolean
-  available: boolean
+/** 目录选择任务的状态（服务端固定集合，计划 §4.2） */
+export type PickFolderStatus = 'pending' | 'selected' | 'canceled' | 'unavailable' | 'failed' | 'expired'
+
+/** 目录选择任务的状态快照（`POST` 受理响应 / `GET` 状态 / `DELETE` 取消，同一形状） */
+export interface PickFolderState {
+  request_id: string
+  status: PickFolderStatus
+  path: string | null
   canceled: boolean
-  path: string
+  /** **用户级文案**（不允许出现端口 / 毫秒数 / traceback） */
   message: string
-}> {
-  return post('/projects/pick-folder', { body: { title } })
+  accepted?: boolean
+  busy?: boolean
+  created?: boolean
+}
+
+/**
+ * 建一条「选目录」任务：请执行环境在研究员屏幕上弹出**系统自带**的文件夹选择框。
+ *
+ * ⚠️ 这里**只等"任务已受理"**（5 秒），不等他在窗口里挑完 ——
+ * 研究员挑几十秒到几分钟都是正常的 `pending`，用 {@link pickFolderStatus} 轮询取结果。
+ * 这条链路以前是同步等待，必然撞上 30 秒默认超时（页面显示"请求超时（30000ms）"）。
+ */
+export function pickFolder(title?: string): Promise<PickFolderState> {
+  return post<PickFolderState>('/projects/pick-folder', {
+    body: { title },
+    timeoutMs: 5_000,
+  })
+}
+
+/** 读一条目录选择任务的状态（终态可重复读，返回同一结果） */
+export function pickFolderStatus(requestId: string): Promise<PickFolderState> {
+  return get<PickFolderState>(`/projects/pick-folder/${encodeURIComponent(requestId)}`)
+}
+
+/** 取消一条目录选择任务（关掉同一个系统窗口；幂等） */
+export function cancelPickFolder(requestId: string): Promise<PickFolderState> {
+  return del<PickFolderState>(`/projects/pick-folder/${encodeURIComponent(requestId)}`)
 }

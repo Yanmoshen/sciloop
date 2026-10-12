@@ -40,7 +40,7 @@ function statusTag(status: string): { text: string; cls: string } {
   if (status === 'cancelled') return { text: '已终止', cls: 'tag--mute' }
   if (status === 'failed') return { text: '失败', cls: 'tag--fail' }
   if (status === 'running' || status === 'accepted') return { text: '进行中', cls: 'tag--warn' }
-  return { text: status, cls: 'tag--mute' }
+  return { text: '等待更新', cls: 'tag--mute' }
 }
 
 function timeOf(value: string | null | undefined): string {
@@ -117,7 +117,6 @@ function close(): void {
                 </span>
                 <span class="num"><b>{{ duration(item) }}</b>用时</span>
               </span>
-              <span class="row__id mono">{{ item.task_id }}</span>
               <span class="row__go">查看监控</span>
             </button>
           </li>
@@ -244,7 +243,7 @@ function close(): void {
 .row {
   width: 100%;
   display: grid;
-  grid-template-columns: 150px 78px 1fr 130px 96px;
+  grid-template-columns: 150px 78px 1fr 96px;
   align-items: center;
   gap: 12px;
   padding: 10px 12px;

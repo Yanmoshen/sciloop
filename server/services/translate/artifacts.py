@@ -15,9 +15,8 @@
         dual.pdf            # 仅 translate 模式
         preview.html        # 可选
 
-容器内根目录为 ``/app/server/.cache/artifacts``（docker-compose 已把宿主
-``./.data/artifacts`` 绑到此处）；可用环境变量 ``TRANSLATE_ARTIFACT_DIR`` 覆盖
-（测试与离线验证使用）。**任务状态存内存会丢，但这里落盘的产物与 manifest 必须保留。**
+根目录在仓库 ``knowledge-base/translations`` 下；可用环境变量 ``TRANSLATE_ARTIFACT_DIR``
+覆盖（测试与离线验证使用）。**任务状态存内存会丢，但这里落盘的产物与 manifest 必须保留。**
 """
 
 from __future__ import annotations

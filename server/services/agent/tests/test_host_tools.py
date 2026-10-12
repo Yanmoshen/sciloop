@@ -22,10 +22,10 @@ import pytest
 from services.agent import mcp_tools
 
 
-def _call(name: str, **arguments) -> dict:
+def _call(tool_name: str, **arguments) -> dict:
     return {
         "id": "call_1",
-        "function": {"name": name, "arguments": json.dumps(arguments, ensure_ascii=False)},
+        "function": {"name": tool_name, "arguments": json.dumps(arguments, ensure_ascii=False)},
     }
 
 
@@ -77,11 +77,23 @@ def test_overwriting_existing_file_asks_first(monkeypatch: pytest.MonkeyPatch, t
     assert verdict.needs_approval
 
 
-def test_command_verdicts() -> None:
+def test_command_verdicts(monkeypatch) -> None:
+    async def capable_host():
+        return {"execution_capabilities": {"workspace_execution": True}}
+
+    monkeypatch.setattr(mcp_tools, "_host_roots_fast", capable_host)
     assert asyncio.run(mcp_tools.judge(_call("run_on_computer", command="git status"))).allowed
     assert asyncio.run(
         mcp_tools.judge(_call("run_on_computer", command="sudo reboot"))
     ).needs_approval
+
+
+def test_read_command_requests_approval_when_restricted_execution_unavailable(monkeypatch):
+    async def host_without_isolation():
+        return {"execution_capabilities": {"workspace_execution": False, "approved_execution": True}}
+
+    monkeypatch.setattr(mcp_tools, "_host_roots_fast", host_without_isolation)
+    assert asyncio.run(mcp_tools.judge(_call("run_on_computer", command="git status"))).needs_approval
 
 
 def test_legacy_tools_keep_their_old_treatment() -> None:
@@ -143,7 +155,36 @@ def test_approved_command_goes_to_the_runner(monkeypatch: pytest.MonkeyPatch) ->
     )
     assert payload["ok"] is True
     assert seen and seen[0]["command"] == "sudo reboot"
+    assert seen[0]["access_mode"] == "approved"
     assert summary == "执行完成（退出码 0）"
+
+
+def test_unapproved_write_cannot_claim_full_access(monkeypatch, tmp_path):
+    monkeypatch.setenv("SCILOOP_PROJECT_ROOTS", str(tmp_path))
+    seen = []
+
+    async def fake_fs(**kwargs):
+        seen.append(kwargs)
+        return {"ok": False}
+
+    monkeypatch.setattr(mcp_tools.host_runner, "call_fs", fake_fs)
+    payload, _ = asyncio.run(mcp_tools.run_tool_call(
+        _call("files_on_computer", action="write", path=str(tmp_path / "new.txt"), content="x"),
+        access_mode="full",
+    ))
+    assert not payload["ok"]
+    assert not any(item.get("action") == "write" for item in seen)
+
+
+def test_skill_without_approval_does_not_run(monkeypatch):
+    from services.skills import service
+
+    async def unexpected(*args, **kwargs):
+        raise AssertionError("unapproved skill execution")
+
+    monkeypatch.setattr(service, "run", unexpected)
+    payload, _ = asyncio.run(mcp_tools.run_tool_call(_call("run_skill", name="example")))
+    assert not payload["ok"]
 
 
 def test_runner_unreachable_says_it_in_human_words(monkeypatch: pytest.MonkeyPatch) -> None:

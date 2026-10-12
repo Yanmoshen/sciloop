@@ -19,7 +19,7 @@
 持久化目录
 ----------
 
-默认仓库 ``knowledge-base/uploads``；宿主机和 Docker 共用同一目录。
+默认仓库 ``knowledge-base/uploads``。
 可用环境变量 ``IMPORT_UPLOAD_DIR`` 覆盖（测试与离线验证使用）。
 """
 

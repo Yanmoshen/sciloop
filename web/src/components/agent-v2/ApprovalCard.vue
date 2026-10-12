@@ -7,6 +7,7 @@
  * 提交后按钮进入等待态，避免重复提交（同一结论重复提交服务端也只认一次）。
  */
 import { computed, ref } from 'vue'
+import { actionDetails } from './presentation'
 
 import type { ApprovalDecision, ApprovalView } from '../../agent-v2/protocol'
 
@@ -21,7 +22,37 @@ const emit = defineEmits<{ (event: 'resolve', decision: ApprovalDecision): void 
 const pending = computed(() => props.approval.status === 'pending')
 const action = computed(() => props.approval.action ?? {})
 const toolName = computed(() => String(action.value.tool ?? '未知工具'))
-const argumentText = computed(() => JSON.stringify(action.value.arguments ?? {}, null, 2))
+const TOOL_LABELS: Record<string, string> = {
+  read_file: '读取本地文件',
+  list_dir: '查看目录',
+  write_file: '写入本地文件',
+  run_command: '运行本地命令',
+  update_plan: '更新任务计划',
+  'agent.spawn': '创建子任务',
+  'agent.send': '向子任务发送消息',
+  'agent.wait': '等待子任务',
+  'agent.interrupt': '中断子任务',
+  'agent.close': '结束子任务',
+  'host.command': '运行本地命令',
+  'host.file.read': '读取本地文件',
+  'host.file.write': '写入本地文件',
+  'search.query': '搜索资料',
+  'search.fetch': '读取网页资料',
+  'knowledge.search': '搜索知识库',
+  'knowledge.write': '写入知识库',
+  'skill.list': '查看可用技能',
+  'skill.run': '运行技能',
+  'mcp.call': '调用外部服务',
+}
+const toolLabel = computed(() => TOOL_LABELS[toolName.value] ?? '执行操作')
+const argumentText = computed(() => actionDetails((action.value.arguments ?? {}) as Record<string, unknown>))
+const scopeLabel = computed(() => {
+  const scope = props.approval.decision_scope
+  return scope === 'once' ? '仅本次' : scope === 'conversation' || scope === 'thread' ? '当前对话' : scope === 'full_access' ? '完全访问' : ''
+})
+const statusLabel = computed(() => ({
+  pending: '等待决定', granted: '已批准', denied: '已拒绝', cancelled: '已取消', expired: '已过期',
+})[props.approval.status] ?? '已处理')
 const directory = computed(() => {
   const args = (action.value.arguments ?? {}) as Record<string, unknown>
   const cwd = args.cwd ?? args.workdir ?? props.threadCwd
@@ -45,9 +76,9 @@ const busy = ref(false)
 
 const OPTIONS: { decision: ApprovalDecision; label: string; hint: string; tone: string }[] = [
   { decision: 'approve_once', label: '批准一次', hint: '仅本次调用放行', tone: 'primary' },
-  { decision: 'approve_conversation', label: '本对话始终批准', hint: '按规范化命令前缀在本会话内一直放行', tone: 'default' },
-  { decision: 'full_access', label: '完全访问', hint: '本会话自动批准命令与文件/技能操作，仍记录审计', tone: 'warn' },
-  { decision: 'deny', label: '拒绝', hint: '拒绝结果会回喂模型，由模型给出替代方案', tone: 'danger' },
+  { decision: 'approve_conversation', label: '本对话始终批准', hint: '此对话中允许相同命令及已批准的目录范围', tone: 'default' },
+  { decision: 'full_access', label: '完全访问', hint: '此对话中的命令和文件操作不再逐次确认，可修改工作目录以外的内容', tone: 'warn' },
+  { decision: 'deny', label: '拒绝', hint: '不执行这项操作，助手将继续考虑其他方案', tone: 'danger' },
   { decision: 'cancel', label: '取消', hint: '拒绝并中断当前回合', tone: 'danger' },
 ]
 
@@ -63,17 +94,17 @@ function choose(decision: ApprovalDecision): void {
     <header class="approval__head">
       <span class="approval__title">需要研究者确认</span>
       <span class="tag" :class="pending ? 'tag--pending' : 'tag--done'">
-        {{ pending ? '等待决定' : approval.status === 'granted' ? '已批准' : approval.status === 'denied' ? '已拒绝' : approval.status }}
+        {{ statusLabel }}
       </span>
-      <span v-if="approval.decision_scope" class="approval__scope" :title="`授权作用域：${approval.decision_scope}`">
-        {{ approval.decision_scope }}
+      <span v-if="scopeLabel" class="approval__scope">
+        {{ scopeLabel }}
       </span>
     </header>
 
     <dl class="approval__facts">
       <div>
         <dt>工具</dt>
-        <dd class="mono">{{ toolName }}</dd>
+        <dd>{{ toolLabel }}</dd>
       </div>
       <div>
         <dt>目录</dt>
@@ -86,7 +117,7 @@ function choose(decision: ApprovalDecision): void {
     </dl>
 
     <section class="approval__args">
-      <p class="label">参数</p>
+      <p class="label">操作内容</p>
       <pre class="mono">{{ argumentText }}</pre>
     </section>
 

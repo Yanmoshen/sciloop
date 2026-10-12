@@ -34,6 +34,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from core.config import get_settings
 from db import session as db_session
+from services.web_frontend import install as install_frontend
 from tasks import scheduler as job_scheduler
 
 APP_NAME = "SciLoop API"
@@ -80,6 +81,8 @@ ROUTER_REGISTRY: tuple[tuple[str, str, bool], ...] = (
     ("api.v1.documents", "/api/v1", False),
     # 6) 构思域（WP08）：聚合 / 空白清单 / idea / 可行性 / 任务书
     ("api.v1.aggregations", "/api/v1", False),
+    # 6.1) 固定 20 专家 Idea 运行（与旧 /ideas 生成链路并存）
+    ("api.v1.idea_runs", "/api/v1", False),
     ("api.v1.ideas", "/api/v1", False),
     ("api.v1.feasibilities", "/api/v1", False),
     ("api.v1.taskbooks", "/api/v1", False),
@@ -176,6 +179,25 @@ async def _warm_up_prompt_caches() -> None:
         logger.warning("提示词料预热失败（首次请求会照旧现算）：%s", exc)
 
 
+async def _warm_up_host_executor() -> None:
+    """让本地安装在第一条对话前就完成执行环境自检/自动拉起。"""
+
+    try:
+        from services.agent import host_runner
+
+        result = await host_runner.ensure_available(wait_s=4.0)
+        if result.get("reachable"):
+            logger.info("本地执行环境已就绪")
+        else:
+            # 这里只写服务端日志；对话层会在实际需要时再次短探测，
+            # 用户正文不应出现连接地址、异常堆栈或内部启动细节。
+            logger.info("本地执行环境当前不可用，将在执行请求时自动重试")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 执行器不可用不应阻断 API 启动
+        logger.info("本地执行环境预热未完成：%s", exc)
+
+
 async def _reap_stale_node_runs() -> None:
     """服务启动时把上一代进程留下的「运行中」节点**如实收尾**（2026-09-26）。
 
@@ -217,11 +239,19 @@ async def lifespan(app: FastAPI):
     job_scheduler.start_scheduler()
     # 后台预热（不阻塞启动）：否则重启后第一条消息要多等约 8.8 秒
     warm_task = asyncio.create_task(_warm_up_prompt_caches())
-    yield
-    warm_task.cancel()
-    job_scheduler.shutdown_scheduler()
-    await db_session.dispose_engines()
-    logger.info("数据库连接池已释放")
+    executor_task = asyncio.create_task(_warm_up_host_executor())
+    try:
+        yield
+    finally:
+        warm_task.cancel()
+        executor_task.cancel()
+        await asyncio.gather(warm_task, executor_task, return_exceptions=True)
+        from services.agent.host_runner import stop_owned_runner
+
+        await asyncio.to_thread(stop_owned_runner)
+        job_scheduler.shutdown_scheduler()
+        await db_session.dispose_engines()
+        logger.info("数据库连接池已释放")
 
 
 def create_app() -> FastAPI:
@@ -234,10 +264,10 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # 开发期前端跑在 5173，生产由 nginx 同源代理 /api，故这里只放行本地来源
+    # 正式前端由本应用同源提供在 8000；保留空的跨域白名单，避免旧开发端口被误用。
     application.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+        allow_origins=[],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -312,14 +342,15 @@ async def health_live() -> dict[str, Any]:
     return {"status": "ok", "uptime_checked_at": datetime.now(UTC).isoformat()}
 
 
-@app.get("/", include_in_schema=False)
-async def root() -> dict[str, str]:
-    return {
-        "name": APP_NAME,
-        "version": APP_VERSION,
-        "docs": "/docs",
-        "health": "/api/v1/health",
-    }
+if not install_frontend(app):
+    @app.get("/", include_in_schema=False)
+    async def root() -> dict[str, str]:
+        return {
+            "name": APP_NAME,
+            "version": APP_VERSION,
+            "docs": "/docs",
+            "health": "/api/v1/health",
+        }
 
 
 # 供 ``python -m main`` 本地起服（生产走 uvicorn 命令）

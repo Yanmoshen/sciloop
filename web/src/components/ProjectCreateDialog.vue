@@ -9,17 +9,23 @@
  *
  * 新建研究项目弹窗（**总览壳层样式**：居中 + 背景模糊，用 `.sl-home` 的 --h-* 令牌）。
  *
- * 字段：项目名（必填）/ 工作目录（**按钮选择**）/ 备注。
+ * 字段：项目名（必填）/ 工作目录（原生目录选择器）/ 备注。
  * 左栏「项目」的 ＋ 与首页「新建研究项目」卡片**共用这一个弹窗**（2026-09-26 统一）。
  *
- * 工作目录为什么走执行环境：网页拿不到本地路径、也调不起系统弹框（浏览器安全边界）；
- * 点按钮 → 后端 → 执行环境弹出**系统自带**的文件夹选择框 → 真实绝对路径回填。
+ * 工作目录选择打开本机原生目录对话框，只回传绝对路径，不读取或上传目录内文件。
  *
  */
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { writeDenied } from '@/utils/messages'
 
-import { createProject, isOwnerRequired, pickFolder, type CreatedProject } from '@/api/projects'
+import {
+  cancelPickFolder,
+  createProject,
+  isOwnerRequired,
+  type CreatedProject,
+  pickFolder,
+  pickFolderStatus,
+} from '@/api/projects'
 
 const props = defineProps<{ modelValue: boolean; prefill?: string }>()
 const emit = defineEmits<{
@@ -32,28 +38,71 @@ const note = ref('')
 const notice = ref('')
 const busy = ref(false)
 
-type PickResult = { ok: boolean; available: boolean; canceled: boolean; path: string; message: string }
-
-/** 研究者用系统选择框选的绝对路径（选完就定，不提供重选） */
+/** 手动填写或本机原生目录选择器返回的真实宿主路径 */
 const workspaceDir = ref('')
-
-/** 选文件夹：这个执行环境弹不弹得出系统框 / 正在等选 / 弹不出时给人看的说明 */
-const pickAvailable = ref(true)
-const pickBusy = ref(false)
-const pickMessage = ref('')
-
+const pickPending = ref(false)
+const pickStarting = ref(false)
+const pickRequestId = ref('')
+let pickTimer: number | undefined
 const canSubmit = computed(() => name.value.trim().length > 0)
+
+function stopPoll(): void {
+  if (pickTimer !== undefined) window.clearTimeout(pickTimer)
+  pickTimer = undefined
+}
+
+function schedulePoll(): void {
+  stopPoll()
+  pickTimer = window.setTimeout(() => void pollFolder(), 350)
+}
+
+async function pollFolder(): Promise<void> {
+  pickTimer = undefined
+  if (!pickRequestId.value) return
+  try {
+    const state = await pickFolderStatus(pickRequestId.value)
+    if (state.status === 'pending') {
+      schedulePoll()
+      return
+    }
+    pickRequestId.value = ''
+    pickPending.value = false
+    if (state.status === 'selected' && state.path) {
+      workspaceDir.value = state.path
+      notice.value = ''
+    } else if (state.status !== 'canceled') {
+      notice.value = state.message || '选择文件夹失败，请重试'
+    }
+  } catch (error) {
+    pickRequestId.value = ''
+    pickPending.value = false
+    notice.value = error instanceof Error ? error.message : '选择文件夹失败，请重试'
+  }
+}
+
+async function discardPick(): Promise<void> {
+  stopPoll()
+  const requestId = pickRequestId.value
+  pickRequestId.value = ''
+  pickPending.value = false
+  if (requestId) await cancelPickFolder(requestId).catch(() => undefined)
+}
 
 watch(
   () => props.modelValue,
   (open) => {
-    if (!open) return
+    if (!open) {
+      void discardPick()
+      return
+    }
     notice.value = ''
+    name.value = ''
+    note.value = ''
     busy.value = false
     workspaceDir.value = ''
-    pickBusy.value = false
-    pickMessage.value = ''
-    pickAvailable.value = true
+    pickPending.value = false
+    pickStarting.value = false
+    pickRequestId.value = ''
     const seed = (props.prefill ?? '').trim()
     if (seed) {
       note.value = seed
@@ -62,35 +111,33 @@ watch(
   },
 )
 
+onBeforeUnmount(() => {
+  void discardPick()
+})
+
 function close(): void {
   emit('update:modelValue', false)
 }
 
-/**
- * 点「选择文件夹…」：请**执行环境**在研究者屏幕上弹出系统自带的文件夹选择框。
- *
- * 为什么不自己做界面：网页拿不到本地路径、也调不起系统弹框（浏览器安全边界）；
- * 而"资源管理器那种选择"正是研究者要的（2026-09-26）。容器执行环境没有屏幕 → 由它如实回"弹不出来"。
- */
 async function chooseFolder(): Promise<void> {
-  if (pickBusy.value || !pickAvailable.value) return
-  pickBusy.value = true
+  if (pickPending.value || pickStarting.value) return
+  pickStarting.value = true
   notice.value = ''
-  pickMessage.value = ''
   try {
-    const result = (await pickFolder()) as PickResult
-    if (!result.ok && !result.available) {
-      pickAvailable.value = false
-      pickMessage.value = result.message || '当前执行环境弹不出系统选择框'
-      return
+    const state = await pickFolder('选择项目工作目录')
+    pickRequestId.value = state.request_id
+    if (state.status === 'pending') {
+      pickPending.value = true
+      schedulePoll()
+    } else if (state.status === 'selected' && state.path) {
+      workspaceDir.value = state.path
+    } else {
+      notice.value = state.message || '选择文件夹失败，请重试'
     }
-    if (result.ok && result.path) workspaceDir.value = result.path
-    else if (result.ok) notice.value = result.message || '你在系统窗口里取消了选择（保持默认）'
-    else notice.value = result.message || '没能打开系统选择框'
   } catch (error) {
-    notice.value = error instanceof Error ? error.message : String(error)
+    notice.value = error instanceof Error ? error.message : '选择文件夹失败，请重试'
   } finally {
-    pickBusy.value = false
+    pickStarting.value = false
   }
 }
 
@@ -132,23 +179,21 @@ async function submit(): Promise<void> {
       </label>
 
       <div class="field">
-        <span class="field__label">工作目录</span>
+        <label class="field__label" for="project-workspace">工作目录</label>
+        <input id="project-workspace" v-model="workspaceDir" type="text" placeholder="输入完整目录路径，或选择文件夹" />
         <div class="pickrow">
           <button
             class="btn"
             type="button"
-            :disabled="pickBusy || !pickAvailable"
-            :title="pickAvailable ? '' : pickMessage"
             @click="chooseFolder"
           >
-            {{ pickBusy ? '等待你在系统窗口里选择…' : '选择文件夹…' }}
+            {{ pickStarting ? '正在打开系统选择窗口…' : pickPending ? '等待选择文件夹…' : '选择文件夹…' }}
           </button>
           <span v-if="workspaceDir" class="pickrow__path">{{ workspaceDir }}</span>
         </div>
-        <p v-if="workspaceDir" class="field__hint">已选择：项目就在这个目录里干活</p>
-        <p v-else-if="pickMessage && !pickAvailable" class="field__hint">{{ pickMessage }}</p>
+        <p v-if="workspaceDir" class="field__hint">已选择：创建项目时将使用这个真实目录路径。</p>
         <p v-else class="field__hint">
-          未选择：将在 SciLoop 目录下的 research-workspaces/&lt;项目名&gt; 建一个
+          留空时将自动创建项目文件夹；填写的新目录会在创建项目时建立。
         </p>
       </div>
 
@@ -161,7 +206,7 @@ async function submit(): Promise<void> {
 
       <footer class="dialog__foot">
         <button class="btn" type="button" @click="close">取消</button>
-        <button class="btn btn--primary" type="button" :disabled="!canSubmit || busy" @click="submit">
+        <button class="btn btn--primary" type="button" :disabled="!canSubmit || busy || pickPending || pickStarting" @click="submit">
           {{ busy ? '创建中…' : '创建项目' }}
         </button>
       </footer>

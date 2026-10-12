@@ -21,6 +21,7 @@ import {
   emptyDraft,
   formatOf,
   folderPath,
+  knowledgeBasePath,
   hasContent,
   loadEntry,
   updateEntry,
@@ -50,6 +51,12 @@ const BUCKET_OPTIONS: ReadonlyArray<{ value: KnowledgeBucket; label: string }> =
 ).map((value) => ({ value, label: BUCKET_LABELS[value] }))
 
 const draft = ref<KnowledgeDraft>(emptyDraft(props.defaultBucket, props.currentFolder))
+const selectedFolder = computed({
+  get: () => folderPath(draft.value.folder),
+  set: (path: string | null | undefined) => {
+    draft.value.folder = (path ?? '').split('/').filter(Boolean)
+  },
+})
 const busy = ref(false)
 const errorNotice = ref('')
 /**
@@ -181,9 +188,9 @@ watch(
 
           <label class="kbd__row">
             <span class="kbd__label">所在文件夹</span>
-            <el-select v-model="draft.folder" size="small" class="kbd__control" clearable placeholder="知识库（根目录）">
-              <el-option label="知识库（根目录）" :value="[]" />
-              <el-option v-for="path in folders" :key="path" :label="path" :value="path.split('/')" />
+            <el-select v-model="selectedFolder" size="small" class="kbd__control" clearable placeholder="knowledge-base/">
+              <el-option label="knowledge-base/" value="" />
+              <el-option v-for="path in folders" :key="path" :label="knowledgeBasePath(path)" :value="path" />
             </el-select>
           </label>
 
@@ -226,7 +233,7 @@ watch(
 
           <p v-if="draft.source_label" class="kbd__source">
             来源 {{ draft.source_label }}
-            <template v-if="draft.folder.length"> · 位置 知识库 / {{ folderPath(draft.folder) }}</template>
+            <template v-if="draft.folder.length"> · 位置 {{ knowledgeBasePath(draft.folder) }}</template>
           </p>
 
           <p v-if="errorNotice" class="kbd__error">{{ errorNotice }}</p>

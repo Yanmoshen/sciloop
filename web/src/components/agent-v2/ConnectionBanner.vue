@@ -8,6 +8,7 @@
 import { computed } from 'vue'
 
 import type { ConnectionState, Notice } from '../../agent-v2/reducer'
+import { humanError } from '../../utils/messages'
 
 const props = defineProps<{
   connection: ConnectionState
@@ -52,6 +53,9 @@ const hint = computed(() => {
 const worstNotice = computed(
   () => [...props.notices].reverse().find((notice) => notice.level !== 'info') ?? null,
 )
+const visibleNotice = computed(() =>
+  worstNotice.value ? humanError({ message: worstNotice.value.text }) : '',
+)
 </script>
 
 <template>
@@ -61,7 +65,7 @@ const worstNotice = computed(
       {{ label }}
     </span>
     <span v-if="hint" class="banner__hint">{{ hint }}</span>
-    <span v-if="worstNotice" class="banner__notice">{{ worstNotice.text }}</span>
+    <span v-if="visibleNotice" class="banner__notice">{{ visibleNotice }}</span>
     <span class="banner__actions">
       <button v-if="!healthy" type="button" class="link" @click="emit('reconnect')">重新连接</button>
       <button v-else type="button" class="link" @click="emit('refresh')">刷新最新进度</button>

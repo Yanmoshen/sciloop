@@ -27,6 +27,7 @@ import {
   type ImportHistoryItem,
   type ImportJob,
 } from '@/api/imports'
+import PaperFetchPanel from '@/components/PaperFetchPanel.vue'
 import { useSessionStore } from '@/stores/session'
 import { writeDenied } from '@/utils/messages'
 
@@ -322,6 +323,9 @@ onUnmounted(() => {
               </button>
             </nav>
 
+            <!-- 按条件抓取：唯一实现在 PaperFetchPanel（设置页「手动抓取」共用同一套参数） -->
+            <PaperFetchPanel :can-fetch="canImport" />
+
             <!-- 上传 PDF -->
             <article v-if="importMode === 'file'" class="panel">
               <div class="panel__head">
@@ -401,7 +405,6 @@ onUnmounted(() => {
       <div class="panel__head">
         <h2>本次导入</h2>
         <span class="tag" :class="statusTag(job.status).cls">{{ statusTag(job.status).text }}</span>
-        <span class="mono task">{{ job.task_id }}</span>
       </div>
 
       <div class="counts">
@@ -449,7 +452,7 @@ onUnmounted(() => {
           </tr>
           <tr v-for="item in history" :key="item.id">
             <td class="mono">{{ timeOf(item.created_at) }}</td>
-            <td>{{ item.source_type ?? '—' }}</td>
+            <td>{{ item.source_type === 'identifier_import' ? '标识符导入' : item.source_type === 'paper_upload' ? '上传文件' : '文献导入' }}</td>
             <td class="ellipsis">{{ item.name_or_identifier ?? item.title ?? '—' }}</td>
             <td><span class="tag" :class="statusTag(item.status).cls">{{ statusTag(item.status).text }}</span></td>
             <td class="mono">{{ item.paper_id ?? '—' }}</td>

@@ -9,8 +9,8 @@
 研究者 2026-09-23 定的口径：
 - **按技能声明的流程跑**（`SKILL.md` 的 `steps`），不是让模型零散点脚本；
 - 脚本跑在**宿主执行器**上 —— 复用现有「研究者批准后才执行」那套，看得见输出、有留痕；
-- 产物落**项目产物目录**（`knowledge-base/exports/<task_id>/skills/<技能>/`，宿主机与 Docker
-  共用同一目录），并写一份 `run.json` 执行记录。
+- 产物落**项目产物目录**（`knowledge-base/exports/<task_id>/skills/<技能>/`），
+  并写一份 `run.json` 执行记录。
 
 边界（写死在代码里，别指望调用方记得）
 ----------------------------------------
@@ -38,7 +38,7 @@ from typing import Any
 from services.agent import host_runner, policy
 from services.skills.registry import SkillPack
 from services.storage import knowledge_root
-from services.translate.artifacts import sha256_file
+from services.translate.artifacts import sha256_file, task_dir
 
 __all__ = [
     "PYTHON_ENV",
@@ -362,7 +362,11 @@ async def run_skill(
 
     result.outputs = [
         {
-            "name": str(path.relative_to(base)) if base in path.parents or path.parent == base else path.name,
+            "name": (
+                str(path.relative_to(base)).replace("\\", "/")
+                if base in path.parents or path.parent == base
+                else path.name
+            ),
             "bytes": path.stat().st_size,
                 "sha256": sha256_file(path) or "",
         }

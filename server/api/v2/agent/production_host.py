@@ -16,6 +16,7 @@ from typing import Any
 
 from contracts.agent_v2.cancellation import CancelToken
 from contracts.agent_v2.clock import Clock
+from contracts.agent_v2.enums import EventType
 from contracts.agent_v2.models import ToolCall
 from services.agent_compaction_v2 import CompactionService
 from services.agent_memory_v2 import MemoryStore
@@ -142,6 +143,18 @@ class ProductionRuntimeHost:
         )
         value = _Runtime(execution=execution, bundle=bundle, runtime=runtime)
         self._runtimes[thread_id] = value
+
+        async def run_child(child_thread_id: str, task: str) -> dict[str, Any]:
+            # Scheduling belongs to this runtime host, not the process runner.
+            # Spawn returns promptly; agent.wait obtains the real child result.
+            child = self.repo.state(child_thread_id).thread
+            if not child.cwd:
+                self.repo.emit_event(child_thread_id, EventType.THREAD_UPDATED, payload={"patch": {"cwd": str(cwd)}})
+            turn = self.repo.start_turn(child_thread_id, inputs=[{"text": task}])
+            self.start(child_thread_id, turn.turn_id)
+            return {"status": "scheduled", "thread_id": child_thread_id, "turn_id": turn.turn_id}
+
+        bundle.registry.bind(agent_runner=run_child)
         return value
 
     def start(self, thread_id: str, turn_id: str, *, register_cancel: bool = True) -> asyncio.Task[Any]:
@@ -156,6 +169,13 @@ class ProductionRuntimeHost:
         async def drive() -> Any:
             try:
                 value.outcome = await value.runtime.run(thread_id, turn_id, cancel=token)
+                if self.tree.parent_of(thread_id) and not value.outcome.suspended:
+                    state = self.repo.state(thread_id)
+                    self.tree.report_result(
+                        thread_id, summary=state.assistant_text(turn_id),
+                        status=value.outcome.status.value, error=value.outcome.error,
+                        idempotency_key=f"child-result:{turn_id}",
+                    )
                 return value.outcome
             except asyncio.CancelledError:
                 self.repo.release_turn(thread_id, reason="task-cancelled")

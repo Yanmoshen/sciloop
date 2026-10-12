@@ -7,7 +7,7 @@
 # 想让命令**在你自己的 Windows 上**执行（能碰这台机器的任何目录、用你装的 Python），
 # 就需要一个跑在 Windows 上的小程序一直待着（tools/host-runner/host_runner.py）。
 #
-# 不装也能用：`docker compose up` 自带一个容器执行环境，只是它只能碰挂进去的目录。
+# 2026-10-11 起本项目不再使用 Docker：这个执行器就是默认（也是唯一）的执行环境。
 # 装了这个之后，后端会**自动优先用你本机**（见 services/agent/host_runner.py 的候选顺序）。
 #
 # 用法（在仓库根目录，用 PowerShell 跑）：
@@ -124,6 +124,6 @@ Write-Host ""
 Write-Host "现在应该已经在跑了。验证一下："
 # 用单引号：PowerShell 里没有 \ 转义引号这回事，写成双引号会让整份脚本**解析阶段就失败**
 # （2026-09-26 实测：一个动作都没执行到，报错还指向 from 关键字，很难联想到是这行）。
-Write-Host '  docker compose exec backend python -c "import asyncio; from services.agent import host_runner; print(asyncio.run(host_runner.health()))"'
+Write-Host '  cd server; ..\.venv\Scripts\python.exe -c "import asyncio; from services.agent import host_runner; print(asyncio.run(host_runner.health()))"'
 Write-Host ""
 Write-Host "卸载：powershell -ExecutionPolicy Bypass -File tools\host-runner\install-host-runner.ps1 -Uninstall"

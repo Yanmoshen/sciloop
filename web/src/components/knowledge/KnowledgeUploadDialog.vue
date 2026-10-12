@@ -21,6 +21,8 @@ import {
   uploadEntry,
   formatOf,
   formatSize,
+  folderPath,
+  knowledgeBasePath,
   hasContent,
   type KnowledgeBucket,
   type KnowledgeDraft,
@@ -63,6 +65,12 @@ const rejected = ref<string[]>([])
 const tags = ref<string[]>([])
 const bucket = ref<KnowledgeBucket>('literature')
 const folder = ref<string[]>([])
+const selectedFolder = computed({
+  get: () => folderPath(folder.value),
+  set: (path: string | null | undefined) => {
+    folder.value = (path ?? '').split('/').filter(Boolean)
+  },
+})
 const projectId = ref<number | null>(null)
 const saving = ref(false)
 const errorNotice = ref('')
@@ -221,9 +229,9 @@ watch(
             </div>
             <div class="kbu__form-row">
               <span class="kbu__label">文件夹</span>
-              <el-select v-model="folder" size="small" class="kbu__control" clearable placeholder="知识库（根目录）">
-                <el-option label="知识库（根目录）" :value="[]" />
-                <el-option v-for="path in folders" :key="path" :label="path" :value="path.split('/')" />
+              <el-select v-model="selectedFolder" size="small" class="kbu__control" clearable placeholder="knowledge-base/">
+                <el-option label="knowledge-base/" value="" />
+                <el-option v-for="path in folders" :key="path" :label="knowledgeBasePath(path)" :value="path" />
               </el-select>
             </div>
             <div class="kbu__form-row">

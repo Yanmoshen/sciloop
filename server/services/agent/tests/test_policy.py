@@ -180,7 +180,6 @@ def test_plain_commands_are_allowed(command: str) -> None:
         "ruff check .",
         "node --version",
         "pip list",
-        "docker ps",
     ],
 )
 def test_readonly_commands_run_without_bothering_anyone(command: str) -> None:

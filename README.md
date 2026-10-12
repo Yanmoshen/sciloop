@@ -18,8 +18,13 @@ Linux/macOS：
 curl -fsSL https://raw.githubusercontent.com/Yanmoshen/sciloop/main/install.sh | sh
 ```
 
-安装器会从 GitHub 拉取仓库，在本机创建 Python 环境、安装后端依赖、构建前端，
-并启动 API、前端和宿主执行器。搜索引擎内核随 API 进程一并启动，无需 Docker 或独立的 SearXNG 服务。首次启动前请在生成的 `.env` 中填写模型密钥。
+安装器会从 GitHub 拉取仓库，检测并通过系统包管理器补齐 Git、Python 3.11+、Node.js 18+ 和 npm，
+创建 Python 环境、安装后端依赖、构建前端，并启动 API、前端和宿主执行器。搜索引擎内核随 API 进程一并启动，
+无需任何容器运行时或独立的 SearXNG 服务。首次启动后在设置页面填写模型密钥即可；安装器会自动生成管理员令牌。
+
+安装器会把完整过程写入 `<安装目录>/.data/install.log`。Windows 使用 `winget` 补齐依赖，
+Linux/macOS 使用可用的 `apt-get`、`dnf`、`pacman` 或 Homebrew。若系统没有这些包管理器，安装器会停止并给出明确的安装地址，
+不会启动一个缺少前端构建产物的半成品服务。
 
 宿主启动后，前端与 API 共用 http://localhost:8000；宿主执行器使用内部端口 8766。
 本项目仅使用 SQLite，不运行独立数据库服务，不占用 5432 等数据库端口。
@@ -30,26 +35,25 @@ python tools/run.py restart
 python tools/run.py stop
 ```
 
-兼容 Docker 的配置也使用同一个知识库 SQLite 文件，已移除独立数据库容器。
-Docker 兼容编排仍可单独使用；宿主部署的正式前端入口固定为 8000。
+2026-10-11 起本项目不再使用 Docker（编排文件、镜像与容器执行环境一并移除），宿主启动即完整可用：
+前端与 API 共用 8000，宿主执行器用内部端口 8766。
 SQLite 表结构由应用启动自动创建及补齐，旧 PostgreSQL 的 Alembic 迁移已移除。
 
 ## 目录
 
 | 目录 | 职责 |
 |---|---|
-| `server/` | FastAPI + SQLAlchemy 2.x + SQLite。顶层按层分目录：`api/`（路由）、`services/`（领域服务：`paper_source` 取数 / `ingest` 导入 / `fulltext` 全文 / `parsing` 解析 / `aggregation` 聚合 / `ideation` 构思 / `feasibility` 可行性 / `pipeline` 流水线 / `research` 研究编排 / `experiment` 实验 / `writing` 写作 / `review` 评审 / `evidence` 证据链 / `translate` 翻译 / `reader` 阅读器 / `export` 导出 / `agent` 动作裁决与批准 / `skills` 技能库 / `cost` 成本 / `settings` 设置）、`db/`（会话与 ORM 模型）、`schemas/`（Pydantic DTO）、`core/`（配置与安全）、`llm/`（OpenAI 兼容适配与按环节路由）、`executor/`（进程内受限执行器）、`tasks/`（后台作业）、`mcp_server/`（自建 MCP server 与工具门）、`exec_service/`（容器执行环境） |
+| `server/` | FastAPI + SQLAlchemy 2.x + SQLite。顶层按层分目录：`api/`（路由）、`services/`（领域服务：`paper_source` 取数 / `ingest` 导入 / `fulltext` 全文 / `parsing` 解析 / `aggregation` 聚合 / `ideation` 构思 / `feasibility` 可行性 / `pipeline` 流水线 / `research` 研究编排 / `experiment` 实验 / `writing` 写作 / `review` 评审 / `evidence` 证据链 / `translate` 翻译 / `reader` 阅读器 / `export` 导出 / `agent` 动作裁决与批准 / `skills` 技能库 / `cost` 成本 / `settings` 设置）、`db/`（会话与 ORM 模型）、`schemas/`（Pydantic DTO）、`core/`（配置与安全）、`llm/`（OpenAI 兼容适配与按环节路由）、`executor/`（进程内受限执行器）、`tasks/`（后台作业）、`mcp_server/`（自建 MCP server 与工具门） |
 | `web/` | Vue 3 + Vite + TypeScript + Pinia + Element Plus + ECharts（`api/` `views/` `components/` `stores/` `router/` `layouts/` `styles/` `utils/`） |
 | `prompts/` | 研究工作流长文档提示词（程序侧契约在 `server/services/research/`） |
 | `config/` | 非机密静态配置（`app.yaml`、`venue_whitelist.json`）；搜索引擎配置由 `server/services/search/` 管理 |
 | `tools/` | `host-runner/`：可选的真机执行器（装在研究者电脑上后，后端会自动优先用它跑命令） |
-| `docker-compose.yml` | 兼容编排：`backend`（server/ 镜像，8000）/ `frontend`（web/ 镜像，nginx，8080）/ `executor`（受限执行环境）；搜索不再是独立容器 |
 
 ## 环境变量
 
 完整清单见 `.env.example`（每一项都有注释）。
 
-联网搜索由 `server/services/search/` 内置。它采用 SearXNG 的分层方式：引擎注册表、分类、并发调度、超时重试、失败冷却、统一结果模型、去重和排序；默认直接从宿主机访问上游，不启动 Docker 搜索容器。搜索设置使用 `SCILOOP_SEARCH_*` 环境变量，可按需选择引擎或配置代理。
+联网搜索由 `server/services/search/` 内置。它采用 SearXNG 的分层方式：引擎注册表、分类、并发调度、超时重试、失败冷却、统一结果模型、去重和排序；默认直接从宿主机访问上游，不依赖任何外部搜索服务。搜索设置使用 `SCILOOP_SEARCH_*` 环境变量，可按需选择引擎或配置代理。
 
 - **红线**：`OWNER_TOKEN` 只允许存在于服务端环境变量，禁止写入前端包或数据库；API Key 不明文落库（`model_configs.api_key_enc` 用 fernet 加密）。
 - 默认 `APP_ACCESS_MODE=owner_mode`：本地测试直接启用管理员/可写面；生产环境可改回 `public_demo`，届时写入请求需要 `X-Owner-Token`。
@@ -69,6 +73,8 @@ SQLite 表结构由应用启动自动创建及补齐，旧 PostgreSQL 的 Alembi
 | 实验与 Passport | `GET /api/v1/passports/{id}`、`POST /api/v1/passports/{id}/replay` |
 
 ## 数据与持久化
+
+项目和对话的新建、重命名不自动追加日期时间。对话所属项目在创建时确定，不支持移入或移出项目。
 
 运行时数据统一落在仓库根目录 `./knowledge-base/`（**已被 `.gitignore` 忽略，不入库**）：
 

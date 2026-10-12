@@ -92,7 +92,7 @@ function startEdit(record: MemoryRecordView): void {
       </label>
     </header>
 
-    <p class="memory__scope mono" :title="'作用域标识'">{{ scope }} / {{ scopeId || '—' }}</p>
+    <p class="memory__scope">{{ SCOPE_LABEL[scope] }}</p>
 
     <div class="memory__editor">
       <textarea

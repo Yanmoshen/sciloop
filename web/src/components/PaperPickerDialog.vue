@@ -139,7 +139,7 @@ async function runSingle(): Promise<void> {
   height: min(820px, 100%);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-lg);
-  background: var(--color-bg);
+  background: var(--color-bg-elevated);
   animation: picker-in 180ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 

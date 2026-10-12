@@ -41,6 +41,10 @@ CLOSE_TRY_AGAIN_LATER = 1013
 
 #: 单条命令的最长执行时间（超过则中断等待，客户端可改用游标补齐）。
 MAX_COMMAND_SECONDS = 120.0
+# Keep the command deadline separate from the event-pump cadence.  Codex
+# delivers stream notifications while a request is still running; a single
+# 120-second wait would make a live response look frozen until completion.
+COMMAND_FLUSH_INTERVAL_SECONDS = 0.25
 
 
 async def _send(websocket: WebSocket, payload: dict) -> bool:
@@ -100,12 +104,12 @@ async def _handle_frame(
     ctx.notifications.clear()
 
     task = asyncio.ensure_future(service.facade.dispatch(request, ctx))
+    deadline = asyncio.get_running_loop().time() + MAX_COMMAND_SECONDS
     try:
         # 命令执行期间继续推送事件，避免长命令（等待子 Agent）冻住界面
         while not task.done():
-            try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=MAX_COMMAND_SECONDS)
-            except TimeoutError:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
@@ -117,16 +121,27 @@ async def _handle_frame(
                         params={
                             "error": {
                                 "code": "internal_error",
-                                "message": f"command {request.method} exceeded {MAX_COMMAND_SECONDS}s",
+                                "message": "command exceeded its execution deadline",
                                 "data": {"method": request.method},
                             }
                         },
                     ).to_dict(),
                 )
                 return
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task),
+                    timeout=min(COMMAND_FLUSH_INTERVAL_SECONDS, remaining),
+                )
+            except TimeoutError:
+                # The task is still alive.  Flush notifications before the
+                # next wait so deltas and terminal events are never starved.
+                if not await _flush(websocket, service, conn):
+                    return
+                continue
             except Exception:  # noqa: BLE001 - 真实结果由 task 自己携带
                 break
-            if not task.done() and not await _flush(websocket, service, conn):
+            if not await _flush(websocket, service, conn):
                 return
         response = await task
     except WebSocketDisconnect:

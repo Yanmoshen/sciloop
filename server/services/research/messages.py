@@ -13,43 +13,19 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
+from services.system_prompt import SCILOOP_SYSTEM_PROMPT
+
 __all__ = [
-    "GUIDE_BLOCKS",
     "SYSTEM_ROW_LABELS",
     "guide_blocks",
+    "waiting_human_blocks",
+    "blocks_for_turn",
     "NODE_CONCLUSION_SYSTEM",
     "NODE_CONCLUSION_TEMPLATE",
     "system_row",
-]
-
-#: 引导词的可点选项（前端渲染成按钮）
-GUIDE_BLOCKS: list[dict[str, Any]] = [
-    {
-        "kind": "choice",
-        "prompt": "这次想怎么做？",
-        "options": [
-            {
-                "id": "literature_review",
-                "label": "从文献调研开始",
-                "send": "开始文献调研",
-                "tone": "primary",
-            },
-            {
-                "id": "idea_and_feasibility",
-                "label": "从 idea 生成开始",
-                "send": "开始 idea 生成",
-                "tone": "default",
-            },
-            {
-                "id": "plain_chat",
-                "label": "只是普通对话",
-                "send": "只是普通对话",
-                "tone": "quiet",
-            },
-        ],
-    }
 ]
 
 #: 节点收尾的提示词 —— **措辞由模型来，程序只给事实**。
@@ -60,22 +36,16 @@ GUIDE_BLOCKS: list[dict[str, Any]] = [
 #:
 #: ⚠️ 严禁出现内部术语（校验 / 重试 / 策略层 / 节点 id / 熔断 / 落库 等）——
 #: 说人话是硬要求，不是风格偏好。
-NODE_CONCLUSION_SYSTEM = (
-    "你是 SciLoop 的科研助手。刚刚跑完了研究流程里的一步，请你**用研究者看得懂的话**"
-    "把这一步交代清楚。\n"
-    "只说你拿得到事实的部分，不要编造未被记录的产出。\n"
-    "**事实里如果有「这一步自己写在产出里的内容」，那就是它自己的判断 —— 一定要用自己的话讲给研究者听**\n"
-    "（例如它选定的切口、给出的空白假设、检索式、覆盖范围与缺口）。不要念字段名、不要照抄 JSON。\n"
-    "**有判断就要说出来**：宁可说「我的判断是…（你可以推翻）」，也不要只说「没有产出」。\n"
-    "**严禁出现内部术语**：不要写「校验」「重试」「策略层」「节点」「流水线」「熔断」"
-    "「落库」「闸门」这类词，也不要用机器状态名（例如 waiting_human）。\n"
-    "按顺序说清四件事（自然分段，不要用「第一/第二」这种编号腔，也不要写小标题）：\n"
-    "1. 这一步现在是什么结果 —— 成了、还是没成、还是需要他来定；\n"
-    "2. 具体产出了什么（有就写清楚数量与名称；没有就直说没有）；\n"
-    "3. 如果没成或需要他定：卡在什么地方、**因为他能做的事**是什么；\n"
-    "4. 接下来可以怎么走，并明确告诉他可以直接回一句什么话来继续。\n"
-    "全程不要提系统、程序、调用了模型几次、花了多少钱。"
-    "不要用 Markdown 标题，就用正常段落。控制在 400 字以内（判断部分不要因为字数被砍）。"
+NODE_CONCLUSION_SYSTEM = SCILOOP_SYSTEM_PROMPT + "\n\n" + (
+    "## 本轮节点成果展示\n"
+    "将提供的真实结果、产物和证据组织成研究者可理解的说明，不照抄 JSON 字段，"
+    "不编造未记录的工作。区分产出中的建议、核实事实和未经验证的判断。\n"
+    "说明本节点成果、实际验证范围、剩余问题及建议下一步。"
+    "用自然语言解释完成的工作；仅在确实需要用户决定时才提出问题，"
+    "不要向用户展示节点、验收、修复次数、编号等内部流程信息。"
+    "运行时不支持的操作如实说明，不宣称已执行。"
+    "只有确实存在互斥决定时才提出简短行动列表；不要为了填充界面制造选项，"
+    "也不要把内部流程状态写进正文。"
 )
 
 #: 收尾提示词的载荷模板（`{facts}` 由程序填**事实**）
@@ -129,4 +99,67 @@ def _label_of(node: str) -> str:
 
 
 def guide_blocks() -> list[dict[str, Any]]:
-    return [dict(block) for block in GUIDE_BLOCKS]
+    """旧 SSE 接口的兼容函数；新的研究入口不生成启动菜单。"""
+
+    return []
+
+
+def _summary_options(summary: str) -> list[dict[str, Any]]:
+    """提取正文中的显式 A/B 行动列表；不依赖节点名或证据数量猜测意图。"""
+
+    options: list[dict[str, Any]] = []
+    for line in (summary or "").splitlines():
+        plain = line.strip().replace("**", "").replace("__", "")
+        match = re.match(r"^(?:[-*+]\s+)?([A-E])[.．、:：)）]\s*(.+)$", plain)
+        if not match:
+            continue
+        letter, action = match.groups()
+        title = re.split(r"[:：]", action, maxsplit=1)[0].strip()
+        # 长段落不能当作按钮标题；只有从 A 起连续排列的至少两项才是选择组。
+        if not title or len(title) > 60 or letter != chr(ord("A") + len(options)):
+            continue
+        options.append({
+            "id": f"proposal_{letter}",
+            "label": f"{letter}：{title}",
+            "send": f"选择 {letter}：{title}",
+            "tone": "primary" if letter == "A" else "default",
+        })
+    return options if len(options) >= 2 else []
+
+
+def waiting_human_blocks(
+    *,
+    summary: str = "",
+    node_label: str = "",
+    node: str | None = None,
+    has_evidence: bool | None = None,
+) -> list[dict[str, Any]]:
+    """只渲染模型正文明确给出的行动选项。
+
+    研究流程不能凭空替模型制造“继续/重跑/普通对话”按钮。没有明确的
+    模型选项时，正文就是完整的用户界面，等待下一条自然语言消息。
+    """
+
+    options = _summary_options(summary)
+    if options:
+        return [{"kind": "choice", "prompt": "想怎么走？", "options": options}]
+
+    return []
+
+
+
+def blocks_for_turn(turn: dict[str, Any]) -> list[dict[str, Any]]:
+    """读旧会话时修复通用按钮与正文不一致的问题，保留原始历史文件。"""
+
+    blocks = turn.get("blocks") or []
+    if turn.get("role") != "assistant" or turn.get("node_status") != "waiting_human":
+        return blocks
+    legacy = any(
+        block.get("kind") == "choice"
+        and {item.get("id") for item in block.get("options", [])} == {"continue", "redo", "plain"}
+        for block in blocks
+    )
+    if not legacy:
+        return blocks
+    replacement = waiting_human_blocks(summary=str(turn.get("content") or ""), node_label="")
+    return [*replacement, *(block for block in blocks if block.get("kind") != "choice")]

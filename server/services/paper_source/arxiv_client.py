@@ -366,8 +366,27 @@ def _submitted_date_window(
     if not date_from and not date_to:
         return None
     start = _to_arxiv_timestamp(date_from) or "199107010000"
-    end = _to_arxiv_timestamp(date_to) or _to_arxiv_timestamp(datetime.now(UTC)) or "203012310000"
+    # A date-only upper bound is inclusive: include the entire selected day.
+    end = _to_arxiv_end_timestamp(date_to) or _to_arxiv_timestamp(datetime.now(UTC)) or "203012312359"
     return f"{start} TO {end}"
+
+
+def _to_arxiv_end_timestamp(value: date | datetime | str | None) -> str | None:
+    """Convert a date-only upper bound to the last minute of that day."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value.astimezone(UTC).strftime("%Y%m%d%H%M")
+    if isinstance(value, date):
+        return value.strftime("%Y%m%d") + "2359"
+    text = str(value).strip()
+    if re.fullmatch(r"\d{8}", text):
+        return text + "2359"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return text.replace("-", "") + "2359"
+    return _to_arxiv_timestamp(value)
 
 
 def _to_arxiv_timestamp(value: date | datetime | str | None) -> str | None:

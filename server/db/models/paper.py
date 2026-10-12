@@ -31,6 +31,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
     func,
     text,
 )
@@ -75,7 +76,7 @@ class Paper(Base):
     score_breakdown: Mapped[Any | None] = mapped_column(JSONB)
     score_coverage: Mapped[Decimal | None] = mapped_column(Numeric(4, 3))
     pdf_url: Mapped[str | None] = mapped_column(Text)
-    is_parsed: Mapped[bool | None] = mapped_column(Boolean, server_default="false")
+    is_parsed: Mapped[bool | None] = mapped_column(Boolean, server_default=false())
     raw: Mapped[Any | None] = mapped_column(JSONB)
     created_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -110,7 +111,7 @@ class PaperIdentity(Base):
     )
     id_type: Mapped[str] = mapped_column(String(24), nullable=False)
     id_value: Mapped[str] = mapped_column(String(256), nullable=False)
-    is_primary: Mapped[bool | None] = mapped_column(Boolean, server_default="false")
+    is_primary: Mapped[bool | None] = mapped_column(Boolean, server_default=false())
     created_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -272,7 +273,7 @@ class PaperFeedSnapshot(Base):
     view_type: Mapped[str] = mapped_column(String(16), nullable=False)
     filters: Mapped[Any | None] = mapped_column(JSONB)
     paper_ids: Mapped[Any] = mapped_column(JSONB, nullable=False)
-    is_demo: Mapped[bool | None] = mapped_column(Boolean, server_default="false")
+    is_demo: Mapped[bool | None] = mapped_column(Boolean, server_default=false())
     created_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

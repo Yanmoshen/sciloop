@@ -5,6 +5,8 @@
  * 关键口径：失败就显示失败原因，**绝不显示伪成功**（验收书 §4）。
  */
 import { computed } from 'vue'
+import { humanError } from '../../utils/messages'
+import { actionDetails } from './presentation'
 
 import type { ToolCallView } from '../../agent-v2/protocol'
 
@@ -12,6 +14,7 @@ const props = defineProps<{
   call: ToolCallView
   output: string
   running?: boolean
+  stopped?: boolean
 }>()
 
 const STATUS_LABEL: Record<string, string> = {
@@ -24,14 +27,41 @@ const STATUS_LABEL: Record<string, string> = {
   invalid_arguments: '参数非法',
 }
 
-const label = computed(() => STATUS_LABEL[props.call.status] ?? props.call.status)
+const label = computed(() => {
+  if (props.stopped && ['requested', 'running'].includes(props.call.status)) return '已停止'
+  return STATUS_LABEL[props.call.status] ?? '处理中'
+})
 const tone = computed(() => {
+  if (props.stopped && ['requested', 'running'].includes(props.call.status)) return 'warn'
   if (props.call.status === 'succeeded') return 'ok'
   if (props.call.status === 'failed' || props.call.status === 'timeout') return 'danger'
   if (props.call.status === 'cancelled' || props.call.status === 'invalid_arguments') return 'warn'
   return 'busy'
 })
 const kindLabel = computed(() => (props.call.kind === 'read_only' ? '只读' : '有副作用'))
+const TOOL_LABELS: Record<string, string> = {
+  read_file: '读取本地文件',
+  list_dir: '查看目录',
+  write_file: '写入本地文件',
+  run_command: '运行本地命令',
+  update_plan: '更新任务计划',
+  'agent.spawn': '创建子任务',
+  'agent.send': '向子任务发送消息',
+  'agent.wait': '等待子任务',
+  'agent.interrupt': '中断子任务',
+  'agent.close': '结束子任务',
+  'host.command': '运行本地命令',
+  'host.file.read': '读取本地文件',
+  'host.file.write': '写入本地文件',
+  'search.query': '搜索资料',
+  'search.fetch': '读取网页资料',
+  'knowledge.search': '搜索知识库',
+  'knowledge.write': '写入知识库',
+  'skill.list': '查看可用技能',
+  'skill.run': '运行技能',
+  'mcp.call': '调用外部服务',
+}
+const displayName = computed(() => TOOL_LABELS[props.call.name] ?? '执行操作')
 /** 把内部错误码翻成用户能看懂的一句话（界面不出现 code）。 */
 const FAILURE_HINT: Record<string, string> = {
   approval_denied: '研究者拒绝了这次操作',
@@ -45,7 +75,7 @@ const FAILURE_HINT: Record<string, string> = {
 const failureText = computed(() => {
   const error = props.call.error
   if (!error) return ''
-  return FAILURE_HINT[error.code] ?? error.message
+  return FAILURE_HINT[error.code] ?? humanError(error)
 })
 
 const duration = computed(() => {
@@ -53,7 +83,7 @@ const duration = computed(() => {
   if (ms === null || ms === undefined) return ''
   return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(2)} s`
 })
-const argumentText = computed(() => JSON.stringify(props.call.arguments ?? {}, null, 2))
+const argumentText = computed(() => actionDetails(props.call.arguments ?? {}))
 const outputText = computed(() => {
   if (props.output) return props.output
   if (!props.call.output) return ''
@@ -62,20 +92,20 @@ const outputText = computed(() => {
 </script>
 
 <template>
-  <article class="tool" :class="`tool--${tone}`">
+  <article class="tool" :class="`tool--${tone}`" :aria-label="`${displayName}：${label}`">
     <header class="tool__head">
-      <span class="tool__name">{{ call.name }}</span>
+      <span class="tool__name">{{ displayName }}</span>
       <span class="tag" :class="`tag--${tone}`">{{ label }}</span>
       <span class="tool__kind" :title="kindLabel === '只读' ? '只读工具可以并行执行' : '有副作用的工具必须串行执行'">
         {{ kindLabel }}
       </span>
-      <span v-if="duration" class="tool__duration" :title="`开始 ${call.started_at ?? '-'}，结束 ${call.finished_at ?? '-'}`">
+      <span v-if="duration" class="tool__duration">
         {{ duration }}
       </span>
     </header>
 
     <details class="tool__section">
-      <summary>参数</summary>
+      <summary>操作内容</summary>
       <pre class="mono">{{ argumentText }}</pre>
     </details>
 

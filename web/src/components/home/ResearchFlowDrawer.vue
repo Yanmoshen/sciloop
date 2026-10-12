@@ -20,11 +20,7 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 import {
-  RESEARCH_TEXT,
-  fetchAccessMode,
   fetchChainState,
-  setAccessMode,
-  streamRunNode,
   type ChainState,
 } from '@/api/research'
 import ResearchFlowPanel from '@/components/home/ResearchFlowPanel.vue'
@@ -34,13 +30,10 @@ const props = defineProps<{ conversationId: string | null }>()
 const ui = usePipelineDrawerStore()
 
 const chain = ref<ChainState | null>(null)
-const accessMode = ref<'ask' | 'trusted'>('ask')
-const busy = ref(false)
-const menuOpen = ref(false)
 const showDetail = ref(false)
 const errorText = ref('')
-const abortCtl = ref<AbortController | null>(null)
 let timer: ReturnType<typeof setInterval> | null = null
+let loadSequence = 0
 
 type Visual = 'idle' | 'running' | 'done' | 'bad'
 
@@ -52,83 +45,41 @@ function visualOf(status: string): Visual {
 }
 
 const nodes = computed(() => chain.value?.nodes ?? [])
+const hasChain = computed(() => chain.value?.has_chain === true)
 const visuals = computed<Visual[]>(() => nodes.value.map((item) => visualOf(item.status)))
 const doneCount = computed(() => visuals.value.filter((item) => item === 'done').length)
 const runningIndex = computed(() => visuals.value.indexOf('running'))
 const badIndex = computed(() => visuals.value.indexOf('bad'))
 
 const headline = computed(() => {
+  if (!hasChain.value) return ''
   const total = nodes.value.length
-  if (!total) return '未开始'
+  if (!total) return ''
   if (badIndex.value >= 0) return `${nodes.value[badIndex.value].label} · 需人工介入`
   if (doneCount.value === total) return `已完成 · ${total}/${total}`
   if (runningIndex.value >= 0) {
     return `${nodes.value[runningIndex.value].label} · ${doneCount.value}/${total}`
   }
-  return `未开始 · 0/${total}`
+  return ''
 })
 
-const modeLabel = computed(() => (accessMode.value === 'trusted' ? '免确认' : '每次确认'))
-
 async function loadChain(): Promise<void> {
-  if (!props.conversationId) {
+  const sequence = ++loadSequence
+  const conversationId = props.conversationId
+  if (!conversationId) {
     chain.value = null
+    errorText.value = ''
     return
   }
   try {
-    const [state, access] = await Promise.all([
-      fetchChainState(props.conversationId),
-      fetchAccessMode(props.conversationId),
-    ])
+    const state = await fetchChainState(conversationId)
+    if (sequence !== loadSequence || props.conversationId !== conversationId) return
     chain.value = state
-    accessMode.value = access.execution_access
     errorText.value = ''
   } catch (error) {
+    if (sequence !== loadSequence || props.conversationId !== conversationId) return
     errorText.value = error instanceof Error ? error.message : String(error)
   }
-}
-
-async function run(): Promise<void> {
-  if (busy.value) {
-    stop()
-    return
-  }
-  if (!props.conversationId) return
-  busy.value = true
-  errorText.value = ''
-  abortCtl.value = new AbortController()
-  try {
-    await streamRunNode(
-      props.conversationId,
-      { node: null, text: '' },
-      { onEvent: () => undefined },
-      abortCtl.value.signal,
-    )
-  } catch (error) {
-    if (!abortCtl.value?.signal.aborted) {
-      errorText.value = error instanceof Error ? error.message : String(error)
-    }
-  } finally {
-    busy.value = false
-    abortCtl.value = null
-    await loadChain()
-  }
-}
-
-function stop(): void {
-  abortCtl.value?.abort()
-}
-
-async function toggleMode(): Promise<void> {
-  if (!props.conversationId) return
-  const next = accessMode.value === 'trusted' ? 'ask' : 'trusted'
-  try {
-    await setAccessMode(props.conversationId, next)
-    accessMode.value = next
-  } catch (error) {
-    errorText.value = error instanceof Error ? error.message : String(error)
-  }
-  menuOpen.value = false
 }
 
 const resizing = ref(false)
@@ -201,7 +152,6 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', refreshViewportMax)
   if (timer) clearInterval(timer)
   timer = null
-  abortCtl.value?.abort()
 })
 </script>
 
@@ -232,8 +182,7 @@ onBeforeUnmount(() => {
     -->
 
     <div class="rfd__body scroll-y">
-      <p v-if="!conversationId" class="rfd__empty">{{ RESEARCH_TEXT.needProject }}</p>
-      <ol v-else class="rflow">
+      <ol v-if="conversationId && hasChain" class="rflow">
         <li
           v-for="(node, index) in nodes"
           :key="node.node"
@@ -253,7 +202,7 @@ onBeforeUnmount(() => {
 
       <p v-if="errorText" class="rfd__err">{{ errorText }}</p>
 
-      <div v-if="showDetail && conversationId" class="rfd__detail">
+      <div v-if="showDetail && conversationId && hasChain" class="rfd__detail">
         <ResearchFlowPanel :conversation-id="conversationId" />
       </div>
     </div>

@@ -35,6 +35,7 @@ import type {
   TurnView,
 } from './protocol'
 import { bufferEvent, drainContiguous, isDuplicate, isOutOfOrder } from './cursor'
+import { humanError } from '../utils/messages'
 import type {
   AgentV2State,
   ConnectionPatch,
@@ -185,6 +186,33 @@ export function setThreadCursor(
   return next
 }
 
+/** Stop locally before the interrupt request round-trip completes. */
+export function markTurnInterrupted(
+  state: AgentV2State,
+  threadId: string,
+  turnId: string,
+  reason = '用户停止',
+): AgentV2State {
+  const turn = state.turns[turnId]
+  if (!turn || turn.thread_id !== threadId || TERMINAL_STATUSES.includes(turn.status)) return state
+  const next = clone(state)
+  const current = next.turns[turnId]
+  next.turns = {
+    ...next.turns,
+    [turnId]: {
+      ...current,
+      status: 'interrupted',
+      cancel_reason: reason,
+      updated_at: nowIso(),
+    },
+  }
+  const thread = next.threads[threadId]
+  if (thread?.active_turn_id === turnId) {
+    next.threads = { ...next.threads, [threadId]: { ...thread, active_turn_id: null } }
+  }
+  return next
+}
+
 export function requestBackfill(state: AgentV2State, threadId: string): AgentV2State {
   const next = clone(state)
   const cursor = next.cursors[threadId] ?? 0
@@ -251,7 +279,7 @@ export function applyNotification(state: AgentV2State, note: NotificationFrame):
       const next = clone(state)
       const error = asRecord(asRecord(note.params).error) as unknown as ErrorPayload
       if (error && typeof error.code === 'string') next.errors = [...next.errors, error]
-      pushNotice(next, 'error', error?.message ? String(error.message) : '协议错误')
+      pushNotice(next, 'error', humanError(error?.message ? error : { message: '协议错误' }))
       return next
     }
     default:
@@ -594,15 +622,15 @@ function applyTurnEvent(
     pushNotice(
       state,
       'error',
-      `Turn 失败：${asString(asRecord(updated.error).message, '未知原因')}`,
+      humanError({ code: asString(asRecord(updated.error).code), message: asString(asRecord(updated.error).message) }),
       threadId,
     )
   }
   if (updated.status === 'interrupted') {
-    pushNotice(state, 'warning', 'Turn 已被中断（不会产生成功结果）', threadId)
+    pushNotice(state, 'warning', '这一轮已停止', threadId)
   }
   if (updated.status === 'waiting_approval') {
-    pushNotice(state, 'info', 'Turn 正在等待研究者审批', threadId)
+    pushNotice(state, 'info', '正在等待你的确认', threadId)
   }
 }
 
@@ -625,7 +653,7 @@ function applyToolEvent(state: AgentV2State, threadId: string, event: EventView)
     pushNotice(
       state,
       'error',
-      `工具 ${call.name} 失败（${call.error.code}）：${asString(call.error.message, '未知原因')}`,
+      humanError({ code: call.error.code, message: asString(call.error.message) }),
       threadId,
     )
   }
@@ -657,7 +685,7 @@ function applyCompactionEvent(state: AgentV2State, threadId: string, event: Even
     pushNotice(
       state,
       'error',
-      `压缩失败：${asString(asRecord(event.payload.error).message, '未知原因')}（原上下文保持不变）`,
+      '上下文压缩没有完成，之前的内容已保留，可以重试。',
       threadId,
     )
   } else if (phase === 'completed') {

@@ -31,6 +31,7 @@ import logging
 import re
 import time
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -46,15 +47,33 @@ from llm import adapter
 from llm.errors import LLMError
 from llm.registry import get_registry
 from llm.types import slugify_provider
-from services import conversations
+from services import conversations, home_turns
 from services.agent import approvals as agent_approvals
-from services.output_style import OUTPUT_STYLE
+from services.chat_attachments import normalize_chat_attachments
 from services.research import dialog, phrasing
 from services.research import intent as intent_mod
+from services.system_prompt import SCILOOP_SYSTEM_PROMPT
 
 logger = logging.getLogger("sciloop.chat")
 
 router = APIRouter(tags=["chat"])
+
+# Active generic homepage turns are separate from research-node subscriptions.
+# The stop endpoint uses this registry to cancel the owning task before the
+# browser closes its SSE connection.
+_ACTIVE_HOME_TURNS: dict[str, tuple[asyncio.Event, asyncio.Task[Any]]] = {}
+
+
+def request_home_turn_interrupt(conversation_id: str) -> bool:
+    active = _ACTIVE_HOME_TURNS.get(str(conversation_id))
+    if active is None:
+        return False
+    event, task = active
+    event.set()
+    current = asyncio.current_task()
+    if task is not current and not task.done():
+        task.cancel()
+    return True
 
 TITLE_MAX_CHARS = 20
 #: 思考过程的落盘上限。**``None`` = 不截断**（2026-09-24 用户口径：不设限制）。
@@ -69,55 +88,14 @@ TITLE_MAX_TOKENS: int | None = None
 #: 触顶后的**收尾提示**：不摆工具，只要它把「完成了什么 / 还差什么」说清楚（用户口径 2026-09-25）。
 WRAP_UP_PROMPT = (
     "本次回答已经达到执行上限，你现在**不能再调用任何工具**。"
-    "请只根据上面已经拿到的事实，按三段如实交代："
-    "**已完成**（确实做过的步骤与得到的结论）、**未完成**（哪些还没做、卡在哪一步）、"
-    "**建议下一步**（研究者接下来该让你做什么）。"
+    "请只根据已经取得的事实，简洁说明真实成果、未完成项及原因和必要的下一步。"
     "不要编造没做过的步骤，也不要再请求调用工具。"
 )
 
 #: 标题调用的 user 提示（约束在 `conversations.TITLE_SYSTEM` 里，两边都留着更稳）
 TITLE_PROMPT = "为下面这段研究需求拟一个标题。\n\n研究需求：\n{text}"
 
-REPLY_SYSTEM = (
-    "你是 SciLoop 的科研助手，帮助研究者从海量论文中提取信息，生成灵感，"
-    "并且整理成一套以论文成稿为目的的自动化研究方案。\n"
-    # 2026-09-25 二次修订（用户口径「按默认的来」）：提问与否**交回模型判断** ——
-    # 「5 个」是上限不是指标（改前那句「以 1. 2. 3. 4. 5. 排列」被读成了"每次都要排满"，
-    # 实测连「你好」都吐 5 个编号问题）。格式部分按默认**保留**：
-    # 集中提问 + 每题给默认值 + a b c 三选项 + 可按「编号+字母」确认。
-    "要不要向研究者提问，由你自己判断：**不需要确认就直接办，不要为了提问而提问**。"
-    "如果确实需要确认，就把问题**集中**提出来（最多 5 个），放在回复的最下面；"
-    "每个问题都给出一个默认值，并给出 a b c 三个选项，"
-    "再提示研究者可以按「编号+字母」（例如 1b、3a）来确认。\n"
-    "研究者未回答这些问题时，就按你给出的默认值继续推进，并在回答里标明你用的是什么假设。\n"
-    # 2026-09-25 补：含糊需求不要「先跑起来」。实测一句「我想做点研究，你看着办」
-    # 会触发约 10 轮工具、31.7 秒 —— 上限从 3 轮放开到 600/500 之后，模型在**含糊**需求上
-    # 会持续自我发挥。这是**提示词层面的边界**（不是程序闸门：项目口径是"跑不跑由模型决定"），
-    # 与上面「需求不明确时先问」同一件事，只是把「别先动手」写明。
-    "**需求还没弄清之前，先问再做**：如果研究者只给了一句含糊的方向"
-    "（例如「我想做点研究」「你看着办」），先别急着调用工具 —— "
-    "把该确认的问清楚（要问几个、问什么由你判断）。\n"
-    "反过来，研究者已经说清要做什么时就直接做，不要重复确认、也不要多问。\n"
-    "**不要输出你的思考过程、推理草稿或自我对话**（例如「我们需要回答用户……」「让我想想……」），"
-    "只输出给研究者看的最终答复。\n"
-    # 2026-09-26 用户口径（新用户首轮体验，逐条确认过）：说清「现在在哪一段」、
-    # 等批准时也必须说话、首轮只问三件事。研究链邀请按会话状态追加，
-    # 不能放在这个公共提示里，否则普通对话会再次收到邀请。
-    "**每一条回复的开头**先用一句话点明现在处于哪个阶段：还没开始研究链就直说"
-    "「现在还没开始研究链」；已经在链上就点明当前节点名。系统消息里给了你"
-    "**当前真实状态**，照它说，不要猜。\n"
-    "**需要研究者批准、或要等他给信息时，也必须先写一句话**说明你在做什么、需要他点头什么 —— "
-    "不允许只有动作、没有正文。\n"
-    "**刚开始对话、还没搞清他要做什么时，最多问三件事**：研究主题或方向、想要的产出、数据情况；"
-    "别的一律先别问。\n"
-    "不要编造文献、数据或结论；没有实际查过本地数据就不要声称查过。\n\n" + OUTPUT_STYLE
-)
-
-CHAIN_OFFER_SYSTEM = (
-    "**还没开始研究链时**，每条回复的**最末尾**原样补上这一句（不要改写、不要省略）："
-    "「" + dialog.CHAIN_OFFER_SENTENCE + "」。研究者下一条只要没明确说不要，就算他同意 —— "
-    "你直接开始第 1 步（文献调研），不要再问第二遍；他要是明确说不需要，这件事就不要再提。\n"
-)
+REPLY_SYSTEM = SCILOOP_SYSTEM_PROMPT + "\n\n"
 
 PLAIN_CHAT_SYSTEM = (
     "本对话已经明确按普通对话处理。请像正常助手一样直接回答当前问题，"
@@ -131,7 +109,7 @@ def reply_system_prompt(conversation: dict[str, Any] | None = None) -> str:
 
     if conversation and conversation.get("plain_chat"):
         return REPLY_SYSTEM + PLAIN_CHAT_SYSTEM
-    return REPLY_SYSTEM + CHAIN_OFFER_SYSTEM
+    return REPLY_SYSTEM
 
 
 #: 技能目录块的缓存（用户口径 2026-09-25：缓存 1 小时 + 技能库一变立即失效）。
@@ -186,7 +164,7 @@ def skills_signature() -> str:
 async def research_state_block(conversation_id: str, conversation: dict[str, Any]) -> str:
     """把「研究链现在到哪了」如实告诉模型 —— **事实块，不是指令**。
 
-    为什么必须有它：模型要在回复开头点明阶段、并决定要不要发那道邀请，就得知道真相。
+    模型需要真实阶段来判断当前授权范围和是否需要用户验收。
     实测（2026-09-26）没有这块时它会**猜错**：把"还没挂链"当成"已经在跑"，
     于是整轮都在做实验准备，而研究者看不到任何阶段分界。
 
@@ -217,20 +195,6 @@ async def _chained(conversation_id: str) -> bool:
     """本对话是否已经在研究链上（读不到就按"没有"处理，不阻塞对话）。"""
 
     return bool((await dialog.chain_snapshot(conversation_id))["chained"])
-
-
-def _last_assistant_text(conversation: dict[str, Any]) -> str:
-    """最近一条**助手说的话**（跳过"系统在说话"的那种轮次）。
-
-    用来判断上一轮到底发没发「是否现在开始研究链」那道邀请 ——
-    靠**读真实正文**判断，而不是另存一个可能过期的标志位。
-    """
-
-    for turn in reversed(conversation.get("turns") or []):
-        if str(turn.get("role") or "") != "assistant" or turn.get("note_only"):
-            continue
-        return str(turn.get("content") or "")
-    return ""
 
 
 def skills_system_block() -> str:
@@ -304,7 +268,7 @@ MODEL_ROUND_MAX_ATTEMPTS = 3
 class HomeChatRequest(BaseModel):
     """首页单轮对话入参。"""
 
-    text: str = Field(min_length=1, max_length=4000)
+    text: str = Field(default="", max_length=4000)
     model_config_id: int
     model_id: str = Field(min_length=1, max_length=200)
     #: 不传 = 新建会话；传了 = 接着这个会话继续（会带上最近若干轮作为上下文）
@@ -315,6 +279,65 @@ class HomeChatRequest(BaseModel):
     #: 再以 ``text`` 作为新的第 N 条重问一次。不传 = 普通追加一轮。
     #: 只接受指向 user 轮次的下标（指到 assistant 轮次直接 422，不做猜测）。
     replace_from: int | None = Field(default=None, ge=0)
+    attachments: list[dict[str, Any]] = Field(default_factory=list, max_length=10)
+
+
+def _turn_timestamp() -> str:
+    return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def _prepare_home_message(payload: HomeChatRequest) -> tuple[str, Any, list[dict[str, Any]]]:
+    """Validate attachments and build the model-facing multimodal user message."""
+    text = payload.text.strip()
+    try:
+        attachment_blocks, display_metadata = normalize_chat_attachments(payload.attachments)
+    except ValueError as exc:
+        raise _error(422, "invalid_attachment", str(exc)) from exc
+    if not text and not attachment_blocks:
+        raise _error(422, "empty_text", "请输入内容或添加附件后再发送")
+    if not attachment_blocks:
+        return text, text, display_metadata
+    blocks: list[dict[str, Any]] = []
+    if text:
+        blocks.append({"type": "text", "text": text})
+    blocks.extend(attachment_blocks)
+    return text or "已上传附件", blocks, display_metadata
+
+
+def _previous_attachment_content(
+    conversation: dict[str, Any] | None, replace_from: int | None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if conversation is None or replace_from is None:
+        return [], []
+    turns = conversation.get("turns") or []
+    if replace_from >= len(turns):
+        return [], []
+    user_number = sum(1 for turn in turns[:replace_from] if (turn or {}).get("role") == "user")
+    for message in conversations.context_messages(conversation):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        if user_number:
+            user_number -= 1
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            break
+        blocks = [
+            block for block in content
+            if isinstance(block, dict)
+            and (block.get("type") == "image_url" or (
+                block.get("type") == "text"
+                and str(block.get("text") or "").startswith("[附件:")
+            ))
+        ]
+        metadata = [item for item in turns[replace_from].get("attachments", []) if isinstance(item, dict)]
+        return blocks, metadata
+    return [], []
+
+
+class HomeInterruptRequest(BaseModel):
+    turn_id: str | None = None
+    conversation_id: str = Field(min_length=1, max_length=64)
 
 
 class HomeChatResponse(BaseModel):
@@ -438,8 +461,98 @@ def _error(status_code: int, code: str, message: str, detail: Any = None) -> HTT
     )
 
 
+def _turn_in_progress_detail(conversation_id: str | None) -> dict[str, Any] | None:
+    """Return the durable owner identity so clients can attach instead of resending."""
+    if not conversation_id:
+        return None
+    owner = home_turns.active(conversation_id)
+    if owner is None:
+        return None
+    return {
+        "conversation_id": owner.conversation_id,
+        "turn_id": owner.turn_id,
+        "status": owner.snapshot.get("status", "inProgress"),
+        "event_seq": owner.snapshot.get("event_seq", 0),
+        "resume_url": f"/api/v1/chat/turns/{owner.conversation_id}/{owner.turn_id}/stream",
+    }
+
+
+def _public_stream_error(exc: BaseException, *, interrupted: bool = False) -> str:
+    """Return reader-facing text without exposing provider diagnostics."""
+
+    if interrupted:
+        return "这轮回答已停止，已经生成的内容已保留。"
+    kind = str(getattr(exc, "kind", "") or "").lower()
+    if kind in {"timeout", "rate_limit"}:
+        return "模型响应时间较长，请稍后重试。"
+    if kind in {"auth", "config", "routing", "model_routing"}:
+        return "当前模型暂时不可用，请检查模型配置。"
+    if kind in {"bad_request", "validation"}:
+        return "当前请求无法由模型处理，请换一种说法。"
+    if kind in {"server", "network", "connection"}:
+        return "模型服务暂时不可用，已经生成的内容已保留。"
+    return "这次回答没有完整完成，已经生成的内容已保留。"
+
+
 def _sse(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def _reasoning_sse(update: Any, *, status: str = "streaming") -> str:
+    """Serialize reasoning separately from tool rows.
+
+    ``text`` remains the raw provider stream for backwards compatibility;
+    ``summary`` is included only when a provider explicitly supplied one.
+    """
+
+    payload: dict[str, Any] = {
+        "text": str(getattr(update, "text", "") or ""),
+        "status": status,
+    }
+    summary = str(getattr(update, "summary", "") or "").strip()
+    if summary:
+        payload["summary"] = summary
+    return _sse("reasoning", payload)
+
+
+def _annotate_tool_row(
+    row: dict[str, Any], call: dict[str, Any], status: str
+) -> dict[str, Any]:
+    """Add stable tool identity/status while preserving legacy row fields."""
+
+    function = call.get("function") or {}
+    name = str(function.get("name") or "")
+    _annotate_tool_identity(row, name, status)
+    # The human-readable summary is deliberately localized, but the collapsed
+    # activity row must retain the exact command/action from the model call.
+    # Recompute it here for every lifecycle row so an end row can never fall
+    # back to text such as "在你的电脑上执行命令".
+    if name in {"run_command", "run_on_computer", "files_on_computer"}:
+        from services.agent import mcp_tools as agent_tools
+
+        action = agent_tools._tool_action(name, agent_tools.arguments_of(call))
+        if action:
+            row["action"] = action
+    call_id = str(call.get("id") or "").strip()
+    if call_id:
+        row["call_id"] = call_id
+    return row
+
+
+def _annotate_tool_identity(row: dict[str, Any], name: str, status: str) -> dict[str, Any]:
+    """Attach canonical identity and lifecycle status to a tool activity row."""
+
+    from services.agent.mcp_tools import TOOL_LABELS
+
+    row["tool_name"] = name
+    row["tool_label"] = TOOL_LABELS.get(name, name or "工具")
+    row["tool_status"] = {
+        "start": "running",
+        "ok": "completed",
+        "err": "failed",
+        "waiting": "waiting_approval",
+    }.get(status, status)
+    return row
 
 
 def _repair_tool_call_pairs(
@@ -523,6 +636,7 @@ def _is_simple_question(text: str) -> bool:
         "分析",
         "总结",
         "知识库",
+        "工具",
         "子agent",
         "子 Agent",
     )
@@ -530,92 +644,161 @@ def _is_simple_question(text: str) -> bool:
         return False
     return bool(
         re.fullmatch(r"(?:你好|您好|嗨|hello|hi|谢谢|辛苦了|再见)[！!。.!？? ]*", compact, re.I)
-        or re.search(r"(?:等于|是多少|是什么|哪个国家|什么颜色|几岁|几点|怎么样|能做什么|你是谁|介绍一下|陪我聊|保持简洁|可以开始|你擅长)", compact)
+        or re.search(r"(?:等于|是多少|是什么|哪个国家|什么颜色|几岁|几点|怎么样|能做什么|你是谁|介绍一下|怎么开始|如何开始|陪我聊|保持简洁|可以开始|你擅长|演示入口|演示模式)", compact)
         or re.fullmatch(r"[\d\s+\-*/().=]+[？?。.!！ ]*", compact)
     )
 
 
-def _fast_simple_reply(text: str) -> str | None:
-    """Return an immediate response for pure social turns.
+def _research_gate_blocks_tools(text: str, conversation: dict[str, Any]) -> bool:
+    """Return whether this turn must run without model tools.
 
-    These turns do not benefit from a model call, and waiting on a provider for
-    a greeting or sign-off makes the chat feel stalled.  Keep the scope narrow:
-    factual questions and anything mentioning a task continue through the
-    normal model path.
+    The prompt explains the confirmation policy, but the policy also needs a
+    deterministic server-side guard so a provider cannot search before the
+    user confirms the research scope.
     """
 
-    compact = " ".join((text or "").split()).strip().lower()
-    if re.fullmatch(r"(?:你好|您好|嗨|哈喽|早上好|晚上好)(?:呀|啊|哦)?[！!。.!？? ]*", compact, re.I):
-        return "你好，我在。你可以直接告诉我想聊的事情，或者给出一个明确任务。"
-    if re.fullmatch(r"(?:谢谢|感谢|多谢|辛苦了)(?:你的|您的)?(?:介绍|帮助)?[！!。.!？? ]*", compact, re.I):
-        return "不客气。需要时继续告诉我就好。"
-    if re.fullmatch(r"(?:谢谢[，, ]*)?(?:再见|拜拜|回头见)[！!。.!？? ]*", compact, re.I):
-        return "好的，再见。需要时随时回来。"
-    if re.search(r"状态怎么样|今天.*怎么样|你还好吗|最近怎么样|最近还好吗", compact):
-        return "我状态正常，可以直接告诉我你想完成的事情。"
-    if re.search(r"你能做什么|你是谁|介绍一下你", compact):
-        return "我是 SciLoop 的科研助手，可以帮你查资料、整理思路并推进研究任务。"
-    if re.search(r"陪我聊|继续聊聊|保持简洁|可以开始工作|你擅长整理资料", compact):
-        return "可以，我已经准备好。你想从哪件事开始？"
-    return None
+    return intent_mod.defers_research(text) or bool(
+        conversation.get("research_confirmation_pending")
+    )
 
 
-_HOST_ACTION_MARKERS = (
-    "新建",
-    "创建",
-    "写入",
-    "覆盖",
-    "修改文件",
-    "删除文件",
-    "删除目录",
-    "移动文件",
-    "复制文件",
-    "运行命令",
-    "执行命令",
-    "打开终端",
-    "读取文件",
-    "查看目录",
-    "列出目录",
-    "保存到",
-    "导出到",
-)
-_HOST_ACTION_REPLY = (
-    "这次文件操作还没有执行，因为本地执行环境暂时不可用。"
-    "启动本地执行服务后，请重新发送这条请求。"
-)
 _INTERNAL_FAILURE_REPLY = "这次回答没有完整完成，请重新发送；已经完成的内容会保留。"
+_INTERNAL_DIAGNOSTIC_REPLACEMENTS = (
+    ("all connection attempts failed", "服务连接失败"),
+    ("error executing tool", "工具执行失败"),
+    ("traceback (most recent call last):", "执行异常："),
+    ("unreachable: true", "服务当前不可用"),
+    ("unreachable:true", "服务当前不可用"),
+    ("unreachable： true", "服务当前不可用"),
+    ("unreachable：true", "服务当前不可用"),
+)
+# Mentioning a tool or a protocol field is ordinary answer content. Only
+# explicit diagnostics are cleaned; prose cannot establish executor health.
 _INTERNAL_DIAGNOSTIC_RE = re.compile(
-    r"run_on_computer|files_on_computer|unreachable\s*[:：]|"
-    r"all connection attempts failed|reasoning_content|tool_call_id|"
-    r"request_id|traceback|error executing tool",
+    "|".join(re.escape(marker) for marker, _ in _INTERNAL_DIAGNOSTIC_REPLACEMENTS),
     re.IGNORECASE,
 )
 
-# 执行器不可用时，文件请求不应每次都等待一次网络超时。失败缓存保持很短，
-# 既能合并连续请求，又允许用户启动执行器后很快恢复；成功探测会立即清除它。
-_HOST_EXECUTOR_FAILURE_TTL_S = 5.0
-_host_executor_failure_at = 0.0
-_host_executor_probe: asyncio.Task[bool] | None = None
+
+def _clean_diagnostic_text(text: str) -> str:
+    for marker, replacement in _INTERNAL_DIAGNOSTIC_REPLACEMENTS:
+        text = re.sub(re.escape(marker), replacement, text, flags=re.IGNORECASE)
+    return text
 
 
-def _looks_like_host_action(text: str) -> bool:
-    """识别明确的文件/命令动作用于执行器预检。"""
+class _DiagnosticTextFilter:
+    """Clean diagnostics across deltas without swallowing the answer suffix."""
 
-    compact = " ".join((text or "").split())
-    if len(compact) > 240 or not any(marker in compact for marker in _HOST_ACTION_MARKERS):
+    def __init__(self) -> None:
+        self.pending = ""
+
+    def feed(self, chunk: str, *, final: bool = False) -> str:
+        self.pending += chunk
+        held = 0
+        if not final:
+            lower = self.pending.lower()
+            for marker, _ in _INTERNAL_DIAGNOSTIC_REPLACEMENTS:
+                for size in range(1, min(len(lower), len(marker) - 1) + 1):
+                    if lower.endswith(marker[:size]):
+                        held = max(held, size)
+        boundary = len(self.pending) - held
+        for match in _INTERNAL_DIAGNOSTIC_RE.finditer(self.pending):
+            if match.start() < boundary < match.end():
+                boundary = match.end()
+        ready, self.pending = self.pending[:boundary], self.pending[boundary:]
+        return _clean_diagnostic_text(ready)
+# Some providers put the model's scratchpad in ``delta.content`` instead of
+# the dedicated reasoning field.  These phrases are unusually specific to
+# that leak (the screenshot that motivated this guard contained most of them)
+# and are therefore safer than trying to redact arbitrary first-person text.
+_INTERNAL_REASONING_MARKERS_RE = re.compile(
+    r"the user asks|per instructions|i should|should i\b|"
+    r"don't reveal (?:the )?thinking|do not reveal (?:the )?thinking|"
+    r"let me (?:organize|think|check)|we need to answer|"
+    r"用户(?:要求|只问了)|按(?:照)?指令|不要透露思考|"
+    r"我(?:需要|应该)回答|让我(?:想想|整理)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_internal_reasoning(text: str) -> bool:
+    """Return whether visible text is a provider scratchpad, not an answer.
+
+    A single phrase can occur in a legitimate answer, so require at least two
+    markers once the text has enough context.  The start-of-scratchpad forms
+    are allowed with one marker because they are unambiguous and let the
+    streaming caller stop before more private text reaches the browser.
+    """
+
+    value = " ".join(str(text or "").split())
+    if len(value) < 36:
         return False
-    return bool(re.search(r"请|帮我|能否|可以|在.+(?:文件|目录)|新建|创建|写入|运行|执行", compact))
-
+    matches = _INTERNAL_REASONING_MARKERS_RE.findall(value)
+    if len(matches) >= 2:
+        return True
+    return bool(
+        re.match(
+            r"^(?:the user asks|per instructions|should i\b|用户(?:要求|只问了)|按(?:照)?指令)",
+            value,
+            re.IGNORECASE,
+        )
+    )
 
 def _sanitize_assistant_content(content: str) -> str:
-    """阻止内部协议、工具名和连接诊断泄漏到用户正文。"""
+    """净化明确诊断，保留工具介绍和诊断之后的正常正文。"""
 
-    text = str(content or "")
-    if not _INTERNAL_DIAGNOSTIC_RE.search(text):
+    text = _clean_diagnostic_text(str(content or ""))
+    reasoning_match = _INTERNAL_REASONING_MARKERS_RE.search(text)
+    if not _looks_like_internal_reasoning(text):
         return text
-    if re.search(r"run_on_computer|files_on_computer|unreachable|connection attempts", text, re.IGNORECASE):
-        return _HOST_ACTION_REPLY
-    return _INTERNAL_FAILURE_REPLY
+    match_start = reasoning_match.start() if reasoning_match is not None else len(text)
+    prefix = text[:match_start].rstrip()
+    # A provider may return only its private scratchpad and no user-facing
+    # answer. Persist a short, actionable message instead of an empty turn;
+    # an empty assistant item makes the completed response appear to vanish.
+    return prefix or _INTERNAL_FAILURE_REPLY
+
+
+def _stream_history(state: dict[str, Any]) -> list[dict[str, Any]]:
+    history = conversations.protocol_messages(state.get("agent_history") or [])
+    offset = state.get("partial_text_from")
+    if isinstance(offset, int):
+        partial = _sanitize_assistant_content("".join((state.get("text") or [])[offset:]))
+        if partial:
+            history.append({"role": "assistant", "content": partial})
+    return history
+
+
+def _save_stream_progress(
+    conversation: dict[str, Any], *, base_turns: list[dict[str, Any]], text: str,
+    state: dict[str, Any], rows: list[dict[str, Any]], approvals: list[dict[str, Any]],
+    model_id: str, duration_ms: int, interrupted: bool = False,
+) -> None:
+    """Checkpoint a single turn in place; never duplicate it on completion."""
+    if conversation.get("id"):
+        latest = conversations.read(str(conversation["id"]))
+        if latest is not None and "grants" in latest:
+            # Access switches may change while the model streams. A checkpoint
+            # must not overwrite that newer explicit user choice with old grants.
+            conversation["grants"] = latest["grants"]
+    pending = state.get("pending")
+    # A stream can be checkpointed after the approval endpoint has consumed
+    # the request.  Never persist a closed request as if this turn still
+    # needed a decision; doing so leaves the UI blocked after a refresh.
+    if isinstance(pending, dict) and str(pending.get("status") or "pending") != "pending":
+        pending = None
+        state["pending"] = None
+    conversation["agent_history"] = _stream_history(state)
+    conversation["turns"] = [*base_turns, {"role": "user", "content": text,
+        "ts": state.get("user_ts"), "attachments": state.get("attachments") or []}, {
+        "role": "assistant", "content": _sanitize_assistant_content("".join(state["text"])),
+        "reasoning": "".join(state["reasoning"]) or None,
+        "reasoning_summary": "".join(state.get("reasoning_summary") or []) or None,
+        "model_id": model_id, "duration_ms": duration_ms, "rows": list(rows),
+        "approvals": list(approvals), "awaiting_approval": pending["id"] if pending else None,
+        "interrupted": interrupted, "interruption_reason": state.get("terminal_reason") if interrupted else None,
+    }]
+    conversations.write(conversation)
 
 
 def _sanitize_compaction_summary(summary: str) -> str:
@@ -629,46 +812,6 @@ def _sanitize_compaction_summary(summary: str) -> str:
     return text
 
 
-async def _host_executor_available() -> bool:
-    """短时探测执行器；失败时让明确的文件请求快速收束。"""
-
-    global _host_executor_failure_at, _host_executor_probe
-    now = time.monotonic()
-    if now - _host_executor_failure_at < _HOST_EXECUTOR_FAILURE_TTL_S:
-        return False
-
-    async def probe() -> bool:
-        global _host_executor_failure_at
-        try:
-            from services.agent import host_runner
-
-            result = await asyncio.wait_for(host_runner.health(), timeout=2.2)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 - a failed probe must not fail a chat request
-            _host_executor_failure_at = time.monotonic()
-            return False
-        available = bool(result.get("reachable"))
-        _host_executor_failure_at = 0.0 if available else time.monotonic()
-        return available
-
-    probe_task = _host_executor_probe
-    if probe_task is None or probe_task.done():
-        probe_task = asyncio.create_task(probe())
-        _host_executor_probe = probe_task
-    try:
-        # A cancelled client request must not cancel the shared health probe for
-        # another concurrent request that is still waiting on the same result.
-        available = await asyncio.shield(probe_task)
-    except asyncio.CancelledError:
-        raise
-    finally:
-        if probe_task.done() and _host_executor_probe is probe_task:
-            _host_executor_probe = None
-
-    return available
-
-
 async def _agent_loop(
     messages_now: list[dict[str, Any]],
     *,
@@ -680,6 +823,7 @@ async def _agent_loop(
     state: dict[str, Any],
     allow_fallback_first: bool = True,
     workspace_root: str | None = None,
+    max_attempts: int | None = None,
 ) -> AsyncIterator[str]:
     """agent 循环：模型 → 工具 → 结果回喂 → 再模型（轮数有上限，防死循环）。
 
@@ -703,6 +847,7 @@ async def _agent_loop(
     # 之前只按「轮」算（3 轮），复杂任务会在第 4 轮被静默截断。
     model_calls = 0
     tool_calls_done = 0
+    attempt_limit = max(1, int(max_attempts or MODEL_ROUND_MAX_ATTEMPTS))
     #: 非空 = 因触顶而停（值说明哪一边触的顶），用于触发收尾交代
     stopped_by: str | None = None
 
@@ -712,12 +857,14 @@ async def _agent_loop(
     meter = context_meter.get_meter()
     compactions: list[dict[str, Any]] = state.setdefault("compactions", [])
     snapshots: list[dict[str, Any]] = state.setdefault("compaction_snapshots", [])
+    reasoning_summaries: list[str] = state.setdefault("reasoning_summary", [])
     state["agent_history"] = conversations.protocol_messages(messages_now)
 
     def save_history() -> None:
         # Keep the dynamic system prompt out of the durable history.  It is
         # rebuilt on every request so changed skills/project state take effect.
         state["agent_history"] = conversations.protocol_messages(messages_now)
+        state["partial_text_from"] = None
 
     def checkpoint(
         kind: str,
@@ -837,6 +984,7 @@ async def _agent_loop(
         #: reasoning_content 跟着 assistant.tool_calls 一起回喂（见下面 append 处）。
         reasoning_from = len(state["reasoning"])
         text_from = len(state["text"])
+        state["partial_text_from"] = text_from
         # ---------------------------------------------------------------- #
         # 「不再强制中断」（用户口径 2026-09-26）：模型这一跳失败**不再直接判死整轮**。
         # 先自愈（把报文形状修好）再重试；重试仍不成，就把失败如实摊开、
@@ -847,6 +995,8 @@ async def _agent_loop(
         while True:
             attempt += 1
             emitted_before = len(state["text"])
+            internal_text_blocked = False
+            diagnostic_filter = _DiagnosticTextFilter()
             try:
                 async for update in adapter.chat_stream(
                     messages_now,
@@ -864,50 +1014,71 @@ async def _agent_loop(
                     tools=tool_defs or None,
                 ):
                     if update.kind == "delta":
-                        state["text"].append(update.text)
+                        # A few gateways incorrectly label scratchpad text as
+                        # normal content.  Stop forwarding it as soon as the
+                        # distinctive combination appears; otherwise the UI
+                        # shows a long private monologue and then replaces it
+                        # during final sanitization.
+                        if internal_text_blocked:
+                            state["reasoning"].append(update.text)
+                            yield _sse("reasoning", {"text": update.text})
+                            continue
+                        clean_delta = diagnostic_filter.feed(update.text)
+                        if not clean_delta:
+                            continue
+                        state["text"].append(clean_delta)
                         visible = "".join(state["text"])
-                        if _INTERNAL_DIAGNOSTIC_RE.search(visible):
-                            # A provider may reveal an internal tool diagnostic over
-                            # several deltas. Replace the accumulated visible answer
-                            # immediately so it cannot remain in the browser DOM.
-                            replacement = _HOST_ACTION_REPLY if re.search(
-                                r"run_on_computer|files_on_computer|unreachable|connection attempts",
-                                visible,
-                                re.IGNORECASE,
-                            ) else _INTERNAL_FAILURE_REPLY
-                            state["text"][:] = [replacement]
-                            yield _sse("delta", {"text": replacement})
+                        reasoning_match = _looks_like_internal_reasoning(visible)
+                        if reasoning_match:
+                            # Scratchpad is private; ordinary tool descriptions
+                            # and diagnostics must never stop further deltas.
+                            internal_text_blocked = True
+                            match_start = max(0, len(visible) - len(clean_delta))
+                            prefix = visible[:match_start].rstrip()
+                            state["text"][:] = [prefix] if prefix else []
+                            state["reasoning"].append(visible[match_start:])
+                            yield _sse("reasoning", {"text": visible[match_start:]})
                         else:
-                            yield _sse("delta", {"text": update.text})
+                            yield _sse("delta", {"text": clean_delta})
                     elif update.kind == "reasoning":
                         # **思考过程走独立通道**：它不是答复。前端折叠展示在耗时那一行下面，
                         # 落盘也单独存一个字段。此前它只被收集、最后被塞进 content 冒充正文，
                         # 结果「界面上看到的回答」和「库里存的」不是同一个东西。
                         state["reasoning"].append(update.text)
-                        yield _sse("reasoning", {"text": update.text})
+                        summary = str(getattr(update, "summary", "") or "").strip()
+                        if summary:
+                            reasoning_summaries.append(summary)
+                        yield _reasoning_sse(update)
                     elif update.kind == "done":
                         round_result = update.result
+                if not internal_text_blocked:
+                    tail = diagnostic_filter.feed("", final=True)
+                    if tail:
+                        state["text"].append(tail)
+                        yield _sse("delta", {"text": tail})
                 break
             except LLMError as exc:
+                if not internal_text_blocked:
+                    tail = diagnostic_filter.feed("", final=True)
+                    if tail:
+                        state["text"].append(tail)
+                        yield _sse("delta", {"text": tail})
                 emitted = len(state["text"]) > emitted_before
                 # 自愈：实测最常见的 400（reasoning_content 没回传）修完就能过。
                 healed = repair_reasoning_echo(messages_now, ref) if not emitted else 0
                 logger.warning(
                     "模型这一跳失败（第 %d/%d 次，已上屏=%s，自愈修了 %d 条）：%s",
                     attempt,
-                    MODEL_ROUND_MAX_ATTEMPTS,
+                    attempt_limit,
                     emitted,
                     healed,
                     exc,
                 )
-                if attempt < MODEL_ROUND_MAX_ATTEMPTS and not emitted:
+                if attempt < attempt_limit and not emitted:
                     retry_row = {
                         "kind": "system",
                         "tone": "warn",
-                        "text": (
-                            f"模型这一跳没有成功（{type(exc).__name__}），"
-                            f"已自动修正报文形状并重试（第 {attempt + 1}/{MODEL_ROUND_MAX_ATTEMPTS} 次）。"
-                        ),
+                        "text": "模型这一跳没有完成，正在自动修正请求并重试本轮回答。",
                     }
                     rows.append(retry_row)
                     yield _sse("row", {"row": retry_row})
@@ -916,15 +1087,42 @@ async def _agent_loop(
                 # 如实记下，交给调用方落成一句说完的话。
                 state["soft_failure"] = str(exc)
                 break
+            except Exception as exc:  # noqa: BLE001 - provider 边界异常也必须可恢复
+                # 传输层通常会把网络错误归一为 LLMError，但第三方适配器或自定义
+                # provider 仍可能直接抛出 TimeoutError/协议解析异常。它们不应绕过
+                # 同一套重试与模型收尾路径，否则用户会看到半截正文后直接中断。
+                if not internal_text_blocked:
+                    tail = diagnostic_filter.feed("", final=True)
+                    if tail:
+                        state["text"].append(tail)
+                        yield _sse("delta", {"text": tail})
+                emitted = len(state["text"]) > emitted_before
+                logger.warning(
+                    "模型这一跳出现未归类异常（第 %d/%d 次，已上屏=%s）：%s",
+                    attempt,
+                    attempt_limit,
+                    emitted,
+                    exc,
+                )
+                if attempt < attempt_limit and not emitted:
+                    retry_row = {
+                        "kind": "system",
+                        "tone": "warn",
+                        "text": "模型连接没有完成，正在自动重试本轮回答。",
+                    }
+                    rows.append(retry_row)
+                    yield _sse("row", {"row": retry_row})
+                    continue
+                # 不把第三方异常原样暴露给前端；交给 finally 中的 phrasing.say
+                # 生成面向研究者的正文收尾，保持与 LLMError 路径一致。
+                state["soft_failure"] = f"{type(exc).__name__}: {exc}"
+                break
 
         if state.get("soft_failure"):
-            fail_row = {
-                "kind": "system",
-                "tone": "warn",
-                "text": "本轮未拿到模型的完整回答，已在正文里如实说明（没有丢已经跑过的步骤）。",
-            }
-            rows.append(fail_row)
-            yield _sse("row", {"row": fail_row})
+            # The failure is an implementation detail.  The caller asks the
+            # model for a reader-facing recovery paragraph; exposing a fixed
+            # backend warning here made the UI look like a debug console and
+            # could be mistaken for the assistant's answer.
             break
 
         if round_result is not None:
@@ -935,6 +1133,20 @@ async def _agent_loop(
             prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
             if prompt_tokens:
                 meter.calibrate(prompt_tokens=prompt_tokens, estimated=estimate_before)
+            # Some providers send reasoning only in the final message rather
+            # than as deltas. Surface it through the same independent channel
+            # without copying it into the tool activity rows.
+            raw_result = getattr(round_result, "raw", None) or {}
+            final_reasoning = str(raw_result.get("reasoning") or "").strip()
+            if final_reasoning and not state["reasoning"][reasoning_from:]:
+                state["reasoning"].append(final_reasoning)
+                final_summary = str(raw_result.get("reasoning_summary") or "").strip()
+                if final_summary:
+                    reasoning_summaries.append(final_summary)
+                payload = {"text": final_reasoning, "status": "completed"}
+                if final_summary:
+                    payload["summary"] = final_summary
+                yield _sse("reasoning", payload)
         calls = agent_tools.normalize_tool_calls(getattr(round_result, "tool_calls", None) or [])
         if not calls:
             # A completed assistant message is part of the resumable protocol
@@ -980,16 +1192,6 @@ async def _agent_loop(
         messages_now.append(assistant_call)
         save_history()
 
-        # **这一轮的思考也落成一行**（2026-09-24 研究者要求）：
-        # 原来整个回合的思考只存在 turn.reasoning 里，界面只能把它整段堆在正文最上方；
-        # 落成行以后，它就能跟在它后面那些过程行**按顺序交叉展示**
-        # （前端按 `kind === 'reasoning'` 渲染成一段可折叠的思考）。
-        # ⚠️ 顺序要紧：必须在本轮的工具行之前 yield，否则思考会跑到自己的动作后面。
-        if round_reasoning:
-            reasoning_row = {"kind": "reasoning", "tone": "idle", "text": round_reasoning}
-            rows.append(reasoning_row)
-            yield _sse("row", {"row": reasoning_row})
-
         stopped_for_approval = False
         for call in calls:
             tool_calls_done += 1
@@ -1004,7 +1206,9 @@ async def _agent_loop(
                 # **没有商量余地的事不进批准队列**：直接拒绝，把原因如实回给模型，
                 # 并落一行过程行 —— 研究者看得到"它想干什么、为什么被挡"。
                 refused = {"ok": False, "error": verdict.message, "refused": True}
-                row = agent_tools.tool_row(call, "err", verdict.message)
+                row = _annotate_tool_row(
+                    agent_tools.tool_row(call, "err", verdict.message), call, "err"
+                )
                 rows.append(row)
                 yield _sse("row", {"row": row})
                 messages_now.append(
@@ -1018,9 +1222,7 @@ async def _agent_loop(
             if verdict.needs_approval or not verdict.harmless:
                 # 本对话当前的授权（**每轮重读**：研究者中途拨开关要立刻生效）
                 high_risk = verdict.needs_approval
-                # 三档授权：本对话默认允许（含高危）/ 完全访问模式 / **按工具授权**
-                # （用户口径 2026-09-25：批准一次命令 = 本对话内允许这个工具，换参数不再问；
-                #  高危永远逐次批准）。
+                # 两种执行语义：普通模式逐次人工批准，完全访问模式自动批准；执行范围一致。
                 allowed_by_grant = agent_approvals.allows(
                     grants_now, high_risk=high_risk, tool=tool_name
                 )
@@ -1039,6 +1241,9 @@ async def _agent_loop(
                     # 刷新后凭它重建）也发 approval（前端据此渲染按钮）——
                     # 只发 SSE 不落盘的话，刷新后卡片刻凭空消失，而库里留着一句"等待批准"。
                     card = agent_tools.approval_row(request)
+                    card["tool_name"] = tool_name
+                    card["tool_label"] = agent_tools.TOOL_LABELS.get(tool_name, tool_name or "工具")
+                    card["tool_status"] = "waiting_approval"
                     rows.append(card)
                     yield _sse("row", {"row": card})
                     yield _sse("approval", card)
@@ -1052,7 +1257,9 @@ async def _agent_loop(
             else:
                 start_detail = ""
                 grant_token = None
-            start_row = agent_tools.tool_row(call, "start", start_detail)
+            start_row = _annotate_tool_row(
+                agent_tools.tool_row(call, "start", start_detail), call, "start"
+            )
             rows.append(start_row)
             yield _sse("row", {"row": start_row})
             payload_out, summary = await agent_tools.run_tool_call(
@@ -1060,9 +1267,10 @@ async def _agent_loop(
                 access_mode="full" if grants_now.get(agent_approvals.GRANT_FULL_ACCESS) else "workspace",
                 workspace_root=workspace_root,
             )
-            end_row = agent_tools.tool_row(
+            end_status = "ok" if payload_out.get("ok") else "err"
+            end_row = _annotate_tool_row(agent_tools.tool_row(
                 call,
-                "ok" if payload_out.get("ok") else "err",
+                end_status,
                 summary,
                 # 搜索结果挂在这一行上，界面才能画折叠面板（行随会话落盘）
                 search=agent_tools.search_row_payload(
@@ -1070,7 +1278,8 @@ async def _agent_loop(
                     _tool_arguments(call),
                     (payload_out.get("result") or {}) if isinstance(payload_out.get("result"), dict) else {},
                 ),
-            )
+            ), call, end_status)
+            end_row.update(agent_tools.tool_execution_details(payload_out))
             rows.append(end_row)
             yield _sse("row", {"row": end_row})
             messages_now.append(
@@ -1116,7 +1325,10 @@ async def _agent_loop(
                 yield _sse("delta", {"text": update.text})
             elif update.kind == "reasoning":
                 state["reasoning"].append(update.text)
-                yield _sse("reasoning", {"text": update.text})
+                summary = str(getattr(update, "summary", "") or "").strip()
+                if summary:
+                    reasoning_summaries.append(summary)
+                yield _reasoning_sse(update)
             elif update.kind == "done":
                 state["result"] = update.result
         wrap_content = str(getattr(state.get("result"), "content", "") or "")
@@ -1135,74 +1347,6 @@ def _streaming(source: AsyncIterator[str]) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache, no-transform", "Connection": "keep-alive"},
     )
-
-
-async def _stream_fast_simple(
-    *, conversation: dict[str, Any], conversation_id: str, text: str, reply: str
-) -> AsyncIterator[str]:
-    """Persist and stream a deterministic social reply without provider latency."""
-
-    started = time.perf_counter()
-    reply_content = _sanitize_assistant_content(reply)
-    model_ref = conversation.get("model_ref")
-    model_id = str(model_ref or "").split(":", 1)[-1]
-    provider = str(model_ref or "").split(":", 1)[0]
-    duration_ms = 0
-    persisted = False
-
-    def persist(*, interrupted: bool) -> None:
-        nonlocal duration_ms, persisted
-        if persisted:
-            return
-        duration_ms = int((time.perf_counter() - started) * 1000)
-        conversations.append_turns(
-            conversation,
-            [
-                {"role": "user", "content": text},
-                {
-                    "role": "assistant",
-                    "content": reply_content,
-                    "model_id": model_id,
-                    "duration_ms": duration_ms,
-                    "interrupted": interrupted or None,
-                },
-            ],
-        )
-        history = conversations.context_messages(conversation)
-        conversations.update_agent_state(conversation, history)
-        conversations.write(conversation)
-        persisted = True
-
-    try:
-        yield _sse(
-            "meta",
-            {
-                "conversation_id": conversation_id,
-                "project_id": conversation.get("project_id"),
-                "model_ref": model_ref,
-                "model_id": model_id,
-                "title": conversation.get("title"),
-                "turn_count": len(conversation.get("turns") or []),
-            },
-        )
-        yield _sse("delta", {"text": reply_content})
-        persist(interrupted=False)
-        yield _sse(
-            "done",
-            {
-                "conversation_id": conversation_id,
-                "content": reply_content,
-                "duration_ms": duration_ms,
-                "model_id": model_id,
-                "model_ref": model_ref,
-                "provider": provider,
-                "finish_reason": "stop",
-            },
-        )
-    finally:
-        # A browser navigation can close the stream at either yield. Keep the
-        # user's turn recoverable even when the client never receives `done`.
-        persist(interrupted=not persisted)
 
 
 async def _resolve_model_ref(model_config_id: int, model_id: str) -> str:
@@ -1284,6 +1428,12 @@ def _truncate_for_edit(conversation: dict[str, Any] | None, replace_from: int | 
         )
     if (turns[replace_from] or {}).get("role") != "user":
         raise _error(422, "not_a_user_turn", "只能编辑你自己发过的消息")
+    last_user_index = max(
+        (index for index, turn in enumerate(turns) if (turn or {}).get("role") == "user"),
+        default=-1,
+    )
+    if replace_from != last_user_index:
+        raise _error(422, "only_latest_user_turn_editable", "只能编辑最后一条用户消息")
     user_turn_index = sum(1 for turn in turns[:replace_from] if (turn or {}).get("role") == "user")
     conversations.truncate_agent_history_from_user(conversation, user_turn_index)
     conversations.truncate_from(conversation, replace_from)
@@ -1297,107 +1447,126 @@ def _truncate_for_edit(conversation: dict[str, Any] | None, replace_from: int | 
     dependencies=[Depends(require_owner)],
 )
 async def home_chat(payload: HomeChatRequest) -> HomeChatResponse:
-    text = payload.text.strip()
-    if not text:
-        raise _error(422, "empty_text", "请输入内容后再发送")
+    async with home_turns.write_lock(payload.conversation_id):
+        if payload.conversation_id and home_turns.active(payload.conversation_id):
+            raise _error(409, "turn_in_progress", "当前对话仍在运行")
+        text, user_content, attachment_metadata = _prepare_home_message(payload)
+        user_ts = _turn_timestamp()
 
-    ref = await _resolve_model_ref(payload.model_config_id, payload.model_id)
+        ref = await _resolve_model_ref(payload.model_config_id, payload.model_id)
 
-    conversation = conversations.read(payload.conversation_id) if payload.conversation_id else None
-    # 编辑重开：先校验并截断（会话不存在/下标越界都不会先建出空会话）
-    is_edit = _truncate_for_edit(conversation, payload.replace_from)
-
-    # 1) 标题：失败只降级，不让整次请求失败。编辑重开不动标题 —— 用户改的是正文，
-    #    这次会话的主题没变（也避免"编辑一下标题就换了"）。
-    if is_edit and conversation is not None:
-        title = str(conversation.get("title") or text[:TITLE_MAX_CHARS])
-        title_source, title_note = "kept", None
-    else:
-        title, title_source, title_note = await _generate_title(text, ref)
-
-    # 2) 正式回答：失败必须如实抛出（不能伪装成功）
-    #    带上下文：同一会话的历史轮次（实现「接着上次继续」；编辑重开后即为截断后的历史）
-    history = (
-        _repair_tool_call_pairs(conversations.context_messages(conversation))
-        if conversation
-        else []
-    )
-    request_messages = [
-        {"role": "system", "content": reply_system_prompt(conversation) + skills_system_block()},
-        *history,
-        {"role": "user", "content": text},
-    ]
-    try:
-        reply_result = await adapter.chat(
-            request_messages,
-            model_ref=ref,
-            purpose="home_reply",
-            allow_fallback=False,
+        conversation = conversations.read(payload.conversation_id) if payload.conversation_id else None
+        prior_attachment_blocks, prior_attachment_metadata = _previous_attachment_content(
+            conversation, payload.replace_from
         )
-    except LLMError as exc:
-        raise _error(
-            status.HTTP_502_BAD_GATEWAY,
-            getattr(exc, "code", "llm_failed") or "llm_failed",
-            str(exc),
-            {"model_ref": ref, "type": type(exc).__name__},
-        ) from exc
+        if prior_attachment_blocks and not attachment_metadata:
+            user_content = ([{"type": "text", "text": text}] if text else []) + prior_attachment_blocks
+            attachment_metadata = prior_attachment_metadata
+        # 编辑重开：先校验并截断（会话不存在/下标越界都不会先建出空会话）
+        is_edit = _truncate_for_edit(conversation, payload.replace_from)
 
-    # 3) 落盘：新会话用模型给的标题建，已知会话则只补这一轮（编辑重开时标题保持不变）
-    if conversation is None:
-        workspace_dir = await _workspace_dir(payload.project_id)
-        conversation = conversations.create(
+        # 1) 标题：失败只降级，不让整次请求失败。编辑重开不动标题 —— 用户改的是正文，
+        #    这次会话的主题没变（也避免"编辑一下标题就换了"）。
+        if is_edit and conversation is not None:
+            title = str(conversation.get("title") or text[:TITLE_MAX_CHARS])
+            title_source, title_note = "kept", None
+        else:
+            title, title_source, title_note = await _generate_title(text, ref)
+
+        # 2) 正式回答：失败必须如实抛出（不能伪装成功）
+        #    带上下文：同一会话的历史轮次（实现「接着上次继续」；编辑重开后即为截断后的历史）
+        history = (
+            _repair_tool_call_pairs(conversations.context_messages(conversation))
+            if conversation
+            else []
+        )
+        request_messages = [
+            {"role": "system", "content": reply_system_prompt(conversation) + skills_system_block()},
+            *history,
+            {"role": "user", "content": user_content},
+        ]
+        try:
+            reply_result = await adapter.chat(
+                request_messages,
+                model_ref=ref,
+                purpose="home_reply",
+                allow_fallback=False,
+            )
+        except LLMError as exc:
+            raise _error(
+                status.HTTP_502_BAD_GATEWAY,
+                getattr(exc, "code", "llm_failed") or "llm_failed",
+                str(exc),
+                {"model_ref": ref, "type": type(exc).__name__},
+            ) from exc
+
+        # 3) 落盘：新会话用模型给的标题建，已知会话则只补这一轮（编辑重开时标题保持不变）
+        if conversation is None:
+            workspace_dir = await _workspace_dir(payload.project_id)
+            conversation = conversations.create(
+                title=title,
+                model_ref=ref,
+                project_id=payload.project_id,
+                workspace_dir=workspace_dir,
+            )
+        elif not is_edit:
+            conversations.rename(str(conversation["id"]), title)
+        reply_content = _sanitize_assistant_content(reply_result.content or "")
+        raw_reasoning = str((getattr(reply_result, "raw", None) or {}).get("reasoning") or "").strip()
+        reasoning_summary = str(
+            (getattr(reply_result, "raw", None) or {}).get("reasoning_summary") or ""
+        ).strip()
+        conversations.append_turns(
+            conversation,
+            [
+                {
+                    "role": "user",
+                    "content": text,
+                    "ts": user_ts,
+                    "attachments": attachment_metadata,
+                },
+                {
+                    "role": "assistant",
+                    "content": reply_content,
+                    "model_id": reply_result.model_id,
+                    "duration_ms": reply_result.duration_ms,
+                    "reasoning": raw_reasoning or None,
+                    "reasoning_summary": reasoning_summary or None,
+                    "ts": _turn_timestamp(),
+                },
+            ],
+        )
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": reply_content,
+        }
+        if raw_reasoning:
+            assistant_message["reasoning_content"] = raw_reasoning
+        conversations.update_agent_state(
+            conversation,
+            [*history, {"role": "user", "content": user_content}, assistant_message],
+        )
+        conversations.write(conversation)
+
+        usage = reply_result.usage
+        return HomeChatResponse(
             title=title,
-            model_ref=ref,
-            project_id=payload.project_id,
-            workspace_dir=workspace_dir,
-        )
-    elif not is_edit:
-        conversations.rename(str(conversation["id"]), title)
-    reply_content = _sanitize_assistant_content(reply_result.content or "")
-    conversations.append_turns(
-        conversation,
-        [
-            {"role": "user", "content": text},
-            {
-                "role": "assistant",
-                "content": reply_content,
-                "model_id": reply_result.model_id,
-                "duration_ms": reply_result.duration_ms,
+            title_source=title_source,
+            title_note=title_note,
+            conversation_id=str(conversation["id"]),
+            project_id=conversation.get("project_id"),
+            reply=reply_content,
+            model_ref=reply_result.model_ref,
+            provider=reply_result.provider,
+            model_id=reply_result.model_id,
+            cost_usd=reply_result.cost_usd,
+            cost_unknown_reason=reply_result.cost_unknown_reason,
+            usage={
+                "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                "completion_tokens": getattr(usage, "completion_tokens", None),
+                "total_tokens": getattr(usage, "total_tokens", None),
             },
-        ],
-    )
-    assistant_message: dict[str, Any] = {
-        "role": "assistant",
-        "content": reply_content,
-    }
-    raw_reasoning = str((getattr(reply_result, "raw", None) or {}).get("reasoning") or "").strip()
-    if raw_reasoning:
-        assistant_message["reasoning_content"] = raw_reasoning
-    conversations.update_agent_state(
-        conversation,
-        [*history, {"role": "user", "content": text}, assistant_message],
-    )
-    conversations.write(conversation)
-
-    usage = reply_result.usage
-    return HomeChatResponse(
-        title=title,
-        title_source=title_source,
-        title_note=title_note,
-        conversation_id=str(conversation["id"]),
-        project_id=conversation.get("project_id"),
-        reply=reply_content,
-        model_ref=reply_result.model_ref,
-        provider=reply_result.provider,
-        model_id=reply_result.model_id,
-        cost_usd=reply_result.cost_usd,
-        cost_unknown_reason=reply_result.cost_unknown_reason,
-        usage={
-            "prompt_tokens": getattr(usage, "prompt_tokens", None),
-            "completion_tokens": getattr(usage, "completion_tokens", None),
-            "total_tokens": getattr(usage, "total_tokens", None),
-        },
-    )
+        )
 
 
 @router.post(
@@ -1407,79 +1576,82 @@ async def home_chat(payload: HomeChatRequest) -> HomeChatResponse:
     dependencies=[Depends(require_owner)],
 )
 async def compact_chat(payload: CompactChatRequest) -> CompactChatResponse:
-    """Codex-style manual compaction.
+    async with home_turns.write_lock(payload.conversation_id):
+        """Codex-style manual compaction.
 
-    The active history is replaced by a short, model-readable summary while
-    the pre-compaction protocol messages remain in a checkpoint snapshot.
-    """
+        The active history is replaced by a short, model-readable summary while
+        the pre-compaction protocol messages remain in a checkpoint snapshot.
+        """
 
-    record = conversations.read(payload.conversation_id)
-    if record is None:
-        raise _error(status.HTTP_404_NOT_FOUND, "conversation_not_found", "会话不存在")
-    ref = await _resolve_model_ref(payload.model_config_id, payload.model_id)
-    from services import context_compaction as compaction_mod
-    from services import context_meter
+        record = conversations.read(payload.conversation_id)
+        if record is None:
+            raise _error(status.HTTP_404_NOT_FOUND, "conversation_not_found", "会话不存在")
+        ref = await _resolve_model_ref(payload.model_config_id, payload.model_id)
+        if home_turns.active(payload.conversation_id):
+            raise _error(409, "turn_in_progress", "请等待当前轮次结束后再压缩上下文")
+        from services import context_compaction as compaction_mod
+        from services import context_meter
 
-    messages = conversations.context_messages(record)
-    span = compaction_mod.select_summary_span(messages)
-    if span is None:
+        messages = conversations.context_messages(record)
+        span = compaction_mod.select_summary_span(messages)
+        if span is None:
+            return CompactChatResponse(
+                ok=True,
+                conversation_id=payload.conversation_id,
+                changed=False,
+                reason="nothing_to_compact",
+                context=context_meter.get_meter().breakdown(messages),
+            )
+        summary_record = await compaction_mod.summarize_early_turns(
+            messages,
+            span=span,
+            model_ref=ref,
+        )
+        if summary_record is None:
+            raise _error(
+                status.HTTP_502_BAD_GATEWAY,
+                "compaction_failed",
+                "上下文摘要没有返回有效内容，原始会话保持不变",
+            )
+        summary_record["summary"] = _sanitize_compaction_summary(str(summary_record.get("summary") or ""))
+        before = conversations.protocol_messages(messages)
+        freed_chars = compaction_mod.apply_turn_summary(
+            messages,
+            span=span,
+            summary=str(summary_record["summary"]),
+        )
+        checkpoint_id = f"cp-manual-{time.time_ns()}"
+        summary_record.update(
+            {
+                "checkpoint_id": checkpoint_id,
+                "trigger": "manual",
+                "before_message_count": len(before),
+                "freed_chars": freed_chars,
+            }
+        )
+        record["compactions"] = [*(record.get("compactions") or []), summary_record]
+        conversations.update_agent_state(
+            record,
+            messages,
+            checkpoints=[summary_record],
+            snapshots=[
+                {
+                    "id": checkpoint_id,
+                    "created_at": time.time(),
+                    "reason": "manual",
+                    "messages": before,
+                }
+            ],
+        )
+        conversations.write(record)
         return CompactChatResponse(
             ok=True,
             conversation_id=payload.conversation_id,
-            changed=False,
-            reason="nothing_to_compact",
+            changed=True,
+            checkpoint_id=checkpoint_id,
+            summary=str(summary_record["summary"]),
             context=context_meter.get_meter().breakdown(messages),
         )
-    summary_record = await compaction_mod.summarize_early_turns(
-        messages,
-        span=span,
-        model_ref=ref,
-    )
-    if summary_record is None:
-        raise _error(
-            status.HTTP_502_BAD_GATEWAY,
-            "compaction_failed",
-            "上下文摘要没有返回有效内容，原始会话保持不变",
-        )
-    summary_record["summary"] = _sanitize_compaction_summary(str(summary_record.get("summary") or ""))
-    before = conversations.protocol_messages(messages)
-    freed_chars = compaction_mod.apply_turn_summary(
-        messages,
-        span=span,
-        summary=str(summary_record["summary"]),
-    )
-    checkpoint_id = f"cp-manual-{time.time_ns()}"
-    summary_record.update(
-        {
-            "checkpoint_id": checkpoint_id,
-            "trigger": "manual",
-            "before_message_count": len(before),
-            "freed_chars": freed_chars,
-        }
-    )
-    record["compactions"] = [*(record.get("compactions") or []), summary_record]
-    conversations.update_agent_state(
-        record,
-        messages,
-        checkpoints=[summary_record],
-        snapshots=[
-            {
-                "id": checkpoint_id,
-                "created_at": time.time(),
-                "reason": "manual",
-                "messages": before,
-            }
-        ],
-    )
-    conversations.write(record)
-    return CompactChatResponse(
-        ok=True,
-        conversation_id=payload.conversation_id,
-        changed=True,
-        checkpoint_id=checkpoint_id,
-        summary=str(summary_record["summary"]),
-        context=context_meter.get_meter().breakdown(messages),
-    )
 
 
 @router.post(
@@ -1488,492 +1660,520 @@ async def compact_chat(payload: CompactChatRequest) -> CompactChatResponse:
     dependencies=[Depends(require_owner)],
 )
 async def home_chat_stream(payload: HomeChatRequest, request: Request) -> StreamingResponse:
-    """首页对话的流式版本。
+    async with home_turns.write_lock(payload.conversation_id):
+        """首页对话的流式版本。
 
-    事件序列：
+        事件序列：
 
-    - ``meta``：会话 id / 模型 / 项目（前端据此立刻把「新对话」挂到左栏）
-    - ``delta``：正文增量（**逐段追加渲染**）
-    - ``done``：耗时 / 用量 / 成本（``cost_usd`` 单价缺失时为 null，不估算）
-    - ``title``：标题（模型生成完成或如实降级为需求前 20 字）
-    - ``error``：建连失败或流中途断线；**此时 delta 已推的部分仍然有效并已落盘**
+        - ``meta``：会话 id / 模型 / 项目（前端据此立刻把「新对话」挂到左栏）
+        - ``delta``：正文增量（**逐段追加渲染**）
+        - ``done``：耗时 / 用量 / 成本（``cost_usd`` 单价缺失时为 null，不估算）
+        - ``title``：标题（模型生成完成或如实降级为需求前 20 字）
+        - ``error``：建连失败或流中途断线；**此时 delta 已推的部分仍然有效并已落盘**
 
-    落盘在 ``finally`` 里做：正常结束、报错、客户端断开三种情况都会把已生成的部分写进
-    会话文件——**不白花 token**，也不允许"界面显示了但记录里没有"。
+        落盘在 ``finally`` 里做：正常结束、报错、客户端断开三种情况都会把已生成的部分写进
+        会话文件——**不白花 token**，也不允许"界面显示了但记录里没有"。
 
-    ``replace_from`` 非空时为**编辑重开**：先校验（会话必须存在、下标必须指向 user 轮次，
-    否则 404 / 422）再丢弃该条及其后的所有轮次，然后以 ``text`` 作为新的该条重问一次。
-    这种情况下即使一个字都没生成也会落盘 —— 用户改过的正文必须留痕。
-    """
-    text = payload.text.strip()
-    if not text:
-        raise _error(422, "empty_text", "请输入内容后再发送")
-
-    ref = await _resolve_model_ref(payload.model_config_id, payload.model_id)
-
-    conversation = conversations.read(payload.conversation_id) if payload.conversation_id else None
-    # 编辑重开：先校验并截断，再建会话（会话不存在/下标越界都不会先建出空会话）
-    is_edit = _truncate_for_edit(conversation, payload.replace_from)
-    is_new = conversation is None
-    if conversation is None:
-        workspace_dir = await _workspace_dir(payload.project_id)
-        conversation = conversations.create(
-            title=text[:TITLE_MAX_CHARS],
-            model_ref=ref,
-            project_id=payload.project_id,
-            workspace_dir=workspace_dir,
-            persist=False,
-        )
-    conversation_id = str(conversation["id"])
-    history = _repair_tool_call_pairs(conversations.context_messages(conversation))
-    simple_mode = _is_simple_question(text)
-    fast_reply = _fast_simple_reply(text)
-
-    # Greetings and sign-offs are social acknowledgements, not research tasks.
-    # Complete them locally so the first visible token is immediate even when
-    # the configured provider is slow or temporarily unavailable.
-    if fast_reply is not None:
-        return _streaming(
-            _stream_fast_simple(
-                conversation=conversation,
-                conversation_id=conversation_id,
-                text=text,
-                reply=fast_reply,
+        ``replace_from`` 非空时为**编辑重开**：先校验（会话必须存在、下标必须指向 user 轮次，
+        否则 404 / 422）再丢弃该条及其后的所有轮次，然后以 ``text`` 作为新的该条重问一次。
+        这种情况下即使一个字都没生成也会落盘 —— 用户改过的正文必须留痕。
+        """
+        if payload.conversation_id and home_turns.active(payload.conversation_id):
+            raise _error(
+                409, "turn_in_progress", "当前对话仍在运行，请重新连接或停止当前轮次",
+                _turn_in_progress_detail(payload.conversation_id),
             )
-        )
+        text, user_content, attachment_metadata = _prepare_home_message(payload)
+        user_ts = _turn_timestamp()
 
-    # 明确的文件/命令请求先确认本地执行环境。执行器未启动时不再让模型先
-    # 生成标题、探测工具、再等待多轮失败；用户得到一条可执行的短说明。
-    if _looks_like_host_action(text) and not await _host_executor_available():
-        return _streaming(
-            _stream_fast_simple(
-                conversation=conversation,
-                conversation_id=conversation_id,
-                text=text,
-                reply=_HOST_ACTION_REPLY,
+        ref = await _resolve_model_ref(payload.model_config_id, payload.model_id)
+
+        conversation = conversations.read(payload.conversation_id) if payload.conversation_id else None
+        prior_attachment_blocks, prior_attachment_metadata = _previous_attachment_content(
+            conversation, payload.replace_from
+        )
+        if prior_attachment_blocks and not attachment_metadata:
+            user_content = ([{"type": "text", "text": text}] if text else []) + prior_attachment_blocks
+            attachment_metadata = prior_attachment_metadata
+        # 编辑重开：先校验并截断，再建会话（会话不存在/下标越界都不会先建出空会话）
+        is_edit = _truncate_for_edit(conversation, payload.replace_from)
+        is_new = conversation is None
+        if conversation is None:
+            workspace_dir = await _workspace_dir(payload.project_id)
+            conversation = conversations.create(
+                title=text[:TITLE_MAX_CHARS],
+                model_ref=ref,
+                project_id=payload.project_id,
+                workspace_dir=workspace_dir,
+                persist=False,
             )
-        )
+        conversation_id = str(conversation["id"])
+        history = _repair_tool_call_pairs(conversations.context_messages(conversation))
+        simple_mode = _is_simple_question(text)
+        # Natural-language mentions of creating projects or writing files are not
+        # execution requests. Executor recovery belongs to the actual tool call;
+        # never terminate a model answer based on a guessed intent/health probe.
 
-    # ------------------------------------------------------------------ #
-    # 意图路由：**对话就是 agent 的入口**
-    #   guide  → 模糊引导词且还没开链：给引导词 + 三个可点出口
-    #   node   → 明确执行意图（「开始文献调研」）：直接跑节点，过程回到对话
-    #   query  → 查询本地数据：确定性只读查询 + 结果卡片
-    #   其余    → 通用回答（下面原有的流式路径）
-    # 前三条都是**确定性**的（不再多花一次模型调用去措辞），费用与措辞都可控。
-    # ------------------------------------------------------------------ #
-    scope: dict[str, Any] = {
-        "conversation": conversation,
-        "project_id": conversation.get("project_id"),
-        "text": text,
-    }
+        # ------------------------------------------------------------------ #
+        # 意图路由：**对话就是 agent 的入口**
+        #   guide  → 明确启动研究但缺少唯一必要的主题：只问一个问题
+        #   node   → 明确执行意图：直接跑真实节点
+        #   query  → 查询本地数据：确定性只读查询 + 结果卡片
+        #   其余    → 通用回答（下面原有的流式路径）
+        # ------------------------------------------------------------------ #
+        base_count = len(conversation.get("turns") or [])
 
-    if dialog.is_plain_chat_reply(text):
-        return _streaming(
-            dialog.stream_plain_chat(conversation_id=conversation_id, scope=scope)
-        )
+        def owned(source: AsyncIterator[str], kind: str = "chat") -> StreamingResponse:
+            try:
+                owner = home_turns.start(conversation_id, source, kind=kind, base_count=base_count)
+            except ValueError:
+                raise _error(
+                    409, "turn_in_progress", "当前对话仍在运行，请先重新连接",
+                    _turn_in_progress_detail(conversation_id),
+                ) from None
+            return _streaming(home_turns.subscribe(conversation_id, owner.turn_id))
 
-    # ------------------------------------------------------------------ #
-    # 「是否现在开始研究链？默认现在开始」怎么落地（用户口径 2026-09-26）
-    #
-    # 分工写清楚，免得两边都当成"写死规则"：
-    #   · 邀请**发不发**由**提示词**决定（模型自己判断）—— 程序不代它说这句话；
-    #   · 程序只做**事实判断**：上一轮助手到底发出邀请没有（读它的正文，不存标志位）；
-    #   · 发过 + 这一条是明确的确认短语 ⇒ 算同意，直接按「开始文献调研」走；
-    #     普通追问、补充信息和上下文续问不算确认，避免意外启动长时间研究链；
-    #   · 发过 + 明确说不要 ⇒ 走既有的「本对话声明为普通对话」（`plain_chat`，永久不再提）；
-    #   · 没发过邀请 ⇒ 什么都不做（免得研究者随口一句就被拉进研究链）。
-    # ------------------------------------------------------------------ #
-    offer_live = (
-        not conversation.get("plain_chat")
-        and dialog.mentions_chain_offer(_last_assistant_text(conversation))
-        and not await _chained(conversation_id)
-    )
-    if offer_live:
-        if dialog.is_chain_denial(text):
-            return _streaming(
+        scope: dict[str, Any] = {
+            "conversation": conversation,
+            "project_id": conversation.get("project_id"),
+            "text": text,
+        }
+
+        if not attachment_metadata and dialog.is_plain_chat_reply(text):
+            return owned(
                 dialog.stream_plain_chat(conversation_id=conversation_id, scope=scope)
             )
-        if dialog.is_chain_acceptance(text):
-            return _streaming(
-                dialog.stream_node(
-                    conversation_id=conversation_id,
-                    text=text,
-                    scope=scope,
-                    routing=intent_mod.Intent(
-                        kind="node",
-                        node="literature_review",
-                        reason="研究者明确接受研究链邀请",
-                    ),
-                )
+
+        if not attachment_metadata and not simple_mode:
+            routing = await dialog.route(
+                text,
+                conversation_id,
+                # 规则兜底要用模型判一次 —— 用**这次对话选的模型**（不硬编码供应商）
+                model_ref=ref,
+                conversation=conversation,
             )
-
-    if not simple_mode:
-        routing = await dialog.route(
-            text,
-            conversation_id,
-            force_plain=bool(conversation.get("plain_chat")),
-            # 规则兜底要用模型判一次 —— 用**这次对话选的模型**（不硬编码供应商）
-            model_ref=ref,
-        )
-        if routing.kind == "guide":
-            return _streaming(dialog.stream_guide(conversation_id=conversation_id, scope=scope))
-        if routing.kind == "node":
-            return _streaming(
-                dialog.stream_node(
-                    conversation_id=conversation_id, text=text, scope=scope, routing=routing
+            if routing.kind == "guide":
+                return owned(dialog.stream_guide(conversation_id=conversation_id, scope=scope))
+            if routing.kind == "node" and routing.node in {"literature_review", "idea_and_feasibility"}:
+                return owned(
+                    dialog.stream_node(
+                        conversation_id=conversation_id, text=text, scope=scope, routing=routing
+                    )
                 )
-            )
-        if routing.kind == "query":
-            return _streaming(
-                dialog.stream_query(
-                    conversation_id=conversation_id, text=text, scope=scope, routing=routing
+            if routing.kind == "query":
+                return owned(
+                    dialog.stream_query(
+                        conversation_id=conversation_id, text=text, scope=scope, routing=routing
+                    )
                 )
-            )
 
-    async def event_source() -> AsyncIterator[str]:
-        # 首帧只建立连接，不写入新会话。浏览器可能在收到首帧后立即切页，
-        # 这时生成器会在下一个 yield 处被关闭；占位记录必须等 meta 已交付后再落盘。
-        yield ": connected\n\n"
-        yield _sse(
-            "meta",
-            {
-                "conversation_id": conversation_id,
-                "project_id": conversation.get("project_id"),
-                "model_ref": ref,
-                "model_id": payload.model_id,
-                "title": conversation.get("title"),
-                "turn_count": len(conversation.get("turns") or []),
-            },
-        )
-
-        # 只有会话 id 已经交给前端后才落下新会话占位记录。若客户端在首帧或
-        # meta 帧之间切页，生成器不会执行到这里，也就不会留下空会话。
-        if is_new:
-            conversations.write(conversation)
-
-        # 标题与正文并行：标题只在「新会话」时生成（续聊不改标题）
-        title_task: asyncio.Task[tuple[str, str, str | None]] | None = None
-        if is_new:
-            title_task = asyncio.create_task(_generate_title(text, ref))
-
-        buffer: list[str] = []
-        reasoning_buffer: list[str] = []
-        # 工具调用过程行也要**落盘**：只发 SSE 不落盘的话，刷新后这段过程凭空消失，
-        # 而库里只剩一句结论 —— 正是「显示与落盘必须一致」要防的那种不一致。
-        tool_rows: list[dict[str, Any]] = []
-        #: 本轮发生的上下文压缩记录（会话级 `compactions[]`，与过程行一起落盘）
-        compactions_out: list[dict[str, Any]] = []
-        #: 本轮里模型的**写盘/执行请求**（尚未执行）。与正文同源落进这一轮，
-        #: 这样刷新后卡片还能按原状态重建，而不是"界面上一张卡、库里什么都没有"。
-        approval_requests: list[dict[str, Any]] = []
-        #: 停下来等研究者裁决的那一条（非空 = 这一轮没有答完，在等人）
-        pending_approval: dict[str, Any] | None = None
-        #: 本轮正文是**系统说明**（模型只给了思考过程）而不是模型说的话
-        note_only = False
-        #: 非空 = 模型这一跳彻底失败、但**没有**把整轮判死（见 `MODEL_ROUND_MAX_ATTEMPTS`）。
-        #: 在 try 之前先初始化：`finally` 里要读它，不能因为"异常发生在赋值之前"而 NameError。
-        soft_failure: str | None = None
-        started = time.perf_counter()
-        result: Any = None
-        error_info: dict[str, Any] | None = None
-        aborted = False
-        state: dict[str, Any] = {
-            "text": buffer,
-            "reasoning": reasoning_buffer,
-            "result": None,
-            "pending": None,
-            "compactions": compactions_out,
-            "compaction_snapshots": [],
-            "agent_history": [],
-        }
-        try:
-            # ------------------------------------------------------------ #
-            # agent 循环：把工具摆给模型 → 收 tool_calls → 只读的经 MCP 执行、
-            # 写/执行类**只建批准请求** → 结果以 role=tool 喂回 → 再调一次，
-            # 直到模型不再要求调工具（上限防死循环）。
-            # 工具跑在 `mcp_server` 那个进程里（stdio 标准协议），边界也在那边。
-            # 循环体在 `_agent_loop`，与批准后续答共用同一份口径。
-            # 局部导入：与六环节的写法一致，避免无工具场景引入导入期依赖。
-            # ------------------------------------------------------------ #
-            from services.agent import mcp_tools as agent_tools
-
-            messages_now: list[dict[str, Any]] = [
+        async def event_source() -> AsyncIterator[str]:
+            cancel_event = asyncio.Event()
+            owner_task = asyncio.current_task()
+            if owner_task is not None:
+                _ACTIVE_HOME_TURNS[conversation_id] = (cancel_event, owner_task)
+            # 首帧只建立连接，不写入新会话。浏览器可能在收到首帧后立即切页，
+            # 这时生成器会在下一个 yield 处被关闭；占位记录必须等 meta 已交付后再落盘。
+            yield ": connected\n\n"
+            yield _sse(
+                "meta",
                 {
-                    "role": "system",
-                    "content": (
-                        (REPLY_SYSTEM + PLAIN_CHAT_SYSTEM if simple_mode else reply_system_prompt(conversation))
-                        + await research_state_block(conversation_id, conversation)
-                        + skills_system_block()
-                    ),
+                    "conversation_id": conversation_id,
+                    "project_id": conversation.get("project_id"),
+                    "model_ref": ref,
+                    "model_id": payload.model_id,
+                    "title": conversation.get("title"),
+                    "turn_count": len(conversation.get("turns") or []),
                 },
-                *history,
-                {"role": "user", "content": text},
-            ]
-            if simple_mode:
-                tool_defs = []
-            else:
+            )
+
+            # 只有会话 id 已经交给前端后才落下新会话占位记录。若客户端在首帧或
+            # meta 帧之间切页，生成器不会执行到这里，也就不会留下空会话。
+            if is_new:
+                conversations.write(conversation)
+
+            # 标题与正文并行：标题只在「新会话」时生成（续聊不改标题）
+            title_task: asyncio.Task[tuple[str, str, str | None]] | None = None
+            if is_new:
+                title_task = asyncio.create_task(_generate_title(text, ref))
+
+            buffer: list[str] = []
+            reasoning_buffer: list[str] = []
+            reasoning_summary_buffer: list[str] = []
+            # 工具调用过程行也要**落盘**：只发 SSE 不落盘的话，刷新后这段过程凭空消失，
+            # 而库里只剩一句结论 —— 正是「显示与落盘必须一致」要防的那种不一致。
+            tool_rows: list[dict[str, Any]] = []
+            #: 本轮发生的上下文压缩记录（会话级 `compactions[]`，与过程行一起落盘）
+            compactions_out: list[dict[str, Any]] = []
+            #: 本轮里模型的**写盘/执行请求**（尚未执行）。与正文同源落进这一轮，
+            #: 这样刷新后卡片还能按原状态重建，而不是"界面上一张卡、库里什么都没有"。
+            approval_requests: list[dict[str, Any]] = []
+            #: 停下来等研究者裁决的那一条（非空 = 这一轮没有答完，在等人）
+            pending_approval: dict[str, Any] | None = None
+            #: 本轮正文是**系统说明**（模型只给了思考过程）而不是模型说的话
+            note_only = False
+            #: 非空 = 模型这一跳彻底失败、但**没有**把整轮判死（见 `MODEL_ROUND_MAX_ATTEMPTS`）。
+            #: 在 try 之前先初始化：`finally` 里要读它，不能因为"异常发生在赋值之前"而 NameError。
+            soft_failure: str | None = None
+            started = time.perf_counter()
+            result: Any = None
+            error_info: dict[str, Any] | None = None
+            aborted = False
+            generator_closing = False
+            state: dict[str, Any] = {
+                "text": buffer,
+                "reasoning": reasoning_buffer,
+                "reasoning_summary": reasoning_summary_buffer,
+                "result": None,
+                "pending": None,
+                "compactions": compactions_out,
+                "compaction_snapshots": [],
+                "agent_history": [],
+                "user_ts": user_ts,
+                "attachments": attachment_metadata,
+            }
+            base_turns = list(conversation.get("turns") or [])
+            last_checkpoint = 0.0
+            state["agent_history"] = conversations.protocol_messages(history + [{"role": "user", "content": user_content}])
+            _save_stream_progress(conversation, base_turns=base_turns, text=text, state=state,
+                                  rows=tool_rows, approvals=approval_requests, model_id=payload.model_id, duration_ms=0)
+            try:
+                # ------------------------------------------------------------ #
+                # agent 循环：把工具摆给模型 → 收 tool_calls → 只读的经 MCP 执行、
+                # 写/执行类**只建批准请求** → 结果以 role=tool 喂回 → 再调一次，
+                # 直到模型不再要求调工具（上限防死循环）。
+                # 工具跑在 `mcp_server` 那个进程里（stdio 标准协议），边界也在那边。
+                # 循环体在 `_agent_loop`，与批准后续答共用同一份口径。
+                # 局部导入：与六环节的写法一致，避免无工具场景引入导入期依赖。
+                # ------------------------------------------------------------ #
+                from services.agent import mcp_tools as agent_tools
+
+                messages_now: list[dict[str, Any]] = [
+                    {
+                        "role": "system",
+                        "content": (
+                            # Short questions skip intent routing, but they still
+                            # receive the normal agent prompt and tool policy.
+                            reply_system_prompt(conversation)
+                            + await research_state_block(conversation_id, conversation)
+                            + skills_system_block()
+                            + ("\n当前对话工作目录：" + str(conversation.get("workspace_dir"))
+                               + "。所有相对路径和命令默认目录均以此为准。不要扫描其他项目；工作区拒绝时不得换到旧项目写入。"
+                               if conversation.get("workspace_dir") else "")
+                        ),
+                    },
+                    *history,
+                    {"role": "user", "content": user_content},
+                ]
                 try:
-                    tool_defs = await agent_tools.tool_schemas()
+                    # Short turns use the same model path. Read-only tools such as
+                    # the local clock remain available for factual questions.
+                    tool_defs = await agent_tools.tool_schemas(workspace_root=conversation.get("workspace_dir"))
                 except Exception as exc:  # noqa: BLE001 - 工具侧不可用不该拖垮整段对话
                     logger.warning("工具声明获取失败，本轮按无工具回答：%s", exc)
                     tool_defs = []
 
-            state.update(
-                {
-                    "agent_history": conversations.protocol_messages(messages_now),
-                }
-            )
-            async for frame in _agent_loop(
-                messages_now,
-                conversation_id=conversation_id,
-                ref=ref,
-                tool_defs=tool_defs,
-                rows=tool_rows,
-                approvals_out=approval_requests,
-                state=state,
-                workspace_root=str(conversation.get("workspace_dir") or "") or None,
-            ):
-                # 客户端断开（研究者按了「停止」、或关掉页面）→ 尽早走**正常收尾路径**。
-                # 说明：正常写法下 uvicorn/Starlette 会先在流上抛 CancelledError（下面那个
-                # except 就是兜它的），所以这里多数时候探测不到；留着是因为"先探到"能让收尾
-                # 更干净（不依赖取消）。真正保证"停止也落盘"的是 finally 里的落盘条件。
-                if await request.is_disconnected():
-                    aborted = True
-                    error_info = {
-                        "code": "client_disconnected",
-                        "message": "研究者停止了本轮生成",
-                        "kind": "ClientDisconnected",
+                # 研究确认门是服务端边界，不只是一条给模型的提示词。用户明确要求
+                # 先讨论/确认范围时，或会话仍在等待研究启动确认时，本轮不得把任何
+                # 搜索、抓取、文件或执行工具交给模型；这样即使模型误判，也不会产生
+                # 只读搜索副作用。确认后下一轮会重新发现完整工具清单。
+                if _research_gate_blocks_tools(text, conversation):
+                    tool_defs = []
+
+                state.update(
+                    {
+                        "agent_history": conversations.protocol_messages(messages_now),
                     }
-                    logger.info("首页流式：客户端断开，按中断收尾 conversation=%s", conversation_id)
-                    break
-                yield frame
-            result = state.get("result")
-            pending_approval = state.get("pending")
-            soft_failure = state.get("soft_failure")
-        except LLMError as exc:
-            aborted = True
-            error_info = {
-                "code": getattr(exc, "code", "llm_failed") or "llm_failed",
-                "message": str(exc),
-                "kind": type(exc).__name__,
-            }
-            logger.warning("首页流式调用失败 conversation=%s：%s", conversation_id, exc)
-        except asyncio.CancelledError:
-            # 客户端断开：finally 仍会把已生成的部分落盘，然后原样抛出
-            aborted = True
-            error_info = {"code": "client_disconnected", "message": "客户端已断开", "kind": "Cancelled"}
-            raise
-        except Exception as exc:  # noqa: BLE001 - 兜底：未预期异常也不该"甩个码就断"
-            # 用户口径 2026-09-26：不允许把整轮变成强制中断。分两种情况处理最诚实：
-            #   · 已经有字上屏 → 确实答了一半，如实标中断（不假装答完）；
-            #   · 一个字都没说出去 → 交给模型写一句收尾（见 finally 里的 phrasing.say）；写不出来就留空 + 一条过程行。
-            logger.exception("首页流式出现未预期异常 conversation=%s", conversation_id)
-            if buffer:
+                )
+                async for frame in _agent_loop(
+                    messages_now,
+                    conversation_id=conversation_id,
+                    ref=ref,
+                    tool_defs=tool_defs,
+                    rows=tool_rows,
+                    approvals_out=approval_requests,
+                    state=state,
+                    max_attempts=None,
+                    workspace_root=str(conversation.get("workspace_dir") or "") or None,
+                ):
+                    now = time.monotonic()
+                    if now - last_checkpoint >= 1.0:
+                        _save_stream_progress(
+                            conversation, base_turns=base_turns, text=text, state=state,
+                            rows=tool_rows, approvals=approval_requests, model_id=payload.model_id,
+                            duration_ms=int((time.perf_counter() - started) * 1000),
+                        )
+                        last_checkpoint = now
+                    yield frame
+                result = state.get("result")
+                pending_approval = state.get("pending")
+                soft_failure = state.get("soft_failure")
+            except LLMError as exc:
+                # Provider failures are recoverable at the conversation boundary.
+                # Keep the stream in a normal terminal state so the UI receives a
+                # reader-facing paragraph and one ``done`` event instead of a
+                # backend-looking error frame.
+                soft_failure = str(exc)
+                error_info = {"code": "llm_failed", "message": _public_stream_error(exc)}
+                logger.warning("首页流式调用失败 conversation=%s：%s", conversation_id, exc)
+            except GeneratorExit:
+                # ASGI subscriber shutdown is not a turn cancellation. The
+                # owner keeps running; this generator must never yield from
+                # its finally path after aclose/GeneratorExit.
+                generator_closing = True
+                raise
+            except asyncio.CancelledError:
+                # Only the durable owner is cancelled by the explicit stop
+                # endpoint. A detached subscriber never reaches this worker.
                 aborted = True
                 error_info = {
-                    "code": getattr(exc, "code", "unexpected_error") or "unexpected_error",
-                    "message": f"服务端异常：{type(exc).__name__}: {exc}",
-                    "kind": type(exc).__name__,
+                    "code": "turn_interrupted",
+                    "message": "本轮已停止",
+                    "kind": "Cancelled",
                 }
-            else:
-                soft_failure = f"服务端异常 {type(exc).__name__}：{exc}"
-        finally:
-            if aborted and title_task is not None and not title_task.done():
-                # 本轮已经失败/断开，标题结果用不上了，别留悬挂任务
-                title_task.cancel()
-            duration_ms = int((time.perf_counter() - started) * 1000)
-            generated = _sanitize_assistant_content("".join(buffer))
-            # **显示与落盘必须一致**：部分供应商只在收尾帧给正文（delta 为空），
-            # 旧代码只存 delta buffer，于是界面上有内容、库里是空串。
-            if not generated and result is not None:
-                generated = _sanitize_assistant_content(str(getattr(result, "content", "") or ""))
-            reasoning_text = "".join(reasoning_buffer)
-            if not reasoning_text and result is not None:
-                reasoning_text = str((getattr(result, "raw", None) or {}).get("reasoning") or "")
-            if REASONING_MAX_CHARS is not None and len(reasoning_text) > REASONING_MAX_CHARS:
-                reasoning_text = reasoning_text[:REASONING_MAX_CHARS] + "\n…（思考过程过长，已截断）"
-            if not generated and soft_failure and error_info is None:
-                # 模型这一跳失败 → **再要一次收尾话**（走降级链，可能是另一家供应商）。
-                # 口径 2026-09-26：对话正文一律**模型写**，程序不代它说话。
-                generated = await phrasing.say(
-                    facts=(
-                        "刚才那一次回答没能生成出来。"
-                        "请用研究者看得懂的话说明：这一轮没有拿到答复；"
-                        "已经跑过的步骤都在上面的过程里、没有丢；他可以直接再发一次，或换个说法。"
-                        "两三句话，不要提任何内部术语，也不必反复道歉。\n"
-                        f"（技术原文，仅供你判断严重程度，不要照抄）{soft_failure[:220]}"
-                    ),
-                    model_ref=ref,
-                    purpose="chat_soft_failure_note",
-                )
-            if not generated and reasoning_text and error_info is None:
-                # 模型只给了思考过程、没给正文 → 让**它自己**把结论整理成答复。
-                # 不做"程序如实说明它没说话"那种系统文案：那还是程序在代替模型说话。
-                generated = await phrasing.say(
-                    facts=(
-                        "你刚才只输出了思考过程，没有给出给研究者看的答复。"
-                        "请把结论整理成一段正常的中文答复（不要复述思考过程本身）。\n"
-                        f"你的思考过程（只作素材）：\n{reasoning_text[:4000]}"
-                    ),
-                    model_ref=ref,
-                    purpose="chat_reasoning_to_answer",
-                )
-            if not generated and error_info is None:
-                # 两条路都没拿到模型的话 → **正文留空**，只留一条过程行如实说明。
-                # 绝不拿程序话术冒充对话正文（口径 2026-09-26）。
-                blank_note = {
-                    "kind": "system",
-                    "tone": "warn",
-                    "text": "这一轮没有生成出可显示的答复；已经跑过的步骤与工具结果都在上面的过程行里，没有丢。",
-                }
-                tool_rows.append(blank_note)
-                yield _sse("row", {"row": blank_note})
-            # 有正文 → 追加本轮；无正文且无错误 → 模型真的返回空，也要如实记一条。
-            # 编辑重开时**无条件落盘**：用户改过的正文必须留痕，否则刷新后改动就凭空消失了。
-            # 等批准时也**无条件落盘**：卡片本身就是这一轮的产出（哪怕一个字都没有），
-            # 不落盘就会出现"界面上有一张待批的卡、刷新后它不见了、而工具也永远没跑"。
-            try:
-                if compactions_out:
-                    # 会话级 `compactions[]`（用户口径 2026-09-25：**新字段存摘要、原始轮次一字不改**）。
-                    # 先挂到记录上再 `append_turns`，这样"压缩 + 本轮"**一次写入**，不留半成品状态。
-                    conversation["compactions"] = [
-                        *(conversation.get("compactions") or []),
-                        *compactions_out,
-                    ]
-                # Persist the model-facing protocol history separately from the
-                # readable turns.  This is the durable resume point used by the
-                # next request, while checkpoints retain the pre-compaction view.
-                conversations.update_agent_state(
-                    conversation,
-                    state.get("agent_history") or [],
-                    checkpoints=compactions_out,
-                    snapshots=state.get("compaction_snapshots") or [],
-                )
-                #: 研究者主动停止（前端 abort → 客户端断开）。这一轮**没有正文也得留痕**：
-                #  思考过程、过程行、待批卡片都是"已产出"的东西，更别说用户那句话本身 ——
-                #  2026-09-26 实测：按原来的条件（无正文 + 有错误）会被判成"没什么可记的"，
-                #  于是整轮跳过落盘，接着被下面那条 delete 把**整个会话**清掉，
-                #  表现就是"点了停止、刷新后那一轮连同自己的提问一起消失"（前端保留、后端没有）。
-                stopped_by_client = bool(error_info) and error_info.get("code") == "client_disconnected"
-                if (
-                    generated
-                    or error_info is None
-                    or is_edit
-                    or pending_approval is not None
-                    or stopped_by_client
-                ):
-                    conversations.append_turns(
-                        conversation,
-                        [
-                            {"role": "user", "content": text},
-                            {
-                                "role": "assistant",
-                                "content": generated,
-                                "model_id": getattr(result, "model_id", payload.model_id)
-                                if result is not None
-                                else payload.model_id,
-                                # ⚠️ 这里必须是**整轮耗时**（`started` 是请求进来时打的表），
-                                # 不能拿 `result.duration_ms` —— 那是**最后一次模型调用**的耗时：
-                                # 多轮工具调用时它只有整轮的零头，研究者会看到"跑了半天显示 10s"。
-                                "duration_ms": duration_ms,
-                                "reasoning": reasoning_text or None,
-                                "rows": tool_rows,
-                                # 批准请求随轮次落盘：裁决端点要凭它认账（一次性、带有效期）
-                                "approvals": approval_requests,
-                                "awaiting_approval": pending_approval["id"] if pending_approval else None,
-                                # 正文是系统说明（不是模型说的话）→ 别让它进下一轮的上下文
-                                "note_only": note_only or None,
-                                "interrupted": bool(error_info),
-                            },
-                        ],
-                    )
-                if is_new and error_info is not None and not generated and not stopped_by_client:
-                    # 一个字都没生成也没落轮的「空会话」不留垃圾记录。
-                    # ⚠️ 但**研究者主动停止不算垃圾**：他刚敲进去的那句话必须留着，
-                    #    否则停止一下连提问都没了。
-                    conversations.delete(conversation_id)
-            except Exception as exc:  # noqa: BLE001 - persistence must end the stream cleanly
-                logger.exception("首页对话持久化失败 conversation=%s", conversation_id)
-                if error_info is None:
-                    error_info = {
-                        "code": "conversation_persist_failed",
-                        "message": f"对话保存失败：{type(exc).__name__}",
-                        "kind": type(exc).__name__,
-                    }
-
-        if error_info is not None:
-            # 已生成部分照旧显示；尾部用 error 事件让前端标「已中断 / 出错」
-            yield _sse(
-                "error",
-                {
-                    **error_info,
-                    "interrupted": True,
-                    "generated_chars": len("".join(buffer)),
-                },
-            )
-            return
-
-        usage = getattr(result, "usage", None)
-        yield _sse(
-            "done",
-            {
-                "conversation_id": conversation_id,
-                "content": getattr(result, "content", "") if result is not None else "",
-                # 同上：整轮耗时（前端在 done 里会用它覆盖那一轮的显示）
-                "duration_ms": duration_ms,
-                "model_id": getattr(result, "model_id", payload.model_id),
-                "model_ref": getattr(result, "model_ref", ref),
-                "provider": getattr(result, "provider", ""),
-                "cost_usd": getattr(result, "cost_usd", None) if result is not None else None,
-                "cost_unknown_reason": getattr(result, "cost_unknown_reason", None)
-                if result is not None
-                else None,
-                "finish_reason": getattr(result, "finish_reason", None) if result is not None else None,
-                # 停在「等研究者批准」：前端据此把这一轮标成待裁决，**而不是**当成正常答完。
-                # 两者混起来，界面会显示一个"答完了但什么都没有"的空回复。
-                "awaiting_approval": agent_tools.approval_row(pending_approval)
-                if pending_approval is not None
-                else None,
-                "usage": {
-                    "prompt_tokens": getattr(usage, "prompt_tokens", None),
-                    "completion_tokens": getattr(usage, "completion_tokens", None),
-                    "total_tokens": getattr(usage, "total_tokens", None),
-                },
-            },
-        )
-
-        if title_task is not None:
-            try:
-                title, title_source, title_note = await title_task
-            except Exception as exc:  # noqa: BLE001 - 标题失败不能影响这一轮对话
-                logger.warning("标题任务异常：%s", exc)
-                title, title_source, title_note = text[:TITLE_MAX_CHARS], "fallback", str(exc)[:200]
-            if title != conversation.get("title"):
+                raise
+            except Exception as exc:  # noqa: BLE001 - 兜底：未预期异常也不该"甩个码就断"
+                # 用户口径 2026-09-26：不允许把整轮变成强制中断。分两种情况处理最诚实：
+                #   · 已经有字上屏 → 确实答了一半，如实标中断（不假装答完）；
+                #   · 一个字都没说出去 → 交给模型写一句收尾（见 finally 里的 phrasing.say）；写不出来就留空 + 一条过程行。
+                logger.exception("首页流式出现未预期异常 conversation=%s", conversation_id)
+                # Treat unexpected provider/adapter failures the same way as a
+                # classified LLM error.  Already emitted text stays visible and a
+                # local recovery paragraph is used only when there is no text.
+                soft_failure = str(exc)
+                error_info = {"code": "worker_failed", "message": _public_stream_error(exc)}
+            finally:
+                if _ACTIVE_HOME_TURNS.get(conversation_id, (None, None))[1] is owner_task:
+                    _ACTIVE_HOME_TURNS.pop(conversation_id, None)
+                # Synchronous atomic save precedes any await: a cancelled ASGI
+                # scope cannot skip it, nor can a slow follow-up model erase it.
                 try:
-                    conversations.rename(conversation_id, title)
-                except Exception as exc:  # noqa: BLE001 - title is ancillary to the completed turn
-                    logger.warning("标题保存失败 conversation=%s：%s", conversation_id, exc)
+                    _save_stream_progress(
+                        conversation, base_turns=base_turns, text=text, state=state,
+                        rows=tool_rows, approvals=approval_requests, model_id=payload.model_id,
+                        duration_ms=int((time.perf_counter() - started) * 1000),
+                        interrupted=bool(error_info),
+                    )
+                except OSError:
+                    logger.exception("保存流式检查点失败 conversation=%s", conversation_id)
+                if aborted and title_task is not None and not title_task.done():
+                    # 本轮已经失败/断开，标题结果用不上了，别留悬挂任务
+                    title_task.cancel()
+                duration_ms = int((time.perf_counter() - started) * 1000)
+                generated = _sanitize_assistant_content("".join(buffer))
+                # **显示与落盘必须一致**：部分供应商只在收尾帧给正文（delta 为空），
+                # 旧代码只存 delta buffer，于是界面上有内容、库里是空串。
+                if not generated and result is not None:
+                    generated = _sanitize_assistant_content(str(getattr(result, "content", "") or ""))
+                reasoning_text = "".join(reasoning_buffer)
+                if not reasoning_text and result is not None:
+                    reasoning_text = str((getattr(result, "raw", None) or {}).get("reasoning") or "")
+                if REASONING_MAX_CHARS is not None and len(reasoning_text) > REASONING_MAX_CHARS:
+                    reasoning_text = reasoning_text[:REASONING_MAX_CHARS] + "\n…（思考过程过长，已截断）"
+                if not generated and (soft_failure or reasoning_text) and error_info is None:
+                    # A failed provider step must not trigger a second model call
+                    # from HTTP ``finally``.  Preserve the turn and expose one
+                    # stable, reader-facing status block; explicit recovery is a
+                    # new turn owned by the runtime.
+                    generated = _public_stream_error(
+                        RuntimeError("provider step did not produce an answer")
+                    )
+                    note_only = True
+                if generated and not buffer and error_info is None and not generator_closing:
+                    buffer.append(generated)
+                    history_for_resume = _stream_history(state)
+                    if history_for_resume and history_for_resume[-1].get("role") == "assistant" and not history_for_resume[-1].get("content"):
+                        history_for_resume[-1]["content"] = generated
+                    else:
+                        history_for_resume.append({"role": "assistant", "content": generated})
+                    state["agent_history"] = history_for_resume
+                    state["partial_text_from"] = None
+                    yield _sse("delta", {"text": generated})
+                # Do not add a canned warning row when both recovery attempts are
+                # empty.  The visible transcript must contain model prose or the
+                # already generated content, never an internal diagnostic.
+                # 有正文 → 追加本轮；无正文且无错误 → 模型真的返回空，也要如实记一条。
+                # 编辑重开时**无条件落盘**：用户改过的正文必须留痕，否则刷新后改动就凭空消失了。
+                # 等批准时也**无条件落盘**：卡片本身就是这一轮的产出（哪怕一个字都没有），
+                # 不落盘就会出现"界面上有一张待批的卡、刷新后它不见了、而工具也永远没跑"。
+                try:
+                    if compactions_out:
+                        # 会话级 `compactions[]`（用户口径 2026-09-25：**新字段存摘要、原始轮次一字不改**）。
+                        # 先挂到记录上再 `append_turns`，这样"压缩 + 本轮"**一次写入**，不留半成品状态。
+                        conversation["compactions"] = [
+                            *(conversation.get("compactions") or []),
+                            *compactions_out,
+                        ]
+                    # Persist the model-facing protocol history separately from the
+                    # readable turns.  This is the durable resume point used by the
+                    # next request, while checkpoints retain the pre-compaction view.
+                    conversations.update_agent_state(
+                        conversation,
+                        _stream_history(state),
+                        checkpoints=compactions_out,
+                        snapshots=state.get("compaction_snapshots") or [],
+                    )
+                    #: 研究者主动停止（前端 abort → 客户端断开）。这一轮**没有正文也得留痕**：
+                    #  思考过程、过程行、待批卡片都是"已产出"的东西，更别说用户那句话本身 ——
+                    #  2026-09-26 实测：按原来的条件（无正文 + 有错误）会被判成"没什么可记的"，
+                    #  于是整轮跳过落盘，接着被下面那条 delete 把**整个会话**清掉，
+                    #  表现就是"点了停止、刷新后那一轮连同自己的提问一起消失"（前端保留、后端没有）。
+                    stopped_by_client = bool(error_info) and error_info.get("code") == "turn_interrupted"
+                    if (
+                        generated
+                        or error_info is None
+                        or is_edit
+                        or pending_approval is not None
+                        or stopped_by_client
+                        or error_info is not None
+                    ):
+                        conversation["turns"] = base_turns
+                        conversations.append_turns(
+                            conversation,
+                            [
+                                {
+                                    "role": "user",
+                                    "content": text,
+                                    "ts": user_ts,
+                                    "attachments": attachment_metadata,
+                                },
+                                {
+                                    "role": "assistant",
+                                    "content": generated,
+                                    "model_id": getattr(result, "model_id", payload.model_id)
+                                    if result is not None
+                                    else payload.model_id,
+                                    # ⚠️ 这里必须是**整轮耗时**（`started` 是请求进来时打的表），
+                                    # 不能拿 `result.duration_ms` —— 那是**最后一次模型调用**的耗时：
+                                    # 多轮工具调用时它只有整轮的零头，研究者会看到"跑了半天显示 10s"。
+                                    "duration_ms": duration_ms,
+                                    "reasoning": reasoning_text or None,
+                                    "reasoning_summary": "".join(state.get("reasoning_summary") or []) or None,
+                                    "rows": tool_rows,
+                                    # 批准请求随轮次落盘：裁决端点要凭它认账（一次性、带有效期）
+                                    "approvals": approval_requests,
+                                    "awaiting_approval": pending_approval["id"] if pending_approval else None,
+                                    # 正文是系统说明（不是模型说的话）→ 别让它进下一轮的上下文
+                                    "note_only": note_only or None,
+                                    "interrupted": bool(error_info),
+                                    "interruption_reason": "user_stop" if aborted else "worker_failed" if error_info else None,
+                                    "ts": _turn_timestamp(),
+                                },
+                            ],
+                            sync_history=False,
+                        )
+                except Exception as exc:  # noqa: BLE001 - persistence must end the stream cleanly
+                    logger.exception("首页对话持久化失败 conversation=%s", conversation_id)
+                    if error_info is None:
+                        error_info = {
+                            "code": "conversation_persist_failed",
+                            "message": f"对话保存失败：{type(exc).__name__}",
+                            "kind": type(exc).__name__,
+                        }
+
+                if error_info is not None and not generator_closing:
+                    # 已生成部分照旧显示；尾部用 error 事件让前端标「已中断 / 出错」
+                    yield _sse(
+                        "error",
+                        {
+                            **error_info,
+                            "interrupted": True,
+                            "generated_chars": len("".join(buffer)),
+                        },
+                    )
+                    return  # noqa: B012 - preserve one terminal SSE error frame
+
+            usage = getattr(result, "usage", None)
             yield _sse(
-                "title",
+                "done",
                 {
                     "conversation_id": conversation_id,
-                    "title": title,
-                    "title_source": title_source,
-                    "title_note": title_note,
+                    "content": generated
+                    or (getattr(result, "content", "") if result is not None else ""),
+                    # 同上：整轮耗时（前端在 done 里会用它覆盖那一轮的显示）
+                    "duration_ms": duration_ms,
+                    "model_id": getattr(result, "model_id", payload.model_id),
+                    "model_ref": getattr(result, "model_ref", ref),
+                    "provider": getattr(result, "provider", ""),
+                    "cost_usd": getattr(result, "cost_usd", None) if result is not None else None,
+                    "cost_unknown_reason": getattr(result, "cost_unknown_reason", None)
+                    if result is not None
+                    else None,
+                    "finish_reason": getattr(result, "finish_reason", None) if result is not None else None,
+                    # 停在「等研究者批准」：前端据此把这一轮标成待裁决，**而不是**当成正常答完。
+                    # 两者混起来，界面会显示一个"答完了但什么都没有"的空回复。
+                    "awaiting_approval": agent_tools.approval_row(pending_approval)
+                    if pending_approval is not None
+                    else None,
+                    "usage": {
+                        "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                        "completion_tokens": getattr(usage, "completion_tokens", None),
+                        "total_tokens": getattr(usage, "total_tokens", None),
+                    },
                 },
             )
 
-    return StreamingResponse(
-        event_source(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-transform",
-            "Connection": "keep-alive",
-            # nginx 反向代理下必须禁用缓冲，否则增量会被攒批，流式观感全失
-            "X-Accel-Buffering": "no",
-        },
-    )
+            if title_task is not None and not title_task.done():
+                def save_late_title(task: asyncio.Task[Any]) -> None:
+                    if task.cancelled():
+                        return
+                    try:
+                        title, _source, _note = task.result()
+                        conversations.rename(conversation_id, title)
+                    except Exception:
+                        logger.exception("标题保存失败 conversation=%s", conversation_id)
+                title_task.add_done_callback(save_late_title)
+                return
+            if title_task is not None:
+                try:
+                    title, title_source, title_note = title_task.result()
+                except Exception as exc:  # noqa: BLE001 - 标题失败不能影响这一轮对话
+                    logger.warning("标题任务异常：%s", exc)
+                    title, title_source, title_note = text[:TITLE_MAX_CHARS], "fallback", str(exc)[:200]
+                if title != conversation.get("title"):
+                    try:
+                        conversations.rename(conversation_id, title)
+                    except Exception as exc:  # noqa: BLE001 - title is ancillary to the completed turn
+                        logger.warning("标题保存失败 conversation=%s：%s", conversation_id, exc)
+                yield _sse(
+                    "title",
+                    {
+                        "conversation_id": conversation_id,
+                        "title": title,
+                        "title_source": title_source,
+                        "title_note": title_note,
+                    },
+                )
+
+        return owned(event_source())
+
+
+@router.post(
+    "/chat/research/interrupt",
+    summary="停止当前对话中的研究节点",
+    dependencies=[Depends(require_owner)],
+)
+async def interrupt_research(payload: HomeInterruptRequest) -> dict[str, Any]:
+    """Signal the server-side research iterator before the browser closes SSE."""
+    terminal = await home_turns.interrupt(payload.conversation_id, payload.turn_id)
+    if terminal is not None:
+        return {"ok": True, "requested": True, "status": terminal["status"],
+                "conversation_id": payload.conversation_id, "turn": terminal}
+    if payload.turn_id:
+        terminal = home_turns.snapshot(payload.conversation_id, payload.turn_id)
+        return {"ok": terminal is not None, "requested": False,
+                "status": terminal["status"] if terminal else "not_running", "turn": terminal}
+    requested = request_home_turn_interrupt(payload.conversation_id)
+    research_requested = dialog.request_node_interrupt(payload.conversation_id)
+    requested = requested or research_requested
+    if not requested:
+        requested = await dialog.request_persisted_node_interrupt(payload.conversation_id)
+    return {
+        "ok": True,
+        "requested": requested,
+        "status": "cancel_requested" if requested else "not_running",
+        "conversation_id": payload.conversation_id,
+    }
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -2061,6 +2261,7 @@ async def _approval_stream(
     rows: list[dict[str, Any]] = []
     buffer: list[str] = []
     reasoning_buffer: list[str] = []
+    reasoning_summary_buffer: list[str] = []
     #: 续答里模型**新提出**的批准请求：它们属于这一轮（新的一轮），不属于原来那一轮
     approvals_out: list[dict[str, Any]] = []
     pending: dict[str, Any] | None = None
@@ -2083,29 +2284,34 @@ async def _approval_stream(
             agent_approvals.decide(
                 record, request_id, status="denied", actor="owner", note=payload.note
             )
-            card = agent_tools.approval_row(request)
-            decision_row = {
-                "kind": "tool",
-                "tone": "warn",
-                "text": f"研究者已拒绝「{label}」" + (f"：{payload.note}" if payload.note else ""),
-            }
-            rows.append(decision_row)
-            yield _sse("row", {"row": decision_row})
-            yield _sse("approval", card)
-            # Close the persisted assistant/tool-call pair with a synthetic
-            # refusal result so the next turn remains protocol-valid.
-            call_id = str(request.get("call_id") or f"call_{request_id}")
+            # Preserve the exact frozen action even though it never executes.
+            denied_call_id = str(request.get("call_id") or f"call_{request_id}")
             denied_call = {
-                "id": call_id,
+                "id": denied_call_id,
                 "type": "function",
                 "function": {
                     "name": tool,
                     "arguments": json.dumps(request.get("args") or {}, ensure_ascii=False),
                 },
             }
+            card = agent_tools.approval_row(request)
+            card["tool_name"] = tool
+            card["tool_label"] = label
+            card["tool_status"] = "failed"
+            decision_row = {
+                "kind": "tool",
+                "tone": "warn",
+                "text": f"研究者已拒绝「{label}」" + (f"：{payload.note}" if payload.note else ""),
+            }
+            _annotate_tool_row(decision_row, denied_call, "err")
+            rows.append(decision_row)
+            yield _sse("row", {"row": decision_row})
+            yield _sse("approval", card)
+            # Close the persisted assistant/tool-call pair with a synthetic
+            # refusal result so the next turn remains protocol-valid.
             denied_history = conversations.context_messages(record)
             if not any(
-                call_id == str(call.get("id") or "")
+                denied_call_id == str(call.get("id") or "")
                 for message in denied_history
                 if isinstance(message, dict)
                 for call in (message.get("tool_calls") or [])
@@ -2114,7 +2320,7 @@ async def _approval_stream(
             agent_history = _repair_tool_call_pairs(
                 denied_history,
                 {
-                    call_id: agent_tools.tool_message_content(
+                    denied_call_id: agent_tools.tool_message_content(
                         {"ok": False, "error": "研究者拒绝了这次工具调用", "refused": True}
                     )
                 },
@@ -2145,24 +2351,18 @@ async def _approval_stream(
                 note=payload.note,
                 token=token,
             )
-            # 选「此对话中默认允许执行」：把授权写进**这个对话**（下一个对话要重新决定）。
-            # 这是比「完全访问模式」更宽的一档：连高危操作也不再弹卡。
-            #
-            # 选普通的「批准」= **按工具授权**（用户口径 2026-09-25）：把**这个工具**加进
-            # 本对话的授权清单，之后同一工具换参数不再逐条问；**高危仍然每次都问**。
-            # 原先「批准」只放行这一条完全匹配的命令（`args_digest`），换个参数又要问一遍。
+            # 「批准此次执行」只放行当前调用；「本对话默认允许」是显式的持续授权。
             if payload.decision == agent_approvals.DECISION_APPROVE:
-                summary = agent_approvals.set_grants(record, tool=str(request.get("tool") or ""))
-                agent_approvals.save(record)
                 grant_row = {
                     "kind": "tool",
                     "tone": "ok",
                     # 用户 2026-09-25：过程行不再带括号说明（界面上只留一句结论）
-                    "text": f"已允许在本对话内直接执行「{label}」",
+                    "text": f"已批准此次「{label}」",
                 }
+                _annotate_tool_identity(grant_row, tool, "waiting_approval")
                 rows.append(grant_row)
                 yield _sse("row", {"row": grant_row})
-                logger.info("会话 %s 获得按工具授权：%s", conversation_id, summary)
+                logger.info("会话 %s 已批准单次调用：%s", conversation_id, tool)
             if payload.decision == agent_approvals.DECISION_APPROVE_CONVERSATION:
                 summary = agent_approvals.set_grants(record, allow_exec=True)
                 agent_approvals.save(record)
@@ -2171,12 +2371,17 @@ async def _approval_stream(
                     "tone": "ok",
                     "text": "已允许在本对话内直接执行",
                 }
+                _annotate_tool_identity(grant_row, tool, "waiting_approval")
                 rows.append(grant_row)
                 yield _sse("row", {"row": grant_row})
                 logger.info("会话 %s 获得执行授权：%s", conversation_id, summary)
             card = agent_tools.approval_row(request)
+            card["tool_name"] = tool
+            card["tool_label"] = label
+            card["tool_status"] = "running"
             yield _sse("approval", card)
             decision_row = {"kind": "tool", "tone": "ok", "text": f"研究者已批准「{label}」"}
+            _annotate_tool_identity(decision_row, tool, "waiting_approval")
             rows.append(decision_row)
             yield _sse("row", {"row": decision_row})
 
@@ -2191,7 +2396,7 @@ async def _approval_stream(
                     "arguments": json.dumps(request.get("args") or {}, ensure_ascii=False),
                 },
             }
-            start_row = agent_tools.tool_row(call, "start")
+            start_row = _annotate_tool_row(agent_tools.tool_row(call, "start"), call, "start")
             rows.append(start_row)
             yield _sse("row", {"row": start_row})
             payload_out, summary = await agent_tools.run_tool_call(
@@ -2203,9 +2408,11 @@ async def _approval_stream(
             # 无论跑成没跑成，这次批准都**已经用掉了**（一次性）：不让"失败就再来一次"
             # 变成不受限的重试 —— 那等于把一次性批准变成了长期开关。
             agent_approvals.mark_consumed(record, request_id)
-            end_row = agent_tools.tool_row(
-                call, "ok" if payload_out.get("ok") else "err", summary
+            end_status = "ok" if payload_out.get("ok") else "err"
+            end_row = _annotate_tool_row(
+                agent_tools.tool_row(call, end_status, summary), call, end_status
             )
+            end_row.update(agent_tools.tool_execution_details(payload_out))
             rows.append(end_row)
             yield _sse("row", {"row": end_row})
 
@@ -2241,13 +2448,14 @@ async def _approval_stream(
             # （实测：不摆工具时，思考型供应商会因为"assistant 的 tool_calls 没带
             #   reasoning_content"直接 400，把续答整段打断。）
             try:
-                tool_defs = await agent_tools.tool_schemas()
+                tool_defs = await agent_tools.tool_schemas(workspace_root=record.get("workspace_dir"))
             except Exception as exc:  # noqa: BLE001 - 工具侧不可用不该拖垮续答
                 logger.warning("续答时工具声明获取失败，本轮按无工具回答：%s", exc)
                 tool_defs = []
             state: dict[str, Any] = {
                 "text": buffer,
                 "reasoning": reasoning_buffer,
+                "reasoning_summary": reasoning_summary_buffer,
                 "result": None,
                 "pending": None,
                 #: 本轮发生的上下文压缩（会话级落盘，刷新后研究者仍能看到"压过什么"）
@@ -2274,7 +2482,7 @@ async def _approval_stream(
     except LLMError as exc:
         error_info = {
             "code": getattr(exc, "code", "llm_failed") or "llm_failed",
-            "message": str(exc),
+            "message": _public_stream_error(exc),
             "kind": type(exc).__name__,
         }
         logger.warning("批准裁决后续答失败 conversation=%s：%s", conversation_id, exc)
@@ -2286,7 +2494,7 @@ async def _approval_stream(
         if buffer:
             error_info = {
                 "code": getattr(exc, "code", "unexpected_error") or "unexpected_error",
-                "message": f"服务端异常：{type(exc).__name__}: {exc}",
+                "message": _public_stream_error(exc),
                 "kind": type(exc).__name__,
             }
         else:
@@ -2302,17 +2510,13 @@ async def _approval_stream(
         if not answer and result is not None:
             answer = str(getattr(result, "content", "") or "")
         if not answer and soft_failure and error_info is None:
-            # 续答这一跳失败 → 再要一次收尾话，**由模型说**（口径 2026-09-26）。
-            answer = await phrasing.say(
-                facts=(
-                    "刚才那一次回答没能生成出来。请用研究者看得懂的话说明："
-                    "这一轮没有拿到答复；已经跑过的步骤都在上面的过程里、没有丢；"
-                    "他可以直接再发一次。两三句话，不要提内部术语。\n"
-                    f"（技术原文，不要照抄）{soft_failure[:220]}"
-                ),
-                model_ref=ref,
-                purpose="approval_soft_failure_note",
+            # Approval follow-up failures are settled by this turn owner.  A
+            # second model call in ``finally`` could race cancellation and
+            # produce a second terminal answer for the same turn.
+            answer = _public_stream_error(
+                RuntimeError("approval follow-up did not produce an answer")
             )
+            note_only = True
         reasoning_text = "".join(reasoning_buffer)
         if not reasoning_text and result is not None:
             reasoning_text = str((getattr(result, "raw", None) or {}).get("reasoning") or "")
@@ -2337,6 +2541,7 @@ async def _approval_stream(
                         # 同上：整轮耗时
                         "duration_ms": duration_ms,
                         "reasoning": reasoning_text or None,
+                        "reasoning_summary": "".join(reasoning_summary_buffer) or None,
                         "rows": rows,
                         # 续答里模型又提出的请求，随**这一轮**落盘（可能要再批一次）
                         "approvals": approvals_out,
@@ -2347,6 +2552,7 @@ async def _approval_stream(
                         "interrupted": bool(error_info),
                     }
                 ],
+                sync_history=False,
             )
         else:  # pragma: no cover - 兜底：一个字都没有、也没有行，至少把裁决写下
             conversations.write(record)
@@ -2389,44 +2595,73 @@ async def _approval_stream(
     dependencies=[Depends(require_owner)],
 )
 async def decide_approval(payload: ApprovalDecisionRequest) -> StreamingResponse:
-    """批准入口 —— 合规 8.3「关键动作需人工接管」的落点。
+    async with home_turns.write_lock(payload.conversation_id):
+        """批准入口 —— 合规 8.3「关键动作需人工接管」的落点。
 
-    校验从严，不做猜测：
+        校验从严，不做猜测：
 
-    - 会话不存在 → 404；请求不存在 → 404
-    - 请求**已批准/已拒绝/已过期** → 409，且**分别给出不同的 code 与说明**
-      （合并成一句"无效"会让研究者以为是自己点错了）
-    - 只有 `pending` 且未过期才可裁决
+        - 会话不存在 → 404；请求不存在 → 404
+        - 请求**已批准/已拒绝/已过期** → 409，且**分别给出不同的 code 与说明**
+          （合并成一句"无效"会让研究者以为是自己点错了）
+        - 只有 `pending` 且未过期才可裁决
 
-    裁决成功后由 ``_approval_stream`` 决定后续动作：批准 → 签发一次性令牌 → 经 MCP
-    执行（令牌进 Guard 的门 3）→ 结果回喂模型 → 继续回答；拒绝 → 确定性答复，不花模型调用。
-    """
+        裁决成功后由 ``_approval_stream`` 决定后续动作：批准 → 签发一次性令牌 → 经 MCP
+        执行（令牌进 Guard 的门 3）→ 结果回喂模型 → 继续回答；拒绝 → 确定性答复，不花模型调用。
+        """
 
-    record = agent_approvals.load(payload.conversation_id)
-    if record is None:
-        raise _error(404, "conversation_not_found", "会话不存在（可能已被删除）")
+        if home_turns.active(payload.conversation_id):
+            raise _error(409, "turn_in_progress", "当前对话仍在运行，请先停止或等待本轮结束")
+        record = agent_approvals.load(payload.conversation_id)
+        if record is None:
+            raise _error(404, "conversation_not_found", "会话不存在（可能已被删除）")
 
-    found = agent_approvals.find_pending(record, payload.request_id)
-    if found is None:
-        existing = agent_approvals.find(record, payload.request_id)
-        if existing is None:
-            raise _error(404, "approval_not_found", "这条批准请求不存在")
-        status = agent_approvals.effective_status(existing[1])
-        raise _error(
-            409,
-            f"approval_{status}",
-            _APPROVAL_CLOSED_REASONS.get(status, f"这条请求当前不可裁决（状态：{status}）"),
-            {"request_id": payload.request_id, "status": status},
-        )
+        found = agent_approvals.find_pending(record, payload.request_id)
+        if found is None:
+            existing = agent_approvals.find(record, payload.request_id)
+            if existing is None:
+                raise _error(404, "approval_not_found", "这条批准请求不存在")
+            status = agent_approvals.effective_status(existing[1])
+            raise _error(
+                409,
+                f"approval_{status}",
+                _APPROVAL_CLOSED_REASONS.get(status, f"这条请求当前不可裁决（状态：{status}）"),
+                {"request_id": payload.request_id, "status": status},
+            )
 
-    turn_index, request = found
-    ref = str(record.get("model_ref") or "")
-    if payload.model_config_id is not None and payload.model_id:
-        ref = await _resolve_model_ref(payload.model_config_id, payload.model_id)
-    if not ref:
-        raise _error(409, "no_model", "会话没有记录可用模型，请重新发送一次对话再裁决")
+        turn_index, request = found
+        ref = str(record.get("model_ref") or "")
+        if payload.model_config_id is not None and payload.model_id:
+            ref = await _resolve_model_ref(payload.model_config_id, payload.model_id)
+        if not ref:
+            raise _error(409, "no_model", "会话没有记录可用模型，请重新发送一次对话再裁决")
 
-    return _streaming(_approval_stream(record, turn_index, request, payload, ref))
+        try:
+            owner = home_turns.start(
+                payload.conversation_id, _approval_stream(record, turn_index, request, payload, ref),
+                kind="approval", base_count=len(record.get("turns") or []),
+            )
+        except ValueError:
+            raise _error(409, "turn_in_progress", "当前对话仍在运行") from None
+        return _streaming(home_turns.subscribe(payload.conversation_id, owner.turn_id))
+
+
+@router.get("/chat/turns/{conversation_id}/{turn_id}", dependencies=[Depends(require_owner)])
+async def read_home_turn(conversation_id: str, turn_id: str) -> dict[str, Any]:
+    try:
+        state = home_turns.snapshot(conversation_id, turn_id)
+    except ValueError:
+        raise _error(422, "invalid_turn", "轮次标识无效") from None
+    if state is None:
+        raise _error(404, "turn_not_found", "轮次不存在")
+    return state
+
+
+@router.get("/chat/turns/{conversation_id}/{turn_id}/stream", dependencies=[Depends(require_owner)])
+async def resume_home_turn(conversation_id: str, turn_id: str, after: int = 0) -> StreamingResponse:
+    await read_home_turn(conversation_id, turn_id)
+    if after < 0:
+        raise _error(422, "invalid_cursor", "事件位置无效")
+    return _streaming(home_turns.subscribe(conversation_id, turn_id, after))
 
 
 class AccessModeRequest(BaseModel):
@@ -2442,15 +2677,14 @@ class AccessModeRequest(BaseModel):
 
 @router.post(
     "/chat/access-mode",
-    summary="切换本对话的完全访问模式（开=普通动手操作不再逐一确认，高危仍会问）",
+    summary="切换本对话的完全访问模式（开启后所有可执行操作自动批准）",
     dependencies=[Depends(require_owner)],
 )
 async def set_access_mode(payload: AccessModeRequest) -> dict[str, Any]:
-    """开 / 关当前对话的「完全访问模式」。
+    """开 / 关当前对话的「完全访问模式」。普通模式人工批准后具有相同执行范围。
 
     它管的是"动手类操作"（跑命令、写文件、删文件）要不要逐一确认：
-    开着 → 普通操作直接做；关着 → 都先问一句。**高危操作无论开关如何都会先问**
-    （除非研究者在那张卡上选了"此对话中默认允许执行"，那是更宽的一档）。
+    开着 → 所有可执行操作自动批准；关着 → 需要人工批准。两者允许的执行范围相同。
     只看东西的操作（列目录、读文件、查论文库）任何时候都不打扰研究者。
     """
 

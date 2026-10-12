@@ -12,7 +12,7 @@
    否则库里留下永远 ``running`` 的僵尸行 —— 控制台的流光会一直转，看起来像还在跑。
    实测当时有两行：一行卡了 9 分钟、一行卡了 **15 小时**。
 2. ``chain_state`` 读取时把「超时仍未收尾的 running」如实报成已中断，
-   让界面显示红点而不是永远进行中（不改库，只改读取口径）。
+   让界面回到可继续状态，而不是永远进行中（不改库，只改读取口径）。
 
 风格与 ``services/agent/tests`` 一致：同步用例 + ``asyncio.run``，
 不依赖 pytest-asyncio 的模式配置。
@@ -24,6 +24,7 @@ import asyncio
 import contextlib
 import datetime
 
+from llm.errors import LLMAuthError, LLMRateLimitError, LLMServerError, LLMTimeoutError
 from services.research import orchestrator
 
 UTC = datetime.UTC
@@ -49,7 +50,7 @@ def test_stale_running_is_reported_as_interrupted() -> None:
     now = datetime.datetime(2026, 9, 22, 1, 30, tzinfo=UTC)  # 闲置 30 分钟
     out = orchestrator._interrupted_if_stale(_row(), now=now)
 
-    assert out["status"] == "failed"
+    assert out["status"] == "pending"
     assert out["interrupted"] is True
     assert out["validation"]["rules"] == ["interrupted"]
     # 面向研究者的话术必须说清「没有结论 + 可以重试」，而不是「模型没做好」
@@ -81,7 +82,7 @@ def test_naive_timestamp_from_legacy_row_does_not_crash() -> None:
     row = _row(updated_at=datetime.datetime(2026, 9, 22, 1, 0), started_at=None)
 
     out = orchestrator._interrupted_if_stale(row, now=now)
-    assert out["status"] == "failed"
+    assert out["status"] == "pending"
 
 
 def test_missing_timestamps_are_not_guessed() -> None:
@@ -89,6 +90,64 @@ def test_missing_timestamps_are_not_guessed() -> None:
     row = _row(updated_at=None, started_at=None)
 
     assert orchestrator._interrupted_if_stale(row, now=now) is row
+
+
+def test_retry_budget_boundary_is_terminal() -> None:
+    limit = orchestrator.graph.MAX_RETRY_PER_ENTRY
+    assert not orchestrator._retry_exhausted(limit - 1, limit)
+    assert orchestrator._retry_exhausted(limit, limit)
+    assert orchestrator._retry_exhausted(limit + 1, limit)
+
+
+def test_provider_retry_classification_is_separate_from_contract_repair() -> None:
+    assert orchestrator._provider_retryable(LLMTimeoutError("read timeout"))
+    assert orchestrator._provider_retryable(LLMRateLimitError("busy"))
+    assert orchestrator._provider_retryable(LLMServerError("upstream 503"))
+    assert not orchestrator._provider_retryable(LLMAuthError("invalid key"))
+    assert not orchestrator._provider_retryable(ValueError("invalid JSON contract"))
+
+
+def test_validation_dict_accepts_serialized_retry_record() -> None:
+    payload = {"ok": False, "retryable": True, "retry_scheduled": True}
+    assert orchestrator._validation_dict(payload) == payload
+    result = orchestrator.ValidationResult(ok=False, level="L1", hits=[])
+    assert orchestrator._validation_dict(result)["ok"] is False
+
+
+def test_exhausted_llm_failure_persists_finished_terminal_row(monkeypatch) -> None:
+    calls: list[dict] = []
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    async def record(_session, **kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr(orchestrator.store, "upsert_node_run", record)
+
+    asyncio.run(
+        orchestrator._settle_llm_failure(
+            Session,
+            conversation_id="retry-exhausted",
+            project_id=None,
+            node="literature_review",
+            entry_index=1,
+            retry_count=orchestrator.graph.MAX_RETRY_PER_ENTRY,
+            validation={"ok": False, "terminal": True},
+            raw_output="",
+            llm_calls=2,
+            total_cost=0,
+        )
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["status"] == "failed"
+    assert calls[0]["finished_at"] is not None
+    assert calls[0]["retry_count"] == orchestrator.graph.MAX_RETRY_PER_ENTRY
 
 
 # --------------------------------------------------------------------------- #
@@ -209,6 +268,20 @@ def test_error_event_means_no_extra_settle(monkeypatch) -> None:
     assert calls == []
 
 
+def test_retryable_error_then_waiting_done_is_forwarded_without_settle(monkeypatch) -> None:
+    calls = _with_settle_recording(
+        monkeypatch,
+        [
+            ("node", {"node": "literature_review", "entry_index": 1}),
+            ("error", {"code": "read_timeout", "retryable": True, "retry_scheduled": True}),
+            ("waiting_human", {"node": "literature_review", "reason": "provider_retry_scheduled"}),
+            ("done", {"node": "literature_review", "status": "waiting_human"}),
+        ],
+    )
+    assert asyncio.run(_drain()) == ["node", "error", "waiting_human", "done"]
+    assert calls == []
+
+
 def test_failure_before_any_node_is_not_settled(monkeypatch) -> None:
     """还没进入任何节点（连行都没建）时不该去写库。"""
 
@@ -246,3 +319,33 @@ def test_events_pass_through_unchanged(monkeypatch) -> None:
         "done",
     ]
     assert calls == []
+
+
+def test_provider_stall_is_bounded_and_emits_terminal_done(monkeypatch) -> None:
+    """A stalled provider must not leave the UI in a permanent running state."""
+    calls: list[dict] = []
+
+    async def fake_settle(session_factory, **kwargs):
+        calls.append(kwargs)
+
+    async def stalled_source(session_factory, *, conversation_id, node=None, text="", project_id=None):
+        yield "node", {"node": "literature_review", "entry_index": 1}
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(orchestrator, "_settle_interrupted", fake_settle)
+    monkeypatch.setattr(orchestrator, "_run_node_events", stalled_source)
+
+    async def drain():
+        names = []
+        async for event, _data in orchestrator.run_node(
+            None,
+            conversation_id="conv-timeout",
+            idle_timeout_s=0.01,
+            wall_timeout_s=0.02,
+        ):
+            names.append(event)
+        return names
+
+    names = asyncio.run(drain())
+    assert names[-3:] == ["notice", "waiting_human", "done"]
+    assert calls and calls[0]["node"] == "literature_review"

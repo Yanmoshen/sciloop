@@ -51,16 +51,41 @@ export const useConversationStore = defineStore('conversations', () => {
     return safeErrorMessage(error_)
   }
 
+  /**
+   * The shell mounts while the API process may still be warming up. A single
+   * failed list request used to clear the rail and leave a raw-looking error
+   * until the next full page reload. Retry a couple of times before exposing a
+   * recoverable message, and keep any already loaded rows visible throughout.
+   */
+  async function loadList(archivedRows: boolean): Promise<ConversationBrief[]> {
+    let lastError: unknown
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const data = await listConversations({
+          group: 'all',
+          archived: archivedRows,
+          limit: 500,
+        })
+        return data.items ?? []
+      } catch (error_) {
+        lastError = error_
+        if (attempt < 2) await new Promise((resolve) => window.setTimeout(resolve, 250 * 2 ** attempt))
+      }
+    }
+    throw lastError
+  }
+
   function load(): Promise<void> {
     if (loadingRequest) return loadingRequest
     loading.value = true
     loadingRequest = (async () => {
       try {
-        const data = await listConversations({ group: 'all', archived: false, limit: 500 })
-        items.value = data.items ?? []
+        items.value = await loadList(false)
         error.value = ''
       } catch (error_) {
-        items.value = []
+        // Keep a previously loaded rail usable when the backend is restarting.
+        // On a first load the list is already empty, so only the friendly
+        // recoverable message is shown.
         error.value = message(error_)
       } finally {
         loading.value = false
@@ -74,11 +99,9 @@ export const useConversationStore = defineStore('conversations', () => {
     if (loadingArchivedRequest) return loadingArchivedRequest
     loadingArchivedRequest = (async () => {
       try {
-        const data = await listConversations({ group: 'all', archived: true, limit: 500 })
-        archived.value = data.items ?? []
+        archived.value = await loadList(true)
         archivedError.value = ''
       } catch (error_) {
-        archived.value = []
         archivedError.value = message(error_)
       } finally {
         loadingArchivedRequest = null

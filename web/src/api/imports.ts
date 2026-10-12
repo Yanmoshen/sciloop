@@ -72,8 +72,19 @@ export function importIdentifiers(
   })
 }
 
-export function fetchImportJob(taskId: string): Promise<ImportJob> {
-  return get<ImportJob>(`/papers/import-jobs/${encodeURIComponent(taskId)}`)
+export async function fetchImportJob(taskId: string): Promise<ImportJob> {
+  const job = await get<ImportJob>(`/papers/import-jobs/${encodeURIComponent(taskId)}`)
+  // The import service returns flat counters; older services used counts.
+  const numberOf = (key: string): number | undefined =>
+    typeof job[key] === 'number' ? job[key] as number : undefined
+  job.counts = {
+    created: numberOf('created'),
+    reused: numberOf('reused'),
+    failed: numberOf('failed'),
+    duplicate: numberOf('duplicated'),
+    ...job.counts,
+  }
+  return job
 }
 
 export interface ImportHistoryItem {

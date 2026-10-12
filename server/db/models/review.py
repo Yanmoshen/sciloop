@@ -25,10 +25,11 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    false,
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import Uuid as UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from db.base import Base
@@ -145,7 +146,7 @@ class LlmCallLog(Base):
     cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(10, 6))
     duration_ms: Mapped[int | None] = mapped_column(BIGINT)
     success: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    is_replay: Mapped[bool | None] = mapped_column(Boolean, server_default="false")
+    is_replay: Mapped[bool | None] = mapped_column(Boolean, server_default=false())
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -166,7 +167,7 @@ class ModelConfig(Base):
     models: Mapped[Any] = mapped_column(JSONB, nullable=False)
     #: Endpoint type (openai / anthropic / compatible); null keeps legacy routing.
     type: Mapped[str | None] = mapped_column(String(32))
-    is_default: Mapped[bool | None] = mapped_column(Boolean, server_default="false")
+    is_default: Mapped[bool | None] = mapped_column(Boolean, server_default=false())
     last_tested_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True)
     )

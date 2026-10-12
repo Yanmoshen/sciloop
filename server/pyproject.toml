@@ -19,11 +19,7 @@ dependencies = [
     "uvicorn[standard]>=0.30,<1.0",
     # --- 数据库 ---
     "sqlalchemy>=2.0.30,<2.1",
-    "asyncpg>=0.29,<0.31",
     "aiosqlite>=0.20,<1.0",
-    # psycopg 提供同步驱动：alembic 同步迁移、feed 端点的同步会话工厂与批量任务共用
-    "psycopg[binary]>=3.1,<4.0",
-    "alembic>=1.13,<2.0",
     # --- 配置与校验 ---
     "pydantic>=2.7,<3.0",
     "pydantic-settings>=2.3,<3.0",
@@ -56,6 +52,9 @@ dev = [
 [tool.setuptools.packages.find]
 include = ["api*", "core*", "db*", "llm*", "schemas*", "services*", "tasks*", "executor*", "fixtures*"]
 
+[tool.setuptools.package-data]
+services = ["prompts/*.md"]
+
 # --------------------------------------------------------------------------- #
 # 工具链
 # --------------------------------------------------------------------------- #
@@ -70,7 +69,6 @@ filterwarnings = ["ignore::DeprecationWarning"]
 line-length = 100
 target-version = "py311"
 extend-exclude = [
-    "migrations/versions",
     # 内置技能包是**第三方内容**（上游仓库整目录拷进来，来源与许可见
     # services/skills/packs/README.md）。它的脚本有自己的风格，不该拿本仓库的
     # lint 规则去要求它 —— 强行改就等于篡改来源。
@@ -87,9 +85,7 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "api/v1/*.py" = ["B008"]
-"migrations/*.py" = ["E402"]
 
 [tool.black]
 line-length = 100
 target-version = ["py311"]
-extend-exclude = "migrations/versions"

@@ -1,6 +1,6 @@
 # Copyright 2026 SciLoop contributors
 # Licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0)
-"""会话接口：列表 / 详情 / 归档 / 移入项目。写操作由 ``POST /chat/home`` 与流式端点完成。
+"""会话接口：列表 / 详情 / 归档 / 重命名。写操作由 ``POST /chat/home`` 与流式端点完成。
 
 顶层字面前缀 ``/conversations``，与四核心模块同样规避「静态段被参数路由抢占」。
 
@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 from core.security import require_owner
 from services import conversations as store
+from services.research.messages import blocks_for_turn
 
 router = APIRouter(tags=["conversations"])
 
@@ -102,32 +103,38 @@ async def get_conversation(conversation_id: str) -> ConversationDetail:
             f"会话 {conversation_id} 不存在",
         )
     data = store.summary(record)
-    data["turns"] = record.get("turns") or []
+    # Present repaired choice blocks for legacy conversations without mutating
+    # their source JSON. This lets an already-open conversation immediately
+    # show the A/B/C actions after the UI refreshes.
+    data["turns"] = [
+        {**turn, **({"blocks": blocks_for_turn(turn)} if "blocks" in turn else {})}
+        for turn in (record.get("turns") or [])
+    ]
     return ConversationDetail(**data)
 
 
 @router.patch(
     "/conversations/{conversation_id}",
     response_model=ConversationDetail,
-    summary="归档 / 取消归档、移入项目、重命名（需 X-Owner-Token）",
+    summary="归档 / 取消归档、重命名（需 X-Owner-Token）",
 )
 async def update_conversation(
     conversation_id: str,
     _owner: OwnerDep,
     payload: Annotated[dict[str, Any], Body(...)],
 ) -> ConversationDetail:
-    """只允许改 ``archived`` / ``project_id`` / ``title`` 三个字段。
+    """只允许改 ``archived`` / ``title``；所属项目在创建时确定。
 
     轮次内容不可从本端点改写：对话正文是「模型真实产出」的留痕，
     任何覆写都会让界面显示与 ``llm_call_logs`` 对不上。
     """
-    unknown = set(payload) - {"archived", "project_id", "title"}
+    unknown = set(payload) - {"archived", "title"}
     if unknown:
         raise _error(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
             "validation_error",
             f"不支持修改字段：{sorted(unknown)}",
-            {"allowed": ["archived", "project_id", "title"]},
+            {"allowed": ["archived", "title"]},
         )
     if not payload:
         raise _error(status.HTTP_422_UNPROCESSABLE_ENTITY, "validation_error", "请求体不能为空", None)
@@ -148,17 +155,6 @@ async def update_conversation(
                 {"archived": payload["archived"]},
             )
         store.set_archived(conversation_id, payload["archived"])
-
-    if "project_id" in payload:
-        raw = payload["project_id"]
-        if raw is not None and not isinstance(raw, int):
-            raise _error(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                "validation_error",
-                "project_id 必须为整数或 null（null = 移回未分组）",
-                {"project_id": raw},
-            )
-        store.move(conversation_id, raw)
 
     if "title" in payload:
         title = str(payload["title"] or "").strip()

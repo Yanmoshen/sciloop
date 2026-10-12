@@ -115,8 +115,8 @@ def build_context(
 ) -> list[dict[str, Any]]:
     """从线程状态装配模型上下文。
 
-    :param include_reasoning: 默认不把推理片段喂回模型（避免污染上下文，
-        也与主流供应商的用法一致）。
+    :param include_reasoning: 保留兼容参数。推理永远不作为正文消息；真实
+        供应商返回的推理仅作为 assistant 的协议字段回传。
     """
     messages: list[dict[str, Any]] = []
     if system_prompt:
@@ -137,16 +137,96 @@ def build_context(
             }
         )
 
-    for item in items:
-        if covered_until is not None and item.sequence <= covered_until:
+    visible = [i for i in items if covered_until is None or i.sequence > covered_until]
+    # Codex normalizes the prompt before every provider request: one output per
+    # call id, with the first durable output winning.  A duplicate output must
+    # not replace the result that was actually observed first after a resume.
+    results: dict[str | None, Item] = {}
+    for item in visible:
+        if item.type is ItemType.TOOL_RESULT and item.call_id not in results:
+            results[item.call_id] = item
+    consumed: set[str] = set()
+    response: dict[str, Any] | None = None
+    response_key: tuple[Any, Any] | None = None
+
+    def flush() -> None:
+        nonlocal response, response_key
+        if response is None:
+            return
+        calls = response.get("tool_calls") or []
+        if response.get("content") or calls:
+            messages.append(response)
+            for call in calls:
+                call_id = call["id"]
+                result = results.get(call_id)
+                if result is not None:
+                    messages.append(item_to_message(result))
+                else:
+                    # An interrupted/failed historical batch must not be
+                    # replayed just to repair the provider wire protocol.
+                    messages.append({
+                        "role": "tool", "tool_call_id": call_id,
+                        "content": json.dumps({"status": "interrupted", "error": {
+                            "code": "result_unavailable",
+                            "message": "此调用没有已记录的执行结果，请勿假定执行成功。",
+                        }}, ensure_ascii=False),
+                    })
+                consumed.add(call_id)
+        response = None
+        response_key = None
+
+    for item in visible:
+        if item.type in {ItemType.REASONING, ItemType.ASSISTANT_TEXT, ItemType.TOOL_CALL}:
+            key = (item.turn_id, item.payload.get("response_id"))
+            if response is not None and key != response_key:
+                flush()
+            if response is None:
+                response = {"role": "assistant", "content": ""}
+                response_key = key
+            if item.type is ItemType.REASONING:
+                response["reasoning_content"] = response.get("reasoning_content", "") + str(item.payload.get("text", ""))
+            elif item.type is ItemType.ASSISTANT_TEXT:
+                response["content"] += str(item.payload.get("text", ""))
+            else:
+                message = item_to_message(item)
+                response.setdefault("tool_calls", []).extend(message["tool_calls"])
             continue
-        if not include_reasoning and item.type is ItemType.REASONING:
+        if item.type is ItemType.TOOL_RESULT:
+            flush()
+            # Match Codex's remove_orphan_outputs: a result whose call is not
+            # present in this model window is dropped.  Re-emitting it as a
+            # user message changes the speaker and can make the model invent a
+            # tool call that never happened after compaction.
             continue
         if item.type not in CONTEXT_ITEM_TYPES:
             continue
+        flush()
         message = item_to_message(item)
+        if item.type is ItemType.APPROVAL:
+            # The append-only Item records the original request, while the
+            # approval event projection contains the current decision. Do not
+            # tell a resumed model that an already decided request is pending.
+            approval = getattr(state, "approvals", {}).get(item.payload.get("approval_id"))
+            if approval is not None:
+                status = getattr(approval.status, "value", approval.status)
+                if status != "pending":
+                    message = {
+                        "role": "user",
+                        "content": (
+                            f"[审批] 当前结果：{status}，范围：{approval.decision_scope or 'once'}。"
+                            "该请求已结束等待；批准只代表允许执行，是否成功以工具结果为准。"
+                        ),
+                    }
         if message is not None:
             messages.append(message)
+    flush()
+    input_texts = {str(i.payload.get("text", "")) for i in visible if i.type is ItemType.USER_INPUT}
+    for delivery in getattr(state, "mailbox", []):
+        if covered_until is not None and int(delivery.get("sequence", 0)) <= covered_until:
+            continue
+        content = str(delivery.get("content", ""))
+        if content and content not in input_texts:
+            messages.append({"role": "user", "content": "[协作消息] " + content})
     return messages
 
 

@@ -117,7 +117,7 @@ defineEmits<{ retry: [] }>()
       show-icon
       data-state="error"
     >
-      <template #title>{{ errorTitle }}（{{ errorCode ?? 'unknown_error' }}）：{{ error }}</template>
+      <template #title>{{ errorTitle }}：{{ error }}</template>
       <template #default>
         <el-button
           v-if="retryable"

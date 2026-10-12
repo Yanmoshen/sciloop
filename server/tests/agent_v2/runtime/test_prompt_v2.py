@@ -16,6 +16,7 @@ from _helpers import Harness
 
 from contracts.agent_v2 import EventType, ItemType, TurnStatus
 from services.agent_prompt_v2 import (
+    BASE_INSTRUCTIONS,
     BLOCK_ORDER,
     RETIRED_PHRASES,
     BlockKind,
@@ -72,7 +73,7 @@ def test_each_block_is_independently_testable():
 def test_research_block_only_appears_when_confirmed():
     before = render_prompt(goal="想做个文献调研")
     assert BlockKind.RESEARCH_CONTEXT not in before.kinds
-    assert "科研任务" not in before.text
+    assert "## 科研任务\n" not in before.text
 
     after = render_prompt(goal="想做个文献调研", research_confirmed=True, research_phase="planning")
     assert BlockKind.RESEARCH_CONTEXT in after.kinds
@@ -125,9 +126,9 @@ def test_retired_style_phrases_are_absent():
 
 def test_base_instructions_are_complexity_driven_not_fixed_template():
     text = render_prompt(goal="你好").text
-    assert "按复杂度组织输出" in text
-    assert "不要固定套用" in text
-    assert "只在多维度对比" in text
+    assert "简单任务简洁回答，复杂任务给足必要细节" in text
+    assert "不强制套用固定结构" in text
+    assert "比较需要时再用列表、标题或表格" in text
 
 
 # ---------------------------------------------------------------------------- 记忆过滤
@@ -157,7 +158,22 @@ def test_prompt_budget_truncates_details_not_base_instructions(tmp_path):
     )
     assert rendered.truncated is True
     assert "工作方式" in rendered.text, "base instructions 永不被砍"
-    assert len(rendered.text) < 2000
+    assert BASE_INSTRUCTIONS in rendered.text
+    assert "待办49" not in rendered.text
+    assert "阻塞49" not in rendered.text
+
+
+def test_default_budget_preserves_research_context_and_task_details():
+    rendered = render_prompt(
+        goal="完整科研流程",
+        todos=["核验引用", "汇总实际结果"],
+        research_confirmed=True,
+        research_phase="planning",
+    )
+    assert not rendered.truncated
+    assert BASE_INSTRUCTIONS in rendered.text
+    assert "汇总实际结果" in rendered.text
+    assert BlockKind.RESEARCH_CONTEXT in rendered.kinds
 
 
 # ---------------------------------------------------------------------------- 研究确认门

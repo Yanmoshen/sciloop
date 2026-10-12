@@ -145,22 +145,27 @@ class TurnRuntime:
     ) -> TurnOutcome:
         """执行一个 Turn，直到完成 / 失败 / 中断 / 挂起等待。"""
         token = cancel or CancelToken()
+        outcome: TurnOutcome | None = None
         try:
             if timeout_s is not None:
-                return await asyncio.wait_for(
+                outcome = await asyncio.wait_for(
                     self._run(token, thread_id, turn_id), timeout=float(timeout_s)
                 )
-            return await self._run(token, thread_id, turn_id)
+            else:
+                outcome = await self._run(token, thread_id, turn_id)
+            return outcome
         except TimeoutError:
-            return self._interrupt(thread_id, turn_id, "runtime timeout")
+            outcome = self._interrupt(thread_id, turn_id, "runtime timeout")
+            return outcome
         except CancelledError as exc:
-            return self._interrupt(thread_id, turn_id, f"cancelled: {exc}")
+            outcome = self._interrupt(thread_id, turn_id, f"cancelled: {exc}")
+            return outcome
         except asyncio.CancelledError:
             # 外部取消本任务：先把 Turn 收尾（中断 + 释放租约），再尊重 asyncio 语义向外抛
-            self._interrupt(thread_id, turn_id, "task cancelled")
+            outcome = self._interrupt(thread_id, turn_id, "task cancelled")
             raise
         except ModelStreamError as exc:
-            return self._fail(
+            outcome = self._fail(
                 thread_id,
                 turn_id,
                 {
@@ -171,16 +176,24 @@ class TurnRuntime:
                     "message": str(exc),
                 },
             )
+            return outcome
         except Exception as exc:  # noqa: BLE001 - 未预期异常必须落成失败事件，不能吞
-            return self._fail(
+            outcome = self._fail(
                 thread_id,
                 turn_id,
                 {
-                    "code": "runtime_error",
-                    "error_class": ErrorClass.FATAL.value,
+                    "code": "model_stream_error" if _is_stream_read_error(exc) else "runtime_error",
+                    "error_class": ErrorClass.RETRYABLE.value if _is_stream_read_error(exc) else ErrorClass.FATAL.value,
                     "message": f"{type(exc).__name__}: {exc}",
                 },
             )
+            return outcome
+        finally:
+            # The runtime owns the final convergence boundary.  If a custom
+            # gateway/iterator exits through an unexpected exception, do not
+            # leave a RUNNING Turn and lease behind.  Suspended turns are
+            # deliberate and remain active for approval/user input.
+            self._ensure_settled(thread_id, turn_id, outcome)
 
     # ------------------------------------------------------------------ 主循环
     async def _run(self, token: CancelToken, thread_id: str, turn_id: str) -> TurnOutcome:
@@ -290,9 +303,21 @@ class TurnRuntime:
                             thread_id, trigger="auto", cancel=token, turn_id=turn_id
                         )
                         outcome.compactions += 1
+                        request.messages = build_context(
+                            self.repo.state(thread_id), system_prompt=self.system_prompt
+                        )
                         # 压缩成功后必须**重新发起**模型请求（用压缩后的上下文），
                         # 而不是直接结束 Turn；compacted_once 保证最多压缩一轮。
                         continue
+                    # Keep already displayed model prose in the durable
+                    # transcript even if its stream fails midway.
+                    for item_type, field_name in ((ItemType.REASONING, "reasoning"), (ItemType.ASSISTANT_TEXT, "text")):
+                        if sink[field_name]:
+                            self.repo.add_item(
+                                thread_id, item_type,
+                                {"text": sink[field_name], "response_id": request.request_id},
+                                turn_id=turn_id, persist_cache=False,
+                            )
                     raise
 
             if sink["usage"]:
@@ -303,7 +328,7 @@ class TurnRuntime:
                 self.repo.add_item(
                     thread_id,
                     ItemType.REASONING,
-                    {"text": sink["reasoning"]},
+                    {"text": sink["reasoning"], "response_id": request.request_id},
                     turn_id=turn_id,
                     persist_cache=False,
                 )
@@ -311,14 +336,14 @@ class TurnRuntime:
                 self.repo.add_item(
                     thread_id,
                     ItemType.ASSISTANT_TEXT,
-                    {"text": sink["text"]},
+                    {"text": sink["text"], "response_id": request.request_id},
                     turn_id=turn_id,
                     persist_cache=False,
                 )
 
             # 5+6：有工具调用则执行并继续循环；否则收尾
             if sink["calls"]:
-                batch = self._materialize_calls(thread_id, turn_id, sink["calls"])
+                batch = self._materialize_calls(thread_id, turn_id, sink["calls"], response_id=request.request_id)
                 suspended = await self._execute_batch(
                     thread_id, turn_id, batch, token, tool_cache, outcome
                 )
@@ -399,6 +424,11 @@ class TurnRuntime:
                         call_id=item.call_id,
                     )
                 elif kind == ModelStreamKind.TOOL_CALL_COMPLETED.value:
+                    if any(call.call_id == item.call_id for call in sink["calls"]):
+                        # Providers occasionally replay the terminal tool-call
+                        # frame after a reconnect.  Keep one durable call and
+                        # one execution identity for the whole response.
+                        continue
                     sink["calls"].append(item)
                     self.repo.emit_event(
                         thread_id,
@@ -455,7 +485,7 @@ class TurnRuntime:
 
     # ------------------------------------------------------------------ 工具
     def _materialize_calls(
-        self, thread_id: str, turn_id: str, stream_calls: list[Any]
+        self, thread_id: str, turn_id: str, stream_calls: list[Any], *, response_id: str | None = None
     ) -> list[ToolCall]:
         """把模型流里的工具调用落成 ToolCall 记录（状态 requested）。"""
         out: list[ToolCall] = []
@@ -483,6 +513,7 @@ class TurnRuntime:
                     "arguments": call.arguments,
                     "kind": kind.value,
                     "status": ToolCallStatus.REQUESTED.value,
+                    "response_id": response_id,
                 },
                 turn_id=turn_id,
                 call_id=call.call_id,
@@ -605,10 +636,48 @@ class TurnRuntime:
             self.repo.release_turn(thread_id, reason="failed")
         return TurnOutcome(turn_id=turn_id, status=TurnStatus.FAILED, error=error)
 
+    def _ensure_settled(
+        self, thread_id: str, turn_id: str, outcome: TurnOutcome | None
+    ) -> None:
+        """Repair an active Turn after an unplanned worker exit."""
+        try:
+            current = self.repo.state(thread_id).turns.get(turn_id)
+        except Exception:  # noqa: BLE001 - best-effort terminal repair
+            return
+        if current is None or current.status in TERMINAL_TURN_STATUSES:
+            return
+        if outcome is not None and outcome.suspended:
+            return
+        if current.status in {TurnStatus.WAITING_APPROVAL, TurnStatus.WAITING_INPUT}:
+            return
+        if outcome is not None and outcome.status is TurnStatus.INTERRUPTED:
+            with contextlib.suppress(Exception):
+                self.repo.interrupt_turn(thread_id, turn_id, reason="runtime exited")
+            return
+        error = outcome.error if outcome is not None and outcome.error else {
+            "code": "runtime_aborted",
+            "error_class": ErrorClass.FATAL.value,
+            "message": "runtime worker exited before the turn reached a terminal state",
+        }
+        with contextlib.suppress(Exception):
+            self.repo.fail_turn(thread_id, turn_id, error=error)
+
 
 # --------------------------------------------------------------------------------------
 # 小工具
 # --------------------------------------------------------------------------------------
+def _is_stream_read_error(exc: BaseException) -> bool:
+    """Recognize transport read failures without coupling the runtime to a client."""
+    names = {type(exc).__name__.lower()}
+    cause = getattr(exc, "__cause__", None)
+    if cause is not None:
+        names.add(type(cause).__name__.lower())
+    return any(
+        name in {"readerror", "incompleteread", "endofstream", "brokenresourceerror"}
+        for name in names
+    )
+
+
 def _is_error_class(value: Any) -> bool:
     try:
         ErrorClass(value)

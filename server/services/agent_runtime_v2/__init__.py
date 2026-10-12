@@ -29,10 +29,14 @@ from .research import (
     is_negative,
 )
 from .runtime import ALLOW, REQUIRE, ApprovalGate, TurnOutcome, TurnRuntime
+from .session import CodexSession, RuntimeHost, SessionTurn
 from .tools import DispatchReport, ToolScheduler
 
 __all__ = [
     "TurnRuntime",
+    "CodexSession",
+    "SessionTurn",
+    "RuntimeHost",
     "TurnOutcome",
     "ApprovalGate",
     "ALLOW",

@@ -17,6 +17,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    false,
     func,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -79,7 +80,7 @@ class Idea(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     mechanism: Mapped[str | None] = mapped_column(String(32))
     novelty_note: Mapped[str | None] = mapped_column(Text)
-    is_selected: Mapped[bool | None] = mapped_column(Boolean, server_default="false")
+    is_selected: Mapped[bool | None] = mapped_column(Boolean, server_default=false())
     created_at: Mapped[datetime.datetime | None] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

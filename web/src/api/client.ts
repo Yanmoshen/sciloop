@@ -195,9 +195,27 @@ export async function request<T = unknown>(
   }
 
   const controller = new AbortController()
-  const timeout = window.setTimeout(() => controller.abort(), options.timeoutMs ?? 30_000)
+  let timedOut = false
+  const timeout = window.setTimeout(() => {
+    timedOut = true
+    controller.abort()
+  }, options.timeoutMs ?? 30_000)
+  // 用户主动取消（关弹窗 / 切页面）与内部超时是**两种事**：前者不该被说成"请求超时"✗
+  let userAborted = false
   if (options.signal) {
-    options.signal.addEventListener('abort', () => controller.abort(), { once: true })
+    if (options.signal.aborted) {
+      userAborted = true
+      controller.abort()
+    } else {
+      options.signal.addEventListener(
+        'abort',
+        () => {
+          userAborted = true
+          controller.abort()
+        },
+        { once: true },
+      )
+    }
   }
 
   let response: Response
@@ -211,6 +229,7 @@ export async function request<T = unknown>(
     })
   } catch (error) {
     if (controller.signal.aborted) {
+      if (userAborted && !timedOut) throw new ApiError(0, 'user_aborted', '请求已取消')
       throw new ApiError(0, 'timeout', `请求超时（${options.timeoutMs ?? 30_000}ms）`)
     }
     throw new ApiError(0, 'network_error', `网络不可达：${(error as Error).message}`)

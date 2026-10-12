@@ -503,6 +503,41 @@ class OpenAlexClient:
         self._record_lookup(kind="title", result=result, matched_by="title")
         return work
 
+    async def search_works(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        use_cache: bool = True,
+    ) -> list[OpenAlexWork]:
+        """Keyword discovery for the unified fetch task."""
+        term = sanitize_search_term(query)
+        if not term:
+            return []
+        filters: list[str] = []
+        if date_from:
+            filters.append(f"from_publication_date:{str(date_from)[:10]}")
+        if date_to:
+            filters.append(f"to_publication_date:{str(date_to)[:10]}")
+        params = self._params({"search": term, "per-page": max(1, min(int(limit), 100))})
+        if filters:
+            params["filter"] = ",".join(filters)
+        payload, result = await self._request(f"{self.base_url}/works", params, use_cache=use_cache)
+        if not isinstance(payload, Mapping):
+            return []
+        works: list[OpenAlexWork] = []
+        for item in payload.get("results") or []:
+            if not isinstance(item, Mapping):
+                continue
+            work = normalize_work(item)
+            work.request_url = result.request_url
+            work.http_status = result.status_code
+            work.matched_by = "keyword"
+            works.append(work)
+        return works
+
     # ---------------------------------------------------------------- 底层请求
     async def _request(
         self, url: str, params: Mapping[str, Any], *, use_cache: bool

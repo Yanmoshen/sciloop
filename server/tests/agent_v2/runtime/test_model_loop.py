@@ -297,3 +297,27 @@ def test_gateway_passes_cancellation_through(tmp_path):
     request = ModelRequest(request_id="r1", messages=[{"role": "user", "content": "hi"}])
     with pytest.raises(CancelledError):
         run(_collect(gateway.stream(request, token)))
+
+
+def test_runtime_converges_unexpected_stream_read_error(tmp_path):
+    """A raw transport read failure still closes the Turn and its lease."""
+    class ReadError(Exception):
+        pass
+
+    class BrokenGateway:
+        async def stream(self, request, cancel=None):
+            raise ReadError("socket read failed")
+            yield  # pragma: no cover
+
+    h = Harness.create(tmp_path)
+    thread = h.thread()
+    turn = h.start(thread.thread_id, "读取失败")
+    runtime = h.runtime(h.provider(h.text_script("unused")))
+    runtime.gateway = BrokenGateway()  # type: ignore[assignment]
+    outcome = run(runtime.run(thread.thread_id, turn.turn_id))
+    assert outcome.status is TurnStatus.FAILED
+    assert outcome.error["code"] == "model_stream_error"
+    assert h.repo.state(thread.thread_id).active_turn is None
+    assert "turn/failed" in h.event_types(thread.thread_id)
+    assert "turn/completed" not in h.event_types(thread.thread_id)
+    h.assert_no_lease_leak()

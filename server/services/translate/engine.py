@@ -396,11 +396,13 @@ def _insert_block(
     color: tuple[float, float, float],
     font_file: Path | None,
     floor: float | None = None,
+    *,
+    commit: bool = True,
 ) -> tuple[bool, float, str | None]:
     """把一个文本块写进 ``rect``；返回 ``(是否写入, 实际字号, 失败原因)``。
 
-    估算字号只是起点：``insert_textbox`` 返回负数表示放不下且**不会写入任何内容**，
-    因此这里按 0.85 的步长继续缩小重试（纯测量、无副作用），直到放下或触到**可读下限**。
+    用未提交的 Shape 按真实字体试排；负数表示放不下，按 0.85 步长缩小到可读下限。
+    ``commit=False`` 仅测量，成功时也不修改页面内容，供清除原文前预检。
     """
     payload = str(text or "")
     if not payload.strip():
@@ -416,9 +418,12 @@ def _insert_block(
     attempt = max(lower, min(float(size), 24.0))
     while True:
         try:
-            leftover = page.insert_textbox(
+            shape = page.new_shape()
+            leftover = shape.insert_textbox(
                 rect, payload, fontsize=attempt, color=color, align=0, **kwargs
             )
+            if leftover >= 0 and commit:
+                shape.commit()
         except Exception as exc:  # noqa: BLE001 - 单块失败不阻断该页
             return False, attempt, f"insert_textbox_failed: {type(exc).__name__}"
         if leftover >= 0:
@@ -662,15 +667,10 @@ def render_mono(
     pymupdf = _get_pymupdf()
     document = pymupdf.open(stream=source_bytes, filetype="pdf")
     font_file = _cjk_font_file()
-    ascii_ratio = ASCII_WIDTH_REGISTERED if font_file is not None else ASCII_WIDTH_BUILTIN
     outcomes: list[BlockOutcome] = []
     skipped_rotated = 0
     skipped_unreadable = 0
     skipped_overlap = 0
-    #: 回写字号**低于可读下限**但成功放下的块数，以及其中用过的最小字号
-    #: （2026-09-26：宁可小字号也要写进去；但汇总里必须报**实际最小值**，不能说成都到了 4pt）
-    below_readable = 0
-    below_readable_min = 0.0
     expanded_blocks = 0
     try:
         by_page: dict[int, list[int]] = {}
@@ -751,32 +751,22 @@ def render_mono(
                     continue
                 floor = _readable_floor(block.font_size)
                 write_rect = rect
-                size = _required_font_size(rect, target, block.font_size, ascii_ratio, floor)
-                if size is None:
-                    # 可读下限放不下 → 先试**技术下限**（字号会小于可读下限，但在可缩放的
-                    # PDF 阅读器里，比"这块留英文"有用得多；用户口径 2026-09-26：回写率 ≥98%）。
-                    size = _required_font_size(
-                        rect, target, block.font_size, ascii_ratio, MIN_FONT_SIZE
-                    )
-                    if size is not None:
-                        floor = MIN_FONT_SIZE
+                fits, size, failure = _insert_block(
+                    page, rect, target, block.font_size, block.color, font_file,
+                    floor=floor, commit=False,
+                )
                 grew = False
-                if size is None:
+                if not fits:
                     grown = _expand_rect(pymupdf, rect, obstacles, page_bottom)
                     if grown is not None:
-                        grown_size = _required_font_size(
-                            grown, target, block.font_size, ascii_ratio, floor
+                        fits, size, failure = _insert_block(
+                            page, grown, target, block.font_size, block.color, font_file,
+                            floor=floor, commit=False,
                         )
-                        if grown_size is None:
-                            grown_size = _required_font_size(
-                                grown, target, block.font_size, ascii_ratio, MIN_FONT_SIZE
-                            )
-                            if grown_size is not None:
-                                floor = MIN_FONT_SIZE
-                        if grown_size is not None:
-                            size, write_rect, grew = grown_size, grown, True
-                if size is None:
-                    reason = "translated_text_does_not_fit_at_readable_size"
+                        if fits:
+                            write_rect, grew = grown, True
+                if not fits:
+                    reason = failure or "translated_text_does_not_fit_at_readable_size"
                     skipped_unreadable += 1
                     warnings.append(
                         f"page={block.page} bbox={_fmt_bbox(block.bbox)} 译文未回写（在可读下限 "
@@ -790,98 +780,59 @@ def render_mono(
 
             if not pending:
                 continue
+            # 保留整页修改前的 PDF。预检消除了普通溢出，但 redaction/commit 仍可能
+            # 因异常失败；此时回滚内容流和字体，不能重新排字冒充“保留原文”。
+            before_page = document.tobytes(deflate=True)
+            page_results: list[tuple[int, str, float, bool]] = []
+            page_failure: str | None = None
             try:
                 for _index, rect, _write_rect, _target, _size, _color, _grew in pending:
                     page.add_redact_annot(rect)
-                # images=NONE：红色遮盖只删该块文本，绝不删除正文图片（PDF_REDACT_IMAGE_NONE）
                 page.apply_redactions(
                     images=pymupdf.PDF_REDACT_IMAGE_NONE,
                     graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
                 )
-            except Exception as exc:  # noqa: BLE001 - 整页 redact 失败则整页保留原文
-                reason = f"redaction_failed: {type(exc).__name__}"
-                warnings.append(f"page={page_number} 原文本清除失败（{reason}），该页保留原文")
+            except Exception as exc:  # noqa: BLE001 - 回滚该页，保留原始字形
+                page_failure = f"redaction_failed: {type(exc).__name__}"
+
+            if page_failure is None:
+                for index, _rect, write_rect, target, size, color, grew in pending:
+                    block = blocks[index]
+                    written, used_size, failure = _insert_block(
+                        page, write_rect, target, size, color, font_file,
+                        floor=_readable_floor(block.font_size),
+                    )
+                    if not written:
+                        page_failure = failure or "insert_failed"
+                        break
+                    page_results.append((index, target, used_size, grew))
+
+            if page_failure is not None:
+                document.close()
+                document = pymupdf.open(stream=before_page, filetype="pdf")
+                warnings.append(
+                    f"page={page_number} 译文未回写（{page_failure}），该页保留原文及原始字体"
+                )
                 for index, _rect, _write_rect, target, _size, _color, _grew in pending:
                     block = blocks[index]
                     outcomes.append(
-                        BlockOutcome(block.page, block.bbox, block.source_text, target, False, reason)
+                        BlockOutcome(block.page, block.bbox, block.source_text, target, False, page_failure)
                     )
                 continue
 
-            for index, rect, write_rect, target, size, color, grew in pending:
+            for index, target, used_size, grew in page_results:
                 block = blocks[index]
-                written, used_size, failure = _insert_block(
-                    # ⚠️ 下限必须与**估算阶段**用的一致（`floor`：走过技术下限就是 MIN_FONT_SIZE）。
-                    # 一度写成 `min(可读下限, size)` → 估算说 11pt 能放下、写入器却卡在 9pt 上，
-                    # 于是"框高比行高还小"的那类块（Abstract、单行小字）永远写不进去。
-                    page,
-                    write_rect,
-                    target,
-                    size,
-                    color,
-                    font_file,
-                    # 起点是估算字号（已经先试过可读下限），下限放到**技术下限**：
-                    # 估算的行高系数（1.22）比真实字体（≈1.36）乐观，
-                    # 不让写入器继续往下搜，就会出现"估算说放得下、实测塞不进"的死结。
-                    # 宁可小字号写进去（并在汇总里报出块数），也不要整块留英文。
-                    floor=MIN_FONT_SIZE,
-                )
-                if not written:
-                    # 回写失败 → 立即把**原文**写回该块，避免「清了原文什么都没写」的内容丢失
-                    restored, _restore_size, restore_failure = _insert_block(
-                        page,
-                        rect,
-                        block.source_text,
-                        block.font_size,
-                        color,
-                        font_file,
-                        floor=_readable_floor(block.font_size),
-                    )
-                    if not restored:
-                        # 原文都写不回去 → 再用**技术下限**兜一次。
-                        # 原设计在这里会留下一块**空白**（原文已 redact、什么都没写回）——
-                        # 那是真的丢内容，比字小严重得多。
-                        restored, _restore_size, restore_failure = _insert_block(
-                            page,
-                            rect,
-                            block.source_text,
-                            block.font_size,
-                            color,
-                            font_file,
-                            floor=MIN_FONT_SIZE,
-                        )
-                    reason = failure or "insert_failed"
-                    warnings.append(
-                        f"page={block.page} bbox={_fmt_bbox(block.bbox)} 译文未回写（{reason}），"
-                        + ("已把原文写回" if restored else f"且原文回写亦失败（{restore_failure}）")
-                    )
-                    outcomes.append(
-                        BlockOutcome(block.page, block.bbox, block.source_text, target, False, reason)
-                    )
-                    continue
                 if grew:
                     expanded_blocks += 1
-                if used_size < _readable_floor(block.font_size) - 1e-9:
-                    below_readable += 1
-                    if below_readable_min <= 0 or used_size < below_readable_min:
-                        below_readable_min = used_size
                 if used_size < block.font_size * SHRINK_WARN_RATIO:
                     warnings.append(
                         f"page={block.page} bbox={_fmt_bbox(block.bbox)} 译文回写字号由 "
-                        f"{block.font_size:.1f}pt 缩到 {used_size:.1f}pt（受原块限制，仍在可读下限内）"
+                        f"{block.font_size:.1f}pt 缩到 {used_size:.1f}pt（仍在可读下限内）"
                     )
                 outcomes.append(
                     BlockOutcome(block.page, block.bbox, block.source_text, target, True, None)
                 )
 
-        if below_readable:
-            warnings.append(
-                f"共 {below_readable} 块译文放不进可读下限（不低于原字号 "
-                f"{READABILITY_FLOOR_RATIO:.0%} 且 {MIN_READABLE_FONT_SIZE:g}pt），"
-                f"已缩到下限以下写入，其中最小到 {below_readable_min:g}pt"
-                f"（技术下限 {MIN_FONT_SIZE:g}pt）—— 在可缩放阅读器里可读，"
-                "但确实比原文字号小，这类块值得人工抽查"
-            )
         if skipped_rotated:
             warnings.append(
                 f"共 {skipped_rotated} 块旋转文本（侧栏/水印/竖排）未回写，PDF 中按原方向保留"

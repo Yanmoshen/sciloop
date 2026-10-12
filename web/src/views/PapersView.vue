@@ -63,7 +63,7 @@ async function sync(): Promise<void> {
   notice.value = ''
   try {
     monitorOpen.value = true
-    const result = await tasks.startFetch(30)
+    const result = await tasks.startFetch({ limit: 30 })
     if (!result.ok) {
       notice.value =
         result.status === 403 ? writeDenied('重新同步（触发抓取）') : result.message

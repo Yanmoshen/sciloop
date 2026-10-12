@@ -35,6 +35,8 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import functools
 import importlib.util
 import json
 import locale
@@ -43,6 +45,7 @@ import secrets
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -128,6 +131,46 @@ def read_env_value(key: str) -> str:
     return ""
 
 
+def _python_selection() -> tuple[str, str]:
+    raw = (os.environ.get(HOST_PYTHON_ENV) or "").strip() or read_env_value(HOST_PYTHON_ENV)
+    configured = raw.strip().strip('"').strip("'")
+    if configured and Path(configured).is_file():
+        return str(Path(configured).resolve()), "configured"
+    for relative in (".venv/Scripts/python.exe", ".venv/bin/python", "server/.venv/Scripts/python.exe", "server/.venv/bin/python"):
+        candidate = REPO_ROOT / relative
+        if candidate.is_file():
+            return str(candidate.resolve()), "project"
+    return sys.executable, "runtime"
+
+
+@functools.lru_cache(maxsize=8)
+def _python_version(executable: str) -> str:
+    try:
+        result = subprocess.run(
+            [executable, "-c", "import platform; print(platform.python_version())"],
+            capture_output=True, timeout=3, check=False,
+            creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) if os.name == "nt" else 0,
+        )
+        return result.stdout.decode("utf-8", "replace").strip() if result.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def python_environment() -> dict[str, str]:
+    executable, source = _python_selection()
+    return {"executable": executable, "source": source, "version": _python_version(executable)}
+
+
+def execution_capabilities() -> dict[str, Any]:
+    try:
+        capability = _load_sandbox_module().available()
+    except (ImportError, OSError) as exc:
+        capability = {"available": False, "reason": str(exc)}
+    return {"full_access": True, "approved_execution": True,
+            "workspace_execution": bool(capability.get("available")),
+            "sandbox": capability}
+
+
 def host_python() -> str:
     r"""研究者电脑上「跑命令时该用哪个 Python」：环境变量 → 项目 `.env` → 空（空＝不改 PATH）。
 
@@ -141,9 +184,7 @@ def host_python() -> str:
     也不动全局配置 —— 不想要就把 `.env` 里那行删掉，行为立刻回到原样。
     """
 
-    raw = (os.environ.get(HOST_PYTHON_ENV) or "").strip() or read_env_value(HOST_PYTHON_ENV)
-    path = raw.strip().strip('"').strip("'")
-    return path if path and Path(path).is_file() else ""
+    return _python_selection()[0]
 
 
 def python_path_prefix() -> list[str]:
@@ -174,6 +215,15 @@ def read_configured_port() -> int | None:
     解析口径与 `read_owner_token` 一致（**必须剥行内注释**，否则端口后面挂的说明会污染取值）。
     """
 
+    # Environment overrides must match the backend's endpoint resolution.
+    configured = (os.environ.get("SCILOOP_HOST_RUNNER_URL") or "").strip()
+    if configured:
+        from urllib.parse import urlsplit
+
+        try:
+            return urlsplit(configured).port
+        except ValueError:
+            return None
     try:
         for raw in ENV_FILE.read_text(encoding="utf-8").splitlines():
             line = raw.strip()
@@ -230,7 +280,7 @@ def _inside(path: Path, root: Path) -> bool:
 
 
 def _path_write_allowed(path: Path, *, workspace_root: str | None, access_mode: str) -> bool:
-    if access_mode == "full":
+    if access_mode in {"full", "approved"}:
         return True
     if not workspace_root:
         return False
@@ -249,9 +299,16 @@ def run_command(
 ) -> dict[str, Any]:
     """执行一条命令，返回真实退出码与输出（**不美化、不伪造**）。"""
 
+    if access_mode not in {"workspace", "read-only", "full", "approved"}:
+        return {"ok": False, "error": "执行权限无效"}
+
     use_shell = False
     if argv:
         args = list(argv)
+        # Bare Python means the selected scientific environment. Preserve an
+        # explicit executable path or version requested by the user/model.
+        if args[0].lower() in {"python", "python.exe", "python3", "python3.exe"}:
+            args[0] = host_python()
     elif command:
         # ⚠️ 2026-09-26 修：原来 Windows 上是 `shlex.split(command, posix=False)` ——
         # **引号会被原样保留**，`python -c "print(1)"` 到程序手里成了**带引号的字符串**
@@ -289,13 +346,13 @@ def run_command(
 
     # 工作区模式必须经过操作系统沙箱；沙箱不可用时返回明确错误，
     # 不能为了“还能跑”而退回到无约束的宿主进程。
-    if access_mode != "full":
+    if access_mode not in {"full", "approved"}:
         try:
             sandbox = _load_sandbox_module()
         except (ImportError, OSError) as exc:
             return {"ok": False, "code": "sandbox_unavailable", "error": f"受限执行器不可用：{exc}", "workdir": workdir}
         result = sandbox.run(
-            argv=list(argv) if argv else None,
+            argv=args if argv else None,
             command=command,
             cwd=workdir,
             workspace_root=str(workspace_root or workdir),
@@ -356,279 +413,465 @@ def run_command(
 
 
 # ---------------------------------------------------------------------------------------
-# 常驻弹框助手（2026-09-26）
+# 目录选择任务（2026-10-11 重构）
 #
-# 为什么要有它：研究者点「选择文件夹」时，走 PowerShell 要等 2.4–3.4 秒（起进程 + 现场
-# 编译 C#），走一次性子进程要 ~18 秒（每次重新预热 COM）—— 点一下等三秒以上不合理。
-# 常驻助手把预热做在前面，点击时只发一行 JSON，窗口几乎立刻出现；
-# **顺带**：助手是无控制台的子进程，所以不会再闪出 PowerShell 黑框。
+# 为什么改成"任务"：研究者可能盯着系统窗口几十秒到几分钟才点 ✓，
+# 而普通 HTTP 请求有 30 秒默认超时 → 页面先报"请求超时（30000ms）"，选择白做 ✗。
+# 于是拆成三段：
+#   POST /pick-folder                  建任务，**立刻**回 {"request_id","status":"pending"}
+#   GET  /pick-folder/<request_id>     读状态（pending/selected/canceled/timed_out/unavailable/failed）
+#   POST /pick-folder/<id>/cancel      取消（关掉同一个系统窗口）
 #
-# 失败一律回落：助手起不来 / 中途崩了 / 回话超时 → 返回 None，`pick_folder` 照旧走原路径 ✓
+# 弹框跑在**专用线程**里：Windows 的 COM 模态对话框必须归它自己那个 STA 线程所有。
+# 取消 / 超时都走 `PostMessage(hwnd, WM_CLOSE)`，由对话框自己的消息循环消费
+# —— 跨线程直接调 `IFileDialog::Close` 不安全，老版本就是踩了这个坑 ✗。
 # ---------------------------------------------------------------------------------------
-_PICK_ASSISTANT: dict[str, Any] = {"proc": None, "lock": threading.Lock()}
+_PICK_RETAIN_S = 600.0        # 终态结果保留 10 分钟（允许前端重复读同一结果）
+_PICK_MAX_LIFE_S = 900.0      # 单条任务最长存活 15 分钟（系统保护期限）
+_PICK_MAX_TASKS = 64
+_PICK_NATIVE: dict[str, Any] = {"loaded": False, "module": None}
 
 
-def _start_pick_assistant() -> subprocess.Popen[bytes] | None:
-    """启动常驻助手（只在 Windows 且原生模块存在时）；失败返回 None。"""
-    if not sys.platform.startswith("win"):
-        return None
-    script = Path(__file__).with_name("pick_native.py")
-    if not script.is_file():
-        return None
+def _load_native_picker() -> Any:
+    """加载同目录的 `pick_native.py`（执行器是独立脚本，不依赖包路径）。"""
+
+    if not _PICK_NATIVE["loaded"]:
+        _PICK_NATIVE["loaded"] = True
+        script = Path(__file__).with_name("pick_native.py")
+        try:
+            spec = importlib.util.spec_from_file_location("sciloop_pick_native", script)
+            if spec is not None and spec.loader is not None:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                _PICK_NATIVE["module"] = module
+        except Exception:  # noqa: BLE001 - 原生模块不可用就如实回落别的实现 ✓
+            _PICK_NATIVE["module"] = None
+    return _PICK_NATIVE["module"]
+
+
+class _PickTask:
+    """一次目录选择请求的全部状态（**只在 `_PickManager` 的锁内改**）。"""
+
+    __slots__ = (
+        "request_id", "title", "initial", "timeout_s", "impl", "status", "path",
+        "error", "error_class", "created_at", "finished_at", "cancel_event", "thread", "proc",
+    )
+
+    def __init__(self, *, request_id: str, title: str, initial: str, timeout_s: int, impl: str) -> None:
+        self.request_id = request_id
+        self.title = title
+        self.initial = initial
+        self.timeout_s = timeout_s
+        self.impl = impl
+        self.status = "pending"
+        self.path = ""
+        self.error = ""
+        self.error_class = ""
+        self.created_at = time.time()
+        self.finished_at = 0.0
+        self.cancel_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.proc: subprocess.Popen[bytes] | None = None
+
+
+def _picker_impl() -> str:
+    """这台机器**默认**用哪种实现（例外情况在 `_pick_windows_native` 里再回落）。"""
+
+    if sys.platform.startswith("win"):
+        return "native" if _load_native_picker() is not None else "fallback"
+    if sys.platform == "darwin":
+        return "osascript"
+    return "zenity"
+
+
+class _PickManager:
+    """同一时刻只允许一个系统窗口；结果保留 10 分钟供重复读取。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._tasks: dict[str, _PickTask] = {}
+        self._active_id = ""
+
+    # -- 建任务 ---------------------------------------------------------- #
+    def create(self, *, request_id: str, title: str, initial: str, timeout_s: int) -> dict[str, Any]:
+        impl = _picker_impl()
+        with self._lock:
+            self._sweep_locked()
+            active = self._tasks.get(self._active_id)
+            if active is not None and active.status == "pending":
+                # 已经有一个窗口挂着 → 复用，**绝不弹第二个** ✓
+                return {
+                    "ok": True,
+                    "request_id": active.request_id,
+                    "status": "pending",
+                    "accepted": False,
+                    "busy": True,
+                    "impl": active.impl,
+                    "fallback": active.impl == "fallback",
+                }
+            task = _PickTask(
+                request_id=request_id or f"pick_{secrets.token_hex(8)}",
+                title=title,
+                initial=initial,
+                timeout_s=timeout_s,
+                impl=impl,
+            )
+            self._tasks[task.request_id] = task
+            self._active_id = task.request_id
+            self._trim_locked()
+            task.thread = threading.Thread(
+                target=self._run, args=(task,), name=f"pick-{task.request_id}", daemon=True
+            )
+            task.thread.start()
+            return {
+                "ok": True,
+                "request_id": task.request_id,
+                "status": "pending",
+                "accepted": True,
+                "impl": impl,
+                "fallback": impl == "fallback",
+            }
+
+    # -- 读状态 ---------------------------------------------------------- #
+    def status(self, request_id: str) -> dict[str, Any]:
+        with self._lock:
+            task = self._tasks.get(request_id)
+            if task is None:
+                return {"ok": True, "request_id": request_id, "status": "expired", "done": True, "path": ""}
+            self._expire_if_overdue_locked(task)
+            return {
+                "ok": True,
+                "request_id": task.request_id,
+                "status": task.status,
+                "done": task.status != "pending",
+                "path": task.path,
+                "error": task.error,
+                "error_class": task.error_class,
+                "impl": task.impl,
+                "fallback": task.impl == "fallback",
+                "elapsed_ms": int(((task.finished_at or time.time()) - task.created_at) * 1000),
+            }
+
+    # -- 取消 ------------------------------------------------------------ #
+    def cancel(self, request_id: str) -> dict[str, Any]:
+        with self._lock:
+            task = self._tasks.get(request_id)
+            if task is None:
+                return {"ok": True, "request_id": request_id, "status": "expired", "done": True}
+            if task.status != "pending":
+                return {"ok": True, "request_id": request_id, "status": task.status, "done": True, "path": task.path}
+            task.cancel_event.set()
+        # PowerShell/命令行回落路径没法被消息打断 → 直接结束它（窗口随进程消失，不留孤儿 ✓）
+        proc = task.proc
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+            except (OSError, ValueError):
+                pass
+        if task.thread is not None:
+            task.thread.join(timeout=10)
+        with self._lock:
+            if task.status == "pending":
+                task.status = "canceled"
+                task.finished_at = time.time()
+            if self._active_id == request_id:
+                self._active_id = ""
+            return {"ok": True, "request_id": request_id, "status": task.status, "done": True, "path": task.path}
+
+    # -- 内部 ------------------------------------------------------------ #
+    def _run(self, task: _PickTask) -> None:
+        try:
+            result = _execute_pick(task)
+        except Exception as exc:  # noqa: BLE001 - 弹框崩了也只影响这一条任务
+            result = {
+                "ok": False,
+                "status": "failed",
+                "error_class": "picker_crashed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        with self._lock:
+            task.status = _settle_status(task, result)
+            task.path = str(result.get("path") or "")
+            task.error = str(result.get("error") or "")
+            task.error_class = str(result.get("error_class") or "")
+            if task.path and not os.path.isdir(task.path):
+                # 选完就被删了 / 不是目录 → 不能返回伪成功 ✗
+                task.status = "failed"
+                task.error = "选中的目录在系统上已经不存在了。"
+                task.error_class = "path_missing"
+            task.finished_at = time.time()
+            if self._active_id == task.request_id:
+                self._active_id = ""
+
+    def _sweep_locked(self) -> None:
+        now = time.time()
+        for key, task in list(self._tasks.items()):
+            if task.status != "pending" and now - task.finished_at > _PICK_RETAIN_S:
+                self._tasks.pop(key, None)
+            elif task.status == "pending" and now - task.created_at > _PICK_MAX_LIFE_S + 60:
+                task.cancel_event.set()
+                task.status = "timed_out"
+                task.finished_at = now
+
+    def _expire_if_overdue_locked(self, task: _PickTask) -> None:
+        """到系统保护期限就收束（任务不能永远 pending，否则前端一直等）✓。"""
+
+        if task.status != "pending":
+            return
+        if time.time() - task.created_at <= _PICK_MAX_LIFE_S:
+            return
+        task.cancel_event.set()
+        task.status = "timed_out"
+        task.finished_at = time.time()
+        if self._active_id == task.request_id:
+            self._active_id = ""
+
+    def _trim_locked(self) -> None:
+        while len(self._tasks) > _PICK_MAX_TASKS:
+            key, task = next(iter(self._tasks.items()))
+            if task.status == "pending":
+                break
+            self._tasks.pop(key, None)
+
+
+_PICK = _PickManager()
+
+
+def pick_create(
+    *, request_id: str = "", title: str = "选择文件夹", initial: str = "", timeout_s: int = 600
+) -> dict[str, Any]:
+    """建一条选择任务（**立刻返回**，不阻塞在用户选择上）。"""
+
+    clamped = max(5, min(int(timeout_s or 600), int(_PICK_MAX_LIFE_S)))
+    return _PICK.create(request_id=request_id, title=title, initial=initial, timeout_s=clamped)
+
+
+def pick_status(*, request_id: str) -> dict[str, Any]:
+    """读任务状态（终态可重复读同一结果 ✓）。"""
+
+    return _PICK.status(request_id)
+
+
+def pick_cancel(*, request_id: str) -> dict[str, Any]:
+    """取消任务（关掉同一个系统窗口；幂等 ✓）。"""
+
+    return _PICK.cancel(request_id)
+
+
+def _settle_status(task: _PickTask, result: dict[str, Any]) -> str:
+    """把各实现的返回值收敛成任务终态（**只能从 pending 落到终态**）。"""
+
+    if task.cancel_event.is_set() and not result.get("path"):
+        return "canceled"
+    status = str(result.get("status") or "")
+    if status in ("selected", "canceled", "timed_out", "unavailable", "failed"):
+        if status == "selected" and not str(result.get("path") or ""):
+            return "canceled"
+        return status
+    if result.get("timed_out"):
+        return "timed_out"
+    if not result.get("ok"):
+        return "unavailable" if result.get("unsupported") else "failed"
+    return "selected" if result.get("path") else "canceled"
+
+
+def _execute_pick(task: _PickTask) -> dict[str, Any]:
+    if task.impl == "native":
+        return _pick_windows_native(task)
+    if task.impl == "fallback":
+        return _pick_windows_fallback(task)
+    if task.impl == "osascript":
+        return _pick_macos(task)
+    return _pick_zenity(task)
+
+
+def _pick_windows_native(task: _PickTask) -> dict[str, Any]:
+    module = _load_native_picker()
+    if module is None:
+        return _pick_windows_fallback(task, reason="原生选择器模块不可用")
+    outcome = module.pick_folder_native(
+        title=task.title, timeout_s=task.timeout_s, cancel_event=task.cancel_event
+    )
+    if not isinstance(outcome, dict):
+        return {
+            "ok": False,
+            "status": "failed",
+            "error_class": "bad_result",
+            "error": "选择器返回了看不懂的内容",
+        }
+    # **只有明确用不了原生**（没有桌面 / 建不出对话框）才回落 —— 正常机器绝不回落 ✓
+    if outcome.get("unsupported") and str(outcome.get("status")) == "unavailable":
+        return _pick_windows_fallback(task, reason=str(outcome.get("error") or "原生选择器不可用"))
+    return outcome
+
+
+def _powershell_quote(value: str) -> str:
+    """单引号字符串 + 去掉控制字符（标题不该带换行/引号/控制字符）✓。"""
+
+    cleaned = "".join(ch for ch in str(value) if ch >= " " or ch == "\t")
+    return "'" + cleaned.replace("'", "''") + "'"
+
+
+def _powershell_script(title: str, initial: str, timeout_s: int) -> str:
+    steps = [
+        "$OutputEncoding = [System.Text.Encoding]::UTF8",
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8",
+        "Add-Type -AssemblyName System.Windows.Forms",
+        "Add-Type -AssemblyName System.Drawing",
+        "$owner = New-Object System.Windows.Forms.Form",
+        "$owner.ShowInTaskbar = $false; $owner.FormBorderStyle = 'None'",
+        "$owner.Opacity = 0; $owner.TopMost = $true",
+        "$owner.Size = New-Object System.Drawing.Size(1,1)",
+        "$owner.StartPosition = 'CenterScreen'; $owner.Show(); $owner.Activate()",
+        "$d = New-Object System.Windows.Forms.FolderBrowserDialog",
+        f"$d.Description = {_powershell_quote(title)}",
+        "$d.ShowNewFolderButton = $true",
+    ]
+    if initial:
+        steps.append(f"$d.SelectedPath = {_powershell_quote(initial)}")
+    steps += [
+        "$hits = 0",
+        "$timer = New-Object System.Windows.Forms.Timer",
+        f"$timer.Interval = {timeout_s * 1000}",
+        "$timer.Add_Tick({ $script:hits = 1; $d.Dispose(); $owner.Close() })",
+        "$timer.Start()",
+        "$sw = [System.Diagnostics.Stopwatch]::StartNew()",
+        "$r = $d.ShowDialog($owner)",
+        "$sw.Stop(); $timer.Stop(); $owner.Close()",
+        "Write-Output ('elapsed_ms=' + $sw.ElapsedMilliseconds)",
+        "Write-Output ('picked=' + $d.SelectedPath)",
+        "if ($hits -eq 1) { Write-Output 'timed_out=1' } else { Write-Output 'timed_out=0' }",
+    ]
+    return "; ".join(steps)
+
+
+def _pick_windows_fallback(task: _PickTask, *, reason: str = "") -> dict[str, Any]:
+    """PowerShell 回落（**只在原生确实不可用时**；结果里标记 `fallback` 供日志与验收）✓。
+
+    标题/路径一律走 `-EncodedCommand`（UTF-16LE base64）：
+    **不把中文拼进命令行源码** —— 那正是标题乱码与多层引号踩雷的地方 ✗。
+    """
+
+    script = _powershell_script(task.title, task.initial, task.timeout_s)
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    argv = ["powershell", "-NoProfile", "-STA", "-EncodedCommand", encoded]
     try:
-        return subprocess.Popen(  # noqa: S603 - 弹系统对话框是本模块的本职
-            [sys.executable, str(script), "--serve"],
-            stdin=subprocess.PIPE,
+        proc = subprocess.Popen(  # noqa: S603 - 弹系统对话框是本模块的本职
+            argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
         )
-    except OSError:
-        return None
-
-
-def _discard_pick_assistant(proc: subprocess.Popen[bytes] | None) -> None:
-    """丢弃一个不正常的助手（杀掉 + 归零；下次请求会重新起一个）。返回值恒为 None。"""
-    if proc is not None:
-        try:
-            proc.kill()
-        except OSError:
-            pass
-    return None
-
-
-def _readline_within(proc: subprocess.Popen[bytes], timeout_s: float) -> str | None:
-    """在独立线程里读一行；超时返回 None（`readline` 本身没法中断）。"""
-    box: dict[str, Any] = {"line": None}
-
-    def worker() -> None:
-        try:
-            raw = proc.stdout.readline() if proc.stdout is not None else b""
-        except Exception:  # noqa: BLE001 - 助手没了就是没结果
-            raw = b""
-        box["line"] = raw.decode("utf-8", errors="replace").strip() if isinstance(raw, bytes) else None
-
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-    thread.join(timeout_s)
-    if thread.is_alive():
-        return None
-    return box["line"] or None
-
-
-def pick_folder_via_assistant(*, title: str, timeout_s: int) -> dict[str, Any] | None:
-    """让常驻助手弹框；**任何异常/超时都返回 None**，由调用方回落原路径。"""
-    with _PICK_ASSISTANT["lock"]:
-        proc = _PICK_ASSISTANT.get("proc")
-        if proc is not None and proc.poll() is not None:
-            proc = None  # 助手已经退出（崩了 / 被关掉）
-        if proc is None:
-            proc = _start_pick_assistant()
-            _PICK_ASSISTANT["proc"] = proc
-        if proc is None or proc.stdin is None or proc.stdout is None:
-            return None
-        request = json.dumps(
-            {"cmd": "pick", "title": title, "timeout_s": int(timeout_s)}, ensure_ascii=False
-        )
-        try:
-            proc.stdin.write((request + "\n").encode("utf-8"))
-            proc.stdin.flush()
-        except (OSError, ValueError):
-            _PICK_ASSISTANT["proc"] = _discard_pick_assistant(proc)
-            return None
-        # 助手自己带对话框超时，这里再留 30 秒余量；仍读不到 → 助手不正常，丢弃回落
-        line = _readline_within(proc, float(timeout_s) + 30)
-        if line is None:
-            _PICK_ASSISTANT["proc"] = _discard_pick_assistant(proc)
-            return None
-        try:
-            payload = json.loads(line)
-        except ValueError:
-            return None
-        return payload if isinstance(payload, dict) else None
-
-
-def pick_folder(*, title: str = "选择文件夹", initial: str = "", timeout_s: int = 600) -> dict[str, Any]:
-    """弹出**系统自带**的文件夹选择框，返回研究者选中的绝对路径。
-
-    - Windows：`System.Windows.Forms.FolderBrowserDialog`（就是资源管理器那种选择框）；
-    - macOS：`osascript` 的 `choose folder`；Linux：`zenity`（没装就如实说"这台机器弹不出来"）。
-
-    2026-09-26 修的三件事（都是真机踩出来的）：
-    1. **强制置顶**：没有 owner 的对话框常被浏览器盖住，研究者看不到 → 用不可见置顶窗体当 owner，
-       弹完再抢一次前台；否则"点了没反应"（实测有一次 0.3 秒就返回 Cancel ✗）。
-    2. **超时自动关**：用 WinForms 计时器到点关闭，**不留孤儿窗口**
-       （`subprocess.run(timeout=)` 只杀直接子进程，窗口会残留 ✗）。
-    3. **如实区分**：`canceled`（弹出来了、人取消）/ `timed_out`（弹出来了、人没点）/
-       `shown=False`（**压根没弹出来**）—— 原来第三种被报成"没有选择文件夹"，是假消息。
-    """
-
-    timeout_s = max(5, min(int(timeout_s or 600), 3600))
-
-    # 2026-09-26：Windows 上**先让独立子进程去弹原生对话框**。
-    # 为什么不就在本进程里弹：COM 模态框在本线程 Show() 时，别的线程 Close() 解不开它 ✗
-    #   → 请求会一直挂着（客户端 22 秒超时）+ 每次留一个卡死的窗口 ✗（实测踩过）。
-    # 子进程方案：快约一倍（~1 秒 vs PowerShell 的 2.4–3.4 秒），卡也只卡它自己，
-    #   超时由 subprocess.run 杀掉 → 窗口随进程消失（孤儿问题一并解决 ✓）。
-# 实测：子进程跑原生 COM 要 ~18 秒 ✗（比旧路径的 2.4–3.4 秒更差），这里不用它；
-# 原生模块 pick_native.py 留着，等以后做“常驻助手进程”时再用。
-    if sys.platform.startswith("win"):
-        # 先试**常驻助手**（快 + 不会闪黑框）；拿不到就回落下面的 PowerShell 路径
-        assisted = pick_folder_via_assistant(title=title, timeout_s=timeout_s)
-        if assisted is not None:
-            return assisted
-        script = (
-            "Add-Type -AssemblyName System.Windows.Forms; "
-            "Add-Type -AssemblyName System.Drawing; "
-            # 抢前台的助手（ShowDialog 会阻塞，只能在消息循环里抢）
-            "Add-Type @'\n"
-            "using System;\n"
-            "using System.Runtime.InteropServices;\n"
-            "public class FG {\n"
-            "  [DllImport(\"user32.dll\")] public static extern bool SetForegroundWindow(IntPtr h);\n"
-            "  [DllImport(\"user32.dll\")] public static extern bool ShowWindow(IntPtr h, int c);\n"
-            "}\n"
-            "'@; "
-            # owner：**不可见但已显示**的置顶窗体（最小化的给不了前台 ✗，2026-09-26 实测）
-            "$owner = New-Object System.Windows.Forms.Form; "
-            "$owner.ShowInTaskbar = $false; $owner.FormBorderStyle = 'None'; "
-            "$owner.Opacity = 0; $owner.TopMost = $true; $owner.Size = New-Object System.Drawing.Size(1,1); "
-            "$owner.StartPosition = 'CenterScreen'; $owner.Show(); $owner.Activate(); "
-            "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
-            f"$d.Description = {json.dumps(title, ensure_ascii=False)}; "
-            "$d.ShowNewFolderButton = $true; "
-            "$d.StartPosition = 'CenterScreen'; "
-            + (f"$d.SelectedPath = {json.dumps(initial, ensure_ascii=False)}; " if initial else "")
-            + "$hits = 0; "
-            # 到点自动关（不留孤儿窗口）
-            "$timer = New-Object System.Windows.Forms.Timer; "
-            f"$timer.Interval = {timeout_s * 1000}; "
-            "$timer.Add_Tick({ $script:hits = 1; $d.Dispose(); $owner.Close() }); "
-            "$timer.Start(); "
-            # 200ms 后主动把对话框抢到前台（抢不到也不算失败，只是可能被盖住）
-            "$fg = New-Object System.Windows.Forms.Timer; "
-            "$fg.Interval = 200; "
-            "$fg.Add_Tick({ try { [void][FG]::ShowWindow($d.Handle, 5); [void][FG]::SetForegroundWindow($d.Handle) } catch {} $fg.Stop() }); "
-            "$fg.Start(); "
-            "$sw = [System.Diagnostics.Stopwatch]::StartNew(); "
-            "$r = $d.ShowDialog($owner); "
-            "$sw.Stop(); $timer.Stop(); $fg.Stop(); "
-            "$owner.Close(); "
-            "Write-Output ('result=' + $r); "
-            "Write-Output ('elapsed_ms=' + $sw.ElapsedMilliseconds); "
-            "Write-Output ('picked=' + $d.SelectedPath); "
-            "if ($hits -eq 1) { Write-Output 'timed_out=1' } else { Write-Output 'timed_out=0' }"
-        )
-        argv = ["powershell", "-NoProfile", "-STA", "-Command", script]
-    elif sys.platform == "darwin":
-        script = f'POSIX path of (choose folder with prompt "{title}")'
-        argv = ["osascript", "-e", script]
-    else:
-        argv = ["zenity", "--file-selection", "--directory", "--title", title]
-
-    # Windows：**隐藏子进程自带的控制台窗口** —— 否则点「选择文件夹」会闪出一个
-    # PowerShell 黑框（对话框是它弹的，那个黑框只是它的控制台副作用，用户不该看到）。
-    # CREATE_NO_WINDOW 只掐掉控制台，不影响 WinForms 对话框本身的显示。
-    run_extra: dict[str, Any] = {}
-    if sys.platform.startswith("win"):
-        run_extra["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-
+    except OSError as exc:
+        return {
+            "ok": False,
+            "status": "unavailable",
+            "error_class": "no_powershell",
+            "fallback": True,
+            "error": f"这台机器上没有可用的系统选择框（{reason or exc}）。",
+        }
+    task.proc = proc
     try:
-        proc = subprocess.run(
-            argv, capture_output=True, timeout=timeout_s, check=False, **run_extra
-        )
-    except FileNotFoundError:
-        return {
-            "ok": False,
-            "supported": False,
-            "shown": False,
-            "error": "这台机器上没有可用的系统选择框（Windows 之外需要 osascript / zenity）。",
-        }
+        raw, _ = proc.communicate(timeout=task.timeout_s + 20)
     except subprocess.TimeoutExpired:
+        proc.kill()
         return {
             "ok": False,
-            "supported": True,
+            "status": "timed_out",
             "shown": True,
-            "timed_out": True,
-            "error": f"等了 {timeout_s} 秒还没选，已关闭选择框。",
+            "fallback": True,
+            "error": f"等了 {task.timeout_s} 秒还没选，已关闭选择框。",
         }
+    finally:
+        task.proc = None
 
-    out = _decode(proc.stdout or b"")
     fields: dict[str, str] = {}
-    for line in out.splitlines():
+    for line in _decode(raw or b"").splitlines():
         if "=" in line:
             key, _, value = line.partition("=")
             fields[key.strip()] = value.strip()
-
-    elapsed_ms = int(fields["elapsed_ms"]) if fields.get("elapsed_ms", "").isdigit() else None
-    timed_out = fields.get("timed_out") == "1"
-    result = fields.get("result", "")
-
-    if elapsed_ms is not None and elapsed_ms < 1000 and not fields.get("picked"):
-        # 人不可能在一秒内点完：只能解释为"窗口没弹出来"（抢不到前台/无桌面会话）
+    if fields.get("timed_out") == "1":
         return {
             "ok": False,
-            "supported": True,
-            "shown": False,
-            "elapsed_ms": elapsed_ms,
-            "error": "系统选择框没能显示出来（这次连一秒都没到就返回了）—— 请把当前界面告诉我，我从执行器的桌面会话查。",
+            "status": "timed_out",
+            "shown": True,
+            "fallback": True,
+            "error": f"等了 {task.timeout_s} 秒还没选，已关闭选择框。",
         }
-
-    if timed_out:
-        return {"ok": False, "supported": True, "shown": True, "timed_out": True, "elapsed_ms": elapsed_ms,
-                "error": f"等了 {timeout_s} 秒还没选，已关闭选择框。"}
-
     picked = (fields.get("picked") or "").strip()
     if not picked:
-        # 弹出来过（耗时正常）+ 没选 = 研究者取消了
-        return {"ok": True, "supported": True, "shown": True, "path": "", "canceled": True, "elapsed_ms": elapsed_ms}
+        return {
+            "ok": True,
+            "status": "canceled",
+            "shown": True,
+            "path": "",
+            "canceled": True,
+            "timed_out": False,
+            "fallback": True,
+        }
     return {
         "ok": True,
-        "supported": True,
+        "status": "selected",
         "shown": True,
         "path": picked,
-        "canceled": False if result else True,
-        "elapsed_ms": elapsed_ms,
+        "canceled": False,
+        "timed_out": False,
+        "fallback": True,
     }
 
 
-def _pick_native_subprocess(*, title: str, timeout_s: int) -> dict[str, Any] | None:
-    """让**独立子进程**去弹原生文件夹选择框（成功/取消/超时都给结构化结果）。
+def _osa_quote(value: str) -> str:
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
-    失败（模块不在、解释器不对、输出看不懂）→ 返回 None，调用方退回 PowerShell 路径 ✓。
-    """
 
-    script = Path(__file__).with_name("pick_native.py")
-    if not script.is_file():
-        return None
+def _pick_macos(task: _PickTask) -> dict[str, Any]:
+    script = f"POSIX path of (choose folder with prompt {_osa_quote(task.title)})"
+    return _run_cli_picker(task, ["osascript", "-e", script])
+
+
+def _pick_zenity(task: _PickTask) -> dict[str, Any]:
+    return _run_cli_picker(task, ["zenity", "--file-selection", "--directory", "--title", task.title])
+
+
+def _run_cli_picker(task: _PickTask, argv: list[str]) -> dict[str, Any]:
+    """macOS / Linux：命令行选择器（标题走**参数数组**，绝不拼 shell 命令）✓。"""
+
     try:
-        proc = subprocess.run(
-            [sys.executable, str(script), "--title", title, "--timeout", str(timeout_s)],
-            capture_output=True,
-            timeout=timeout_s + 15,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        # 超时：杀掉之后窗口随进程消失（这正是子进程方案的好处 ✓）
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)  # noqa: S603
+    except FileNotFoundError:
         return {
             "ok": False,
-            "shown": True,
-            "timed_out": True,
-            "error": f"等了 {timeout_s} 秒还没选，已关闭选择框。",
+            "status": "unavailable",
+            "error_class": "no_picker",
+            "error": "这台机器上没有可用的系统选择框。",
         }
-
-    out = _decode(proc.stdout or b"").strip()
-    for line in reversed(out.splitlines()):
-        line = line.strip()
-        if line.startswith("{") and line.endswith("}"):
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(data, dict):
-                data.setdefault("shown", True)
-                return data
-    return None
+    except OSError as exc:
+        return {
+            "ok": False,
+            "status": "unavailable",
+            "error_class": "no_picker",
+            "error": f"弹不出来：{exc}",
+        }
+    task.proc = proc
+    try:
+        raw, _ = proc.communicate(timeout=task.timeout_s + 20)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return {
+            "ok": False,
+            "status": "timed_out",
+            "shown": True,
+            "error": f"等了 {task.timeout_s} 秒还没选，已关闭选择框。",
+        }
+    finally:
+        task.proc = None
+    if proc.returncode != 0:
+        return {"ok": True, "status": "canceled", "shown": True, "path": "", "canceled": True, "timed_out": False}
+    path = (raw or b"").decode("utf-8", "replace").strip()
+    if not path:
+        return {"ok": True, "status": "canceled", "shown": True, "path": "", "canceled": True, "timed_out": False}
+    return {"ok": True, "status": "selected", "shown": True, "path": path, "canceled": False, "timed_out": False}
 
 
 def fs_action(*, action: str, path: str, to: str | None, content: str | None,
@@ -636,6 +879,8 @@ def fs_action(*, action: str, path: str, to: str | None, content: str | None,
               access_mode: str = "workspace") -> dict[str, Any]:
     """文件操作。删除**只在这里具备能力**，是否允许由后端按用户定的三层边界裁决。"""
 
+    if access_mode not in {"workspace", "read-only", "full", "approved"}:
+        return {"ok": False, "error": "无效的执行授权", "code": "invalid_access_mode"}
     target = Path(path).expanduser()
     write_actions = {"write", "mkdir", "move", "copy", "delete"}
     if action in write_actions and not _path_write_allowed(target, workspace_root=workspace_root, access_mode=access_mode):
@@ -741,7 +986,15 @@ def _say(text: str = "") -> None:
     后台启动的执行器其实活着，但一行输出都看不到）。这里强制 flush。
     """
 
-    print(text, flush=True)
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        # Startup is commonly launched without a UTF-8 console on Windows. A
+        # banner must never terminate the runner after it has already started.
+        stream = getattr(sys, "stdout", None)
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        safe = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+        print(safe, flush=True)
 
 
 def _decode(raw: bytes) -> str:
@@ -810,7 +1063,8 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- 路由 ------------------------------------------------------------- #
     def do_GET(self) -> None:  # noqa: N802 - http.server 的约定
-        if self.path.rstrip("/") == "/health":
+        path = self.path.rstrip("/")
+        if path == "/health":
             # health 故意不需要密钥：后端用它判断"执行器在不在"，好给用户一句人话提示，
             # 顺便把**宿主视角的路径**告诉后端（它自己看不到宿主文件系统）。
             self._send(
@@ -821,6 +1075,8 @@ class Handler(BaseHTTPRequestHandler):
                     "version": VERSION,
                     "platform": sys.platform,
                     "python": sys.version.split()[0],
+                    "python_env": python_environment(),
+                    "execution_capabilities": execution_capabilities(),
                     "uptime_s": int(time.time() - self.started_at),
                     "home": str(Path.home()),
                     "host_root": str(REPO_ROOT),
@@ -829,11 +1085,39 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path.startswith("/pick-folder/"):
+            if not self._authorized():
+                self._send(401, {"ok": False, "error": "密钥不对：请在 SciLoop 设置页填宿主执行器的密钥"})
+                return
+            self._send(200, pick_status(request_id=path[len("/pick-folder/") :]))
+            return
         self._send(404, {"ok": False, "error": "没有这个接口"})
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.rstrip("/")
-        if path not in ("/exec", "/fs", "/pick-folder"):
+        if path == "/pick-folder":
+            # 建任务：**立刻**回受理结果，绝不在这里等研究者选完 ✓
+            if not self._authorized():
+                self._send(401, {"ok": False, "error": "密钥不对：请在 SciLoop 设置页填宿主执行器的密钥"})
+                return
+            body = self._body()
+            self._send(
+                200,
+                pick_create(
+                    request_id=str(body.get("request_id") or ""),
+                    title=str(body.get("title") or "选择文件夹"),
+                    initial=str(body.get("initial") or ""),
+                    timeout_s=int(body.get("timeout_s") or 600),
+                ),
+            )
+            return
+        if path.startswith("/pick-folder/") and path.endswith("/cancel"):
+            if not self._authorized():
+                self._send(401, {"ok": False, "error": "密钥不对：请在 SciLoop 设置页填宿主执行器的密钥"})
+                return
+            self._send(200, pick_cancel(request_id=path[len("/pick-folder/") : -len("/cancel")]))
+            return
+        if path not in ("/exec", "/fs"):
             self._send(404, {"ok": False, "error": "没有这个接口"})
             return
         if not self._authorized():
@@ -841,13 +1125,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         body = self._body()
-        if path == "/pick-folder":
-            result = pick_folder(
-                title=str(body.get("title") or "选择文件夹"),
-                initial=str(body.get("initial") or ""),
-                timeout_s=int(body.get("timeout_s") or 600),
-            )
-        elif path == "/exec":
+        if path == "/exec":
             argv = body.get("argv")
             result = run_command(
                 argv=[str(x) for x in argv] if isinstance(argv, list) else None,
@@ -871,6 +1149,16 @@ class Handler(BaseHTTPRequestHandler):
             )
         self._send(200 if result.get("ok") else 400, result)
 
+    def do_DELETE(self) -> None:  # noqa: N802 - 取消选择任务（等价于 POST .../cancel）
+        path = self.path.rstrip("/")
+        if not path.startswith("/pick-folder/"):
+            self._send(404, {"ok": False, "error": "没有这个接口"})
+            return
+        if not self._authorized():
+            self._send(401, {"ok": False, "error": "密钥不对：请在 SciLoop 设置页填宿主执行器的密钥"})
+            return
+        self._send(200, pick_cancel(request_id=path[len("/pick-folder/") :]))
+
 
 class Server(ThreadingHTTPServer):
     """不许两个实例抢同一个端口。
@@ -888,40 +1176,67 @@ class Server(ThreadingHTTPServer):
 def _selftest() -> int:
     """自检：本机能不能正常跑命令 / 读写文件。用户排障与部署验收都用它。"""
 
-    print("SciLoop 宿主执行器 · 自检")
-    print(f"  平台：{sys.platform}  Python：{sys.version.split()[0]}")
-    print(f"  家目录：{Path.home()}")
-    print()
+    _say("SciLoop 宿主执行器 · 自检")
+    _say(f"  平台：{sys.platform}  Python：{sys.version.split()[0]}")
+    _say(f"  家目录：{Path.home()}")
+    _say()
 
     checks = [
-        ("跑一条最简单的命令", lambda: run_command(argv=[sys.executable, "-c", "print('ok')"], cwd=str(Path.home()), timeout_s=20)),
-        ("看当前用户是谁", lambda: run_command(command="whoami", cwd=str(Path.home()), timeout_s=20)),
-        ("看 git 能不能用", lambda: run_command(argv=["git", "--version"], cwd=str(Path.home()), timeout_s=20)),
-        ("列一下家目录", lambda: fs_action(action="list", path=str(Path.home()), to=None, content=None, encoding=None, recursive=False)),
+        (
+            "跑一条最简单的命令",
+            lambda: run_command(
+                argv=[sys.executable, "-c", "print('ok')"],
+                cwd=str(REPO_ROOT),
+                workspace_root=str(REPO_ROOT),
+                access_mode="full",
+                timeout_s=20,
+            ),
+        ),
+        (
+            "看当前用户是谁",
+            lambda: run_command(
+                command="whoami",
+                cwd=str(REPO_ROOT),
+                workspace_root=str(REPO_ROOT),
+                access_mode="full",
+                timeout_s=20,
+            ),
+        ),
+        (
+            "看 git 能不能用",
+            lambda: run_command(
+                argv=["git", "--version"],
+                cwd=str(REPO_ROOT),
+                workspace_root=str(REPO_ROOT),
+                access_mode="full",
+                timeout_s=20,
+            ),
+        ),
+        ("列一下项目目录", lambda: fs_action(action="list", path=str(REPO_ROOT), to=None, content=None, encoding=None, recursive=False)),
     ]
     failures = 0
     for label, call in checks:
         try:
             result = call()
         except Exception as exc:  # noqa: BLE001 - 自检要把任何异常都摊开给人看
-            print(f"  ✗ {label}：抛异常 {type(exc).__name__}: {exc}")
+            _say(f"  ✗ {label}：抛异常 {type(exc).__name__}: {exc}")
             failures += 1
             continue
         if result.get("ok"):
             extra = (result.get("stdout") or "").strip().splitlines()
             first = extra[0] if extra else ("目录项 %d 个" % len(result.get("children") or []))
-            print(f"  ✓ {label}：{first[:80]}")
+            _say(f"  ✓ {label}：{first[:80]}")
         else:
             code = result.get("exit_code")
-            print(f"  ✗ {label}：{result.get('error') or ('退出码 ' + str(code))}")
+            _say(f"  ✗ {label}：{result.get('error') or ('退出码 ' + str(code))}")
             if code == 3221225794:
-                print("      （退出码 0xC0000142 = 子进程拿不到控制台。"
-                      "把执行器从**普通终端**里启动一次通常就好了；"
-                      "被计划任务/服务拉起时请确保允许交互式进程。）")
+                _say("      （退出码 0xC0000142 = 子进程拿不到控制台。"
+                     "把执行器从**普通终端**里启动一次通常就好了；"
+                     "被计划任务/服务拉起时请确保允许交互式进程。）")
             failures += 1
 
-    print()
-    print("结论：" + ("全部正常，可以把它当执行器用" if failures == 0 else f"有 {failures} 项失败，见上面的原因"))
+    _say()
+    _say("结论：" + ("全部正常，可以把它当执行器用" if failures == 0 else f"有 {failures} 项失败，见上面的原因"))
     return 0 if failures == 0 else 1
 
 
@@ -971,7 +1286,16 @@ def main(argv: list[str] | None = None) -> int:
 
     # 启动时先探一次"能不能起子进程"：不行就当场说清，别等用户点了半天才发现。
     # 超时给 5 秒就够（正常是毫秒级）；探测卡住不该拖着用户看不到启动横幅。
-    probe = run_command(argv=[sys.executable, "-c", "print('ok')"], cwd=str(Path.home()), timeout_s=5)
+    # Probe the actual workspace mode on a tiny disposable directory, never
+    # walk the user's home or modify permissions over the whole checkout.
+    with tempfile.TemporaryDirectory(prefix="sciloop-startup-") as probe_root:
+        probe = run_command(
+            argv=[host_python(), "-c", "from pathlib import Path; Path('probe.txt').write_text('ok'); print('ok')"],
+            cwd=probe_root,
+            workspace_root=probe_root,
+            access_mode="workspace",
+            timeout_s=5,
+        )
 
     # 绑定 127.0.0.1：局域网/外网都连不上，只有本机能调
     try:
@@ -979,8 +1303,8 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         print("")
         print(f"启动失败：端口 {port} 已经被占用了（{exc}）。")
-        print("通常说明已经有一个执行器在跑 —— 先关掉它，或者换一个端口：")
-        print(f"    python tools/host-runner/host_runner.py --port {port + 1}")
+        print("请复用已经运行的执行器；若端口被其他程序占用，请先停止原服务。")
+        print("不会自动换端口：执行器与后端必须使用同一份配置。")
         print("")
         return 2
 
@@ -991,7 +1315,7 @@ def main(argv: list[str] | None = None) -> int:
     _say("  停止：按 Ctrl+C")
     if not probe.get("ok"):
         _say("")
-        _say("⚠️ 注意：现在这台机器上起不了子进程，SciLoop 暂时没法帮你跑命令。")
+        _say("受限执行检查未通过；已明确授权的完全访问模式不受此检查影响。")
         _say(f"   原因：{probe.get('error') or ('退出码 ' + str(probe.get('exit_code')))}")
         if probe.get("exit_code") == 3221225794:
             _say("   （退出码 0xC0000142 = 子进程拿不到控制台。请把本程序改从"

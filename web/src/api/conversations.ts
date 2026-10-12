@@ -15,10 +15,21 @@
 import { get, patch } from '@/api/client'
 
 export interface ConversationTurn {
+  turn_id?: string
+  status?: 'inProgress' | 'completed' | 'waitingApproval' | 'interrupted' | 'failed'
+  interruption_reason?: string | null
+  error?: { code: string } | null
+  started_at?: string
+  completed_at?: string | null
   role: 'user' | 'assistant'
   content: string
+  ts?: string | null
+  attachments?: Array<{ name: string; mime_type?: string; size?: number }>
   model_id?: string
   duration_ms?: number
+  reasoning?: string | null
+  reasoning_summary?: string | null
+  rows?: Array<Record<string, unknown>>
   /** 流式中断/出错时仍落盘的那一轮会带这个标记（如实标注，不假装完成） */
   interrupted?: boolean
 }
@@ -63,11 +74,6 @@ export function getConversation(id: string): Promise<ConversationDetail> {
 /** 归档 / 取消归档（Owner） */
 export function setConversationArchived(id: string, archived: boolean): Promise<ConversationDetail> {
   return patch<ConversationDetail>(`/conversations/${id}`, { body: { archived } })
-}
-
-/** 移入项目；`projectId = null` 即移回未分组（Owner） */
-export function moveConversation(id: string, projectId: number | null): Promise<ConversationDetail> {
-  return patch<ConversationDetail>(`/conversations/${id}`, { body: { project_id: projectId } })
 }
 
 /** 重命名（Owner）：与项目重命名同一口径 `PATCH /conversations/{id}`，空标题在输入框侧先拦一次 */

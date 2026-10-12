@@ -37,6 +37,8 @@ __all__ = [
     "JOB_SPECS",
     "active_jobs",
     "register_jobs",
+    "reload_fetch_job",
+    "scheduler_status",
     "shutdown_scheduler",
     "start_scheduler",
 ]
@@ -208,3 +210,85 @@ def active_jobs() -> list[str]:
     if _scheduler is None:
         return []
     return [job.id for job in _scheduler.get_jobs()]
+
+
+def scheduler_status() -> dict[str, Any]:
+    """调度器真实状态（给界面如实提示用，不做"保存即生效"的乐观假设）。
+
+    - ``running``：本进程里调度器是否真的在跑；
+    - ``enabled``：配置项 ``SCHEDULER_ENABLED``；
+    - ``jobs``：当前已注册任务 id。
+    """
+    return {
+        "running": _scheduler is not None,
+        "enabled": bool(get_settings().scheduler_enabled),
+        "jobs": active_jobs(),
+    }
+
+
+def reload_fetch_job() -> dict[str, Any]:
+    """定时抓取规则保存后动态重载唯一的 ``fetch_papers`` job。
+
+    返回 ``{"applied": ...}``，取值：
+
+    - ``"immediate"``：调度器在跑，已用新规则替换（或按设置关闭）该 job，立即生效；
+    - ``"restart_required"``：调度器未启用/未运行（``SCHEDULER_ENABLED=0`` 是默认值）
+      或重载失败 —— 此时界面必须明确提示"重启后生效"，不得静默误导。
+
+    只在保存设置时调用（请求路径里），因此这里做的是"重注册"，不做幂等启动。
+    """
+    if _scheduler is None:
+        return {
+            "running": False,
+            "enabled": bool(get_settings().scheduler_enabled),
+            "applied": "restart_required",
+            "note": "调度器当前未运行：规则已保存，重启服务后生效",
+        }
+    try:
+        module = importlib.import_module("tasks.jobs.fetch_papers")
+    except ImportError as exc:  # pragma: no cover - 依赖缺失属部署问题
+        return {
+            "running": True,
+            "enabled": True,
+            "applied": "restart_required",
+            "note": f"抓取任务模块不可用，重启后重试：{exc}",
+        }
+    register = getattr(module, "register_jobs", None)
+    if not callable(register):  # pragma: no cover - 契约变动时才会走到
+        return {
+            "running": True,
+            "enabled": True,
+            "applied": "restart_required",
+            "note": "抓取任务未提供注册入口，重启后重试",
+        }
+    try:
+        job = register(_scheduler, limit=get_settings().scheduler_job_limit)
+    except Exception as exc:  # noqa: BLE001 - 重载失败不能让保存接口 500
+        logger.exception("fetch_papers 规则重载失败")
+        return {
+            "running": True,
+            "enabled": True,
+            "applied": "restart_required",
+            "note": f"规则重新注册失败，重启后生效：{exc}",
+        }
+    if job is None:
+        # 注册函数在 settings.enabled=false 时返回 None：光"不注册"不等于"关掉旧规则"
+        existing = _scheduler.get_job("fetch_papers")
+        if existing is not None:
+            _scheduler.remove_job("fetch_papers")
+        return {
+            "running": True,
+            "enabled": True,
+            "applied": "immediate",
+            "scheduled": False,
+            "note": "定时抓取已关闭，立即生效",
+        }
+    next_run = getattr(job, "next_run_time", None)
+    return {
+        "running": True,
+        "enabled": True,
+        "applied": "immediate",
+        "scheduled": True,
+        "next_run_at": next_run.isoformat() if next_run is not None else None,
+        "note": "定时规则已更新，立即生效",
+    }

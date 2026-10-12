@@ -18,9 +18,8 @@
  *
  * 纪律：颜色一律引用 `styles/tokens.css` 变量，组件内不出现硬编码色值。
  */
-import { computed } from 'vue'
 
-const props = withDefaults(
+withDefaults(
   defineProps<{
     variant?: 'top' | 'inline'
     /** 产出物名称，用于说明这条合规提示约束的是哪一份产出（如「解析卡片」「研究草稿」） */
@@ -38,10 +37,6 @@ const props = withDefaults(
   },
 )
 
-const REQUIRED_NOTE = '产出物为研究草稿，不构成可自动投稿的论文；AI 执行、人保有否决权与最终判断。'
-
-/** `note=null` → 用契约默认补充说明；`note=''` → 明确不渲染（页脚单行场景） */
-const resolvedNote = computed(() => props.note ?? REQUIRED_NOTE)
 </script>
 
 <template>

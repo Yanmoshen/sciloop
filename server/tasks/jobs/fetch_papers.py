@@ -82,6 +82,10 @@ class FetchReport:
     date_to: str | None = None
     limit: int = DEFAULT_LIMIT
     sources: list[str] = field(default_factory=list)
+    keywords: list[str] = field(default_factory=list)
+    download_fulltext: bool = True
+    parse_fulltext: bool = False
+    write_knowledge_base: bool = True
     discovered: int = 0
     created: int = 0
     reused: int = 0
@@ -91,6 +95,9 @@ class FetchReport:
     citation_count_filled: int = 0
     citation_count_null: int = 0
     github_stars_filled: int = 0
+    fulltext_downloaded: int = 0
+    fulltext_failed: int = 0
+    fulltext_parse_queued: int = 0
     by_source: dict[str, dict[str, Any]] = field(default_factory=dict)
     degraded: list[dict[str, Any]] = field(default_factory=list)
     errors: list[dict[str, Any]] = field(default_factory=list)
@@ -110,6 +117,10 @@ class FetchReport:
                 "date_to": self.date_to,
                 "limit": self.limit,
                 "sources": self.sources,
+                "keywords": self.keywords,
+                "download_fulltext": self.download_fulltext,
+                "parse_fulltext": self.parse_fulltext,
+                "write_knowledge_base": self.write_knowledge_base,
             },
             "counts": {
                 "discovered": self.discovered,
@@ -121,6 +132,9 @@ class FetchReport:
                 "citation_count_filled": self.citation_count_filled,
                 "citation_count_null": self.citation_count_null,
                 "github_stars_filled": self.github_stars_filled,
+                "fulltext_downloaded": self.fulltext_downloaded,
+                "fulltext_failed": self.fulltext_failed,
+                "fulltext_parse_queued": self.fulltext_parse_queued,
             },
             "by_source": self.by_source,
             "degraded": self.degraded,
@@ -529,6 +543,7 @@ class FetchRun:
         self,
         *,
         fields: Sequence[str] | None = None,
+        keywords: Sequence[str] | None = None,
         date_from: date | datetime | str | None = None,
         date_to: date | datetime | str | None = None,
         limit: int = DEFAULT_LIMIT,
@@ -540,6 +555,9 @@ class FetchRun:
         github: Any | None = None,
         commit_every: int = BATCH_COMMIT_SIZE,
         skip_existing: bool = True,
+        download_fulltext: bool = True,
+        parse_fulltext: bool = False,
+        write_knowledge_base: bool = True,
     ) -> None:
         self.task_id = task_id or uuid.uuid4().hex[:12]
         self.report = FetchReport(
@@ -549,9 +567,18 @@ class FetchRun:
             date_to=str(date_to) if date_to else None,
             limit=int(limit),
             sources=[s for s in (sources or ALL_SOURCES) if s],
+            keywords=[str(item).strip() for item in (keywords or []) if str(item).strip()],
+            download_fulltext=bool(download_fulltext),
+            parse_fulltext=bool(parse_fulltext),
+            write_knowledge_base=bool(write_knowledge_base),
         )
         self.date_from = date_from
         self.date_to = date_to
+        self.keywords = [str(item).strip() for item in (keywords or []) if str(item).strip()]
+        self.download_fulltext = bool(download_fulltext)
+        self.parse_fulltext = bool(parse_fulltext)
+        self.write_knowledge_base = bool(write_knowledge_base)
+        self._downloaded_ids: list[int] = []
         self.session = session
         self._owns_session = session is None
         self.commit_every = max(1, int(commit_every))
@@ -564,7 +591,9 @@ class FetchRun:
         }
         # 缺配置的源直接算"降级"，避免 100 篇论文各撞一次墙
         if "semantic_scholar" in self.states and not self.s2.configured:
+            self.states["semantic_scholar"].available = False
             self.states["semantic_scholar"].reason = "missing_api_key"
+            self.states["semantic_scholar"].non_retryable = True
         if "openalex" in self.states and not self.openalex.configured:
             self.states["openalex"].available = False
             self.states["openalex"].reason = "missing_mailto"
@@ -664,7 +693,7 @@ class FetchRun:
     async def execute(self) -> FetchReport:
         session = self.session or (SessionLocal() if SessionLocal is not None else None)
         if session is None:
-            raise RuntimeError("数据库会话工厂不可用（DATABASE_URL / psycopg 未就绪）")
+            raise RuntimeError("数据库会话工厂不可用（DATABASE_URL / sqlite3 未就绪）")
         own_session = self.session is None
         try:
             self.report.papers_total = int(
@@ -680,11 +709,19 @@ class FetchRun:
             floor = self._published_floor(session)
             papers, results = await arxiv_client.iter_papers(
                 fields=self.report.fields,
+                query=" AND ".join(self.keywords) if self.keywords else None,
                 date_from=self.date_from,
                 date_to=self.date_to,
                 limit=self.report.limit,
             )
             self._record_arxiv_requests(results)
+            if self.keywords:
+                papers.extend(await self._discover_keyword_sources())
+                # de-duplicate external hits by arXiv identity before processing.
+                unique: dict[str, Any] = {}
+                for item in papers:
+                    unique.setdefault(item.arxiv_id, item)
+                papers = list(unique.values())[: self.report.limit]
             self.report.discovered = len(papers)
             arxiv_state = self._state("arxiv")
             if papers:
@@ -737,12 +774,30 @@ class FetchRun:
                     )
 
             session.commit()
+            if self.parse_fulltext and self._downloaded_ids:
+                from tasks.jobs.parse_fulltext import run_parse_fulltext
+
+                parse_report = await run_parse_fulltext(
+                    paper_ids=self._downloaded_ids,
+                    force=False,
+                    delay_seconds=0.0,
+                    only_pending=False,
+                )
+                if parse_report.errors:
+                    self.report.errors.extend(
+                        {"stage": "fulltext_parse", **item} for item in parse_report.errors
+                    )
+                emit_event(
+                    self.task_id,
+                    "warn" if parse_report.errors else "ok",
+                    f"全文解析完成：成功 {parse_report.ok}，部分 {parse_report.partial}，失败 {parse_report.failed + parse_report.unavailable}",
+                )
             self.report.papers_total = int(
                 session.execute(select(func.count()).select_from(Paper)).scalar_one() or 0
             )
             self.report.by_source = {name: state.to_dict() for name, state in self.states.items()}
             self.report.cache = cache_stats()
-            self.report.status = "done"
+            self.report.status = "partial" if self.report.fulltext_failed or self.report.errors else "done"
             emit_event(
                 self.task_id,
                 "ok",
@@ -799,6 +854,65 @@ class FetchRun:
             return identity.coerce_date(self.date_from)
         value = session.execute(select(func.max(Paper.published_at))).scalar_one_or_none()
         return identity.coerce_date(value)
+
+    async def _discover_keyword_sources(self) -> list[arxiv_client.ArxivPaper]:
+        """Query configured OpenAlex/S2 keyword endpoints and retain arXiv-linked hits."""
+        query = " ".join(self.keywords)
+        discovered: list[arxiv_client.ArxivPaper] = []
+        s2_state = self._state("semantic_scholar")
+        if s2_state is not None and self.s2.configured:
+            try:
+                s2_state.requests += 1
+                for item in await self.s2.search_papers(query, limit=self.report.limit, date_from=str(self.date_from) if self.date_from else None, date_to=str(self.date_to) if self.date_to else None):
+                    if self.date_to and item.publication_date and item.publication_date > identity.coerce_date(self.date_to):
+                        continue
+                    if self.date_from and item.publication_date and item.publication_date < identity.coerce_date(self.date_from):
+                        continue
+                    arxiv_id = identity.normalize_arxiv_id(item.external_ids.get("ArXiv"))
+                    if not arxiv_id or not item.title:
+                        continue
+                    s2_state.ok += 1
+                    discovered.append(arxiv_client.ArxivPaper(
+                        arxiv_id=arxiv_id,
+                        title=item.title,
+                        abstract=item.abstract,
+                        authors=item.authors,
+                        published=item.publication_date,
+                        pdf_url=item.open_access_pdf,
+                        doi=item.external_ids.get("DOI"),
+                        request_url=item.request_url,
+                        http_status=item.http_status,
+                    ))
+            except Exception as exc:  # source degradation is reported, not fatal
+                s2_state.failed += 1
+                s2_state.last_error = str(exc)
+        oa_state = self._state("openalex")
+        if oa_state is not None and self.openalex.configured:
+            try:
+                oa_state.requests += 1
+                for item in await self.openalex.search_works(query, limit=self.report.limit, date_from=str(self.date_from) if self.date_from else None, date_to=str(self.date_to) if self.date_to else None):
+                    if self.date_to and item.publication_date and item.publication_date > identity.coerce_date(self.date_to):
+                        continue
+                    if self.date_from and item.publication_date and item.publication_date < identity.coerce_date(self.date_from):
+                        continue
+                    arxiv_id = identity.normalize_arxiv_id(item.identifiers().get("arxiv"))
+                    if not arxiv_id or not item.title:
+                        continue
+                    oa_state.ok += 1
+                    discovered.append(arxiv_client.ArxivPaper(
+                        arxiv_id=arxiv_id,
+                        title=item.title,
+                        authors=item.authors,
+                        published=item.publication_date,
+                        pdf_url=item.open_access_url,
+                        doi=item.doi,
+                        request_url=item.request_url,
+                        http_status=item.http_status,
+                    ))
+            except Exception as exc:
+                oa_state.failed += 1
+                oa_state.last_error = str(exc)
+        return discovered
 
     def _record_arxiv_requests(self, results: Sequence[Any]) -> None:
         state = self._state("arxiv")
@@ -879,6 +993,36 @@ class FetchRun:
             else:
                 self.report.citation_count_filled += 1
 
+        if self.download_fulltext and self.write_knowledge_base:
+            from services.fulltext.downloader import download_for_paper
+
+            downloaded = await download_for_paper(session, result.paper_id)
+            if downloaded.get("ok"):
+                self._downloaded_ids.append(int(result.paper_id))
+                self.report.fulltext_downloaded += 1
+                emit_event(
+                    self.task_id,
+                    "ok",
+                    f"全文已下载（{downloaded.get('format', 'unknown').upper()}）：{paper.title[:80]}",
+                )
+                if self.parse_fulltext:
+                    self.report.fulltext_parse_queued += 1
+            else:
+                self.report.fulltext_failed += 1
+                self.report.errors.append(
+                    {
+                        "stage": "fulltext_download",
+                        "paper_id": result.paper_id,
+                        "error": downloaded.get("error") or "fulltext_download_failed",
+                        "attempts": downloaded.get("attempts") or [],
+                    }
+                )
+                emit_event(
+                    self.task_id,
+                    "fail",
+                    f"全文下载失败，论文未计入成功导入：{paper.title[:80]}",
+                )
+
         session.flush()
 
     # ---------------------------------------------------------------- 引用数 / venue
@@ -887,7 +1031,9 @@ class FetchRun:
     ) -> bool:
         now = time.monotonic()
         s2_state = self._state("semantic_scholar")
-        if s2_state is not None and s2_state.should_try(now):
+        # An unconfigured Semantic Scholar source is disabled, never probed or
+        # called anonymously (anonymous requests are known to return 429).
+        if s2_state is not None and self.s2.configured and s2_state.should_try(now):
             fetched = await self._try_s2(session, paper_id, paper)
             if fetched:
                 return True
@@ -1153,22 +1299,30 @@ class FetchRun:
 async def run_fetch(
     *,
     fields: Sequence[str] | None = None,
+    keywords: Sequence[str] | None = None,
     date_from: date | datetime | str | None = None,
     date_to: date | datetime | str | None = None,
     limit: int = DEFAULT_LIMIT,
     sources: Sequence[str] | None = None,
     task_id: str | None = None,
     skip_existing: bool = True,
+    download_fulltext: bool = True,
+    parse_fulltext: bool = False,
+    write_knowledge_base: bool = True,
 ) -> FetchReport:
     """异步跑一轮抓取（同一事件循环内）。"""
     run = FetchRun(
         fields=fields,
+        keywords=keywords,
         date_from=date_from,
         date_to=date_to,
         limit=limit,
         sources=sources,
         task_id=task_id,
         skip_existing=skip_existing,
+        download_fulltext=download_fulltext,
+        parse_fulltext=parse_fulltext,
+        write_knowledge_base=write_knowledge_base,
     )
     try:
         return await run.execute()
@@ -1179,23 +1333,31 @@ async def run_fetch(
 def run_fetch_sync(
     *,
     fields: Sequence[str] | None = None,
+    keywords: Sequence[str] | None = None,
     date_from: date | datetime | str | None = None,
     date_to: date | datetime | str | None = None,
     limit: int = DEFAULT_LIMIT,
     sources: Sequence[str] | None = None,
     skip_existing: bool = True,
     task_id: str | None = None,
+    download_fulltext: bool = True,
+    parse_fulltext: bool = False,
+    write_knowledge_base: bool = True,
 ) -> FetchReport:
     """同步跑一轮（脚本 / APScheduler / 后台线程用）。``task_id`` 用于回填事件流与进度。"""
     return asyncio.run(
         run_fetch(
             fields=fields,
+            keywords=keywords,
             date_from=date_from,
             date_to=date_to,
             limit=limit,
             sources=sources,
             skip_existing=skip_existing,
             task_id=task_id,
+            download_fulltext=download_fulltext,
+            parse_fulltext=parse_fulltext,
+            write_knowledge_base=write_knowledge_base,
         )
     )
 
@@ -1203,12 +1365,16 @@ def run_fetch_sync(
 def submit_fetch(
     *,
     fields: Sequence[str] | None = None,
+    keywords: Sequence[str] | None = None,
     date_from: date | datetime | str | None = None,
     date_to: date | datetime | str | None = None,
     limit: int = DEFAULT_LIMIT,
     sources: Sequence[str] | None = None,
     skip_existing: bool = True,
     runner: Callable[..., FetchReport] = run_fetch_sync,
+    download_fulltext: bool = True,
+    parse_fulltext: bool = False,
+    write_knowledge_base: bool = True,
 ) -> dict[str, Any]:
     """把一轮抓取丢到后台线程并立即返回 ``task_id``（``POST /papers/fetch`` 用）。"""
     task_id = uuid.uuid4().hex[:12]
@@ -1225,11 +1391,15 @@ def submit_fetch(
             "started_at": datetime.now(UTC).isoformat(),
             "params": {
                 "fields": list(fields or arxiv_client.parse_fields()),
+                "keywords": [str(item).strip() for item in (keywords or []) if str(item).strip()],
                 "date_from": str(date_from) if date_from else None,
                 "date_to": str(date_to) if date_to else None,
                 "limit": int(limit),
                 "sources": [s for s in (sources or ALL_SOURCES) if s],
                 "skip_existing": bool(skip_existing),
+                "download_fulltext": bool(download_fulltext),
+                "parse_fulltext": bool(parse_fulltext),
+                "write_knowledge_base": bool(write_knowledge_base),
             },
         },
     )
@@ -1239,12 +1409,16 @@ def submit_fetch(
         try:
             report = runner(
                 fields=fields,
+                keywords=keywords,
                 date_from=date_from,
                 date_to=date_to,
                 limit=limit,
                 sources=sources,
                 skip_existing=skip_existing,
                 task_id=task_id,
+                download_fulltext=download_fulltext,
+                parse_fulltext=parse_fulltext,
+                write_knowledge_base=write_knowledge_base,
             )
             _update_task(
                 task_id,
@@ -1277,13 +1451,60 @@ def register_jobs(
     fields: Sequence[str] | None = None,
     job_id: str = JOB_NAME,
 ) -> Any:
-    """把增量抓取注册到 APScheduler 实例；返回 job 对象。"""
-    from apscheduler.triggers.interval import IntervalTrigger
+    """Register one daily incremental rule; the window starts at last success."""
+    from apscheduler.triggers.cron import CronTrigger
+
+    settings = get_settings()
+    raw_time = str(getattr(settings, "scheduler_fetch_time", "02:00") or "02:00")
+    # UI settings override the environment default when available.
+    try:
+        from db.models.settings import AppSetting
+        from db.session import SessionLocal
+        from sqlalchemy import select
+
+        if SessionLocal is not None:
+            with SessionLocal() as db:
+                stored = db.execute(select(AppSetting).where(AppSetting.scope == "fetch")).scalar_one_or_none()
+                value = dict(stored.value or {}) if stored is not None else {}
+                raw_time = str(value.get("daily_time") or raw_time)
+                schedule_enabled = bool(value.get("enabled", True))
+            if not schedule_enabled:
+                logger.info("scheduled_fetch_disabled_by_settings")
+                return None
+    except Exception:  # settings storage is optional during bootstrap
+        pass
+    try:
+        hour, minute = (int(part) for part in raw_time.split(":", 1))
+    except (TypeError, ValueError):
+        hour, minute = 2, 0
+    hour, minute = max(0, min(23, hour)), max(0, min(59, minute))
+
+    def _last_success() -> datetime | None:
+        records = _read_history()
+        done = [item for item in records if item.get("status") == "done" and item.get("finished_at")]
+        if not done:
+            return None
+        try:
+            return max(datetime.fromisoformat(str(item["finished_at"])) for item in done)
+        except ValueError:
+            return None
 
     def _job() -> None:
-        report = run_fetch_sync(fields=fields, limit=limit)
+        previous = _last_success()
+        now = datetime.now(UTC)
+        report = run_fetch_sync(
+            fields=fields,
+            date_from=previous or None,
+            date_to=now,
+            limit=limit,
+            download_fulltext=True,
+            parse_fulltext=False,
+            write_knowledge_base=True,
+        )
         logger.info(
-            "scheduled_fetch_done created=%d reused=%d records=%d",
+            "scheduled_fetch_done window=%s..%s created=%d reused=%d records=%d",
+            previous.isoformat() if previous else "beginning",
+            now.isoformat(),
             report.created,
             report.reused,
             report.source_records_written,
@@ -1291,14 +1512,14 @@ def register_jobs(
 
     job = scheduler.add_job(
         _job,
-        trigger=IntervalTrigger(hours=max(1, int(interval_hours))),
+        trigger=CronTrigger(hour=hour, minute=minute, timezone=getattr(settings, "scheduler_timezone", "Asia/Shanghai")),
         id=job_id,
         name="WP03 论文增量抓取",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
     )
-    logger.info("fetch_papers_job_registered interval_hours=%d limit=%d", interval_hours, limit)
+    logger.info("fetch_papers_job_registered daily_at=%02d:%02d timezone=%s limit=%d", hour, minute, getattr(settings, "scheduler_timezone", "Asia/Shanghai"), limit)
     return job
 
 

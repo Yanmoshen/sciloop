@@ -8,11 +8,13 @@
  */
 import PlanPanel from './PlanPanel.vue'
 import ToolCallCard from './ToolCallCard.vue'
+import { humanError } from '../../utils/messages'
 import type { Block } from './blocks'
 
-defineProps<{
+withDefaults(defineProps<{
   block: Block
-}>()
+  stopped?: boolean
+}>(), { stopped: false })
 
 const SUBAGENT_LABEL: Record<string, string> = {
   completed: '已完成',
@@ -31,11 +33,11 @@ const FAILURE_HINT: Record<string, string> = {
 }
 
 function failureText(code: string, message: string): string {
-  return FAILURE_HINT[code] ?? message
+  return FAILURE_HINT[code] ?? humanError({ code, message })
 }
 
 function subagentLabel(status: string): string {
-  return SUBAGENT_LABEL[status] ?? status
+  return SUBAGENT_LABEL[status] ?? '处理中'
 }
 </script>
 
@@ -46,7 +48,7 @@ function subagentLabel(status: string): string {
   </div>
 
   <details v-else-if="block.kind === 'reasoning'" class="reasoning">
-    <summary>推理过程</summary>
+    <summary>思考摘要</summary>
     <p class="reasoning__text">{{ block.text }}</p>
   </details>
 
@@ -55,7 +57,12 @@ function subagentLabel(status: string): string {
     <p class="bubble__text">{{ block.text }}</p>
   </div>
 
-  <ToolCallCard v-else-if="block.kind === 'tool'" :call="block.call" :output="block.output" />
+  <ToolCallCard
+    v-else-if="block.kind === 'tool'"
+    :call="block.call"
+    :output="block.output"
+    :stopped="stopped"
+  />
 
   <slot v-else-if="block.kind === 'approval'" name="approval" :approval="block.approval" />
 

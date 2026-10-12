@@ -26,7 +26,7 @@
 按对话的授权块（`record["grants"]`）
 -----------------------------------
 ``{"full_access": bool, "allow_exec": bool}``
-- `full_access` = 输入栏那个「完全访问模式」开关：**低危动作免批准**（高危仍要点头）；
+- `full_access` = 输入栏那个「完全访问模式」开关：**所有可执行操作自动批准**；
 - `allow_exec` = 批准卡里选「此对话中默认允许执行」：**连高危也免批准**。
 两个都是**按对话**的 —— 换个对话就要重新决定，避免"某一次心软变成了永久开关"。
 
@@ -198,8 +198,8 @@ def grants(record: dict[str, Any]) -> dict[str, Any]:
     """读这个对话当前的授权块。
 
     形状：``{full_access: bool, allow_exec: bool, tools: [工具名…]}``。
-    ``tools`` 是**按工具授权**那一档（用户口径 2026-09-25）：批准一次 ``run_command`` 之后，
-    同一工具换参数不再逐条问（高危仍然每次都问）。
+    ``tools`` 仅保留历史授权数据的兼容读取。普通模式的批准只授予当前调用，
+    不会把工具永久加入会话授权；持续自动批准由 ``full_access`` 控制。
     """
 
     raw = record.get("grants")
@@ -222,8 +222,8 @@ def set_grants(
     """改这个对话的授权块（**只改内存**，落盘由调用方 `save`）。
 
     `None` = 不动这一项。关掉 `allow_exec` 时**不连带关掉** `full_access` ——
-    它们是两件事（一个是"免点头动手"，一个是"连高危也放行"），各有各的开关。
-    `tool` 非空 = 把某个工具加进"按工具授权"清单（用户口径 2026-09-25）。
+    它们是两件事（一个是"完全访问自动批准"，一个是"本对话持续批准"），各有各的开关。
+    `tool` 非空用于兼容读取历史授权清单；当前普通模式不会自动写入该清单。
     """
 
     current = grants(record)
@@ -248,7 +248,7 @@ def grants_summary(record: dict[str, Any]) -> dict[str, Any]:
     if current[GRANT_ALLOW_EXEC]:
         note = "本对话内：连高危操作也直接执行"
     elif current[GRANT_FULL_ACCESS]:
-        note = "本对话内：普通操作直接执行，高危操作仍会先问你"
+        note = "本对话内：所有可执行操作自动批准"
     elif tools:
         note = "本对话内：" + "、".join(tools) + " 直接执行，高危操作仍会先问你"
     else:
@@ -261,20 +261,18 @@ def allows(grant: dict[str, Any], *, high_risk: bool, tool: str | None = None) -
 
     规则（研究者 2026-09-22 定，2026-09-25 加"按工具"一档）：
     - 「此对话中默认允许执行」= 最宽的一档，**连高危也直接做**；
-    - 「完全访问模式」= 普通动手操作直接做，**高危仍然先问**；
+    - 「完全访问模式」= 所有可执行操作自动批准；
     - 「本对话允许这个工具」（``tool`` 命中 ``grants.tools``）= 同一工具换参数不再问，
       **高危仍然先问**；
     - 都没命中 → 一概先问。
 
-    ⚠️ **高危只认第一档**：这是"会不会不打招呼就动研究者机器"的边界，穷举测试钉住它。
+    ⚠️ **高危也遵循同一批准语义**：普通模式逐次人工批准，完全访问模式自动批准；两者执行范围一致。
     """
 
-    if grant.get(GRANT_ALLOW_EXEC):
+    if grant.get(GRANT_ALLOW_EXEC) or grant.get(GRANT_FULL_ACCESS):
         return True
     if high_risk:
         return False
-    if grant.get(GRANT_FULL_ACCESS):
-        return True
     tools = grant.get(GRANT_TOOLS)
     return bool(tool) and isinstance(tools, list) and tool in tools
 

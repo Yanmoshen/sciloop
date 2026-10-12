@@ -73,7 +73,7 @@ async def _session() -> AsyncIterator[AsyncSession]:
         raise _error(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "database_unavailable",
-            "异步数据库会话工厂不可用（DATABASE_URL / asyncpg 未就绪）",
+            "异步数据库会话工厂不可用（DATABASE_URL / aiosqlite 未就绪）",
         )
     async with AsyncSessionLocal() as session:
         yield session
@@ -549,6 +549,18 @@ async def download_translate_pdf(
             "X-SciLoop-Engine": ENGINE_NAME,
         },
     )
+
+
+@router.get("/translate/jobs/{task_id}/preview/blocks", summary="原文/译文正文对照")
+async def preview_translate_blocks(task_id: str) -> dict[str, Any]:
+    safe_id = _urlsafe_task_id(task_id)
+    detail = jobs.get_task(safe_id)
+    if detail is None:
+        raise _error(status.HTTP_404_NOT_FOUND, "task_not_found", "未找到翻译任务")
+    if detail.get("status") not in jobs.TERMINAL_STATUSES:
+        raise _error(status.HTTP_409_CONFLICT, "task_not_completed", "翻译仍在进行中")
+    blocks = jobs.preview_blocks(safe_id)
+    return {"task_id": safe_id, "blocks": blocks, "total": len(blocks)}
 
 
 @router.get("/translate/jobs/{task_id}/preview", summary="原文/译文逐块对照预览")

@@ -21,6 +21,7 @@ import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 
 import { ApiError } from '@/api/client'
+import { safeErrorMessage } from '@/utils/messages'
 import {
   approveDecision,
   evaluateDecisionRisk,
@@ -91,11 +92,11 @@ const MAX_EVENT_LOG = 200
 
 function message(error: unknown): string {
   if (error instanceof ApiError) {
-    if (error.isForbidden) return `public_demo 面禁止该写操作（HTTP ${error.status} ${error.code}）`
+    if (error.isForbidden) return '当前为只读浏览模式，这项操作需要研究者身份。'
     if (error.isDbUnavailable) return `数据库不可用：${error.message}`
-    return error.message
+    return safeErrorMessage(error)
   }
-  return error instanceof Error ? error.message : String(error)
+  return safeErrorMessage(error)
 }
 
 export const useWorkbenchStore = defineStore('workbench', () => {
@@ -349,7 +350,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       // （否则成本端点一次 4xx 会让看板误报「流水线同步失败」）。
       costSummary.value = null
       const detail = error instanceof ApiError ? `${error.code}：${message(error)}` : message(error)
-      costNote.value = `成本接口（GET /costs/summary）不可用：${detail}。已回退 status.cost 的双线阈值，分项与已用金额可能缺失。`
+      costNote.value = `成本信息暂时无法获取：${detail}。已继续显示可用的成本阈值，分项与已用金额可能缺失。`
     }
   }
 

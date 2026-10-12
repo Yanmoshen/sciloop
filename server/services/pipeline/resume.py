@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy import func, select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import PipelineRun, StageOutput
@@ -217,7 +217,7 @@ async def upsert_stage_output(
         updates[key] = value
 
     statement = (
-        pg_insert(StageOutput)
+        sqlite_insert(StageOutput)
         .values(**values)
         .on_conflict_do_update(
             index_elements=["pipeline_run_id", "stage", "attempt"], set_=updates

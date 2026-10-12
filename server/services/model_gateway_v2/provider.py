@@ -101,6 +101,19 @@ class RegisteredModelProvider:
 
         tool_aliases: dict[str, str] = {}
         model_tools = [_model_tool_schema(tool, tool_aliases) for tool in request.tools or []]
+        wire_names = {original: alias for alias, original in tool_aliases.items()}
+        messages = []
+        for message in request.messages:
+            copy = dict(message)
+            if message.get("tool_calls"):
+                copy.setdefault("reasoning_content", "")
+                copy["tool_calls"] = [
+                    {**call, "function": {**call["function"], "name": wire_names.get(
+                        call["function"]["name"], re.sub(r"[^A-Za-z0-9_-]", "_", call["function"]["name"])
+                    )}}
+                    for call in message["tool_calls"]
+                ]
+            messages.append(copy)
 
         kwargs: dict[str, Any] = {
             "model_ref": selected_model,
@@ -118,7 +131,7 @@ class RegisteredModelProvider:
         if timeout is not None:
             kwargs["timeout"] = float(timeout)
 
-        updates = chat_stream(request.messages, **kwargs)
+        updates = chat_stream(messages, **kwargs)
         completed = False
         failed = False
         try:

@@ -49,15 +49,15 @@ function submitEdit(): void {
   <section class="compact">
     <header class="compact__head">
       <span class="compact__title">上下文压缩</span>
-      <span class="compact__meta" :title="`最近一次压缩：覆盖至序号 ${lastRun?.covered_until ?? '-'}`">
-        {{ lastRun ? `覆盖至 ${lastRun.covered_until ?? '-'}` : '尚未压缩' }}
+      <span class="compact__meta">
+        {{ lastRun ? lastRun.ok ? '最近一次已完成' : '最近一次未完成' : '尚未压缩' }}
       </span>
       <button type="button" class="link" :disabled="busy" @click="emit('compact')">立即压缩</button>
       <button type="button" class="link" @click="emit('refresh')">刷新摘要</button>
     </header>
 
     <p v-if="lastRun && lastRun.ok" class="compact__ok">
-      已压缩：{{ lastRun.tokens_before }} → {{ lastRun.tokens_after }} tokens（触发方式 {{ lastRun.trigger }}）
+      已压缩，会话中的约定和重要事实已整理保存。
     </p>
     <p v-else-if="lastRun && lastRun.error" class="compact__fail">
       压缩未完成，原上下文保持不变，可以重试。
@@ -70,7 +70,7 @@ function submitEdit(): void {
         <header class="summary__head">
           <span v-if="summary.active" class="tag tag--active">生效中</span>
           <span v-if="summary.edited" class="tag">已修订</span>
-          <span class="summary__meta">{{ summary.trigger }} · 覆盖至 {{ summary.covered_until ?? '-' }}</span>
+          <span class="summary__meta">会话摘要</span>
         </header>
         <template v-if="editingId === summary.summary_id">
           <textarea v-model="draft" class="summary__editor" rows="6" />

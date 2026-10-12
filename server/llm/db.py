@@ -16,11 +16,13 @@ import logging
 import os
 from typing import Any
 
+from core.database import DEFAULT_DATABASE_URL, database_url
+
 logger = logging.getLogger(__name__)
 
 _engine: Any | None = None
 
-_DEFAULT_DSN = "postgresql+asyncpg://sciloop:sciloop@localhost:5432/sciloop"
+_DEFAULT_DSN = DEFAULT_DATABASE_URL
 
 
 def normalize_async_dsn(dsn: str | None) -> str:
@@ -28,11 +30,7 @@ def normalize_async_dsn(dsn: str | None) -> str:
     url = (dsn or "").strip()
     if not url:
         url = _read_dsn_from_settings()
-    if url.startswith("postgres://"):
-        url = "postgresql://" + url[len("postgres://") :]
-    if url.startswith("postgresql://"):
-        url = "postgresql+asyncpg://" + url[len("postgresql://") :]
-    return url
+    return database_url(url)
 
 
 def _read_dsn_from_settings() -> str:
@@ -64,11 +62,14 @@ def get_async_engine(dsn: str | None = None) -> Any:
         from sqlalchemy.ext.asyncio import create_async_engine
 
         url = normalize_async_dsn(dsn)
+        from sqlalchemy.engine import make_url
+        path = make_url(url).database
+        if path and path != ":memory:":
+            from pathlib import Path
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
         _engine = create_async_engine(
             url,
             pool_pre_ping=True,
-            pool_size=5,
-            max_overflow=5,
             future=True,
         )
         logger.debug("LLM 记账引擎已创建 driver=%s", url.split("://", 1)[0])

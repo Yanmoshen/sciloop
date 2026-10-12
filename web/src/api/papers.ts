@@ -138,7 +138,17 @@ export interface FetchTaskAccepted {
 }
 
 export function triggerFetch(
-  body: { fields?: string[]; limit?: number } = {},
+  body: {
+    fields?: string[]
+    keywords?: string[]
+    date_from?: string | null
+    date_to?: string | null
+    sources?: string[]
+    limit?: number
+    download_fulltext?: boolean
+    parse_fulltext?: boolean
+    write_knowledge_base?: boolean
+  } = {},
   signal?: AbortSignal,
 ): Promise<FetchTaskAccepted> {
   return post<FetchTaskAccepted>('/papers/fetch', { body, signal, timeoutMs: 30_000 })
@@ -155,6 +165,9 @@ export interface FetchJobCounts {
   citation_count_filled?: number
   citation_count_null?: number
   github_stars_filled?: number
+  fulltext_downloaded?: number
+  fulltext_failed?: number
+  fulltext_parse_queued?: number
 }
 
 export interface FetchJobStatus {

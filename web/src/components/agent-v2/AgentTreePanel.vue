@@ -5,6 +5,7 @@
  * 结果一律显示「来自哪个子线程」，避免把子 Agent 的产物误当成父 Agent 的输出。
  */
 import { computed } from 'vue'
+import { humanError } from '../../utils/messages'
 
 import type { ChildView } from '../../agent-v2/protocol'
 
@@ -53,7 +54,7 @@ function depth(child: ChildView): number {
   <section class="tree">
     <header class="tree__head">
       <span class="tree__title">子 Agent</span>
-      <span class="tree__count" :title="`父线程 ${parentThreadId}`">{{ children.length }} 个</span>
+      <span class="tree__count">{{ children.length }} 个</span>
       <button type="button" class="link" @click="emit('refresh')">刷新</button>
       <button
         type="button"
@@ -78,14 +79,13 @@ function depth(child: ChildView): number {
           <span class="tag" :class="`tag--${tone(child.status)}`">
             {{ STATUS_LABEL[child.status] ?? child.status }}
           </span>
-          <span class="node__id mono" :title="child.thread_id">{{ child.thread_id.slice(0, 10) }}</span>
         </div>
         <p v-if="child.summary" class="node__summary">
           <span class="node__from">来自 {{ child.name }}</span>
           {{ child.summary }}
         </p>
         <p v-if="child.error" class="node__error">
-          {{ child.error.code }}：{{ child.error.message }}
+          {{ humanError(child.error) }}
         </p>
         <div class="node__actions">
           <button

@@ -391,7 +391,6 @@ _READONLY_SUBCOMMAND_TOOLS: dict[str, frozenset[str]] = {
     "git": _READONLY_GIT_SUBCOMMANDS,
     "pip": frozenset({"list", "show", "freeze", "check", "--version"}),
     "npm": frozenset({"ls", "list", "view", "outdated", "--version"}),
-    "docker": frozenset({"ps", "images", "inspect", "version", "logs"}),
     "poetry": frozenset({"show", "env", "--version"}),
 }
 
@@ -505,14 +504,9 @@ def judge_fs(
                     CATEGORY_DELETE,
                 )
             return _allow(layer, "在你自己给的研究项目里新建内容，可以直接做")
-        # 其他地方（项目目录之外的磁盘位置）：写新文件放行，覆盖要先问
-        if act == "move" or (act in ("write", "copy") and exists):
-            return _approve(
-                layer,
-                "这会覆盖或移动项目目录之外的文件，请你确认。",
-                CATEGORY_DELETE,
-            )
-        return _allow(layer, "在项目目录之外新建文件，可以直接做")
+        # 未明确选择工作目录时也必须先确认，避免模型把产物写入会话存储或任意磁盘位置。
+        reason = "这会覆盖或移动项目目录之外的文件，请你确认。" if exists or act == "move" else "这会在选定目录之外写入文件，请你确认。"
+        return _approve(layer, reason, CATEGORY_DELETE if exists or act == "move" else CATEGORY_SYSTEM)
 
     if act == "delete":
         if layer == LAYER_SCILOOP:

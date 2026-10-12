@@ -112,7 +112,7 @@ export interface TranslatePreview {
 }
 
 export function fetchTranslatePreview(taskId: string): Promise<TranslatePreview> {
-  return get<TranslatePreview>(`/translate/jobs/${encodeURIComponent(taskId)}/preview`)
+  return get<TranslatePreview>(`/translate/jobs/${encodeURIComponent(taskId)}/preview/blocks`)
 }
 
 /** 下载 PDF（`format=mono|dual`）——走 `apiUrl` 让浏览器直接下载 */

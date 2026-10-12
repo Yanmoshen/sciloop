@@ -144,7 +144,7 @@ def test_grants_summary_says_it_in_human_words() -> None:
     record: dict[str, Any] = {"id": "c1", "turns": []}
     assert "先问" in approvals.grants_summary(record)["note"]
     approvals.set_grants(record, full_access=True)
-    assert "高危" in approvals.grants_summary(record)["note"]
+    assert "自动批准" in approvals.grants_summary(record)["note"]
     approvals.set_grants(record, allow_exec=True)
     assert "高危操作也直接执行" in approvals.grants_summary(record)["note"]
 
@@ -180,7 +180,7 @@ def test_allows_matrix() -> None:
     assert approvals.allows(off, high_risk=False) is False
     assert approvals.allows(off, high_risk=True) is False
     assert approvals.allows(full, high_risk=False) is True
-    assert approvals.allows(full, high_risk=True) is False, "完全访问模式不该放行高危"
+    assert approvals.allows(full, high_risk=True) is True
     assert approvals.allows(exec_, high_risk=True) is True
     assert approvals.allows(both, high_risk=True) is True
 

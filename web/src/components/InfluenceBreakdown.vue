@@ -235,7 +235,6 @@ onBeforeUnmount(() => {
 watch(option, () => renderChart())
 
 const noveltyText = computed(() => describeNovelty(props.novelty).text)
-const novelty = computed(() => describeNovelty(props.novelty))
 </script>
 
 <template>

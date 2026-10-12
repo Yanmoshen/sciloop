@@ -20,7 +20,7 @@ const STEP_LABEL: Record<string, string> = {
   <section class="plan">
     <header class="plan__head">
       <span class="plan__title">{{ plan.title }}</span>
-      <span class="plan__meta" :title="`计划来自事件 ${plan.item_id}`">
+      <span class="plan__meta">
         {{ plan.steps.length }} 步 · 更新于 {{ plan.created_at }}
       </span>
     </header>

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from pathlib import Path
 
 from services.agent import mcp_tools
 
@@ -33,6 +32,18 @@ def test_autonomous_tools_exclude_mutating_ones() -> None:
     assert "run_command" in mcp_tools.APPROVABLE_TOOLS
     assert mcp_tools.requires_approval("run_command") is True
     assert mcp_tools.requires_approval("query_library") is False
+
+
+def test_current_time_is_a_read_only_model_tool() -> None:
+    schemas = asyncio.run(mcp_tools.tool_schemas())
+    assert "clock__curr_time" in {item["function"]["name"] for item in schemas}
+    payload, summary = asyncio.run(
+        mcp_tools.run_tool_call({"function": {"name": "clock__curr_time", "arguments": "{}"}})
+    )
+    assert payload["ok"] is True
+    assert payload["result"]["local_time"]
+    assert payload["result"]["utc_time"].endswith("+00:00")
+    assert "时间" in summary
 
 
 def test_run_tool_call_refuses_unknown_tools() -> None:
@@ -123,6 +134,85 @@ def test_row_kind_is_tool_so_frontend_renders_it_as_system_row() -> None:
     assert isinstance(row["text"], str) and row["text"]
 
 
+def test_tool_rows_keep_exact_command_and_file_action_for_disclosure() -> None:
+    command = {
+        "id": "call-17",
+        "function": {
+            "name": "run_on_computer",
+            "arguments": json.dumps({"command": "python -c \"print('ready')\"", "cwd": "D:/work"}),
+        },
+    }
+    row = mcp_tools.tool_row(command, "start")
+    assert row["action"] == "python -c \"print('ready')\""
+    assert row["call_id"] == "call-17"
+
+    file_call = {
+        "function": {
+            "name": "files_on_computer",
+            "arguments": json.dumps({"action": "move", "path": "draft.md", "to": "archive/draft.md"}),
+        }
+    }
+    assert mcp_tools.tool_row(file_call, "start")["action"] == "move draft.md → archive/draft.md"
+
+
+def test_execution_details_keep_only_process_output_and_exit_facts() -> None:
+    payload = {
+        "ok": False,
+        "result": {
+            "stdout": "partial output",
+            "stderr": "command failed",
+            "exit_code": 7,
+            "timed_out": False,
+            "duration_ms": 129,
+            "workdir": "D:/work",
+            "secret": "must not be serialized",
+        },
+    }
+    details = mcp_tools.tool_execution_details(payload)
+    assert details == {
+        "stdout": "partial output",
+        "stderr": "command failed",
+        "exit_code": 7,
+        "timed_out": False,
+        "duration_ms": 129,
+        "workdir": "D:/work",
+    }
+    assert "secret" not in json.dumps(details)
+
+
+def test_execution_details_include_bounded_directory_entries() -> None:
+    children = [
+        {"name": "paper.pdf", "kind": "file", "size": 4096, "secret": "drop"},
+        {"name": "figures", "type": "directory", "size": 0},
+        "README.md",
+    ] + [{"name": f"item-{index}"} for index in range(100)]
+    details = mcp_tools.tool_execution_details(
+        {"result": {"children": children, "secret": "must not be serialized"}}
+    )
+
+    assert details["children_count"] == 103
+    assert details["children_truncated"] is True
+    assert details["children"][:3] == [
+        {"name": "paper.pdf", "kind": "file", "size": 4096},
+        {"name": "figures", "kind": "directory", "size": 0},
+        {"name": "README.md"},
+    ]
+    assert len(details["children"]) == 100
+    assert "secret" not in json.dumps(details)
+
+
+def test_execution_details_skip_malformed_directory_entries_and_bound_names() -> None:
+    long_name = "x" * 500
+    details = mcp_tools.tool_execution_details(
+        {"result": {"children": [None, {"path": "/tmp/private"}, {"name": long_name, "type": 3}]}}
+    )
+
+    assert details["children_count"] == 3
+    assert details["children"] == [{"name": "x" * 240}]
+    assert "children_truncated" not in details
+    assert "path" not in json.dumps(details)
+
+
 def test_tool_message_content_truncates_but_says_so() -> None:
     big = {"text": "x" * 20000}
     content = mcp_tools.tool_message_content(big)
@@ -138,14 +228,27 @@ def test_tool_message_content_is_json_roundtrippable() -> None:
 # --------------------------------------------------------------------------- #
 # 工作区
 # --------------------------------------------------------------------------- #
-def test_agent_workspace_is_under_server_cache() -> None:
-    """工作区必须是 `server/.cache/agent-workspace`（与 ingest/reader 的 .cache 口径一致），
-    免得 agent 把文件写到别处。"""
+def test_agent_workspace_is_under_knowledge_exports() -> None:
+    """Generic agent artifacts live in the configured knowledge base."""
+
+    from services.storage import knowledge_root
 
     workspace = mcp_tools.agent_workspace()
     assert workspace.name == "agent-workspace"
-    assert workspace.parent.name == ".cache"
-    assert Path(mcp_tools.__file__).resolve().parents[2] == workspace.parent.parent
+    assert workspace.parent == knowledge_root() / "exports"
+
+
+def test_scoped_tool_schemas_do_not_leak_between_projects() -> None:
+    raw = [{"function": {"name": "run_on_computer", "description": "执行命令"}}]
+    first = mcp_tools._scoped_schemas(json.loads(json.dumps(raw)), "D:/项目甲", {
+        "python_env": {"executable": "D:/envs/research/python.exe"},
+    })
+    second = mcp_tools._scoped_schemas(json.loads(json.dumps(raw)), "D:/项目乙")
+    assert "项目甲" in first[0]["function"]["description"]
+    assert "research/python.exe" in first[0]["function"]["description"]
+    assert "项目甲" not in second[0]["function"]["description"]
+    assert "research/python.exe" not in second[0]["function"]["description"]
+    assert raw[0]["function"]["description"] == "执行命令"
 
 
 def test_fetch_url_is_hidden_without_allowed_hosts(monkeypatch) -> None:

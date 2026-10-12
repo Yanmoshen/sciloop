@@ -173,6 +173,16 @@ def test_full_access_auto_approves_and_records_audit(api, service) -> None:
     assert len(api.find_events(thread_id, "approval/requested")) == 1
 
 
+def test_public_production_decision_names_are_mapped_to_tool_manager() -> None:
+    """Production adapter accepts the protocol names used by the UI."""
+    from services.agent_runtime_v2.production_tools import ProductionToolBundle
+
+    assert ProductionToolBundle._public_decision("approve_conversation") == "approve_for_thread"
+    assert ProductionToolBundle._public_decision("full_access") == "escalate_full_access"
+    assert ProductionToolBundle._public_decision("approve_once") == "approve_once"
+    assert ProductionToolBundle._public_decision("cancel") == "cancel"
+
+
 def test_deny_feeds_real_error_back_to_model(api) -> None:
     thread = api.start_thread("拒绝回喂", scenario="approval_flow")["thread"]
     thread_id = thread["thread_id"]

@@ -103,12 +103,11 @@ export function moduleGroup(key: string | undefined): ModuleGroup {
  * `homeNav` 决定左栏哪一项高亮；未标注的页面（研究构思 / 工作台 / 设置）不高亮任何一项。
  */
 export const routes: RouteRecordRaw[] = [
-  // Agent v2 工作台独立占满应用视口，不套用旧 HomeLayout 的导航壳层。
+  // 旧书签兼容：Agent v2 工作台不再作为用户可见入口，统一回到原始开始使用页。
   {
     path: '/agent-v2',
     name: 'agent-v2',
-    component: () => import('@/views/agent-v2/AgentWorkbench.vue'),
-    meta: { title: 'Agent 工作台' },
+    redirect: '/',
   },
   // ---- 独立整页阅读器（不带壳层，整屏只放内容）----
   // 知识库里「在新页面打开」落到这里（新标签页），因此它必须是**顶层路由**，
@@ -136,6 +135,13 @@ export const routes: RouteRecordRaw[] = [
         path: '',
         name: 'home',
         component: () => import('@/views/HomeView.vue'),
+        meta: { title: '开始使用', homeNav: 'home' },
+      },
+      // 旧地址保留为兼容入口，与根路径使用同一套原始开始使用页面。
+      {
+        path: 'legacy',
+        name: 'legacy-home',
+        redirect: '/',
         meta: { title: '开始使用', homeNav: 'home' },
       },
       // 打开左栏里的某条对话（同一个视图，靠路由参数区分「新对话」与「已有对话」）。
@@ -244,10 +250,10 @@ export const routes: RouteRecordRaw[] = [
         meta: { title: '研究构思', module: 'ideas', homeNav: 'ideas' },
       },
       {
-        // 某个研究任务的工作区（四个方向 + 可行性分析）
+        // 某个研究任务的 20 专家 Idea 工作区
         path: 'ideas/:aggregationId',
         name: 'idea-workspace',
-        component: () => import('@/views/IdeaView.vue'),
+        component: () => import('@/views/IdeaExpertWorkbench.vue'),
         meta: { title: '研究构思', module: 'ideas', homeNav: 'ideas' },
       },
       {

@@ -121,3 +121,20 @@ async def test_provider_exception_is_classified_without_fallback(monkeypatch):
     assert isinstance(items[0], StreamError)
     assert items[0].error_class == "retryable"
     assert "upstream unavailable" in items[0].message
+
+
+@pytest.mark.asyncio
+async def test_tool_history_uses_wire_names_and_preserves_reasoning(monkeypatch):
+    seen = {}
+
+    async def fake_chat(messages, **kwargs):
+        seen["messages"] = messages
+        yield StreamUpdate(kind="done", result=LLMResult(content="好了", model_ref="x:y", provider="x", model_id="y"))
+
+    monkeypatch.setattr(provider_module, "chat_stream", fake_chat)
+    req = request(tools=[{"type": "function", "function": {"name": "skill.list"}}])
+    req.messages = [{"role": "assistant", "content": "", "reasoning_content": "真实供应商内容", "tool_calls": [{"id": "a", "function": {"name": "skill.list", "arguments": "{}"}}]}, {"role": "tool", "tool_call_id": "a", "content": "[]"}]
+    await collect(RegisteredModelProvider(), req)
+    assert seen["messages"][0]["tool_calls"][0]["function"]["name"] == "skill_list"
+    assert seen["messages"][0]["reasoning_content"] == "真实供应商内容"
+    assert req.messages[0]["tool_calls"][0]["function"]["name"] == "skill.list"

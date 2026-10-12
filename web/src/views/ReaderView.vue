@@ -99,17 +99,9 @@ const sourcePdfUrl = computed(() =>
     ? readerVersionPdfUrl(documentId.value, sourceVersionId.value)
     : '',
 )
-const targetPdfUrl = computed(() =>
-  documentId.value && targetVersionId.value
-    ? readerVersionPdfUrl(documentId.value, targetVersionId.value)
-    : '',
-)
 /** 批注按版本分栏显示：左栏只看原文版本上的批注，右栏看译文版本上的 */
 const sourceAnnotations = computed(() =>
   annotations.value.filter((item) => item.version_id === sourceVersionId.value),
-)
-const targetAnnotations = computed(() =>
-  annotations.value.filter((item) => item.version_id === targetVersionId.value),
 )
 
 /** 该论文在库内的 id —— 「翻译该论文」要把它带给翻译页。 */

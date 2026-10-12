@@ -9,7 +9,7 @@
 import { fileURLToPath, URL } from 'node:url'
 
 import vue from '@vitejs/plugin-vue'
-import { defineConfig } from 'vite'
+import { defineConfig, type Plugin } from 'vite'
 
 /**
  * `index.html` 用 `%VITE_DEFAULT_THEME%` 做首屏前的主题预置（避免深色模式闪白）。
@@ -19,8 +19,30 @@ import { defineConfig } from 'vite'
  */
 process.env.VITE_DEFAULT_THEME ??= 'light'
 
+function buildIdentity(): Plugin {
+  return {
+    name: 'sciloop-build-identity',
+    generateBundle(_options: unknown, bundle: Record<string, { type: string }>) {
+      const assets = Object.keys(bundle).sort()
+      this.emitFile({
+        type: 'asset',
+        fileName: 'build-manifest.json',
+        source: JSON.stringify(
+          {
+            build_id: process.env.VITE_BUILD_ID ?? new Date().toISOString(),
+            source_revision: process.env.VITE_SOURCE_REVISION ?? 'working-tree',
+            assets,
+          },
+          null,
+          2,
+        ),
+      })
+    },
+  }
+}
+
 export default defineConfig({
-  plugins: [vue()],
+  plugins: [vue(), buildIdentity()],
   resolve: {
     alias: {
       // 全项目统一使用 @ -> src 别名（WP02 等已按此约定引用）
@@ -29,7 +51,10 @@ export default defineConfig({
   },
   server: {
     host: '127.0.0.1',
-    port: 5173,
+    // The application serves the built frontend and API together on 8000.
+    // Keep Vite on the same fixed port so it cannot silently create another port.
+    port: 8000,
+    strictPort: true,
     proxy: {
       // 本地开发同源转发到 FastAPI，SSE 需关闭缓冲
       '/api': {
@@ -38,6 +63,11 @@ export default defineConfig({
         ws: true,
       },
     },
+  },
+  preview: {
+    host: '127.0.0.1',
+    port: 8000,
+    strictPort: true,
   },
   build: {
     outDir: 'dist',

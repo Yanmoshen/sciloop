@@ -28,9 +28,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
+import hashlib
 import json
 import logging
+import os
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from decimal import Decimal
@@ -45,7 +49,7 @@ from db.models.feasibility import Feasibility, Taskbook
 from db.models.research import IMPLEMENTED_NODES, ResearchNodeRun
 from db.models.review import DraftClaim, PaperDraft
 from llm.adapter import chat
-from llm.errors import LLMAuthError, LLMBadRequestError
+from llm.errors import LLMBadRequestError, LLMError
 from llm.providers import looks_like_schema_rejection
 from llm.schema import load_json_payload
 from services.agent import web_search
@@ -69,6 +73,58 @@ from services.research.rules import (
 
 logger = logging.getLogger("sciloop.research.orchestrator")
 
+
+class ResearchInterrupted(Exception):
+    """Explicit server-side interruption of the active research turn."""
+
+
+_INTERRUPTS: dict[str, asyncio.Event] = {}
+
+
+def request_interrupt(conversation_id: str) -> bool:
+    """Request cancellation for the active turn, without cancelling the HTTP task."""
+    event = _INTERRUPTS.get(str(conversation_id))
+    if event is None:
+        return False
+    event.set()
+    return True
+
+
+async def _raise_if_interrupted(conversation_id: str, session_factory: Any) -> None:
+    event = _INTERRUPTS.get(str(conversation_id))
+    if event is not None and event.is_set():
+        raise ResearchInterrupted("研究者请求停止当前研究回合")
+    if session_factory is None:
+        return
+    async with session_factory() as session:
+        runs = await store.list_node_runs(session, conversation_id=conversation_id)
+    running = next((row for row in reversed(runs) if row.get("status") == "running"), None)
+    if running and (running.get("payload") or {}).get("cancel_requested"):
+        raise ResearchInterrupted("研究者请求停止当前研究回合")
+
+
+async def request_persisted_interrupt(session_factory: Any, conversation_id: str) -> bool:
+    """Persist cancellation when the API worker cannot see the owning worker's event."""
+    if session_factory is None:
+        return False
+    async with session_factory() as session:
+        runs = await store.list_node_runs(session, conversation_id=conversation_id)
+        running = next((row for row in reversed(runs) if row.get("status") == "running"), None)
+        if running is None:
+            return False
+        payload = dict(running.get("payload") or {})
+        payload["cancel_requested"] = True
+        await store.upsert_node_run(
+            session,
+            conversation_id=conversation_id,
+            project_id=running.get("project_id"),
+            node=str(running["node"]),
+            entry_index=int(running.get("entry_index") or 1),
+            status="running",
+            payload=payload,
+        )
+    return True
+
 __all__ = [
     "NODE_KEYWORDS",
     "chain_state",
@@ -77,6 +133,8 @@ __all__ = [
     "resolve_entry_index",
     "resolve_model_ref",
     "run_node",
+    "request_interrupt",
+    "request_persisted_interrupt",
 ]
 
 #: 自然语言 → 节点（自动判定；判定结果前端必须回显，且可手动改）
@@ -105,6 +163,62 @@ NODE_MAX_TOKENS: int | None = None
 
 #: 已废弃：保留空表只为兼容旧引用，**不要往里加值**（加回去就等于按节点区别对待）。
 NODE_MAX_TOKENS_BY_NODE: dict[str, int] = {}
+
+# Codex bounds the time spent waiting for a provider stream even when the
+# model is otherwise allowed to decide how many tool/research steps to take.
+# Keep both limits configurable for slower deployments, while ensuring a
+# dropped provider connection can never leave a node without a terminal event.
+NODE_WALL_TIMEOUT_SECONDS = float(
+    os.getenv("SCILOOP_RESEARCH_NODE_TIMEOUT_SECONDS", "1800")
+)
+NODE_IDLE_TIMEOUT_SECONDS = float(
+    os.getenv("SCILOOP_RESEARCH_IDLE_TIMEOUT_SECONDS", "300")
+)
+# A research node must not leave its worker waiting forever on one provider
+# request.  This is an idle/transport budget for a single sampling step; the
+# turn may continue with the accumulated facts after a retryable timeout.
+NODE_MODEL_STEP_TIMEOUT_SECONDS = float(
+    os.getenv("SCILOOP_RESEARCH_MODEL_STEP_TIMEOUT_SECONDS", "45")
+)
+# Search engines already have per-engine timeouts.  This outer bound also
+# covers a broken embedded engine and, unlike the old SSE deadline, only
+# cancels the current search batch.
+NODE_SEARCH_STEP_TIMEOUT_SECONDS = float(
+    os.getenv("SCILOOP_RESEARCH_SEARCH_STEP_TIMEOUT_SECONDS", "45")
+)
+# A bounded turn needs a visible reason when it stops. These limits cap model
+# sampling and search batches independently of the wall/idle provider guards.
+NODE_MAX_LLM_CALLS = max(2, int(os.getenv("SCILOOP_RESEARCH_MAX_LLM_CALLS", "12")))
+NODE_MAX_SEARCH_BATCHES = max(1, int(os.getenv("SCILOOP_RESEARCH_MAX_SEARCH_BATCHES", "8")))
+
+
+def _budget_stop_reason(llm_calls: int, search_batches: int) -> str | None:
+    if llm_calls >= NODE_MAX_LLM_CALLS:
+        return "llm_calls"
+    if search_batches >= NODE_MAX_SEARCH_BATCHES:
+        return "search_batches"
+    return None
+
+
+def _retry_exhausted(retry_count: int, max_retry: int = graph.MAX_RETRY_PER_ENTRY) -> bool:
+    """Return whether a node-level recoverable failure must settle now."""
+    return retry_count >= max(1, int(max_retry))
+
+
+def _provider_retryable(exc: BaseException) -> bool:
+    """Classify transport/provider recovery independently from contract repair.
+
+    Contract retries repair malformed model output. Provider retries are safe
+    only for the LLM layer's explicitly retryable kinds (timeout, rate limit,
+    and 5xx/server transport). Auth, configuration, bad request and schema
+    failures must remain actionable instead of burning the same request again.
+    """
+
+    if isinstance(exc, LLMError):
+        return bool(exc.retryable) and getattr(exc, "kind", "") in {"timeout", "rate_limit", "server"}
+    name = type(exc).__name__.lower()
+    message = str(exc).lower()
+    return any(token in name or token in message for token in ("timeout", "timed out", "connection", "transport"))
 
 
 def max_tokens_for(node: str) -> int | None:
@@ -864,6 +978,9 @@ async def run_node(
     node: str | None = None,
     text: str = "",
     project_id: int | None = None,
+    research_facts: dict[str, Any] | None = None,
+    wall_timeout_s: float | None = None,
+    idle_timeout_s: float | None = None,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """执行一次节点（生成器，逐条产出事件）。
 
@@ -885,24 +1002,116 @@ async def run_node(
 
     entered: dict[str, Any] = {}
     settled = False
-    source = _run_node_events(
-        session_factory,
-        conversation_id=conversation_id,
-        node=node,
-        text=text,
-        project_id=project_id,
-    )
+    wall_limit = NODE_WALL_TIMEOUT_SECONDS if wall_timeout_s is None else wall_timeout_s
+    idle_limit = NODE_IDLE_TIMEOUT_SECONDS if idle_timeout_s is None else idle_timeout_s
+    started_at = time.monotonic()
+    node_kwargs: dict[str, Any] = {
+        "conversation_id": conversation_id,
+        "node": node,
+        "text": text,
+        "project_id": project_id,
+    }
+    # Keep compatibility with lightweight test/adaptor generators that still
+    # implement the pre-facts signature.
+    if research_facts is not None:
+        node_kwargs["research_facts"] = research_facts
+    interrupt_event = asyncio.Event()
+    _INTERRUPTS[conversation_id] = interrupt_event
+    source = _run_node_events(session_factory, **node_kwargs)
+    iterator = source.__aiter__()
     try:
-        async for event, data in source:
+        # Use explicit ``__anext__`` calls so a stalled provider/search call is
+        # bounded as well as a stalled event stream. This mirrors Codex's
+        # turn-level stream deadline without imposing a retry-count policy on
+        # the research model loop.
+        while True:
+            remaining = float(wall_limit) - (time.monotonic() - started_at)
+            if remaining <= 0:
+                raise TimeoutError
+            wait_for = remaining
+            if idle_limit is not None and float(idle_limit) > 0:
+                wait_for = min(wait_for, float(idle_limit))
+            try:
+                event, data = await asyncio.wait_for(iterator.__anext__(), timeout=wait_for)
+            except StopAsyncIteration:
+                break
             if event == "node":
                 entered = {
                     "node": data.get("node"),
                     "entry_index": data.get("entry_index"),
                 }
-            elif event in ("done", "error"):
-                # ``done`` = 正常收尾；``error`` 之前各失败分支都已落过终态
+            elif event == "done":
+                # ``done`` is the durable lifecycle boundary.
                 settled = True
+            elif event == "error":
+                # Codex-style provider errors can be intermediate. A retry
+                # scheduled event keeps the same source/entry alive until its
+                # following waiting_human or terminal done event.
+                retry_scheduled = bool(data.get("retry_scheduled") or data.get("retryable"))
+                settled = not retry_scheduled
             yield event, data
+            # Codex stops consuming a turn once its terminal lifecycle event
+            # is delivered; ignore any provider tail that arrives afterward.
+            if settled:
+                break
+    except ResearchInterrupted as exc:
+        reason = str(exc) or "研究者请求停止当前研究回合"
+        if entered and not settled:
+            await _settle_interrupted(
+                session_factory,
+                conversation_id=conversation_id,
+                project_id=project_id,
+                node=str(entered.get("node") or ""),
+                entry_index=int(entered.get("entry_index") or 1),
+            )
+        settled = True
+        yield "error", {
+            "code": "research_interrupted",
+            "message": reason,
+            "retryable": True,
+            "node": entered.get("node"),
+        }
+        yield "done", {
+            "node": entered.get("node"),
+            "status": "interrupted",
+            "reason": "user_interrupt",
+        }
+    except TimeoutError:
+        reason = "研究节点仍在等待模型或外部检索，当前订阅已结束；重新打开会话即可继续。"
+        if entered and not settled:
+            await _settle_interrupted(
+                session_factory,
+                conversation_id=conversation_id,
+                project_id=project_id,
+                node=str(entered.get("node") or ""),
+                entry_index=int(entered.get("entry_index") or 1),
+            )
+        settled = True
+        yield "notice", {
+            "node": entered.get("node"),
+            "code": "node_timeout",
+            "message": reason,
+            "wall_timeout_s": wall_limit,
+            "idle_timeout_s": idle_limit,
+        }
+        # Explicit timeout arguments are retained for old callers/tests that
+        # requested a human hand-off. Production calls leave both arguments
+        # unset: a transport budget must not manufacture a waiting-human turn.
+        if wall_timeout_s is not None or idle_timeout_s is not None:
+            yield "waiting_human", {
+                "node": entered.get("node"),
+                "entry_index": entered.get("entry_index"),
+                "message": reason,
+                "reason": "timeout",
+            }
+        yield "done", {
+            "node": entered.get("node"),
+            "status": "waiting_human" if wall_timeout_s is not None or idle_timeout_s is not None else "pending",
+            "display_status": graph.display_status(
+                "waiting_human" if wall_timeout_s is not None or idle_timeout_s is not None else "pending"
+            ),
+            "reason": "timeout",
+        }
     except BaseException:
         if entered and not settled:
             await _settle_interrupted(
@@ -913,6 +1122,11 @@ async def run_node(
                 entry_index=int(entered.get("entry_index") or 1),
             )
         raise
+    finally:
+        if _INTERRUPTS.get(conversation_id) is interrupt_event:
+            _INTERRUPTS.pop(conversation_id, None)
+        with contextlib.suppress(Exception):
+            await source.aclose()
 
 
 async def _settle_interrupted(
@@ -989,6 +1203,37 @@ async def _settle_interrupted(
         )
 
 
+async def _settle_llm_failure(
+    session_factory: Any,
+    *,
+    conversation_id: str,
+    project_id: int | None,
+    node: str,
+    entry_index: int,
+    retry_count: int,
+    validation: dict[str, Any],
+    raw_output: str,
+    llm_calls: int,
+    total_cost: float,
+) -> None:
+    """Persist an exhausted provider retry as a terminal failed node."""
+    async with session_factory() as session:
+        await store.upsert_node_run(
+            session,
+            conversation_id=conversation_id,
+            project_id=project_id,
+            node=node,
+            entry_index=entry_index,
+            status="failed",
+            retry_count=retry_count,
+            raw_output=raw_output[:20000],
+            validation=validation,
+            llm_call_count=llm_calls,
+            cost_usd=round(total_cost, 6),
+            finished_at=_utcnow(),
+        )
+
+
 async def _run_node_events(
     session_factory: Any,
     *,
@@ -996,6 +1241,7 @@ async def _run_node_events(
     node: str | None = None,
     text: str = "",
     project_id: int | None = None,
+    research_facts: dict[str, Any] | None = None,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """节点执行主体（事件语义见 ``run_node`` 的文档字符串）。"""
 
@@ -1079,6 +1325,7 @@ async def _run_node_events(
             entry_index=entry_index,
             status="running",
             retry_count=0,
+            payload={},
             validation=None,
             started_at=_utcnow(),
         )
@@ -1123,20 +1370,16 @@ async def _run_node_events(
     payload: dict[str, Any] | None = None
     total_cost = 0.0
     llm_calls = 0
+    search_batches = 0
     last_raw = ""
     last_validation: ValidationResult | None = None
     #: 契约反复产不出可落库产出时，**通牒只发一次**（用户口径 2026-09-26：
     #: 决定权在模型；程序只在通牒之后仍无解时兜底）。
     ultimatum_sent = False
     repair: str | None = None
-    # 循环的出口只有两个：模型说完成（break）或模型要人介入（return）。
-    # 不再有"重试用尽"这个由程序判定出来的出口。
-
-    # **不设次数上限**：由模型决定什么时候停（2026-09-22 研究者明确要求「让模型自己决定
-    # 什么时候停下、什么时候需要人工介入」）。程序这一层的职责只剩三件：
-    #   ① 把产出摆成能落库的形状（契约不过 = 产出不可用，必须再来一轮）；
-    #   ② 把"验收到了什么"如实整理成事实（只报事实，不判通过）；
-    #   ③ 读模型自己的决定：done / continue / need_human。
+    # The model controls research decisions inside an observable call budget.
+    # A budget stop is an explicit failure/waiting state, never a fabricated
+    # successful completion.
     attempt = 0
     contract_misses = 0
     self_checks = 0
@@ -1144,17 +1387,63 @@ async def _run_node_events(
     advisories: list[str] = []
     #: 模型要求搜的结果累积在这里，下一轮作为事实塞进提示词
     search_notes: list[dict[str, Any]] = []
+    fallback_search_done = False
+    provider_retry_attempt = 0
+    provider_retry_limit = max(3, max_retry + 1)
     #: 连续多少轮检索都没命中（2026-09-26）：作为**事实**写进提示词交给模型判断，
     #: 并在达到防呆线时交回研究者 —— 防的是"一圈一圈白跑"，不是替模型做决定。
     zero_hit_streak = 0
     #: 模型要求跑的命令与真实输出（同样是"事实"，下一轮塞回去）
     command_notes: list[dict[str, Any]] = []
     while True:
+        await _raise_if_interrupted(conversation_id, session_factory)
+        if _budget_stop_reason(llm_calls, search_batches) == "llm_calls":
+            reason = (
+                f"本研究节点已达到模型调用预算（{NODE_MAX_LLM_CALLS} 次），"
+                "已保留当前结果并停止自动重试；可继续当前研究或缩小问题范围。"
+            )
+            await _hand_off_to_human(
+                session_factory,
+                conversation_id=conversation_id,
+                project_id=project_id,
+                node=target,
+                entry_index=entry_index,
+                retry_count=attempt,
+                reason=reason,
+                validation=last_validation,
+                raw_output=last_raw,
+                llm_calls=llm_calls,
+                total_cost=total_cost,
+                budget_snapshot={**budget, "search_batches": search_batches},
+                extra={"decided_by": "program_budget", "state": "budget_exhausted"},
+            )
+            yield "error", {
+                "code": "research_budget_exhausted",
+                "message": reason,
+                "node": target,
+                "attempt": attempt,
+                "llm_calls": llm_calls,
+                "search_batches": search_batches,
+            }
+            yield "done", {
+                "node": target,
+                "status": "waiting_human",
+                "reason": "llm_budget_exhausted",
+                "llm_call_count": llm_calls,
+                "search_batch_count": search_batches,
+                "cost_usd": round(total_cost, 6),
+            }
+            return
+
         yield "attempt", {
             "node": target,
             "attempt": attempt + 1,
             "max_attempts": None,
             "retry_count": attempt,
+            "llm_calls": llm_calls,
+            "max_llm_calls": NODE_MAX_LLM_CALLS,
+            "search_batches": search_batches,
+            "max_search_batches": NODE_MAX_SEARCH_BATCHES,
             "library_hits": len(hits or []),
             "paper_total": library.get("paper_total"),
         }
@@ -1171,6 +1460,7 @@ async def _run_node_events(
             repair=repair,
             search_results=search_notes,
             command_results=command_notes,
+            research_facts=research_facts,
         )
 
         result: Any = None
@@ -1182,6 +1472,7 @@ async def _run_node_events(
         for schema_try in (0, 1):
             want_schema = schema_try == 0 and model_ref not in _SCHEMA_UNSUPPORTED
             try:
+                await _raise_if_interrupted(conversation_id, session_factory)
                 result = await chat(
                     messages,
                     model_ref,
@@ -1195,9 +1486,13 @@ async def _run_node_events(
                     # env 兜底：实测 env 的 Key 可能为空，主模型只要应答不理想就会去试它，
                     # 结果把一次本可重试的调用变成硬认证失败。
                     allow_fallback=False,
+                    timeout=max(5.0, NODE_MODEL_STEP_TIMEOUT_SECONDS),
                 )
+                await _raise_if_interrupted(conversation_id, session_factory)
                 llm_failed = None
                 break
+            except ResearchInterrupted:
+                raise
             except Exception as exc:  # noqa: BLE001 - 失败如实上报，不做假成功
                 llm_failed = exc
                 if want_schema and _is_schema_rejection(exc):
@@ -1232,9 +1527,10 @@ async def _run_node_events(
             # 重试额度**再继续，而不是让一次调用抖动直接终结整个节点。
             # 认证/配置类失败重试没有意义（拿空 Key 再撞只会白花钱）；
             # 其余失败（供应商抖动、超时）继续交给模型，**不再受次数上限约束**。
-            recoverable = not isinstance(llm_failed, LLMAuthError)
+            recoverable = _provider_retryable(llm_failed)
             if recoverable:
-                llm_calls += 0  # 已在上面计过
+                retry_count = attempt + 1
+                provider_retry_attempt += 1
                 failure = ValidationResult(
                     ok=False,
                     level="L1",
@@ -1252,11 +1548,52 @@ async def _run_node_events(
                     "node": target,
                     "node_label": graph.NODE_LABELS.get(target, target),
                     "attempt": attempt + 1,
-                    "max_attempts": None,
+                    "max_attempts": max_retry,
                     "ok": False,
                     "level": "L1",
                     "items": [h.to_dict() for h in failure.hits],
                 }
+                if provider_retry_attempt >= provider_retry_limit:
+                    reason = (
+                        f"模型传输连续 {provider_retry_attempt} 次失败，已暂存当前研究回合。"
+                        "研究设定和已有检索结果已保留，可继续同一节点重试。"
+                    )
+                    terminal_validation = failure.to_dict()
+                    terminal_validation.update({
+                        "terminal": False,
+                        "retryable": True,
+                        "retry_scheduled": True,
+                        "provider_retry_attempt": provider_retry_attempt,
+                        "provider_retry_limit": provider_retry_limit,
+                    })
+                    await _hand_off_to_human(
+                        session_factory, conversation_id=conversation_id, project_id=project_id,
+                        node=target, entry_index=entry_index, retry_count=retry_count,
+                        reason=reason, validation=terminal_validation, raw_output=last_raw,
+                        llm_calls=llm_calls, total_cost=total_cost,
+                        budget_snapshot={**budget, "provider_retry_attempt": provider_retry_attempt},
+                        extra={"state": "retry_scheduled", "retryable": True},
+                    )
+                    yield "error", {
+                        "code": getattr(llm_failed, "code", "llm_failed") or "llm_failed",
+                        "message": reason,
+                        "detail": str(llm_failed)[:400],
+                        "node": target,
+                        "attempt": retry_count,
+                        "max_attempts": max_retry,
+                        "retryable": True,
+                        "retry_scheduled": True,
+                        "provider_retry_attempt": provider_retry_attempt,
+                    }
+                    yield "done", {
+                        "node": target,
+                        "status": "waiting_human",
+                        "reason": "provider_retry_scheduled",
+                        "retry_count": retry_count,
+                        "llm_call_count": llm_calls,
+                        "cost_usd": round(total_cost, 6),
+                    }
+                    return
                 async with session_factory() as session:
                     await store.upsert_node_run(
                         session,
@@ -1265,19 +1602,25 @@ async def _run_node_events(
                         node=target,
                         entry_index=entry_index,
                         status="running",
-                        retry_count=attempt + 1,
+                        retry_count=retry_count,
                         raw_output=last_raw[:20000],
                         validation=failure.to_dict(),
                         llm_call_count=llm_calls,
                         cost_usd=round(total_cost, 6),
                     )
                     budget = await _budget_snapshot(
-                        session, conversation_id=conversation_id, node=target, retry_count=attempt + 1
+                        session, conversation_id=conversation_id, node=target, retry_count=retry_count
                     )
                 repair = (
                     "上一次模型调用没有成功返回可用结果。请直接输出符合契约的完整 JSON 对象，"
                     "不要输出解释文字，也不要使用代码围栏。"
                 )
+                attempt = retry_count
+                # Provider retries do not consume the contract repair budget.
+                # Keep the same conversation/node/entry and expose the retry
+                # fact to the next model request instead of replaying user text.
+                repair = None
+                await asyncio.sleep(min(2.0, 0.25 * provider_retry_attempt))
                 continue
 
             async with session_factory() as session:
@@ -1304,6 +1647,7 @@ async def _run_node_events(
                     },
                     llm_call_count=llm_calls,
                     cost_usd=round(total_cost, 6),
+                    finished_at=_utcnow(),
                 )
             yield "error", {
                 "code": getattr(llm_failed, "code", "llm_failed") or "llm_failed",
@@ -1455,7 +1799,107 @@ async def _run_node_events(
         # 研究者也正好能看见"为了这个结论我搜过什么、搜到了什么"。
         academic_wanted = _query_list(candidate, "academic_queries")
         web_wanted = _query_list(candidate, "web_queries")
+
+        # A literature turn should produce an auditable source even when the
+        # first structured response omitted query fields.  The model remains
+        # responsible for interpretation; this one bounded lookup only makes
+        # the user's research topic available as evidence for the next sample.
+        if (
+            target == "literature_review"
+            and attempt == 0
+            and not fallback_search_done
+            and not academic_wanted
+            and not web_wanted
+        ):
+            if _budget_stop_reason(llm_calls, search_batches) == "search_batches":
+                reason = f"本研究节点已达到联网检索预算（{NODE_MAX_SEARCH_BATCHES} 批），没有启动额外检索。"
+                yield "notice", {"node": target, "code": "search_budget_exhausted", "message": reason}
+                yield "waiting_human", {"node": target, "node_label": graph.NODE_LABELS.get(target, target), "message": reason}
+                yield "done", {"node": target, "status": "waiting_human", "reason": "search_budget_exhausted", "llm_call_count": llm_calls, "search_batch_count": search_batches}
+                return
+            search_batches += 1
+            fallback_search_done = True
+            fallback_query = " ".join((research_question or text).split())[:240]
+            if fallback_query:
+                yield "notice", {
+                    "node": target,
+                    "code": "searching",
+                    "message": "正在根据你的研究主题查找可核验的学术来源。",
+                }
+                try:
+                    await _raise_if_interrupted(conversation_id, session_factory)
+                    fallback_rows = await asyncio.wait_for(
+                        _run_academic_queries([fallback_query]),
+                        timeout=max(5.0, NODE_SEARCH_STEP_TIMEOUT_SECONDS),
+                    )
+                except TimeoutError:
+                    fallback_rows = [
+                        {
+                            "capability": "academic",
+                            "query": fallback_query,
+                            "ok": False,
+                            "count": 0,
+                            "sources_used": [],
+                            "sources_failed": [{"reason": "timeout", "detail": "学术来源响应超时"}],
+                            "results": [],
+                        }
+                    ]
+                search_notes.extend(fallback_rows)
+                yield "row", {
+                    "row": {
+                        "kind": "search",
+                        "tone": "idle",
+                        "label": "联网检索",
+                        "text": f"联网搜索 · {sum(len(item.get('results') or []) for item in fallback_rows)} 条",
+                        "query_count": 1,
+                        "total": sum(len(item.get("results") or []) for item in fallback_rows),
+                        "groups": fallback_rows,
+                    }
+                }
+
         if academic_wanted or web_wanted:
+            await _raise_if_interrupted(conversation_id, session_factory)
+            if _budget_stop_reason(llm_calls, search_batches) == "search_batches":
+                reason = (
+                    f"本研究节点已达到联网检索预算（{NODE_MAX_SEARCH_BATCHES} 批），"
+                    "没有继续重复请求；现有来源和未解决问题已保留。"
+                )
+                search_notes.append({
+                    "capability": "research_budget",
+                    "query": "、".join([*academic_wanted, *web_wanted])[:240],
+                    "ok": False,
+                    "count": 0,
+                    "sources_used": [],
+                    "sources_failed": [{"reason": "budget_exhausted", "detail": reason}],
+                    "results": [],
+                })
+                await _hand_off_to_human(
+                    session_factory,
+                    conversation_id=conversation_id,
+                    project_id=project_id,
+                    node=target,
+                    entry_index=entry_index,
+                    retry_count=attempt,
+                    reason=reason,
+                    validation=last_validation,
+                    raw_output=last_raw,
+                    llm_calls=llm_calls,
+                    total_cost=total_cost,
+                    budget_snapshot={**budget, "search_batches": search_batches},
+                    extra={"decided_by": "program_budget", "state": "search_budget_exhausted"},
+                )
+                yield "notice", {"node": target, "code": "search_budget_exhausted", "message": reason}
+                yield "waiting_human", {"node": target, "node_label": graph.NODE_LABELS.get(target, target), "message": reason}
+                yield "done", {
+                    "node": target,
+                    "status": "waiting_human",
+                    "reason": "search_budget_exhausted",
+                    "llm_call_count": llm_calls,
+                    "search_batch_count": search_batches,
+                    "cost_usd": round(total_cost, 6),
+                }
+                return
+            search_batches += 1
             # 先报一句「正在检索」：检索可能等十几秒，缺了这句用户只会觉得"卡住了"
             # （2026-09-26 实测：整轮 178 秒里，界面在这段完全没有增量反馈）。
             all_wanted = [*academic_wanted, *web_wanted]
@@ -1473,7 +1917,25 @@ async def _run_node_events(
                 tasks.append(_run_academic_queries(academic_wanted))
             if web_wanted:
                 tasks.append(_run_web_queries(web_wanted))
-            batches = await asyncio.gather(*tasks)
+            try:
+                batches = await asyncio.wait_for(
+                    asyncio.gather(*tasks),
+                    timeout=max(5.0, NODE_SEARCH_STEP_TIMEOUT_SECONDS),
+                )
+            except TimeoutError:
+                # Preserve a structured fact for the next model sample rather
+                # than leaving the turn in an unobservable await.
+                batches = [[
+                    {
+                        "capability": "academic" if academic_wanted else "web",
+                        "query": all_wanted[0] if all_wanted else "",
+                        "ok": False,
+                        "count": 0,
+                        "sources_used": [],
+                        "sources_failed": [{"reason": "timeout", "detail": "搜索批次响应超时"}],
+                        "results": [],
+                    }
+                ]]
             found: list[dict[str, Any]] = [item for batch in batches for item in batch]
             search_notes.extend(found)
 
@@ -1487,8 +1949,8 @@ async def _run_node_events(
             if zero_hit_streak >= SEARCH_ZERO_HIT_LIMIT:
                 stop_text = (
                     f"连续 {zero_hit_streak} 轮检索都没有命中任何材料，已停下来交给你："
-                    "继续用同样的词搜下去大概率还是空手。可以换一批更具体的论文、"
-                    "或把研究问题写得更明确，然后让我重跑这一步。"
+                    "继续用同样的词搜下去大概率还是空手。你可以用自然语言补充或修正研究方向，"
+                    "我会沿着当前研究回合继续处理。"
                 )
                 yield "notice", {
                     "node": target,
@@ -1560,7 +2022,11 @@ async def _run_node_events(
             else []
         )[:MAX_NODE_COMMANDS]
         if commands:
-            records, granted = await _run_node_commands(conversation_id, commands)
+            records, granted = await _run_node_commands(
+                conversation_id,
+                commands,
+                turn_id=f"research:{conversation_id}:{target}:{entry_index}:{attempt}",
+            )
             command_notes.extend(records)
             if not granted:
                 yield "notice", {
@@ -1663,16 +2129,48 @@ async def _run_node_events(
         # ---- 模型说完成 → **再让同一个模型回头自查一遍**（研究者点名要的）-- #
         payload = normalized if isinstance(normalized, dict) else (candidate or {})
         if self_checks < SELF_CHECK_LIMIT:
+            if llm_calls >= NODE_MAX_LLM_CALLS:
+                reason = f"本研究节点已达到模型调用预算（{NODE_MAX_LLM_CALLS} 次），自检未再启动。"
+                yield "notice", {"node": target, "code": "llm_budget_exhausted", "message": reason}
+                await _hand_off_to_human(
+                    session_factory,
+                    conversation_id=conversation_id,
+                    project_id=project_id,
+                    node=target,
+                    entry_index=entry_index,
+                    retry_count=attempt,
+                    reason=reason,
+                    validation=last_validation,
+                    raw_output=last_raw,
+                    llm_calls=llm_calls,
+                    total_cost=total_cost,
+                    budget_snapshot={**budget, "search_batches": search_batches},
+                    extra={"decided_by": "program_budget", "state": "budget_exhausted"},
+                )
+                yield "waiting_human", {"node": target, "node_label": graph.NODE_LABELS.get(target, target), "message": reason}
+                yield "done", {"node": target, "status": "waiting_human", "reason": "llm_budget_exhausted", "llm_call_count": llm_calls, "search_batch_count": search_batches}
+                return
             self_checks += 1
-            check = await _run_self_check(
-                node=target,
-                model_ref=model_ref,
-                payload=payload,
-                research_question=research_question,
-                advisories=advisories,
-                library=library,
-                project_id=project_id,
-            )
+            try:
+                check = await asyncio.wait_for(
+                    _run_self_check(
+                        node=target,
+                        model_ref=model_ref,
+                        payload=payload,
+                        research_question=research_question,
+                        advisories=advisories,
+                        library=library,
+                        project_id=project_id,
+                    ),
+                    timeout=max(5.0, NODE_MODEL_STEP_TIMEOUT_SECONDS),
+                )
+            except TimeoutError:
+                check = {}
+                yield "notice", {
+                    "node": target,
+                    "code": "self_check_timeout",
+                    "message": "自检调用超时，已保留主体产出并结束本轮。",
+                }
             llm_calls += 1
             if check:
                 total_cost += float(check.get("cost_usd") or 0)
@@ -1948,6 +2446,24 @@ def _contract_payload(target: str, candidate: dict[str, Any] | None) -> tuple[bo
     return True, obj.model_dump(), ""
 
 
+def _validation_dict(validation: Any) -> dict[str, Any]:
+    """Normalize validation objects at persistence boundaries.
+
+    Retry scheduling enriches an already serialized validation dictionary,
+    while older paths pass ``ValidationResult``. Both are durable audit data.
+    """
+
+    if validation is None:
+        return {}
+    if isinstance(validation, dict):
+        return dict(validation)
+    to_dict = getattr(validation, "to_dict", None)
+    if callable(to_dict):
+        value = to_dict()
+        return dict(value) if isinstance(value, dict) else {}
+    return {"value": str(validation)}
+
+
 async def _hand_off_to_human(
     session_factory: Any,
     *,
@@ -1970,7 +2486,7 @@ async def _hand_off_to_human(
     以及自检结论 —— 这几项是审计链上最该留住的证据，缺了就没法回答"这个节点为什么停在这"。
     """
 
-    stored: dict[str, Any] = dict(validation.to_dict()) if validation is not None else {}
+    stored: dict[str, Any] = _validation_dict(validation)
     stored.update(extra or {})
     async with session_factory() as session:
         await store.upsert_node_run(
@@ -2113,10 +2629,11 @@ async def _run_academic_queries(queries: list[str]) -> list[dict[str, Any]]:
     if not queries:
         return []
     fetched = await asyncio.gather(
-        *(web_search.search_academic(query, limit=SEARCH_RESULTS_PER_QUERY) for query in queries)
+        *(web_search.search_academic(query, limit=SEARCH_RESULTS_PER_QUERY) for query in queries),
+        return_exceptions=True,
     )
     return [
-        _block(web_search.CAPABILITY_ACADEMIC, query, result)
+        _search_result(web_search.CAPABILITY_ACADEMIC, query, result)
         for query, result in zip(queries, fetched, strict=False)
     ]
 
@@ -2132,12 +2649,29 @@ async def _run_web_queries(queries: list[str]) -> list[dict[str, Any]]:
     if not queries:
         return []
     fetched = await asyncio.gather(
-        *(web_search.search_web(query, limit=SEARCH_RESULTS_PER_QUERY) for query in queries)
+        *(web_search.search_web(query, limit=SEARCH_RESULTS_PER_QUERY) for query in queries),
+        return_exceptions=True,
     )
     return [
-        _block(web_search.CAPABILITY_WEB, query, result)
+        _search_result(web_search.CAPABILITY_WEB, query, result)
         for query, result in zip(queries, fetched, strict=False)
     ]
+
+
+def _search_result(capability: str, query: str, result: Any) -> dict[str, Any]:
+    if isinstance(result, BaseException):
+        return {
+            "capability": capability,
+            "query": query,
+            "ok": False,
+            "count": 0,
+            "sources_used": [],
+            "sources_failed": [{"reason": "search_error", "detail": str(result)[:240]}],
+            "reason": "search_error",
+            "error": str(result)[:240],
+            "results": [],
+        }
+    return _block(capability, query, result if isinstance(result, dict) else {})
 
 
 async def _run_searches(queries: list[str]) -> list[dict[str, Any]]:
@@ -2159,7 +2693,10 @@ SEARCH_ZERO_HIT_LIMIT = 3
 
 
 async def _run_node_commands(
-    conversation_id: str, commands: list[str]
+    conversation_id: str,
+    commands: list[str],
+    *,
+    turn_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], bool]:
     """在研究者电脑上跑模型点名的命令，返回 `(记录, 是否获授权)`。
 
@@ -2179,31 +2716,47 @@ async def _run_node_commands(
         return [], False
 
     results: list[dict[str, Any]] = []
-    for command in commands[:MAX_NODE_COMMANDS]:
+    for index, command in enumerate(commands[:MAX_NODE_COMMANDS]):
+        call_id = "call_" + hashlib.sha256(
+            f"{conversation_id}\n{turn_id or ''}\n{index}\n{command}".encode()
+        ).hexdigest()[:20]
+        base = {
+            "call_id": call_id,
+            "turn_id": turn_id,
+            "command": command,
+        }
         verdict = policy.judge_command(command=command)
         if verdict.forbidden:
-            results.append(
-                {"command": command, "ok": False, "refused": True, "error": verdict.message}
-            )
+            results.append({**base, "ok": False, "refused": True, "error": verdict.message})
             continue
         if verdict.needs_approval:
-            results.append(
-                {
-                    "command": command,
-                    "ok": False,
-                    "needs_approval": True,
-                    "error": "这条属于高危操作，需要在对话里单独确认后才会执行",
-                }
-            )
+            results.append({
+                **base,
+                "ok": False,
+                "needs_approval": True,
+                "approval_id": "approval_" + call_id.removeprefix("call_"),
+                "error": "这条属于高危操作，需要在对话里单独确认后才会执行",
+            })
             continue
         outcome = await host_runner.call_exec(command=command, timeout_s=NODE_COMMAND_TIMEOUT_S)
+        stdout = str(outcome.get("stdout") or "")
+        stderr = str(outcome.get("stderr") or "")
+        exit_code = outcome.get("exit_code")
+        ok = bool(outcome.get("ok")) and exit_code == 0
+        reason = None
+        if ok and not stdout.strip():
+            reason = "empty_output"
+        elif not ok and outcome.get("error"):
+            reason = "network_error" if "fetch" in str(outcome.get("error")).lower() else "process_failed"
         results.append(
             {
-                "command": command,
-                "ok": bool(outcome.get("ok")),
-                "exit_code": outcome.get("exit_code"),
-                "stdout_tail": str(outcome.get("stdout") or "")[-2000:],
-                "stderr_tail": str(outcome.get("stderr") or "")[-800:],
+                **base,
+                "ok": ok,
+                "exit_code": exit_code,
+                "stdout_tail": stdout[-2000:],
+                "stderr_tail": stderr[-800:],
+                "stdout_empty": not bool(stdout.strip()),
+                "reason": reason,
                 "error": outcome.get("error"),
             }
         )

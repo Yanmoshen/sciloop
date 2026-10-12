@@ -67,6 +67,35 @@ export interface SettingsList {
   total: number
 }
 
+export interface FetchSettings {
+  enabled: boolean
+  daily_time: string
+  incremental: boolean
+  download_fulltext: boolean
+  parse_fulltext: boolean
+  write_knowledge_base: boolean
+}
+
+/**
+ * 定时抓取所在进程的**真实**调度器状态（后端 `tasks/scheduler.py`）。
+ *
+ * `applied` 只在 PUT 之后出现：`immediate` = 已即时生效；`restart_required` = 必须重启服务。
+ * 界面不得在没拿到它时假设"保存即生效"。
+ */
+export interface FetchSchedulerStatus {
+  running: boolean
+  enabled: boolean
+  jobs?: string[]
+  applied?: 'immediate' | 'restart_required'
+  scheduled?: boolean
+  next_run_at?: string | null
+  note?: string
+}
+
+export interface FetchSettingsScope extends SettingsScope<FetchSettings> {
+  scheduler?: FetchSchedulerStatus
+}
+
 /** 全部设置分组（公开只读） */
 export function listSettingsScopes(): Promise<SettingsList> {
   return get<SettingsList>('/settings')
@@ -85,4 +114,12 @@ export function putReadingSettings(
   patch: Partial<ReadingSettings>,
 ): Promise<SettingsScope<ReadingSettings>> {
   return put<SettingsScope<ReadingSettings>>('/settings/reading', { body: patch })
+}
+
+export function getFetchSettings(): Promise<FetchSettingsScope> {
+  return get<FetchSettingsScope>('/settings/fetch')
+}
+
+export function putFetchSettings(patch: Partial<FetchSettings>): Promise<FetchSettingsScope> {
+  return put<FetchSettingsScope>('/settings/fetch', { body: patch })
 }

@@ -104,7 +104,7 @@ class SnapshotReport:
 # 会话
 # --------------------------------------------------------------------------- #
 def _open_session() -> Any:
-    """同步会话（``psycopg``）；工厂不可用返回 ``None``，由调用方如实报错。"""
+    """同步会话（``sqlite3``）；工厂不可用返回 ``None``，由调用方如实报错。"""
     if SessionLocal is None:
         return None
     return SessionLocal()
@@ -139,7 +139,7 @@ def build_snapshots(
         report.errors.append(
             {
                 "code": "database_unavailable",
-                "message": "同步会话工厂不可用（DATABASE_URL / psycopg 未就绪）",
+                "message": "同步会话工厂不可用（DATABASE_URL / sqlite3 未就绪）",
             }
         )
         return report

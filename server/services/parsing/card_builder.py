@@ -801,7 +801,7 @@ async def _maybe_await(value: Any) -> Any:
 
 
 def _load_json(value: Any, default: Any) -> Any:
-    """JSONB 列在不同驱动下可能返回 str（asyncpg）或已解析对象（psycopg）。"""
+    """JSON 列可能返回文本或已解析对象。"""
     if value is None:
         return default
     if isinstance(value, str):
@@ -904,8 +904,7 @@ class SqlCardRepository(SqlDocumentRepository):
     async def insert_card(self, row: CardRow) -> CardRow:
         from sqlalchemy import text
 
-        dialect = getattr(getattr(self.session, "bind", None), "dialect", None)
-        json_cast = "json(:{name})" if getattr(dialect, "name", "") == "sqlite" else "CAST(:{name} AS JSONB)"
+        json_cast = "json(:{name})"
         statement = text(
             f"""
             INSERT INTO paper_cards
@@ -984,7 +983,10 @@ class SqlCardRepository(SqlDocumentRepository):
         from sqlalchemy import text
 
         await self._run(
-            text("UPDATE papers SET is_parsed = :value, updated_at = now() WHERE id = :pid"),
+            text(
+                "UPDATE papers SET is_parsed = :value, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = :pid"
+            ),
             {"value": bool(value), "pid": int(paper_id)},
         )
         await self._commit()
@@ -1099,7 +1101,7 @@ async def build_card(
     from db.session import AsyncSessionLocal
 
     if AsyncSessionLocal is None:  # pragma: no cover - 部署期驱动缺失
-        raise RuntimeError("异步数据库会话工厂不可用（DATABASE_URL / asyncpg 未就绪）")
+        raise RuntimeError("异步数据库会话工厂不可用（DATABASE_URL / aiosqlite 未就绪）")
     async with AsyncSessionLocal() as owned:
         return await _build_card_impl(paper_id, force=force, session=owned, project_id=project_id)
 

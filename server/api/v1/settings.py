@@ -56,7 +56,7 @@ async def _session() -> AsyncIterator[AsyncSession]:
         raise _error(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "database_unavailable",
-            "异步数据库会话工厂不可用（DATABASE_URL / asyncpg 未就绪）",
+            "异步数据库会话工厂不可用（DATABASE_URL / aiosqlite 未就绪）",
         )
     async with AsyncSessionLocal() as session:
         yield session
@@ -92,14 +92,33 @@ async def list_all_settings(session: DbSession) -> dict[str, Any]:
     return {"items": items, "total": len(items)}
 
 
+def _fetch_scheduler_status() -> dict[str, Any]:
+    """定时抓取所在进程的真实调度器状态（取不到就如实说"未知"，不假装已生效）。"""
+    try:
+        from tasks.scheduler import scheduler_status
+    except Exception:  # noqa: BLE001 - 部署期缺 apscheduler 等依赖
+        return {"running": False, "enabled": False, "jobs": [], "applied": "restart_required"}
+    try:
+        return scheduler_status()
+    except Exception:  # noqa: BLE001
+        logger.exception("读取调度器状态失败")
+        return {"running": False, "enabled": False, "jobs": [], "applied": "restart_required"}
+
+
 @router.get("/settings/{scope}", summary="读一个设置分组（公开只读）")
 async def read_settings(scope: str, session: DbSession) -> dict[str, Any]:
     """返回该 scope 的 **默认值 ⊕ 已存值**，并附 ``defaults`` 供界面"恢复默认"用。
 
     ``defaults`` 一并返回是刻意的：前端不必自己维护一份默认值副本（否则两处漂移）。
+
+    ``scope=fetch`` 时额外带上 ``scheduler``：界面据此提示"启用状态与调度器实际状态是否一致"
+    （定时规则只在**服务启动时**注册进调度器，保存后能不能立刻生效取决于该进程）。
     """
     with _guard():
-        return await store.get_scope(session, scope)
+        payload = await store.get_scope(session, scope)
+    if scope == "fetch":
+        payload["scheduler"] = _fetch_scheduler_status()
+    return payload
 
 
 @router.put(
@@ -112,9 +131,26 @@ async def update_settings(scope: str, patch: dict[str, Any], session: DbSession)
 
     是部分更新而不是整体替换，是为了支持"界面上只改了一个开关"这种最小提交，
     避免把并发会话里另一个开关的值顺手覆盖掉。
+
+    ``scope=fetch`` 保存后**主动重载**唯一的 ``fetch_papers`` 定时规则，并在 ``scheduler``
+    里返回 ``applied`` —— ``immediate`` 表示已即时生效，``restart_required`` 表示必须重启，
+    界面照此如实提示（不允许"保存成功"被当成"定时已生效"）。
     """
     with _guard():
-        return await store.put_scope(session, scope, patch)
+        payload = await store.put_scope(session, scope, patch)
+    if scope == "fetch":
+        try:
+            from tasks.scheduler import reload_fetch_job
+        except Exception:  # noqa: BLE001 - 依赖缺失时按"需重启"如实返回
+            payload["scheduler"] = {
+                "running": False,
+                "enabled": False,
+                "jobs": [],
+                "applied": "restart_required",
+            }
+        else:
+            payload["scheduler"] = reload_fetch_job()
+    return payload
 
 
 __all__ = ["router"]

@@ -470,7 +470,7 @@ async def run_pdf_import_batch(
     from db.session import SessionLocal
 
     if SessionLocal is None:  # pragma: no cover - 部署期驱动缺失
-        message = "database_unavailable：同步会话工厂不可用（DATABASE_URL / psycopg 未就绪）"
+        message = "database_unavailable：同步会话工厂不可用（DATABASE_URL / sqlite3 未就绪）"
         jobs.add_note(task_id, message)
         jobs.finish_task(task_id, status=jobs.STATUS_FAILED, error=message)
         return

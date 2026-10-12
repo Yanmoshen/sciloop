@@ -10,7 +10,7 @@
 --------
 
 1. **不引入第三方 DOM 依赖**：用标准库 ``html.parser`` 建一棵极简 DOM，
-   保证 austin 环境下也能跑（Docker 镜像只装 pyproject 里的依赖）。
+   只依赖 pyproject 里声明的包，轻量环境下也能跑。
 2. **阅读顺序 = 文档顺序**：HTML 的 DOM 顺序本身就是阅读顺序，
    不需要像 PDF 那样做坐标聚类。
 3. **字符偏移**：所有块的 ``char_start/char_end`` 都相对本文档的

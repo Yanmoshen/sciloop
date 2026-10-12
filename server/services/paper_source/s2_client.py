@@ -320,6 +320,36 @@ class S2Client:
             )
         return self._normalize(result.payload, result=result)
 
+    async def search_papers(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        use_cache: bool = True,
+    ) -> list[S2Paper]:
+        """Keyword discovery endpoint used by the unified fetch task."""
+        if not self.configured:
+            return []
+        params: dict[str, Any] = {
+            "query": str(query).strip(),
+            "limit": max(1, min(int(limit), 100)),
+            "fields": ",".join(S2_FIELDS),
+        }
+        if date_from:
+            params["publicationDateOrYear"] = f"{str(date_from)[:10]}-"
+        result = await self._http.get_json(
+            f"{self.base_url}/paper/search",
+            params,
+            headers=self._headers(),
+            use_cache=use_cache,
+            max_retries=self.max_retries,
+        )
+        if not result.ok or not isinstance(result.payload, Mapping):
+            return []
+        return [self._normalize(item, result=result) for item in (result.payload.get("data") or []) if isinstance(item, Mapping)]
+
     @staticmethod
     def _build_lookup_id(*, paper_id: str | None, arxiv_id: str | None, doi: str | None) -> str:
         if paper_id:

@@ -31,10 +31,10 @@ const emit = defineEmits<{
 }>()
 
 const SOURCE_LABELS: Record<string, string> = {
-  arxiv: 'arXiv API',
+  arxiv: 'arXiv',
   semantic_scholar: 'Semantic Scholar',
   openalex: 'OpenAlex',
-  github: 'GitHub API',
+  github: 'GitHub',
 }
 
 const timelineRef = ref<HTMLElement | null>(null)
@@ -140,30 +140,30 @@ const advice = computed<{ title: string; body: string; tone: 'danger' | 'info' }
   if (isFailed.value || zeroYield) {
     if (codes.includes(406) || errors.includes('406')) {
       return {
-        title: '建议：arXiv 这次把我们拦下了（406）',
+        title: 'arXiv 暂时拒绝了本次请求',
         tone: 'danger',
-        body: '它是临时性的，不是配置坏了。等 1~2 分钟再点右上角的重新同步基本就好；连续失败可以把单轮条数从 30 降到 10。',
+        body: '稍后可以重新同步。如果持续出现，请尝试其他文献来源。',
       }
     }
     if (codes.includes(429) || errors.includes('429')) {
       return {
-        title: '建议：接口在限流（429）',
+        title: '文献来源请求过于频繁',
         tone: 'danger',
-        body: '论文本身通常已经抓到，只是引用数和代码热度没补上。等 5 分钟再同步一次即可；想让 Semantic Scholar 稳定，去「设置」里补一个它的 API Key。',
+        body: '稍后重新同步。已保存的论文会保留。',
       }
     }
     if (codes.includes(403) || errors.includes('403')) {
       return {
-        title: '建议：当前是浏览模式',
+        title: '文献来源拒绝访问',
         tone: 'danger',
-        body: '去「设置」页启用编辑，再回来点重新同步。',
+        body: '当前来源无法访问，可以稍后重试或选择其他来源。',
       }
     }
     if (errors.includes('timeout') || errors.includes('connect')) {
       return {
         title: '建议：请求超时或连不上外网',
         tone: 'danger',
-        body: '多半是服务器出网不稳或对方响应慢。确认网络后重试；持续超时就降低单轮条数。',
+        body: '当前网络或文献来源响应缓慢，可以稍后重新同步。',
       }
     }
     return {
@@ -185,6 +185,16 @@ const advice = computed<{ title: string; body: string; tone: 'danger' | 'info' }
 
 function close(): void {
   emit('update:modelValue', false)
+}
+
+function eventText(text: string): string {
+  if (/traceback|task_id|request_id|exception|HTTP\s*\d{3}|status_code|\b(?:timeout|connection error)\b/i.test(text)) {
+    if (/429|rate.?limit/i.test(text)) return '来源请求过于频繁，稍后可重试。'
+    if (/403|406/.test(text)) return '来源暂时拒绝访问。'
+    if (/timeout|connect/i.test(text)) return '来源暂时无法连接。'
+    return '本次获取没有完成，已经保存的资料仍然保留。'
+  }
+  return text
 }
 
 /** 事件流跟随最新一条（用户往上翻时不打扰） */
@@ -318,7 +328,6 @@ function finishText(): string {
             <tr>
               <th>来源</th>
               <th>结果</th>
-              <th>HTTP</th>
               <th>请求</th>
               <th>失败</th>
             </tr>
@@ -331,7 +340,6 @@ function finishText(): string {
                   {{ sourceResult(row.state).text }}
                 </span>
               </td>
-              <td class="mono">{{ row.state.http_status ?? '—' }}</td>
               <td>{{ row.state.requests ?? 0 }}</td>
               <td>{{ row.state.failed ?? 0 }}</td>
             </tr>
@@ -345,14 +353,13 @@ function finishText(): string {
         <div ref="timelineRef" class="timeline-wrap scroll-y">
           <ul class="timeline">
             <li v-for="(event, index) in events" :key="`${event.at}-${index}`" :class="event.level">
-              <span class="t mono">{{ timeOf(event.at) }}</span>{{ event.text }}
+              <span class="t mono">{{ timeOf(event.at) }}</span>{{ eventText(event.text) }}
             </li>
           </ul>
         </div>
 
         <footer class="foot">
           <span class="meta">{{ finishText() }}</span>
-          <span class="meta mono">task_id={{ job?.task_id }}</span>
         </footer>
       </div>
     </div>

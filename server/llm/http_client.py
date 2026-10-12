@@ -296,6 +296,20 @@ class OpenAICompatibleClient:
                         status_code=response.status_code,
                         detail=_truncate(body_text),
                     )
+                # Some OpenAI-compatible gateways ignore ``stream=true`` and
+                # return one ordinary JSON completion. Adapt it into the same
+                # stream instead of silently yielding an empty response.
+                content_type = ""
+                try:
+                    content_type = str(response.headers.get("content-type") or "").lower()
+                except Exception:  # noqa: BLE001 - response doubles may omit headers
+                    content_type = ""
+                if content_type and "text/event-stream" not in content_type:
+                    body = _safe_json(await _aread_text(response))
+                    if body is not None:
+                        body["_sciloop_stream_mode"] = "adapted"
+                        yield body
+                        return
                 async for line in response.aiter_lines():
                     chunk = _parse_sse_line(line)
                     if chunk is None:
@@ -385,18 +399,10 @@ def _extract_content(data: dict[str, Any]) -> tuple[str, str | None]:
     if content is None:
         # 部分供应商把结果放在 text 字段
         content = first.get("text") or ""
-    if not str(content).strip():
-        # 思考型模型（或网关）可能把正文放在 reasoning_content / reasoning，
-        # 而 content 为空、completion_tokens 却照常计入 —— 此时改读思考内容，
-        # 否则前端会拿到空正文（表现为「已完成但没有任何输出」）。
-        reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
-        if isinstance(reasoning, list):
-            reasoning = "".join(
-                str(item.get("text") or "") if isinstance(item, dict) else str(item)
-                for item in reasoning
-            )
-        if isinstance(reasoning, str) and reasoning.strip():
-            content = reasoning
+    # Never use ``reasoning_content`` / ``reasoning`` as a content fallback.
+    # Those fields are private scratchpad data.  Treating them as the answer
+    # leaks the model's self-talk when a gateway omits the normal ``content``
+    # field; callers can decide how to present an empty answer instead.
     return str(content), finish_reason
 
 
@@ -465,12 +471,21 @@ def extract_tool_call_deltas(chunk: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(first, dict):
         return []
     delta = first.get("delta")
-    if not isinstance(delta, dict):
-        return []
-    calls = delta.get("tool_calls")
+    calls = delta.get("tool_calls") if isinstance(delta, dict) else None
+    # A non-streaming completion puts calls under ``message``.
+    if calls is None:
+        message = first.get("message")
+        calls = message.get("tool_calls") if isinstance(message, dict) else None
     if not isinstance(calls, list):
         return []
-    return [call for call in calls if isinstance(call, dict)]
+    result: list[dict[str, Any]] = []
+    for index, call in enumerate(calls):
+        if not isinstance(call, dict):
+            continue
+        normalized = dict(call)
+        normalized.setdefault("index", index)
+        result.append(normalized)
+    return result
 
 
 def extract_delta(chunk: dict[str, Any]) -> tuple[str, str, str | None]:
@@ -492,6 +507,10 @@ def extract_delta(chunk: dict[str, Any]) -> tuple[str, str, str | None]:
     content = delta.get("content")
     if content is None:
         content = first.get("text")
+    if content is None:
+        message = first.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
     if isinstance(content, list):
         content = "".join(
             str(item.get("text") or "") if isinstance(item, dict) else str(item) for item in content
@@ -499,12 +518,53 @@ def extract_delta(chunk: dict[str, Any]) -> tuple[str, str, str | None]:
     reasoning = delta.get("reasoning_content")
     if reasoning is None:
         reasoning = delta.get("reasoning")
+    if reasoning is None:
+        message = first.get("message")
+        if isinstance(message, dict):
+            reasoning = message.get("reasoning_content")
+            if reasoning is None:
+                reasoning = message.get("reasoning")
+    if isinstance(reasoning, dict):
+        reasoning = reasoning.get("text") or reasoning.get("content") or ""
     if isinstance(reasoning, list):
         reasoning = "".join(
             str(item.get("text") or "") if isinstance(item, dict) else str(item)
             for item in reasoning
         )
     return str(content or ""), str(reasoning or ""), finish_reason
+
+
+def extract_reasoning_summary(chunk: dict[str, Any]) -> str:
+    """Return an explicitly supplied reasoning summary, never raw reasoning.
+
+    Providers do not share a standard summary field.  Accept only fields that
+    identify themselves as summaries so ``reasoning_content`` is never
+    accidentally presented as a user-facing summary.
+    """
+
+    choices = chunk.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        return ""
+    delta = choices[0].get("delta")
+    if not isinstance(delta, dict):
+        delta = {}
+    summary = delta.get("reasoning_summary")
+    if summary is None:
+        reasoning = delta.get("reasoning")
+        if isinstance(reasoning, dict):
+            summary = reasoning.get("summary")
+    if summary is None:
+        message = choices[0].get("message")
+        if isinstance(message, dict):
+            summary = message.get("reasoning_summary")
+            if summary is None and isinstance(message.get("reasoning"), dict):
+                summary = message["reasoning"].get("summary")
+    if isinstance(summary, list):
+        summary = "".join(
+            str(item.get("text") or "") if isinstance(item, dict) else str(item)
+            for item in summary
+        )
+    return summary if isinstance(summary, str) else ""
 
 
 def extract_usage(chunk: dict[str, Any]) -> Usage | None:
@@ -539,5 +599,6 @@ __all__ = [
     "ChatOutcome",
     "OpenAICompatibleClient",
     "extract_delta",
+    "extract_reasoning_summary",
     "extract_usage",
 ]

@@ -17,6 +17,8 @@
   },
   "include": [
     "../../src/agent-v2/**/*.ts",
-    "../../src/api/agent-v2.ts"
+    "../../src/components/agent-v2/blocks.ts",
+    "../../src/api/agent-v2.ts",
+    "../../src/utils/messages.ts"
   ]
 }

@@ -195,7 +195,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKey))
 .dual__label {
   flex: none;
   padding: 6px 12px;
-  color: var(--color-text-tertiary);
+  color: var(--color-text-secondary);
   font-size: var(--font-size-xs);
 }
 .dual__state {
