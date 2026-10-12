@@ -1,15 +1,33 @@
 # SciLoop
 
-**可审计的科研流水线：文献空白 → 可复现实验 → 风险自适应。**
+**面向科研工作的可审计 AI 工作台。**
 
-把「读了很多论文，还是不知道做什么」拆成六个可检查、可回退、可取证的环境节，并让**人在任何一步都保有否决权**。
+SciLoop 把文献检索、全文阅读、研究构思、实验执行、证据整理和论文产出放进同一个本地工作区。每一步都有可追踪的输入、输出和状态；需要执行命令、写入文件或调用外部服务时，研究者可以查看并保留最终决定权。
 
-## 快速启动
+> 当前项目处于持续开发阶段。它适合研究原型、课程项目和内部工作流，不会替研究者验证事实、数据或论文结论。
 
-宿主机部署（推荐）：Windows PowerShell：
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB.svg)](server/pyproject.toml)
+[![Node.js](https://img.shields.io/badge/Node.js-18%2B-339933.svg)](web/package.json)
+
+## 能做什么
+
+- **发现文献**：从多个公开来源检索、导入和整理论文，保留来源与抓取状态。
+- **理解全文**：解析 PDF/HTML，提供阅读器、版本、批注和可定位的文本证据。
+- **构思研究**：围绕研究问题生成候选方向、可行性分析和后续任务。
+- **运行实验**：在项目工作区执行命令，记录 stdout、stderr、状态和产物。
+- **管理知识**：统一保存上传资料、解析结果、翻译版本、实验文件和对话记录。
+- **辅助写作**：把研究过程中的证据和产物组织成论文草稿，并支持 PDF 编译。
+- **保留人工控制**：高风险命令、越界写入和需要授权的操作会进入审批流程。
+
+## 快速开始
+
+### 一键安装（推荐）
+
+Windows PowerShell：
 
 ```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/Yanmoshen/sciloop/main/install.ps1 | iex"
+powershell -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/Yanmoshen/sciloop/main/install.ps1 | iex"
 ```
 
 Linux/macOS：
@@ -18,108 +36,169 @@ Linux/macOS：
 curl -fsSL https://raw.githubusercontent.com/Yanmoshen/sciloop/main/install.sh | sh
 ```
 
-安装器会从 GitHub 拉取仓库，检测并通过系统包管理器补齐 Git、Python 3.11+、Node.js 18+ 和 npm，
-创建 Python 环境、安装后端依赖、构建前端，并启动 API、前端和宿主执行器。搜索引擎内核随 API 进程一并启动，
-无需任何容器运行时或独立的 SearXNG 服务。首次启动后在设置页面填写模型密钥即可；安装器会自动生成管理员令牌。
+安装器会检查 Git、Python 3.11+、Node.js 18+ 和 npm，创建虚拟环境，安装后端依赖，构建前端并启动服务。默认安装目录是 `~/sciloop`；可通过 `SCILOOP_HOME` 和 `SCILOOP_REPO_URL` 覆盖。安装日志保存在安装目录的 `.data/install.log`（Windows 还会保留安装过程转录文件）。
 
-安装器会把完整过程写入 `<安装目录>/.data/install.log`。Windows 使用 `winget` 补齐依赖，
-Linux/macOS 使用可用的 `apt-get`、`dnf`、`pacman` 或 Homebrew。若系统没有这些包管理器，安装器会停止并给出明确的安装地址，
-不会启动一个缺少前端构建产物的半成品服务。
+启动完成后打开：<http://127.0.0.1:8000>
 
-宿主启动后，前端与 API 共用 http://localhost:8000；宿主执行器使用内部端口 8766。
-本项目仅使用 SQLite，不运行独立数据库服务，不占用 5432 等数据库端口。
+### 手动安装
+
+需要：Python 3.11+、Node.js 18+、npm 和 Git。
 
 ```bash
-python tools/run.py status
+git clone https://github.com/Yanmoshen/sciloop.git
+cd sciloop
+cp .env.example .env
+
+python -m venv .venv
+# Windows: .venv\Scripts\Activate.ps1
+# Linux/macOS: source .venv/bin/activate
+python -m pip install -e ./server
+
+cd web
+npm ci
+npm run build
+cd ..
+
+python tools/run.py start
+```
+
+Windows 没有 `cp` 时，可以使用：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+首次运行前，在 `.env` 中设置 `OWNER_TOKEN` 和要使用的模型供应商。也可以直接在网页的设置页面配置 OpenAI 兼容接口。启动器只管理当前 checkout 创建的服务，不会自动终止其他程序占用的端口。
+
+## 日常运行
+
+所有命令都在仓库根目录执行：
+
+```bash
+python tools/run.py start     # 启动
+python tools/run.py status    # 查看状态和健康检查
+python tools/run.py restart   # 重启
+python tools/run.py stop      # 停止并回收本次启动的进程
+```
+
+服务和前端由同一个 FastAPI 进程提供，默认监听 `127.0.0.1:8000`。启动状态和日志位于 `.data/run/`：`state.json` 保存进程状态，`supervisor.log` 保存启动器日志，`backend.log` 保存 API 日志。
+
+修改前端后重新构建：
+
+```bash
+cd web
+npm run build
+cd ..
 python tools/run.py restart
-python tools/run.py stop
 ```
 
-2026-10-11 起本项目不再使用 Docker（编排文件、镜像与容器执行环境一并移除），宿主启动即完整可用：
-前端与 API 共用 8000，宿主执行器用内部端口 8766。
-SQLite 表结构由应用启动自动创建及补齐，旧 PostgreSQL 的 Alembic 迁移已移除。
+## 配置
 
-## 目录
+`.env.example` 是完整配置索引。复制后只修改 `.env`，不要把真实密钥写入源码或提交到 Git：
 
-| 目录 | 职责 |
-|---|---|
-| `server/` | FastAPI + SQLAlchemy 2.x + SQLite。顶层按层分目录：`api/`（路由）、`services/`（领域服务：`paper_source` 取数 / `ingest` 导入 / `fulltext` 全文 / `parsing` 解析 / `aggregation` 聚合 / `ideation` 构思 / `feasibility` 可行性 / `pipeline` 流水线 / `research` 研究编排 / `experiment` 实验 / `writing` 写作 / `review` 评审 / `evidence` 证据链 / `translate` 翻译 / `reader` 阅读器 / `export` 导出 / `agent` 动作裁决与批准 / `skills` 技能库 / `cost` 成本 / `settings` 设置）、`db/`（会话与 ORM 模型）、`schemas/`（Pydantic DTO）、`core/`（配置与安全）、`llm/`（OpenAI 兼容适配与按环节路由）、`executor/`（进程内受限执行器）、`tasks/`（后台作业）、`mcp_server/`（自建 MCP server 与工具门） |
-| `web/` | Vue 3 + Vite + TypeScript + Pinia + Element Plus + ECharts（`api/` `views/` `components/` `stores/` `router/` `layouts/` `styles/` `utils/`） |
-| `prompts/` | 研究工作流长文档提示词（程序侧契约在 `server/services/research/`） |
-| `config/` | 非机密静态配置（`app.yaml`、`venue_whitelist.json`）；搜索引擎配置由 `server/services/search/` 管理 |
-| `tools/` | `host-runner/`：可选的真机执行器（装在研究者电脑上后，后端会自动优先用它跑命令） |
+```bash
+cp .env.example .env
+```
 
-## 环境变量
+最常用的配置项：
 
-完整清单见 `.env.example`（每一项都有注释）。
+| 变量 | 作用 |
+| --- | --- |
+| `OWNER_TOKEN` | 本地管理员令牌，写入接口和高风险操作使用 |
+| `DATABASE_URL` | SQLite 数据库地址，默认位于 `knowledge-base/sciloop.sqlite3` |
+| `KNOWLEDGE_BASE_DIR` | 论文、上传资料、对话和产物的根目录 |
+| `LLM_DEFAULT_BASE_URL` | 默认的 OpenAI 兼容 API 地址 |
+| `LLM_DEFAULT_API_KEY` | 默认模型 API Key，仅保存在服务端配置中 |
+| `LLM_DEFAULT_MODEL` | 默认模型名称 |
+| `SCILOOP_HOST_RUNNER_URL` | 可选宿主执行器地址，默认端口为 `8766` |
+| `HOST_EXECUTION_MODE` | 工作区权限模式：`workspace` 或 `full` |
 
-联网搜索由 `server/services/search/` 内置。它采用 SearXNG 的分层方式：引擎注册表、分类、并发调度、超时重试、失败冷却、统一结果模型、去重和排序；默认直接从宿主机访问上游，不依赖任何外部搜索服务。搜索设置使用 `SCILOOP_SEARCH_*` 环境变量，可按需选择引擎或配置代理。
+SciLoop 使用 OpenAI 兼容的 `/v1/chat/completions` 协议。没有模型密钥时，离线回放或本地桩会明确标记结果来源，不会把模拟结果伪装成真实调用。
 
-- **红线**：`OWNER_TOKEN` 只允许存在于服务端环境变量，禁止写入前端包或数据库；API Key 不明文落库（`model_configs.api_key_enc` 用 fernet 加密）。
-- 默认 `APP_ACCESS_MODE=owner_mode`：本地测试直接启用管理员/可写面；生产环境可改回 `public_demo`，届时写入请求需要 `X-Owner-Token`。
-- LLM 走 **OpenAI 兼容协议**（`/v1/chat/completions`），自带 Base URL 与 Key；无 Key 时走本地桩/回放并**如实标记**，不会静默降级成假结果。
+## 数据与项目工作区
 
-## 核心能力（后端 API）
+默认数据目录是仓库根目录下的 `knowledge-base/`，该目录已被 `.gitignore` 排除：
 
-| 模块 | 端点 |
-|---|---|
-| 论文导入 | `POST /api/v1/papers/import`（PDF ≤20MB，单次 ≤20）、`POST /api/v1/papers/import/identifiers`（DOI / arXiv ID 批量）、`GET /api/v1/papers/import-jobs/{task_id}` |
-| 论文翻译 | `POST /api/v1/translate/jobs`（`mode=translate\|simplify`）、`GET /api/v1/translate/jobs/{task_id}/pdf?format=mono\|dual` |
-| 全文阅读器 | `POST /api/v1/reader/documents`、`GET /api/v1/reader/documents/{id}/versions`、`/state/`、`/annotations/` |
-| 多格式导出 | `GET /api/v1/exports/{json,bibtex,csl-json,obsidian,csv}`、`GET /api/v1/exports/paper/{paper_id}` |
-| 论文流与检索 | `GET /api/v1/papers/feed`、`/papers/search`、`/papers/overview` |
-| 内置元搜索 | `GET/POST /api/v1/search`、`GET /api/v1/config`；支持 `general`、`science`、`it`、`news` 分类、引擎选择、语言、时间范围、分页和 SafeSearch |
-| 流水线与决策 | `GET /api/v1/pipelines/{project_id}/stages`、`POST /api/v1/decisions/{id}/approve` |
-| 实验与 Passport | `GET /api/v1/passports/{id}`、`POST /api/v1/passports/{id}/replay` |
-
-## 数据与持久化
-
-项目和对话的新建、重命名不自动追加日期时间。对话所属项目在创建时确定，不支持移入或移出项目。
-
-运行时数据统一落在仓库根目录 `./knowledge-base/`（**已被 `.gitignore` 忽略，不入库**）：
-
-| 目录 | 内容 |
-|---|---|
-| `literature/` | 文献调研结果与论文资料 |
-| `uploads/` | 用户上传的原始资料 |
-| `parses/` | 全文解析、阅读器索引与全文缓存 |
-| `translations/` | 翻译产物与 `manifest.json` |
-| `projects/` | 项目相关产物与任务历史 |
-| `conversations/` | 对话 JSON 记录 |
+| 路径 | 内容 |
+| --- | --- |
+| `literature/` | 外部文献和检索结果 |
+| `uploads/` | 用户上传的 PDF、图片和多格式文件 |
+| `parses/` | 全文解析、索引和缓存 |
+| `translations/` | 翻译产物和清单 |
+| `projects/` | 项目目录、实验文件和生成的论文 |
+| `conversations/` | 对话记录 |
 | `memories/` | Agent 记忆 |
-| `exports/` | Agent 与系统导出的文件 |
-| `metadata/`、`trash/` | 知识库索引和回收站 |
+| `exports/` | 导出的文件 |
+| `sciloop.sqlite3` | SQLite 主数据库 |
 
-主数据库位于 `knowledge-base/sciloop.sqlite3`，同步与异步服务统一访问此文件。
+创建项目时选择的文件夹是该项目的工作区路径。对话在创建时绑定项目，项目和对话名称不会自动追加日期时间；删除 `knowledge-base/` 会同时删除这些本地数据，请先备份。
 
-删除 `knowledge-base/` 会丢失论文、对话、解析、翻译和 Agent 产物。
+## 论文与文件产物
 
-### 论文 PDF 编译
+论文源文件通常位于 `knowledge-base/projects/<项目目录>/`。编译前可以检查静态引用和文件结构：
 
-论文源文件保存在知识库项目目录中。统一入口优先使用 PATH 中的
-`xelatex`；找不到时可用 `--bootstrap` 下载并校验固定版本 Tectonic（0.17.0），
-二进制只写入本地 `.data/latex/`，不会进入 Git：
-
-```powershell
+```bash
 python tools/compile_paper.py --check
-python tools/compile_paper.py --bootstrap
-```
-
-也可以指定论文目录：
-
-```powershell
 python tools/compile_paper.py "knowledge-base/projects/<项目目录>" --bootstrap
 ```
 
-成功时会在论文目录产生 `main.pdf`、`compile.log` 和 `compile-result.json`。
-任何引擎缺失、下载校验失败、宏包缺失或编译错误都会返回非零状态，并把真实诊断写入
-`compile.log`，不会把旧 PDF 当成新编译结果。安装时设置 `SCILOOP_BUILD_PAPER=1`，
-可在 `install.ps1` 或 `install.sh` 中显式执行该步骤。
+编译器优先使用系统中的 `xelatex`；找不到时，`--bootstrap` 会把固定版本的 Tectonic 下载到本地 `.data/latex/`。编译输出 `main.pdf`、`compile.log` 和 `compile-result.json` 都留在论文项目目录中，下载的二进制文件不会进入 Git。
 
-## 许可与合规
+对话框支持粘贴图片和上传常见文本、代码、PDF、Office 文档及表格文件。上传内容写入知识库或当前项目工作区，原始文件不会被打包进前端构建产物。
 
-- 许可证：**Apache License 2.0**（见 `LICENSE`）
-- 第三方依赖：FastAPI / SQLAlchemy / Pydantic / httpx / aiosqlite / PyMuPDF / Vue 3 / Vite / Element Plus / ECharts / Pinia，均遵循各自许可证
-- 产出物一律标注「**本内容由 AI 辅助生成，需研究者自行核验**」；本工具定位为科研辅助工作台（教学用途），产出物为研究草稿，**不是**「可自动投稿的论文生成器」
-- 演示叙事强调「AI 执行、人保有否决权与最终判断」；回放结果必须标 `is_replay=true`
-- 数据源失败一律**降级并披露**（`null` + `source` + `confidence`），**禁止编造数据**
+## 开发
+
+后端：
+
+```bash
+cd server
+python -m pytest
+ruff check .
+```
+
+前端：
+
+```bash
+cd web
+npm run typecheck
+npm run lint
+npm run build
+```
+
+开发时也可以单独运行 API：
+
+```bash
+cd server
+python -m uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+API 文档由 FastAPI 提供：<http://127.0.0.1:8000/docs>。生产式运行仍建议使用 `python tools/run.py start`，这样可以统一处理健康检查、日志和进程回收。
+
+## 架构概览
+
+```text
+web/                    Vue 3 + Vite + TypeScript 前端
+server/api/             FastAPI 路由和 WebSocket 接口
+server/services/        检索、解析、研究编排、Agent、翻译和导出
+server/db/              SQLAlchemy 模型与 SQLite 会话
+server/llm/             OpenAI 兼容模型适配、路由和成本记录
+server/contracts/       Agent v2 的事件与工具契约
+prompts/                面向研究流程的提示词和设计文档
+tools/                  启动器、论文编译器和宿主执行器
+config/                 非机密静态配置
+knowledge-base/         本地运行数据，不提交到仓库
+```
+
+搜索、解析、翻译和导出等能力在服务端统一编排；Agent v2 通过结构化事件连接前端，工具调用、审批和恢复状态会被保存并可追踪。
+
+## 安全边界
+
+- `OWNER_TOKEN` 和模型 API Key 只存在于服务端环境，不写入前端包、数据库明文或提交记录。
+- `workspace` 模式只允许在选定工作区内写入和执行；越界路径、凭据访问和高风险命令需要额外裁决。
+- 宿主执行器使用 argv 直启、输出大小限制和进程树回收，避免把用户命令拼接进 shell 字符串。
+- 外部来源失败时返回来源和置信信息；系统不会用猜测内容填补缺失的实验数据或文献证据。
+- 上传文件和生成产物默认保存在本机知识库，部署到共享机器前请配置访问控制和备份策略。
+
+## 许可证
+
+SciLoop 使用 [Apache License 2.0](LICENSE)。第三方依赖和内置技能包遵循各自的许可证与来源说明。
