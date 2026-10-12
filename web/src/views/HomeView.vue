@@ -952,7 +952,7 @@ function streamHandlers(
       conversationTitle.value = payload.title
       syncStore()
     },
-    onError: (streamError) => {
+    onError: () => {
       if (requestController && userStoppedControllers.has(requestController)) {
         return
       }

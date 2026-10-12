@@ -220,13 +220,13 @@ def parse_pack(skill_dir: Path) -> SkillPack:
 
     scripts_dir = skill_dir / "scripts"
     scripts = (
-        sorted(str(path.relative_to(skill_dir)) for path in scripts_dir.rglob("*") if path.is_file())
+        sorted(path.relative_to(skill_dir).as_posix() for path in scripts_dir.rglob("*") if path.is_file())
         if scripts_dir.is_dir()
         else []
     )
     references_dir = skill_dir / "references"
     references = (
-        sorted(str(path.relative_to(skill_dir)) for path in references_dir.rglob("*") if path.is_file())
+        sorted(path.relative_to(skill_dir).as_posix() for path in references_dir.rglob("*") if path.is_file())
         if references_dir.is_dir()
         else []
     )

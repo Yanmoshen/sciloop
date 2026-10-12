@@ -50,6 +50,7 @@ from llm.types import slugify_provider
 from services import conversations, home_turns
 from services.agent import approvals as agent_approvals
 from services.chat_attachments import normalize_chat_attachments
+from services.output_style import OUTPUT_STYLE
 from services.research import dialog, phrasing
 from services.research import intent as intent_mod
 from services.system_prompt import SCILOOP_SYSTEM_PROMPT
@@ -95,7 +96,7 @@ WRAP_UP_PROMPT = (
 #: 标题调用的 user 提示（约束在 `conversations.TITLE_SYSTEM` 里，两边都留着更稳）
 TITLE_PROMPT = "为下面这段研究需求拟一个标题。\n\n研究需求：\n{text}"
 
-REPLY_SYSTEM = SCILOOP_SYSTEM_PROMPT + "\n\n"
+REPLY_SYSTEM = SCILOOP_SYSTEM_PROMPT + "\n\n" + OUTPUT_STYLE + "\n\n"
 
 PLAIN_CHAT_SYSTEM = (
     "本对话已经明确按普通对话处理。请像正常助手一样直接回答当前问题，"
