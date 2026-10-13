@@ -171,3 +171,18 @@ def test_non_stream_parser_never_promotes_reasoning_to_content() -> None:
     }
 
     assert _extract_content(payload) == ("", "stop")
+
+
+def test_literal_think_block_is_removed_from_non_stream_answer() -> None:
+    answer = "<think>先分析用户问题，再决定怎么回答。</think>结论是冒泡排序平均时间复杂度为 O(n²)。"
+
+    assert chat_api._sanitize_assistant_content(answer) == "结论是冒泡排序平均时间复杂度为 O(n²)。"
+
+
+def test_literal_think_block_can_be_split_across_stream_chunks(monkeypatch: pytest.MonkeyPatch) -> None:
+    chunks = [
+        "<thi",
+        "nk>这是私有思考，不应显示。</thin",
+        "k>结论保留。",
+    ]
+    _assert_stream_matches_saved(monkeypatch, chunks, "结论保留。")

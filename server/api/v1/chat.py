@@ -680,6 +680,79 @@ _INTERNAL_DIAGNOSTIC_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Grok-compatible gateways sometimes put the private scratchpad in
+# ``content`` as a literal XML block instead of ``reasoning_content``.  Keep
+# these tags out of the user-facing answer, including when a tag is split
+# across streaming chunks.
+_PRIVATE_REASONING_OPEN_RE = re.compile(
+    r"<\s*(?:think|thinking|analysis|reasoning)\s*>", re.IGNORECASE
+)
+_PRIVATE_REASONING_CLOSE_RE = re.compile(
+    r"<\s*/\s*(?:think|thinking|analysis|reasoning)\s*>", re.IGNORECASE
+)
+_PRIVATE_REASONING_TAG_NAMES = ("think", "thinking", "analysis", "reasoning")
+
+
+class _PrivateReasoningFilter:
+    """Remove literal private-reasoning blocks from a streamed answer."""
+
+    def __init__(self) -> None:
+        self.pending = ""
+        self.inside = False
+
+    def feed(self, chunk: str, *, final: bool = False) -> str:
+        self.pending += str(chunk or "")
+        visible: list[str] = []
+        while self.pending:
+            if self.inside:
+                close = _PRIVATE_REASONING_CLOSE_RE.search(self.pending)
+                if close is None:
+                    self.pending = "" if final else self.pending[-32:]
+                    return "".join(visible)
+                self.pending = self.pending[close.end():]
+                self.inside = False
+                continue
+
+            opening = _PRIVATE_REASONING_OPEN_RE.search(self.pending)
+            if opening is not None:
+                visible.append(self.pending[:opening.start()])
+                self.pending = self.pending[opening.end():]
+                self.inside = True
+                continue
+
+            if final:
+                visible.append(self.pending)
+                self.pending = ""
+                break
+
+            # Retain only a possible incomplete opening tag.  Normal text is
+            # emitted immediately, while ``<thi`` + ``nk>`` is reconstructed.
+            last_open = self.pending.rfind("<")
+            if last_open < 0:
+                visible.append(self.pending)
+                self.pending = ""
+                break
+            suffix = self.pending[last_open:]
+            lowered = suffix.lower()
+            possible = any(
+                candidate.startswith(lowered)
+                for name in _PRIVATE_REASONING_TAG_NAMES
+                for candidate in (f"<{name}>", f"<{name} ", f"</{name}>")
+            ) and len(suffix) <= 24
+            if possible:
+                visible.append(self.pending[:last_open])
+                self.pending = suffix
+            else:
+                visible.append(self.pending)
+                self.pending = ""
+            break
+        return "".join(visible)
+
+
+def _strip_private_reasoning(content: str) -> str:
+    cleaner = _PrivateReasoningFilter()
+    return cleaner.feed(str(content or ""), final=True)
+
 
 def _clean_diagnostic_text(text: str) -> str:
     for marker, replacement in _INTERNAL_DIAGNOSTIC_REPLACEMENTS:
@@ -748,7 +821,7 @@ def _looks_like_internal_reasoning(text: str) -> bool:
 def _sanitize_assistant_content(content: str) -> str:
     """净化明确诊断，保留工具介绍和诊断之后的正常正文。"""
 
-    text = _clean_diagnostic_text(str(content or ""))
+    text = _strip_private_reasoning(_clean_diagnostic_text(str(content or "")))
     reasoning_match = _INTERNAL_REASONING_MARKERS_RE.search(text)
     if not _looks_like_internal_reasoning(text):
         return text
@@ -998,6 +1071,7 @@ async def _agent_loop(
             emitted_before = len(state["text"])
             internal_text_blocked = False
             diagnostic_filter = _DiagnosticTextFilter()
+            private_reasoning_filter = _PrivateReasoningFilter()
             try:
                 async for update in adapter.chat_stream(
                     messages_now,
@@ -1025,6 +1099,7 @@ async def _agent_loop(
                             yield _sse("reasoning", {"text": update.text})
                             continue
                         clean_delta = diagnostic_filter.feed(update.text)
+                        clean_delta = private_reasoning_filter.feed(clean_delta)
                         if not clean_delta:
                             continue
                         state["text"].append(clean_delta)
@@ -1054,6 +1129,7 @@ async def _agent_loop(
                         round_result = update.result
                 if not internal_text_blocked:
                     tail = diagnostic_filter.feed("", final=True)
+                    tail = private_reasoning_filter.feed(tail, final=True)
                     if tail:
                         state["text"].append(tail)
                         yield _sse("delta", {"text": tail})
@@ -1061,6 +1137,7 @@ async def _agent_loop(
             except LLMError as exc:
                 if not internal_text_blocked:
                     tail = diagnostic_filter.feed("", final=True)
+                    tail = private_reasoning_filter.feed(tail, final=True)
                     if tail:
                         state["text"].append(tail)
                         yield _sse("delta", {"text": tail})
@@ -1094,6 +1171,7 @@ async def _agent_loop(
                 # 同一套重试与模型收尾路径，否则用户会看到半截正文后直接中断。
                 if not internal_text_blocked:
                     tail = diagnostic_filter.feed("", final=True)
+                    tail = private_reasoning_filter.feed(tail, final=True)
                     if tail:
                         state["text"].append(tail)
                         yield _sse("delta", {"text": tail})
@@ -1157,7 +1235,7 @@ async def _agent_loop(
                 content = "".join(state["text"][text_from:])
             assistant_message: dict[str, Any] = {
                 "role": "assistant",
-                "content": content,
+                "content": _sanitize_assistant_content(content),
             }
             reasoning = "".join(state["reasoning"][reasoning_from:]).strip()
             reasoning_value = reasoning_echo(reasoning, ref)
