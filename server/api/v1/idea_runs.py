@@ -21,6 +21,7 @@ from services.ideation.expert_pipeline import (
     create_run,
     execute_run,
     get_run,
+    list_runs,
 )
 
 router = APIRouter(tags=["idea-runs"])
@@ -117,6 +118,12 @@ async def post_idea_run(body: IdeaRunCreate, background_tasks: BackgroundTasks, 
     background_tasks.add_task(_schedule_worker, run_id)
     payload["run"]["status"] = "queued"
     return payload
+
+
+@router.get("/idea-runs", summary="研究任务的 20 专家运行历史")
+async def list_idea_runs(aggregation_id: int, session: DbSession) -> dict[str, Any]:
+    """公开只读地返回一个研究任务的运行历史，前端默认使用最新一条。"""
+    return {"items": await list_runs(session, aggregation_id=int(aggregation_id)), "aggregation_id": int(aggregation_id)}
 
 
 @router.get("/idea-runs/{run_id}", summary="Idea 专家运行状态与产物")

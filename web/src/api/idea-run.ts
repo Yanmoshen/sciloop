@@ -39,6 +39,12 @@ export interface IdeaExpertStage {
   started_at?: string | null
   completed_at?: string | null
   duration_ms?: number | null
+  output?: unknown
+  raw_output?: string | null
+  model_ref?: string | null
+  prompt_version?: string | null
+  attempts?: number
+  cost_usd?: number | null
 }
 
 export interface IdeaRunCandidate {
@@ -54,6 +60,10 @@ export interface IdeaRunCandidate {
   evidence_count?: number
   analyses?: Record<string, unknown>
   scores?: Record<string, number | null>
+  /** 各维度打分的理由（人话），键与 `scores` 一致 —— 见 `normalizeDimensions` */
+  score_reasons?: Record<string, string>
+  /** 各维度打分引用的证据编号（如 `E7`），键与 `scores` 一致 */
+  score_refs?: Record<string, string[]>
   total_score?: number | null
   rank?: number | null
   recommendation?: string | null
@@ -79,6 +89,8 @@ export interface IdeaExpertRun {
   completed_experts?: number
   failed_experts?: string[]
   experts_total?: number
+  candidate_count?: number
+  expert_count?: number
   created_at?: string | null
   completed_at?: string | null
   generation_seconds?: number | null
@@ -92,6 +104,95 @@ export interface CreateIdeaRunBody {
   project_id?: number | null
   candidate_count_per_direction?: number
   model_ref?: string | null
+}
+
+/**
+ * 把 `score.dimensions` 拆成三样东西。
+ *
+ * ⚠️ 2026-10-14 修：`dimensions` 每一项的真实形态是 `{score, reason, evidence_refs}`，
+ * 改前把它**当数字**直接塞进 `scores`，模板里 `{{ score }}` 就把对象渲染成了
+ * `{"score":88,"reason":"…"}` 这种 JSON 文本（研究者报的"右侧还是 JSON，要人话"）。
+ * 现在分开：分数（数字）/ 理由（人话）/ 引用证据编号，界面各取所需。
+ */
+function normalizeDimensions(raw: unknown): {
+  scores?: Record<string, number | null>
+  reasons?: Record<string, string>
+  refs?: Record<string, string[]>
+} {
+  if (!raw || typeof raw !== 'object') return {}
+  const scores: Record<string, number | null> = {}
+  const reasons: Record<string, string> = {}
+  const refs: Record<string, string[]> = {}
+  for (const [key, item] of Object.entries(raw as Record<string, unknown>)) {
+    if (item && typeof item === 'object') {
+      const value = item as Record<string, unknown>
+      scores[key] = typeof value.score === 'number' ? value.score : null
+      if (typeof value.reason === 'string' && value.reason.trim()) reasons[key] = value.reason.trim()
+      const listed = Array.isArray(value.evidence_refs) ? value.evidence_refs.map(String) : []
+      if (listed.length) refs[key] = listed
+      continue
+    }
+    scores[key] = typeof item === 'number' ? item : null
+  }
+  return {
+    scores,
+    reasons: Object.keys(reasons).length ? reasons : undefined,
+    refs: Object.keys(refs).length ? refs : undefined,
+  }
+}
+
+/** 反转义 JSON 字符串里的 `\"` `\n` 这类转义，让摘录读起来是正常句子。 */
+function unescapeJsonText(raw: string): string {
+  return raw
+    .replace(/\\"/g, '"')
+    .replace(/\\n/g, ' ')
+    .replace(/\\t/g, ' ')
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_match, code: string) => String.fromCharCode(parseInt(code, 16)))
+    .replace(/\\\\/g, '\\')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/**
+ * 证据里的 `quote_text` 可能是 JSON 字符串（论文卡字段原样存），摊平成可读文本。
+ *
+ * ⚠️ 管道里这份 JSON **在 2500 字处被截断**（实测 `Unterminated string`），所以不能只靠
+ * `JSON.parse`；解析失败时退回正则把 `"键":"值"` 里的**值**抠出来，保证界面上永远不会出现
+ * `[{"limitation":"…` 这种原文（研究者口径：证据链要人话）。
+ */
+function flattenQuote(value: unknown): string {
+  if (typeof value !== 'string') return value == null ? '' : String(value)
+  const text = value.trim()
+  if (!text.startsWith('{') && !text.startsWith('[')) return text
+
+  try {
+    const parsed: unknown = JSON.parse(text)
+    const parts: string[] = []
+    const walk = (node: unknown): void => {
+      if (typeof node === 'string') parts.push(node)
+      else if (Array.isArray(node)) node.forEach(walk)
+      else if (node && typeof node === 'object') Object.values(node as Record<string, unknown>).forEach(walk)
+    }
+    walk(parsed)
+    const joined = parts.map((part) => part.trim()).filter(Boolean).join('；')
+    if (joined) return joined
+  } catch {
+    /* 截断的 JSON 走下面的正则兜底 */
+  }
+
+  const values = [...text.matchAll(/"\s*:\s*"((?:[^"\\]|\\.)*)"/g)].map((match) => unescapeJsonText(match[1]))
+  return values.filter((item) => item.length > 0).join('；') || unescapeJsonText(text)
+}
+
+/** 候选 Idea 的证据链：只留研究者要看的四件事，其余原样带回。 */
+function normalizeEvidence(raw: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(raw)) return []
+  return raw
+    .filter((item) => item && typeof item === 'object')
+    .map((item) => {
+      const value = item as Record<string, unknown>
+      return { ...value, quote_text: flattenQuote(value.quote_text) }
+    })
 }
 
 function normalizeRun(payload: unknown, aggregationId?: number): IdeaExpertRun {
@@ -114,6 +215,12 @@ function normalizeRun(payload: unknown, aggregationId?: number): IdeaExpertRun {
       started_at: (found?.started_at as string | null | undefined) ?? null,
       completed_at: (found?.completed_at as string | null | undefined) ?? null,
       duration_ms: (found?.duration_ms as number | null | undefined) ?? null,
+      output: found?.output,
+      raw_output: (found?.raw_output as string | null | undefined) ?? null,
+      model_ref: (found?.model_ref as string | null | undefined) ?? null,
+      prompt_version: (found?.prompt_version as string | null | undefined) ?? null,
+      attempts: typeof found?.attempts === 'number' ? found.attempts : undefined,
+      cost_usd: typeof found?.cost_usd === 'number' ? found.cost_usd : null,
     }
   })
   const rawCandidates = Array.isArray(source.candidates) ? source.candidates : Array.isArray(source.items) ? source.items : []
@@ -121,9 +228,7 @@ function normalizeRun(payload: unknown, aggregationId?: number): IdeaExpertRun {
     const value = (item && typeof item === 'object' ? item : {}) as Record<string, unknown>
     const payload = value.payload && typeof value.payload === 'object' ? value.payload as Record<string, unknown> : {}
     const scoreObject = value.score && typeof value.score === 'object' ? value.score as Record<string, unknown> : null
-    const scoreDimensions = scoreObject?.dimensions && typeof scoreObject.dimensions === 'object'
-      ? scoreObject.dimensions as Record<string, number | null>
-      : undefined
+    const dimensions = normalizeDimensions(scoreObject?.dimensions ?? value.scores ?? payload.scores)
     const scoreTotal = scoreObject && typeof scoreObject.total === 'number' ? scoreObject.total : null
     return {
       ...payload,
@@ -133,8 +238,10 @@ function normalizeRun(payload: unknown, aggregationId?: number): IdeaExpertRun {
       mechanism: (value.mechanism ?? value.direction) as string | null | undefined,
       summary: (value.summary ?? payload.summary) as string | null | undefined,
       content: (value.content ?? payload.content) as string | null | undefined,
-      evidence: Array.isArray(value.evidence) ? value.evidence as Array<Record<string, unknown>> : [],
-      scores: (value.scores ?? scoreDimensions ?? payload.scores) as Record<string, number | null> | undefined,
+      evidence: normalizeEvidence(value.evidence),
+      scores: dimensions.scores,
+      score_reasons: dimensions.reasons,
+      score_refs: dimensions.refs,
       total_score: typeof value.total_score === 'number' ? value.total_score : typeof value.score === 'number' ? value.score : scoreTotal,
       rank: typeof value.rank === 'number' ? value.rank : index + 1,
     }
@@ -162,6 +269,14 @@ export async function createIdeaExpertRun(body: CreateIdeaRunBody, signal?: Abor
 export async function getIdeaExpertRun(id: number | string, signal?: AbortSignal): Promise<IdeaExpertRun> {
   const payload = await get<unknown>(`/idea-runs/${encodeURIComponent(String(id))}`, { signal })
   return normalizeRun(payload)
+}
+
+export async function listIdeaExpertRuns(aggregationId: number, signal?: AbortSignal): Promise<IdeaExpertRun[]> {
+  const payload = await get<{ items?: unknown[] }>(`/idea-runs`, {
+    query: { aggregation_id: aggregationId },
+    signal,
+  })
+  return (payload.items ?? []).map((item) => normalizeRun({ run: item }, aggregationId))
 }
 export async function confirmIdeaExpertRun(
   id: number | string,

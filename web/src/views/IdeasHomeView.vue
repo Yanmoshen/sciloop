@@ -25,6 +25,7 @@ import {
   listIdeas,
   type Aggregation,
 } from '@/api/idea'
+import { listIdeaExpertRuns, type IdeaExpertRun } from '@/api/idea-run'
 import { searchPapers, type PaperSearchItem } from '@/api/papers'
 
 const router = useRouter()
@@ -33,6 +34,7 @@ const aggregations = ref<Aggregation[]>([])
 const titleById = ref<Record<number, string>>({})
 const ideaCounts = ref<Record<number, number>>({})
 const directionCounts = ref<Record<number, number>>({})
+const expertRuns = ref<Record<number, IdeaExpertRun | undefined>>({})
 const loading = ref(false)
 /** 统计每个任务的 idea 数要跑好几条请求，这段时间不能让行里显示"还没有生成"（那是假话） */
 const statsLoading = ref(false)
@@ -84,6 +86,18 @@ function createdAtText(item: Aggregation): string {
 }
 
 function directionSummary(id: number): string {
+  const expertRun = expertRuns.value[id]
+  if (expertRun) {
+    const completed = expertRun.completed_experts ?? 0
+    const total = expertRun.experts_total ?? 20
+    if (expertRun.status === 'completed' || expertRun.status === 'awaiting_confirmation') {
+      return `20 专家已完成 · ${expertRun.candidate_count ?? expertRun.candidates.length} 条候选 Idea`
+    }
+    if (expertRun.status === 'failed') {
+      return `20 专家运行失败 · 已完成 ${completed}/${total}`
+    }
+    return `20 专家运行中 · ${completed}/${total}`
+  }
   // 统计还没回来时如实说"正在统计" —— 不能显示"还没有生成 idea"（那是假话，会让人以为白干了）
   if (statsLoading.value || ideaCounts.value[id] === undefined) return '正在统计…'
   const total = ideaCounts.value[id] ?? 0
@@ -112,15 +126,26 @@ async function loadList(): Promise<void> {
     await Promise.all(
       aggregations.value.slice(0, STAT_LIMIT).map(async (item) => {
         try {
-          const page = await listIdeas({ aggregationId: item.id, pageSize: 100 })
+          const [page, runs] = await Promise.all([
+            listIdeas({ aggregationId: item.id, pageSize: 100 }),
+            listIdeaExpertRuns(item.id),
+          ])
           const items = page.items ?? []
+          const latestRun = runs[0]
           ideaCounts.value = { ...ideaCounts.value, [item.id]: items.length }
           directionCounts.value = {
             ...directionCounts.value,
             [item.id]: new Set(items.map((idea) => idea.mechanism).filter(Boolean)).size,
           }
+          expertRuns.value = { ...expertRuns.value, [item.id]: latestRun }
         } catch {
-          /* 统计失败不影响列表本身 */
+          // 旧 idea 统计失败时仍尝试显示已持久化的 20 专家运行。
+          try {
+            const runs = await listIdeaExpertRuns(item.id)
+            expertRuns.value = { ...expertRuns.value, [item.id]: runs[0] }
+          } catch {
+            /* 统计失败不影响列表本身 */
+          }
         }
       }),
     )

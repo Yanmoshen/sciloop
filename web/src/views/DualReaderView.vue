@@ -46,6 +46,13 @@ const chineseId = ref<number | null>(null)
 const loading = ref(true)
 const notice = ref('')
 
+/** 翻译列表点进来时传入的任务号，用来锁定用户刚点开的译文版本。 */
+const requestedTaskId = computed(() => {
+  const raw = route.query.task_id
+  const value = Array.isArray(raw) ? raw[0] : raw
+  return String(value ?? '').trim()
+})
+
 const originalUrl = computed(() =>
   documentId.value && originalId.value ? readerVersionPdfUrl(documentId.value, originalId.value) : '',
 )
@@ -81,7 +88,11 @@ async function load(): Promise<void> {
     }
     versions.value = versionList.items ?? []
     originalId.value = versions.value.find((item) => item.kind === 'original')?.id ?? null
-    chineseId.value = pickChinese(versions.value)
+    const requested = requestedTaskId.value
+    const requestedVersion = requested
+      ? versions.value.find((item) => String(item.task_id ?? '') === requested)
+      : null
+    chineseId.value = requestedVersion?.id ?? pickChinese(versions.value)
   } catch (error) {
     notice.value = error instanceof Error ? error.message : String(error)
   } finally {
@@ -95,11 +106,20 @@ async function attachNewest(): Promise<void> {
   if (!id || !paperId.value) return
   try {
     const page = await listTranslateJobs(50)
-    const latest = (page.items ?? [])
+    const completed = (page.items ?? [])
       .filter((job) => job.paper_id === paperId.value && job.status === 'completed' && job.task_id)
       .sort((left, right) =>
         String(right.created_at ?? '').localeCompare(String(left.created_at ?? '')),
       )[0]
+    const requested = requestedTaskId.value
+      ? (page.items ?? []).find(
+          (job) =>
+            String(job.task_id ?? '') === requestedTaskId.value &&
+            job.paper_id === paperId.value &&
+            job.status === 'completed',
+        )
+      : null
+    const latest = requested ?? completed
     if (!latest?.task_id) return
     const registered = new Set(
       versions.value.map((item) => String(item.task_id ?? '')).filter(Boolean),

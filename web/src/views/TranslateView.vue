@@ -17,6 +17,7 @@ import { computed, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import type { PaperSearchItem } from '@/api/papers'
+import { listReaderDocuments } from '@/api/reader'
 import PaperPickerDialog from '@/components/PaperPickerDialog.vue'
 import {
   cancelTranslateJob,
@@ -174,6 +175,25 @@ async function openDetail(taskId: string): Promise<void> {
   previewNotice.value = ''
   detail.value = jobs.value.find((job) => job.task_id === taskId) ?? null
   await refreshDetail(taskId)
+
+  // Completed paper translations open in the source/translation PDF reader.
+  if (detail.value?.status === 'completed' && detail.value.paper_id) {
+    try {
+      const page = await listReaderDocuments(1, 100)
+      const document = (page.items ?? []).find(
+        (item) => item.paper_id === detail.value?.paper_id,
+      )
+      if (document?.id) {
+        await router.push({
+          path: `/papers/dual/${document.id}`,
+          query: { task_id: detail.value.task_id },
+        })
+        return
+      }
+    } catch {
+      // Fall back to task details if the reader index is unavailable.
+    }
+  }
   if (detail.value?.status === 'completed') void loadPreview(taskId)
 }
 

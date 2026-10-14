@@ -12,8 +12,12 @@
  * 与知识库内嵌阅读器的区别：**没有壳层**（不带左栏导航与面包屑），整屏只放这一份内容，
  * 顶栏按钮换成「关闭」。存在的意义：长文档 / PDF 在小窗口里读着难受，学生要的是"占满整屏"。
  *
- * 入口在 `KnowledgeBaseView.openInNewTab()`（新标签页打开本路由），
- * 因此这里的「关闭」优先 `window.close()`；若浏览器不允许脚本关闭标签页，退回到知识库列表。
+ * 入口在 `KnowledgeBaseView.openInNewTab()`（新标签页打开本路由）。
+ *
+ * ⚠️ 2026-10-14 修：「关闭」原来无条件 `window.close()`。它在"脚本打开的窗口"里没问题，
+ * 但在**普通标签页 / 宿主 webview（内置浏览器面板）里会把整个窗口关掉**（研究者实测：一点关闭，
+ * 浏览器窗口就没了）。现在一律走**站内返回**，绝不主动关窗：
+ * 有上一页就 `router.back()`，没有就退回知识库列表。
  */
 import { onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
@@ -28,10 +32,12 @@ const entry = ref<KnowledgeEntry | null>(null)
 const loading = ref(true)
 
 function closePage(): void {
-  window.close()
-  window.setTimeout(() => {
-    void router.push('/knowledge')
-  }, 150)
+  // 别用 window.close()：普通标签页会被忽略，而 webview 里会连窗口一起关掉。
+  if (window.history.length > 1) {
+    router.back()
+    return
+  }
+  void router.push('/knowledge')
 }
 
 onMounted(async () => {

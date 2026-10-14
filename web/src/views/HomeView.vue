@@ -124,6 +124,23 @@ const threadEl = ref<HTMLElement | null>(null)
 const turns = ref<Turn[]>([])
 const conversationId = ref<string | null>(null)
 const conversationTitle = ref('')
+
+/**
+ * 「查看论文成稿」入口（2026-10-14 研究者口径）。
+ *
+ * 这条对话讨论的那篇成稿已经放进知识库（服务器上是
+ * `projects/generated-papers/滑动窗口求和优化__20261010/manuscript/` 里的那本 PDF），
+ * 这里只做一件事：在正文最下面露一个按钮，点开进阅读器看它。
+ * 目前按对话标题里的关键词判断该不该露（后续接对话元数据再换掉这个判断即可）。
+ */
+const PAPER_DRAFT = { entryId: 'kb-disk-5b3b8b853c57606d', titleKeyword: '滑动窗口' }
+const showsPaperDraft = computed(
+  () => active.value && conversationTitle.value.includes(PAPER_DRAFT.titleKeyword),
+)
+
+function openPaperDraft(): void {
+  void router.push(`/knowledge/read/${PAPER_DRAFT.entryId}`)
+}
 const projectId = ref<number | null>(null)
 const archived = ref(false)
 const phase = ref<'idle' | 'thinking'>('idle')
@@ -2142,6 +2159,11 @@ onUnmounted(() => {
       </button>
     </div>
 
+    <!-- 论文成稿：正文最下面的入口，点进阅读器看这本 PDF -->
+    <div v-if="showsPaperDraft" class="paper-draft">
+      <button class="btn btn--sm" type="button" @click="openPaperDraft">查看论文成稿</button>
+    </div>
+
     <div class="composer rise-in rise-step-3" :class="{ 'composer--hero': !active }">
       <textarea
         ref="textareaEl"
@@ -3129,6 +3151,14 @@ onUnmounted(() => {
 }
 
 /* ---------- 输入栏（Cherry 口径：整体一块圆角容器，上输入下工具栏） ---------- */
+/* 论文成稿入口：贴在正文最下面、输入框正上方，居中一行 */
+.paper-draft {
+  flex: none;
+  display: flex;
+  justify-content: center;
+  padding: 4px 12px 0;
+}
+
 .composer {
   flex: none;
   /* 与上方标题 / 流程行 / 三张卡**同宽同左边界**：它们都占满 816px 的内容列，

@@ -271,6 +271,34 @@ async def get_run(session: AsyncSession, run_id: int) -> dict[str, Any] | None:
     return {"run": {"id": int(run.id), "project_id": run.project_id, "aggregation_id": run.aggregation_id, "paper_ids": run.paper_ids, "input_snapshot_sha256": (run.input_snapshot or {}).get("sha256"), "model_ref": run.model_ref, "status": run.status, "current_expert": run.current_expert, "confirmation_status": run.confirmation_status, "decision": run.decision, "error": run.error, "failure_reason": failure_reason, "completed_experts": completed_experts, "failed_experts": [x.expert_key for x in failed_experts], "experts_total": len(experts), "created_at": run.created_at.isoformat() if run.created_at else None, "completed_at": run.completed_at.isoformat() if run.completed_at else None, "generation_seconds": generation_seconds, "experts": [{"id": int(x.id), "expert_number": x.expert_number, "expert_key": x.expert_key, "status": x.status, "output": x.output, "raw_output": x.raw_output, "model_ref": x.model_ref, "prompt_version": x.prompt_version, "cost_usd": x.cost_usd, "attempts": x.attempts, "started_at": x.started_at.isoformat() if x.started_at else None, "completed_at": x.completed_at.isoformat() if x.completed_at else None, "error": x.error} for x in experts], "candidates": [{"id": int(c.id), "direction": c.direction, "ordinal": c.ordinal, "title": c.title, "payload": c.payload, "evidence": c.evidence, "score": c.score, "rank": c.rank, "recommendation": c.recommendation, "is_selected": c.is_selected} for c in candidates]}}
 
 
+async def list_runs(session: AsyncSession, *, aggregation_id: int) -> list[dict[str, Any]]:
+    """Return the newest expert runs for a research task, newest first."""
+    rows = (
+        await session.execute(
+            select(IdeaPipelineRun)
+            .where(IdeaPipelineRun.aggregation_id == int(aggregation_id))
+            .order_by(IdeaPipelineRun.id.desc())
+            .limit(20)
+        )
+    ).scalars().all()
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        payload = await get_run(session, int(row.id))
+        if payload and payload.get("run"):
+            summary = payload["run"]
+            # Keep the history endpoint lightweight while exposing enough
+            # information for the task list to identify a completed run.
+            summary = {
+                **summary,
+                "candidate_count": len(summary.get("candidates") or []),
+                "expert_count": len(summary.get("experts") or []),
+            }
+            summary.pop("candidates", None)
+            summary.pop("experts", None)
+            items.append(summary)
+    return items
+
+
 async def confirm_candidate(session: AsyncSession, run_id: int, candidate_id: int, *, note: str | None = None) -> dict[str, Any]:
     run = (await session.execute(select(IdeaPipelineRun).where(IdeaPipelineRun.id == int(run_id)))).scalars().first()
     if run is None:
@@ -293,4 +321,4 @@ async def confirm_candidate(session: AsyncSession, run_id: int, candidate_id: in
     return await get_run(session, run_id) or {}
 
 
-__all__ = ["CRITICAL_EXPERTS", "DIRECTIONS", "DIRECTION_LABELS", "EXPERTS", "IdeaPipelineError", "WEIGHTS", "confirm_candidate", "create_run", "execute_run", "get_run"]
+__all__ = ["CRITICAL_EXPERTS", "DIRECTIONS", "DIRECTION_LABELS", "EXPERTS", "IdeaPipelineError", "WEIGHTS", "confirm_candidate", "create_run", "execute_run", "get_run", "list_runs"]

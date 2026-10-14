@@ -7,6 +7,7 @@ import {
   confirmIdeaExpertRun,
   createIdeaExpertRun,
   getIdeaExpertRun,
+  listIdeaExpertRuns,
   IDEA_EXPERTS,
   type IdeaExpertRun,
   type IdeaExpertStage,
@@ -28,6 +29,8 @@ const starting = ref(false)
 const confirming = ref(false)
 const notice = ref('')
 const selectedCandidateId = ref<number | string | null>(null)
+/** 20 个专家卡片里当前展开的是哪一位（点卡片切换，右侧/下方显示他的产出） */
+const activeStageKey = ref<string>('')
 /** POST /idea-runs 同步等待时还没有 run 对象，用本地时间保持等待状态可见。 */
 const localStartedAt = ref<number | null>(null)
 let pollTimer: ReturnType<typeof setTimeout> | null = null
@@ -81,6 +84,65 @@ const recentStatusText = computed(() => {
   return '尚未启动专家运行'
 })
 const activeCandidate = computed(() => run.value?.candidates.find((item) => String(item.id) === String(selectedCandidateId.value)) ?? run.value?.candidates[0] ?? null)
+
+/**
+ * 点开的那个专家：默认第一位。
+ *
+ * 2026-10-14：20 个专家卡片改成**可点开**，点谁看谁自己的产出（研究者口径：
+ * 左边 20 个专家、点开看这一位说了什么，右边证据链要人话，不要 JSON）。
+ */
+const activeStage = computed(
+  () => stages.value.find((stage) => String(stage.key) === activeStageKey.value) ?? stages.value[0] ?? null,
+)
+
+/**
+ * 专家产出摊平成「标签 + 人话」两列。
+ *
+ * - 有 `findings[]` 的专家：每条 `claim` 本身就是模型写的人话结论，直接用；
+ * - 没有 findings 的专家（如排序专家）：把标量字段平铺成「键：值」，数组只报条数 ——
+ *   **任何情况下都不把 JSON 打到界面上**（旧版直接把对象渲染成 `{"score":88,…}`）。
+ */
+const expertFindings = computed<Array<{ label: string; text: string }>>(() => {
+  const output = activeStage.value?.output
+  if (!output || typeof output !== 'object') return []
+  const value = output as Record<string, unknown>
+  const rows: Array<{ label: string; text: string }> = []
+  const findings = Array.isArray(value.findings) ? value.findings : []
+  findings.forEach((item, index) => {
+    if (!item || typeof item !== 'object') return
+    const finding = item as Record<string, unknown>
+    const claim = typeof finding.claim === 'string' ? finding.claim.trim() : ''
+    if (!claim) return
+    const tag = [finding.evidence_type, finding.idea_id]
+      .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
+      .join(' · ')
+    rows.push({ label: tag || `结论 ${index + 1}`, text: claim })
+  })
+  if (!rows.length) {
+    for (const [key, raw] of Object.entries(value)) {
+      if (key === 'findings' || raw === null || raw === undefined) continue
+      if (typeof raw === 'string' || typeof raw === 'number' || typeof raw === 'boolean') {
+        rows.push({ label: key, text: String(raw) })
+      } else if (Array.isArray(raw)) {
+        rows.push({ label: key, text: `${raw.length} 条` })
+      }
+    }
+  }
+  return rows
+})
+
+/** 候选证据链：引用编号 + 论文 + 出处字段 + 原文摘录（已是人话，见 api 里的 flattenQuote） */
+const candidateEvidence = computed<Array<{ ref: string; meta: string; quote: string }>>(() => {
+  const list = activeCandidate.value?.evidence ?? []
+  return list.map((item, index) => {
+    const ref = String(item.ref_id ?? item.id ?? `E${index + 1}`)
+    const meta = [item.paper_id ? `论文 ${item.paper_id}` : '', String(item.card_field ?? item.kind ?? '')]
+      .filter(Boolean)
+      .join(' · ')
+    return { ref, meta, quote: String(item.quote_text ?? '').trim() }
+  })
+})
+
 const isTerminal = computed(() => ['completed', 'awaiting_confirmation', 'failed', 'cancelled'].includes(String(run.value?.status)))
 const canConfirm = computed(() => Boolean(run.value && activeCandidate.value && ['completed', 'awaiting_confirmation'].includes(String(run.value.status)) && run.value.confirmation_status !== 'confirmed'))
 
@@ -133,7 +195,21 @@ async function load(): Promise<void> {
     paperIds.value = aggregation.paper_ids ?? []
     if (papers) paperTitles.value = Object.fromEntries((papers.items ?? []).map((paper: PaperSearchItem) => [paper.id, paper.title]))
     const runId = route.query.run_id
-    if (runId) run.value = await getIdeaExpertRun(String(runId))
+    if (runId) {
+      run.value = await getIdeaExpertRun(String(runId))
+    } else {
+      // Task pages are opened from the list without a run_id. Restore the
+      // newest persisted 20-expert result automatically.
+      const runs = await listIdeaExpertRuns(aggregationId.value)
+      const latestRun = runs[0]
+      // The history endpoint intentionally returns a compact summary. Load
+      // the selected run once more to render all 20 expert outputs and the
+      // eight persisted candidates.
+      run.value = latestRun?.id ? await getIdeaExpertRun(latestRun.id) : null
+      if (run.value?.id) {
+        await router.replace({ query: { ...route.query, run_id: String(run.value.id) } })
+      }
+    }
   } catch (error) {
     notice.value = ownerError(error)
   } finally {
@@ -282,7 +358,17 @@ onUnmounted(() => {
           <span class="muted">{{ completedStages }}/20 已完成</span>
         </header>
         <div class="stage-grid">
-          <div v-for="stage in stages" :key="stage.key" class="stage" :class="stageClass(stage)">
+          <div
+            v-for="stage in stages"
+            :key="stage.key"
+            class="stage"
+            :class="[stageClass(stage), { 'stage--active': String(stage.key) === String(activeStage?.key) }]"
+            role="button"
+            tabindex="0"
+            :aria-label="`查看「${stageLabel(stage)}」这位专家的产出`"
+            @click="activeStageKey = String(stage.key)"
+            @keyup.enter="activeStageKey = String(stage.key)"
+          >
             <span class="stage-index">{{ stage.order }}</span>
             <span class="stage-copy">
               <strong>{{ stageLabel(stage) }}</strong>
@@ -292,6 +378,26 @@ onUnmounted(() => {
             <span class="stage-dot" aria-hidden="true" />
           </div>
         </div>
+      </article>
+
+      <!-- 点开的这位专家说了什么（人话；不打印 JSON） -->
+      <article v-if="activeStage" class="panel expert-output">
+        <header class="panel-head">
+          <div>
+            <p class="panel-kicker">专家产出</p>
+            <h2>{{ activeStage.order }}. {{ stageLabel(activeStage) }}</h2>
+          </div>
+          <span class="muted">{{ stageStatus(activeStage) }}</span>
+          <span class="spacer" />
+          <span v-if="activeStage.model_ref" class="muted">{{ activeStage.model_ref }}</span>
+        </header>
+        <ul v-if="expertFindings.length" class="finding-list">
+          <li v-for="(row, index) in expertFindings" :key="`${activeStage.key}-${index}`">
+            <span class="finding-tag">{{ row.label }}</span>
+            <p class="finding-text">{{ row.text }}</p>
+          </li>
+        </ul>
+        <p v-else class="empty">这位专家没有留下可读结论。</p>
       </article>
 
       <div class="results-layout">
@@ -341,9 +447,31 @@ onUnmounted(() => {
               <div v-if="activeCandidate.innovation"><dt>预期创新</dt><dd>{{ activeCandidate.innovation }}</dd></div>
               <div><dt>证据</dt><dd>{{ activeCandidate.evidence_count ?? activeCandidate.evidence?.length ?? 0 }} 条论文证据</dd></div>
             </dl>
+            <!-- 打分：分数是数字，理由走 tooltip（口径与分数分列，不塞 JSON） -->
             <div v-if="activeCandidate.scores" class="score-grid">
-              <div v-for="(score, key) in activeCandidate.scores" :key="key"><span>{{ key }}</span><strong>{{ score ?? '—' }}</strong></div>
+              <div
+                v-for="(score, key) in activeCandidate.scores"
+                :key="key"
+                :title="activeCandidate.score_reasons?.[key] ?? ''"
+              >
+                <span>{{ key }}</span>
+                <strong>{{ score ?? '—' }}</strong>
+                <small v-if="activeCandidate.score_refs?.[key]?.length">{{ (activeCandidate.score_refs?.[key] ?? []).join(' ') }}</small>
+              </div>
             </div>
+            <!-- 证据链：编号 + 论文/字段 + 原文摘录（人话） -->
+            <section v-if="candidateEvidence.length" class="evidence-chain">
+              <h3>证据链</h3>
+              <ul>
+                <li v-for="item in candidateEvidence" :key="item.ref">
+                  <span class="evidence-ref">{{ item.ref }}</span>
+                  <div>
+                    <p v-if="item.meta" class="evidence-meta">{{ item.meta }}</p>
+                    <p class="evidence-quote">{{ item.quote || '（这条证据没有摘录）' }}</p>
+                  </div>
+                </li>
+              </ul>
+            </section>
             <footer class="confirm-bar">
               <span v-if="run?.confirmation_status === 'confirmed'" class="confirmed">已人工确认</span>
               <span v-else class="muted">排序完成后必须人工确认才能进入任务书</span>
@@ -386,7 +514,10 @@ onUnmounted(() => {
 .result-time { margin-left: auto; color: var(--color-text-secondary); font-size: var(--font-size-xs); }
 @keyframes run-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .45; transform: scale(.8); } }
 .stage-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin-top: var(--space-4); background: var(--color-border); border: 1px solid var(--color-border); }
-.stage { display: flex; align-items: center; gap: 9px; min-height: 68px; padding: 10px; background: var(--color-card-bg); }
+.stage { display: flex; align-items: center; gap: 9px; min-height: 68px; padding: 10px; background: var(--color-card-bg); cursor: pointer; }
+.stage:hover { background: var(--color-bg-subtle); }
+.stage:focus-visible { outline: 2px solid var(--color-brand); outline-offset: -2px; }
+.stage--active { background: var(--color-brand-soft); box-shadow: inset 0 0 0 1px var(--color-brand); }
 .stage-index { display: grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; background: var(--color-bg-subtle); color: var(--color-text-secondary); font: 600 var(--font-size-xs)/1 var(--font-family-mono); }
 .stage-copy { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; }
 .stage-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--font-size-sm); }
@@ -412,6 +543,20 @@ onUnmounted(() => {
 .score-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-2); margin-top: var(--space-4); }
 .score-grid div { display: flex; justify-content: space-between; padding: 9px; background: var(--color-bg-subtle); font-size: var(--font-size-xs); }
 .score-grid strong { font-family: var(--font-family-mono); }
+.score-grid small { color: var(--color-text-secondary); font-family: var(--font-family-mono); }
+/* 专家产出：标签 + 人话结论（点开某位专家后显示） */
+.expert-output .finding-list { display: flex; flex-direction: column; gap: var(--space-3); margin: var(--space-3) 0 0; padding: 0; list-style: none; }
+.expert-output .finding-list li { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: var(--space-3); align-items: start; }
+.finding-tag { padding: 2px 8px; border-radius: var(--radius-sm); background: var(--color-bg-subtle); color: var(--color-text-secondary); font: 500 var(--font-size-xs)/1.6 var(--font-family-mono); text-align: center; overflow-wrap: anywhere; }
+.finding-text { margin: 0; font-size: var(--font-size-sm); line-height: 1.7; }
+/* 证据链：编号 + 论文/字段 + 原文摘录 */
+.evidence-chain { margin-top: var(--space-5); }
+.evidence-chain h3 { margin: 0 0 var(--space-2); font-size: var(--font-size-sm); font-weight: 600; }
+.evidence-chain ul { display: flex; flex-direction: column; gap: var(--space-3); margin: 0; padding: 0; list-style: none; }
+.evidence-chain li { display: grid; grid-template-columns: 52px minmax(0, 1fr); gap: var(--space-3); align-items: start; }
+.evidence-ref { padding: 2px 6px; border-radius: var(--radius-sm); background: var(--color-brand-soft); font: 600 var(--font-size-xs)/1.6 var(--font-family-mono); text-align: center; }
+.evidence-meta { margin: 0 0 2px; color: var(--color-text-secondary); font-size: var(--font-size-xs); }
+.evidence-quote { margin: 0; font-size: var(--font-size-sm); line-height: 1.7; }
 .confirm-bar { margin-top: var(--space-5); padding-top: var(--space-3); border-top: 1px solid var(--color-border); }
 .confirmed { color: var(--color-success); font-size: var(--font-size-sm); }
 .empty { margin: 0; padding: var(--space-5) 0; color: var(--color-text-secondary); text-align: center; }
