@@ -18,7 +18,11 @@ import { useRouter } from 'vue-router'
 
 import { searchPapers, type PaperSearchItem } from '@/api/papers'
 import { rebuildCard } from '@/api/parse'
-import { registerReaderDocument } from '@/api/reader'
+import {
+  listReaderDocuments,
+  registerReaderDocument,
+  type ReaderDocumentSummary,
+} from '@/api/reader'
 import Pager from '@/components/Pager.vue'
 import SmoothSelect from '@/components/SmoothSelect.vue'
 import { writeDenied } from '@/utils/messages'
@@ -76,6 +80,8 @@ const pickedOpen = ref(false)
 
 const busy = ref('')
 const notice = ref('')
+/** 已登记阅读文档的公开索引；只读演示面可以直接打开这些文档。 */
+const readerDocuments = ref<ReaderDocumentSummary[] | null>(null)
 /** 表头列数随「选文弹窗隐藏操作列」而变（加载/空态那一行要跨正确列数，否则表格会错位） */
 const columnCount = computed(() => (props.selectMode ? 6 : 7))
 /** 旧后端会静默忽略 source/parse_status/sort → 如实提示，不装作筛过了 */
@@ -209,6 +215,18 @@ async function openReader(row: PaperSearchItem): Promise<void> {
   busy.value = `reader-${row.id}`
   notice.value = '正在登记全文（首次需要解析 PDF，稍等）…'
   try {
+    // public_demo 不能执行登记写操作。先查公开阅读文档索引，命中后无需令牌即可打开。
+    if (readerDocuments.value === null) {
+      const page = await listReaderDocuments(1, 100)
+      readerDocuments.value = page.items ?? []
+    }
+    const existing = readerDocuments.value.find((document) => document.paper_id === row.id)
+    if (existing?.id) {
+      notice.value = ''
+      await router.push({ path: `/papers/reader/${existing.id}` })
+      return
+    }
+
     const doc = await registerReaderDocument(row.id)
     if (doc?.id) {
       notice.value = ''
@@ -217,12 +235,13 @@ async function openReader(row: PaperSearchItem): Promise<void> {
     }
     notice.value = '打开全文失败：服务端没有返回文档号，请稍后重试。'
   } catch (error) {
-    notice.value =
-      (error as { status?: number })?.status === 403
-        ? writeDenied('登记全文')
-        : error instanceof Error
-          ? error.message
-          : String(error)
+    if ((error as { status?: number })?.status === 403) {
+      // 只读面不能登记新文档，但论文解析页仍是公开可读的论文界面。
+      notice.value = ''
+      await router.push({ path: `/papers/parse/${row.id}` })
+      return
+    }
+    notice.value = error instanceof Error ? error.message : String(error)
   } finally {
     busy.value = ''
   }
